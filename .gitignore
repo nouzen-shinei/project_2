@@ -1,0 +1,123 @@
+# dependencies
+node_modules/
+
+.venv
+
+# expo
+.expo/
+.expo-export/
+dist/
+web-build/
+expo-env.d.ts
+.expo-shared/
+public/
+
+# native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# metro
+.metro-health-check*
+
+# Android/Gradle local build noise
+android/.kotlin/
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# editor/OS backups
+*.bak
+
+# macos
+.DS_Store
+*.pem
+
+# Firebase Service Account Keys - NEVER COMMIT THESE!
+serviceAccountKey.json
+firebase-service-account.json
+scripts/serviceAccountKey.json
+scripts/firebase-service-account.json
+*-service-account*.json
+*serviceAccount*.json
+.tmp-service-account.json
+backend-runtime/firebase_sa.b64
+email-backend/firebase_sa.b64
+
+# local env files
+.env
+.env*.local
+.env.*
+!.env.example
+eas.json
+
+# local runtime artifacts (keep local, don't commit)
+reports/
+firestore-debug.log
+email-backend/logs/
+
+# email-backend local data (runtime state)
+email-backend/data/
+
+# backend-runtime local job audit artifacts
+backend-runtime/jobs-audit*.json
+
+# old Firestore index backup files
+firestore.indexes.old*.json
+
+# typescript
+*.tsbuildinfo
+vercel/
+.vercel
+
+# android builds
+*.apk
+*.aab
+
+# docs (do not commit)
+docs/*.md
+docs/roadmaps/
+
+# android build directories and config
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+
+# iOS build directories and artifacts
+ios/build/
+ios/DerivedData/
+ios/Pods/
+*.ipa
+*.xcarchive
+
+# additional signing artifacts
+*.keystore
+
+# iOS Xcode project/workspace noise
+ios/*.xcodeproj/xcuserdata/
+ios/*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Local Xcode env (host-specific)
+ios/.xcode.env
+
+# expo export archives
+dist/**/*.tar.gz
+web-build/**/*.tar.gz
+
+# coverage reports
+coverage/
+backend-runtime/coverage/
+
+# Firebase/Google config and locks (do not commit)
+android/app/google-services.json
+app/google-services.json
+
+README-old.md
+docs/devlog/

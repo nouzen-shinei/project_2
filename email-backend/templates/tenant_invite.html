@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{subject}}</title>
+  <style>
+    body { margin:0; padding:0; background:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif; color:#0f172a; line-height:1.6; }
+    table { border-collapse:collapse; }
+    .container { width:100%; background:#f8fafc; padding:24px 0; }
+    .card { background:#ffffff; border:1px solid #e2e8f0; border-radius:14px; overflow:hidden; max-width:640px; width:640px; }
+    .header { background:linear-gradient(135deg,#059669,#10b981); color:#ffffff; padding:30px 28px 24px; }
+    .brand { font-size:13px; letter-spacing:0.08em; text-transform:uppercase; opacity:0.92; margin:0 0 6px; }
+    .title { margin:0; font-size:24px; font-weight:800; line-height:1.25; }
+    .content { padding:26px 28px 10px; }
+    .lead { margin:0 0 12px; font-size:15px; }
+    .panel { border:1px solid #e2e8f0; border-radius:12px; padding:16px 16px; background:#f8fafc; margin:14px 0; }
+    .label { font-size:12px; letter-spacing:0.08em; text-transform:uppercase; color:#64748b; font-weight:700; margin:0 0 6px; }
+    .value { margin:0; font-size:15px; color:#0f172a; }
+    .message { white-space:pre-line; word-break:break-word; font-size:14px; color:#0f172a; margin:0; }
+    .button { display:inline-block; background:#059669; color:#ffffff !important; text-decoration:none; font-weight:800; padding:12px 22px; border-radius:999px; }
+    .muted { color:#475569; font-size:13px; }
+    .hr { height:1px; background:#e2e8f0; margin:18px 0; }
+    .footer { padding:16px 28px 22px; background:#ffffff; }
+    .fineprint { font-size:12px; color:#64748b; line-height:1.6; }
+    @media (max-width: 680px) {
+      .card { width:100% !important; border-radius:0 !important; }
+      .content, .header, .footer { padding-left:18px !important; padding-right:18px !important; }
+    }
+  </style>
+</head>
+<body>
+  <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
+    Invitation to join {{tenant_display}} as {{invite_role_label}}{{#expires_at_human}} • Expires {{expires_at_human}}{{/expires_at_human}}
+  </div>
+
+  <table role="presentation" class="container" width="100%" cellspacing="0" cellpadding="0">
+    <tr>
+      <td align="center">
+        <table role="presentation" class="card" width="640" cellspacing="0" cellpadding="0">
+          <tr>
+            <td class="header">
+              <p class="brand">Invitation • {{tenant_display}}</p>
+              <h1 class="title">{{subject}}</h1>
+            </td>
+          </tr>
+
+          <tr>
+            <td class="content">
+              <p class="lead"><strong>Hi {{to_name}},</strong></p>
+              <p class="lead" style="margin-top:0;">You’ve been invited to join <strong>{{tenant_display}}</strong> on the tuition platform.</p>
+
+              <div class="panel">
+                <p class="label">Your access</p>
+                <p class="value"><strong>Role:</strong> {{invite_role_label}}</p>
+                {{#expires_at_human}}<p class="muted" style="margin:6px 0 0;">This invite expires on {{expires_at_human}}.</p>{{/expires_at_human}}
+              </div>
+
+              {{#has_invite_message}}
+              <div class="panel">
+                <p class="label">Message from your team</p>
+                <p class="message">{{invite_message}}</p>
+              </div>
+              {{/has_invite_message}}
+
+              {{#invite_link}}
+              <div style="margin:16px 0 10px;">
+                <a class="button" href="{{invite_link}}" target="_blank" rel="noopener noreferrer">Accept invite</a>
+              </div>
+              <p class="muted" style="margin:0 0 10px;">If the button doesn’t work, copy and paste this link into your browser:</p>
+              <p class="muted" style="word-break:break-all; margin:0 0 10px;"><a href="{{invite_link}}" target="_blank" rel="noopener noreferrer">{{invite_link}}</a></p>
+              {{/invite_link}}
+
+              <div class="hr"></div>
+              <p class="muted" style="margin:0 0 8px;">Security note: If you weren’t expecting this invite, you can ignore this email.</p>
+            </td>
+          </tr>
+
+          <tr>
+            <td class="footer">
+              <p class="fineprint" style="margin:0 0 6px;">
+                Sent by {{from_name}} on behalf of {{tenant_display}}.
+                {{#reply_to}}Questions? Reply to this email or contact {{reply_to}}.{{/reply_to}}
+                {{^reply_to}}{{#teacher_email}}Questions? Contact {{teacher_email}}.{{/teacher_email}}{{/reply_to}}
+              </p>
+              <p class="fineprint" style="margin:0;">This automated email helps you join your coaching center.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

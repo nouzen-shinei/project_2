@@ -1,0 +1,119 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Fetch global app settings used for feature flags
+    function settings() {
+      return get(/databases/$(database)/documents/appSettings/globalSettings).data;
+    }
+
+    // Feature flags from settings
+    function allowAllReminderHistory() {
+      return exists(/databases/$(database)/documents/appSettings/globalSettings) &&
+        settings().allowNonAdminAllReminderHistory == true;
+    }
+
+    function hideAuthorizedEmailsForNonAdmins() {
+      return exists(/databases/$(database)/documents/appSettings/globalSettings) &&
+        settings().hideAuthorizedEmailsForNonAdmins == true;
+    }
+
+    function tenantMembershipDocId(tenantId) {
+      return tenantId + '_' + request.auth.uid;
+    }
+
+    function tenantMembership(tenantId) {
+      return get(/databases/$(database)/documents/tenantMemberships/$(tenantMembershipDocId(tenantId)));
+    }
+
+    function hasTenantStaffAccess(tenantId) {
+      return isSignedIn() && tenantMembership(tenantId).data.status == 'active' && (
+        tenantMembership(tenantId).data.role == 'owner' ||
+        tenantMembership(tenantId).data.role == 'admin' ||
+        tenantMembership(tenantId).data.role == 'staff'
+      );
+    }
+
+  // Admin check: use a UID-keyed mirror doc in authorizedUsersByUid
+  // Rationale: Security rules cannot compute dynamic string replacements reliably in path segments,
+  // so we keep a separate collection keyed by request.auth.uid.
+    function isAdmin() {
+      return isSignedIn() &&
+    exists(/databases/$(database)/documents/authorizedUsersByUid/$(request.auth.uid)) &&
+    get(/databases/$(database)/documents/authorizedUsersByUid/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    match /tenantUsage/{tenantId}/months/{monthId} {
+      allow read: if hasTenantStaffAccess(tenantId) || isAdmin();
+      allow create: if false;
+      allow update, delete: if false;
+
+      match /alerts/{alertId} {
+        allow read: if hasTenantStaffAccess(tenantId) || isAdmin();
+        allow write: if false;
+      }
+    }
+
+    // Reminder History: restrict reads to owner unless the flag allows all
+    match /reminderHistory/{docId} {
+      // Reads: allow all when flag is on or admin; otherwise only owner
+      allow read: if isSignedIn() && (
+        allowAllReminderHistory() || isAdmin() || resource.data.userId == request.auth.uid
+      );
+      // Writes: only the owner can write their own history documents
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Students: allow reads/updates as before, but block client-side creation so limits can be enforced by backend.
+    match /students/{studentId} {
+      allow read: if isSignedIn();
+      allow create: if false;
+      allow update, delete: if isSignedIn();
+    }
+
+    // Reminder Batches: same visibility as reminder history
+    match /reminderBatches/{docId} {
+      allow read: if isSignedIn() && (
+        allowAllReminderHistory() || isAdmin() || resource.data.userId == request.auth.uid
+      );
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Authorized Emails: when hidden, only allow users to read their own entry
+    match /authorizedEmails/{docId} {
+      // Read rules
+      allow get: if isSignedIn() && (
+        isAdmin() || !hideAuthorizedEmailsForNonAdmins() || resource.data.email == request.auth.token.email
+      );
+      // List: allow admins always; block non-admins when hidden; allow when visible
+      allow list: if isSignedIn() && (
+        isAdmin() || !hideAuthorizedEmailsForNonAdmins()
+      );
+
+      // Writes: keep permissive for now (client admin UI enforces role)
+      allow create, update, delete: if isSignedIn();
+    }
+
+    // App settings: readable and writable to authenticated users (admin UI is client-side)
+    match /appSettings/{docId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Maintenance mode: allow anyone to read the single maintenance doc so the app can
+    // show a blocking screen even before login.
+    match /appConfig/maintenance {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Default fallback: keep existing permissive behavior for other collections
+    match /{document=**} {
+      allow read, write: if isSignedIn();
+    }
+  }
+}

@@ -1,0 +1,6 @@
+<resources>
+	<!-- Dark mode overrides for splash background -->
+	<color name="splashscreen_background">#0f172a</color>
+	<!-- Optional: keep icon background consistent in dark mode -->
+	<color name="iconBackground">#0f172a</color>
+</resources>

@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "cleanUrls": false,
+  "trailingSlash": false,
+  "builds": [
+    {
+      "src": "package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "dist"
+      }
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/landing",
+      "permanent": false
+    }
+  ],
+  "rewrites": [
+    { "source": "/landing", "destination": "/landing.html" },
+    { "source": "/uljd9b26bh8okpseu6hhnygxf8bfys", "destination": "/uljd9b26bh8okpseu6hhnygxf8bfys.html" },
+    { "source": "/contact", "destination": "/contact.html" },
+    { "source": "/about", "destination": "/about.html" },
+    { "source": "/data-deletion", "destination": "/data-deletion.html" },
+    { "source": "/refund-policy", "destination": "/refund-policy.html" },
+    { "source": "/cookie-policy", "destination": "/cookie-policy.html" },
+    { "source": "/privacy-policy", "destination": "/privacy-policy.html" },
+    { "source": "/terms-of-service", "destination": "/terms-of-service.html" },
+    { "source": "/robots.txt", "destination": "/robots.txt" },
+    { "source": "/VIPIKA%20Udyam%20Registration%20Certificate.pdf", "destination": "/VIPIKA%20Udyam%20Registration%20Certificate.pdf" },
+    {
+      "source": "/((?!robots\\.txt|favicon\\.ico|landing|contact|about|data-deletion|refund-policy|cookie-policy|privacy-policy|terms-of-service|VIPIKA%20Udyam%20Registration%20Certificate\\.pdf)(?!.*\\.).*)",
+      "destination": "/landing.html"
+    }
+  ]
+}

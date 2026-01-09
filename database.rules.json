@@ -1,0 +1,48 @@
+{
+  "rules": {
+    ".read": "auth != null",
+    ".write": "auth != null",
+    "messages": {
+      ".indexOn": ["recipientId", "sender"]
+    },
+    "tenantChat": {
+      "$tenantId": {
+        "conversationMessages": {
+          "$conversation": {
+            ".indexOn": ["timestamp", "sender", "recipientId"]
+          }
+        },
+        "messageIndex": {
+          ".indexOn": ["timestamp", "conversationKey", "recipientId", "sender"]
+        },
+        "conversationSummaries": {
+          "$user": {
+            "$partner": {
+              ".indexOn": ["updatedAt", "partnerEmail"]
+            }
+          }
+        },
+        "conversationLatest": {
+          "$conversation": {
+            ".indexOn": ["timestamp"]
+          }
+        },
+        "userConversations": {
+          "$user": {
+            ".indexOn": ["updatedAt", "partnerEmail"]
+          }
+        },
+        "typing": { ".read": false, ".write": false },
+        "messageReactions": { ".read": false, ".write": false }
+      }
+    },
+
+    "conversationMessages": { ".read": false, ".write": false },
+    "messageIndex": { ".read": false, ".write": false },
+    "conversationSummaries": { ".read": false, ".write": false },
+    "conversationLatest": { ".read": false, ".write": false },
+    "userConversations": { ".read": false, ".write": false },
+    "messageReactions": { ".read": false, ".write": false },
+    "typing": { ".read": false, ".write": false }
+  }
+}

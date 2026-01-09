@@ -1,0 +1,132 @@
+import { logger } from '@/lib/logger';
+// File download utility with CORS support
+// This handles proper file downloads for web by fetching as blob
+
+import { Platform } from 'react-native';
+
+export const FileDownloadUtil = {
+  // Helper function to extract clean filename from URL or provided name
+  extractCleanFileName(fileUrl: string, providedFileName?: string): string {
+    let cleanName = providedFileName || '';
+    
+    // If no provided filename or it contains URL artifacts, extract from URL
+    if (!cleanName || cleanName.includes('%2F') || cleanName.includes('alt=media') || cleanName.includes('token=')) {
+      try {
+        // Parse the URL to get the path
+        const url = new URL(fileUrl);
+        const pathParts = url.pathname.split('/');
+        
+        // Find the part that looks like a filename (contains an underscore and looks like a filename)
+        for (const part of pathParts) {
+          const decoded = decodeURIComponent(part);
+          // Look for parts that contain file extensions or look like filenames
+          if (decoded.match(/\.(jpg|jpeg|png|gif|pdf|doc|docx|txt|mp4|mov|avi|mkv|webm|m4v|3gp|wmv|mp3|zip|rar|xlsx|xls|ppt|pptx)$/i)) {
+            cleanName = decoded;
+            break;
+          }
+          // Also check for parts that look like timestamped filenames
+          if (decoded.match(/^\d+_.*\./)) {
+            cleanName = decoded;
+            break;
+          }
+        }
+        
+        // If still no good filename found, try to extract from the o/ path parameter
+        if (!cleanName || cleanName.includes('%2F')) {
+          const oParam = pathParts.find(part => part.startsWith('o%2F') || part.includes('%2F'));
+          if (oParam) {
+            const decoded = decodeURIComponent(oParam);
+            const filenamePart = decoded.split('/').pop();
+            if (filenamePart && filenamePart.includes('.')) {
+              cleanName = filenamePart;
+            }
+          }
+        }
+      } catch (error) {
+        logger.warn('Failed to parse URL for filename:', error);
+      }
+    }
+    
+    // Final cleanup - remove any remaining URL artifacts
+    cleanName = cleanName
+      .replace(/^.*%2F/, '') // Remove path prefixes
+      .replace(/\?.*$/, '')   // Remove query parameters
+      .replace(/&.*$/, '')    // Remove additional parameters
+      .replace(/_alt=media.*$/, '') // Remove Firebase storage parameters
+      .trim();
+    
+    // If we still don't have a good filename, create a default one
+    if (!cleanName || cleanName.length < 3) {
+      const timestamp = Date.now();
+      cleanName = `downloaded_file_${timestamp}.bin`;
+    }
+    
+    return cleanName;
+  },
+
+  async downloadFile(fileUrl: string, fileName: string): Promise<boolean> {
+    if (Platform.OS !== 'web') {
+      // For mobile, delegate to the existing mobile implementation
+      return false; // Indicates that mobile should handle this differently
+    }
+
+    try {
+      // Clean the filename first
+      const cleanFileName = this.extractCleanFileName(fileUrl, fileName);
+
+      if (fileUrl.startsWith('blob:') || fileUrl.startsWith('data:')) {
+        const link = document.createElement('a');
+        link.href = fileUrl;
+        link.download = cleanFileName;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return true;
+      }
+      
+      // Fetch the file as a blob to bypass CORS issues with direct download
+      const response = await fetch(fileUrl);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      
+      // Create object URL from blob
+      const objectUrl = URL.createObjectURL(blob);
+      
+      // Create download link
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = cleanFileName;
+      link.style.display = 'none';
+      
+      // Add to document, click, and clean up
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      
+      return true;
+    } catch (error) {
+      logger.error('Download failed:', error);
+      throw error;
+    }
+  },
+
+  async checkFileAccessibility(fileUrl: string): Promise<boolean> {
+    if (fileUrl.startsWith('blob:') || fileUrl.startsWith('data:')) {
+      return true;
+    }
+    try {
+      const response = await fetch(fileUrl, { method: 'HEAD' });
+      return response.ok;
+    } catch (error) {
+      // Silently handle 404s and network errors for deleted files
+      // Don't log expected 404 errors to avoid console spam
+      return false;
+    }
+  }
+};

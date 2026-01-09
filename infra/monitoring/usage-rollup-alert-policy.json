@@ -1,0 +1,30 @@
+{
+  "displayName": "Usage rollup job: investigate",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/tution-app-6c0c3/notificationChannels/5197969209122830959"
+  ],
+  "conditions": [
+    {
+      "displayName": "usage-rollup execution failed",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/usage_rollup_execution_failed\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "documentation": {
+    "content": "This alert covers the nightly usage rollup Cloud Run Job.\n\nRunbook:\n- Cloud Run Job: usage-rollup-job (asia-south1)\n- Check latest execution logs.\n- If failures: inspect [usage_rollup_scheduler] logs for the tenantId target(s) and error message(s).\n\nNote: Cloud Monitoring conditionAbsent only supports up to 23h30m, so we do not use a missing-heartbeat condition for a once-per-day job. If you want a missing-run alert, use Cloud Scheduler metrics/alerts or run the rollup more frequently.\n",
+    "mimeType": "text/markdown"
+  }
+}

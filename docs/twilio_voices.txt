@@ -1,0 +1,48 @@
+
+# 🔊 Text-to-Speech Voices
+
+### 🌐 Language: **Hindi (India)**
+
+#### 👩 Female Voices
+
+| Language (Locale) | Code  | Type     | Gender | Provider | Voice                   |
+| ----------------- | ----- | -------- | ------ | -------- | ----------------------- |
+| Hindi (India)     | hi-IN | Standard | Female | Google   | hi-IN-Standard-A        |
+| Hindi (India)     | hi-IN | Standard | Female | Google   | hi-IN-Standard-D        |
+| Hindi (India)     | hi-IN | Standard | Female | Google   | hi-IN-Standard-E        |
+| Hindi (India)     | hi-IN | Standard | Female | Polly    | **Aditi**\* (Bilingual) |
+
+#### 👨 Male Voices
+
+| Language (Locale) | Code  | Type     | Gender | Provider | Voice            |
+| ----------------- | ----- | -------- | ------ | -------- | ---------------- |
+| Hindi (India)     | hi-IN | Standard | Male   | Google   | hi-IN-Standard-B |
+| Hindi (India)     | hi-IN | Standard | Male   | Google   | hi-IN-Standard-C |
+| Hindi (India)     | hi-IN | Standard | Male   | Google   | hi-IN-Standard-F |
+
+---
+
+### 🌐 Language: **English (India)**
+
+#### 👩 Female Voices
+
+| Language (Locale) | Code  | Type     | Gender | Provider | Voice                   |
+| ----------------- | ----- | -------- | ------ | -------- | ----------------------- |
+| English (India)   | en-IN | Standard | Female | Google   | en-IN-Standard-A        |
+| English (India)   | en-IN | Standard | Female | Google   | en-IN-Standard-D        |
+| English (India)   | en-IN | Standard | Female | Google   | en-IN-Standard-E        |
+| English (India)   | en-IN | Standard | Female | Polly    | **Aditi**\* (Bilingual) |
+| English (India)   | en-IN | Standard | Female | Polly    | Raveena                 |
+
+#### 👨 Male Voices
+
+| Language (Locale) | Code  | Type     | Gender | Provider | Voice            |
+| ----------------- | ----- | -------- | ------ | -------- | ---------------- |
+| English (India)   | en-IN | Standard | Male   | Google   | en-IN-Standard-B |
+| English (India)   | en-IN | Standard | Male   | Google   | en-IN-Standard-C |
+| English (India)   | en-IN | Standard | Male   | Google   | en-IN-Standard-F |
+
+---
+
+✅ **Note:** Voices marked with `*` are **bilingual** (supporting both English & Hindi). Currently, only **Amazon Polly** provides this feature for select voices.
+

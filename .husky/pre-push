@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Pre-push hook: enforce production env safety when pushing main/release branches.
+# Requires: chmod +x .husky/pre-push
+
+BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [[ "$BRANCH_NAME" =~ ^(main|master|release|prod) ]]; then
+  echo "[pre-push] Running production environment enforcement script..."
+  node scripts/enforceProdEnv.js production || {
+    echo "[pre-push] Aborting push due to environment policy violation." >&2
+    exit 1
+  }
+fi

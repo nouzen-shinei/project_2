@@ -1,0 +1,34 @@
+1) Template Name - custom_message_bilingual
+    Subject - "New Message - {{coaching_name}}"
+    To Email - "{{to_email}}"
+    From Name - "{{from_name}}"
+    Reply To - "{{reply_to}}"
+
+2) Template Name - Fee Reminder
+    Subject - "{{subject}}"
+    To Email - "{{to_email}}"
+    From Name - "{{from_name}}"
+    Reply To - "{{reply_to}}"
+
+3) Template Name - tenant_join_request
+    Subject - "{{subject}}" (defaults to "New join request • {{tenant_name}}")
+    To Email - "{{to_email}}"
+    From Name - "{{from_name}}"
+    Reply To - "{{reply_to}}"
+    Tenant Name - "{{tenant_name}}"
+    Requester Name - "{{requester_name}}"
+    Requester Email - "{{requester_email}}"
+    Request ID - "{{request_id}}"
+    Request Message - "{{request_message}}"
+    Admin Portal URL (optional) - "{{admin_portal_url}}"
+
+4) Template Name - tenant_invite
+    Subject - "{{subject}}" (defaults to "You're invited to join {{tenant_name}}")
+    To Email - "{{to_email}}"
+    From Name - "{{from_name}}"
+    Reply To - "{{reply_to}}"
+    Tenant Name - "{{tenant_name}}"
+    Invite Role - "{{invite_role}}"
+    Invite Message - "{{invite_message}}"
+    Invite Link - "{{invite_link}}"
+    Invite Expiration - "{{expires_at}}" / "{{expires_at_human}}"

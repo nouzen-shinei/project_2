@@ -1,0 +1,51 @@
+# Speed up EAS local build compression by excluding unnecessary files
+# Keep native android/ios source (do NOT ignore entire directories)
+
+# VCS
+.git
+.gitignore
+.expo/
+.expo-export/
+
+# Node artifacts
+node_modules/
+node_modules/.cache
+backend-runtime/node_modules/
+email-backend/node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# macOS & editor metadata
+.DS_Store
+.vscode/
+.idea/
+
+# Build outputs
+android/app/build
+android/build
+android/.gradle
+ios/build
+ios/Pods/
+build/
+dist/
+coverage/
+backend-runtime/coverage
+backend-runtime/dist/
+email-backend/dist/
+email-backend/logs/
+
+# Project areas not required for mobile build
+backend-runtime/
+email-backend/
+docs/
+tests/
+
+# Generated bundles / artifacts
+*.apk
+*.aab
+
+# Misc
+*.log
+firebase_sa.b64
+
+# Do not exclude gradlew or gradle wrapper files required for build

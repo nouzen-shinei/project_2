@@ -1,0 +1,49 @@
+name: Backend Runtime CI
+on:
+  push:
+    paths:
+      - 'backend-runtime/**'
+  pull_request:
+    paths:
+      - 'backend-runtime/**'
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+    defaults:
+      run:
+        working-directory: backend-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend-runtime/package-lock.json
+      - name: Install deps
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: backend-runtime/coverage/lcov.info
+      - name: Codecov Upload
+        if: success()
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend-runtime/coverage/lcov.info
+          flags: backend-runtime
+          fail_ci_if_error: false

@@ -1,0 +1,32 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: usage-refresh-job
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: usage-refresh-job@tution-app-6c0c3.iam.gserviceaccount.com
+          timeoutSeconds: 900
+          containers:
+            - image: gcr.io/tution-app-6c0c3/backend-runtime:latest
+              command: ["npm"]
+              args: ["run", "usage:refresh-worker"]
+              env:
+                - name: FIREBASE_PROJECT_ID
+                  value: tution-app-6c0c3
+                - name: FIREBASE_DATABASE_URL
+                  value: https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app
+                - name: FIREBASE_STORAGE_BUCKET
+                  value: tution-app-6c0c3.firebasestorage.app
+                - name: USAGE_REFRESH_BATCH_LIMIT
+                  value: "5"
+                - name: USAGE_REFRESH_DRY_RUN
+                  value: "0"
+                - name: USAGE_REFRESH_VERBOSE
+                  value: "0"

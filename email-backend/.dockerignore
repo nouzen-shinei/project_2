@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+dist
+.env
+logs
+secure-data
+.git
+.vscode
+coverage
+**/*.test.*
+*.md

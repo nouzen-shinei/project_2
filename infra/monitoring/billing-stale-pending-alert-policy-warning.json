@@ -1,0 +1,30 @@
+{
+  "displayName": "Billing stale-pending: capacity warning",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/tution-app-6c0c3/notificationChannels/5197969209122830959"
+  ],
+  "conditions": [
+    {
+      "displayName": "billing-stale-pending scan saturated",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/billing_stale_pending_scan_saturated\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "documentation": {
+    "content": "This is a WARNING alert indicating the billing-stale-pending-job scan hit its capacity limit (saturated).\n\nRunbook:\n- Check job logs for: scanSaturated=true and scanLimit.\n- If this happens repeatedly: increase scanning capacity (BILLING_STALE_PENDING_MAX_TENANTS) and/or implement pagination/cursor scanning in the job.\n",
+    "mimeType": "text/markdown"
+  }
+}

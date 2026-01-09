@@ -1,0 +1,27 @@
+{
+  "extends": "./node_modules/expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+  "jsx": "react-jsx",
+  "esModuleInterop": true,
+  "allowSyntheticDefaultImports": true,
+  "baseUrl": ".",
+      "paths": {
+        "@/*": ["./*"]
+      }
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".expo/types/**/*.ts",
+    "expo-env.d.ts",
+    "nativewind-env.d.ts"
+  ],
+  "exclude": [
+    "email-backend/**",
+    "backend-runtime/**",
+    "android/**",
+    "ios/**",
+    "node_modules/**"
+  ]
+}

@@ -1,0 +1,147 @@
+diff --git a/node_modules/expo-modules-core/index.js b/node_modules/expo-modules-core/index.js
+index b894a23..37d0f91 100644
+--- a/node_modules/expo-modules-core/index.js
++++ b/node_modules/expo-modules-core/index.js
+@@ -1 +1,141 @@
+-module.exports = null;
++// Comprehensive compatibility wrapper for expo-modules-core
++// This addresses Node.js TypeScript compatibility issues and provides required functions
++
++// Mock implementations of expo-modules-core functions
++function requireNativeModule(moduleName) {
++  console.warn(`requireNativeModule(${moduleName}) called in non-native environment`);
++  return {};
++}
++
++function requireOptionalNativeModule(moduleName) {
++  console.warn(`requireOptionalNativeModule(${moduleName}) called in non-native environment`);
++  return null;
++}
++
++function requireNativeViewManager(viewName) {
++  console.warn(`requireNativeViewManager(${viewName}) called in non-native environment`);
++  return null;
++}
++
++function registerWebModule(module) {
++  console.warn('registerWebModule called in compatibility mode');
++  return module;
++}
++
++function NativeModulesProxy() {
++  return new Proxy({}, {
++    get: function(target, prop) {
++      console.warn(`NativeModulesProxy.${prop} accessed in non-native environment`);
++      return {};
++    }
++  });
++}
++
++// EventEmitter mock
++class EventEmitter {
++  constructor() {
++    this.listeners = {};
++  }
++  
++  addListener(event, listener) {
++    if (!this.listeners[event]) {
++      this.listeners[event] = [];
++    }
++    this.listeners[event].push(listener);
++    return { remove: () => this.removeListener(event, listener) };
++  }
++  
++  removeListener(event, listener) {
++    if (this.listeners[event]) {
++      this.listeners[event] = this.listeners[event].filter(l => l !== listener);
++    }
++  }
++  
++  emit(event, ...args) {
++    if (this.listeners[event]) {
++      this.listeners[event].forEach(listener => listener(...args));
++    }
++  }
++}
++
++// LegacyEventEmitter - needed for notifications
++class LegacyEventEmitter extends EventEmitter {
++  constructor(nativeModule) {
++    super();
++    this.nativeModule = nativeModule;
++  }
++  
++  addListener(eventName, listener) {
++    const subscription = super.addListener(eventName, listener);
++    // In a real implementation, this would register with the native module
++    console.warn(`LegacyEventEmitter: addListener(${eventName}) called in compatibility mode`);
++    return subscription;
++  }
++  
++  removeAllListeners(eventName) {
++    if (eventName) {
++      this.listeners[eventName] = [];
++    } else {
++      this.listeners = {};
++    }
++  }
++}
++
++// Platform detection
++const Platform = {
++  OS: typeof window !== 'undefined' ? 'web' : 'node',
++  select: (options) => options.web || options.default,
++};
++
++// NativeModule base class - needed for font and other modules
++class NativeModule {
++  constructor() {
++    console.warn('NativeModule instantiated in compatibility mode');
++  }
++}
++
++// Main export object
++const expoModulesCore = {
++  requireNativeModule,
++  requireOptionalNativeModule,
++  requireNativeViewManager,
++  registerWebModule,
++  NativeModulesProxy: NativeModulesProxy(),
++  EventEmitter,
++  LegacyEventEmitter,
++  NativeModule,
++  Platform,
++  // Additional common exports
++  CodedError: class CodedError extends Error {
++    constructor(code, message) {
++      super(message);
++      this.code = code;
++    }
++  },
++  UnavailabilityError: class UnavailabilityError extends Error {
++    constructor(moduleName, propertyName) {
++      super(`${moduleName}.${propertyName} is not available on this platform.`);
++    }
++  }
++};
++
++try {
++  // Try to load the actual module if available
++  if (typeof window !== 'undefined') {
++    // Browser environment - try to load actual implementation
++    try {
++      const actualModule = require('./build/index.js');
++      // Merge actual implementation with our mocks, preferring actual implementation
++      module.exports = { ...expoModulesCore, ...actualModule };
++    } catch (buildError) {
++      // Fallback to our mock implementation
++      module.exports = expoModulesCore;
++    }
++  } else {
++    // Node.js environment - use mock implementation
++    module.exports = expoModulesCore;
++  }
++} catch (error) {
++  // Ultimate fallback
++  module.exports = expoModulesCore;
++}

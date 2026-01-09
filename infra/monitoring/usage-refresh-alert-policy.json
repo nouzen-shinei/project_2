@@ -1,0 +1,38 @@
+{
+  "displayName": "Usage refresh job: investigate",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/tution-app-6c0c3/notificationChannels/5197969209122830959"
+  ],
+  "conditions": [
+    {
+      "displayName": "usage-refresh execution failed",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/usage_refresh_execution_failed\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    },
+    {
+      "displayName": "usage-refresh heartbeat missing (>= 20m)",
+      "conditionAbsent": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/usage_refresh_heartbeat\"",
+        "duration": "1200s",
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "documentation": {
+    "content": "This alert covers the usage refresh queue drainer Cloud Run Job (scheduled every 5 minutes).\n\nRunbook:\n- Cloud Run Job: usage-refresh-job (asia-south1)\n- Check latest execution logs for [usage_refresh_worker].\n- If failures: look for request failures and Firestore index errors; confirm tenantUsageRefreshRequests are being drained.\n- If heartbeat missing: verify Cloud Scheduler trigger (usage-refresh-queue) and Cloud Run job health.\n",
+    "mimeType": "text/markdown"
+  }
+}

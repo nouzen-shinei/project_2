@@ -1,0 +1,76 @@
+<!-- Mirrors email-backend/templates/tenant_invite.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{subject}}</title>
+  <style>
+    body { margin:0; padding:0; background:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif; color:#0f172a; line-height:1.6; }
+    .email-container { max-width:620px; margin:0 auto; background:#ffffff; border-radius:14px; overflow:hidden; box-shadow:0 12px 40px rgba(15,23,42,0.12); }
+    .header { background:linear-gradient(135deg,#059669,#10b981); color:#fff; padding:38px 32px 36px; }
+    .header h1 { margin:0; font-size:26px; font-weight:600; }
+    .content { padding:40px 36px; }
+    .greeting { font-size:18px; font-weight:600; margin:0 0 14px; }
+    .intro { font-size:16px; margin:0 0 20px; }
+    .card { border:1px solid #e2e8f0; border-radius:12px; padding:18px 20px; margin-bottom:18px; background:#f8fafc; }
+    .label { font-size:12px; letter-spacing:0.08em; text-transform:uppercase; color:#64748b; font-weight:600; margin-bottom:6px; }
+    .value { font-size:16px; color:#0f172a; margin:0; }
+    .message { white-space:pre-line; word-break:break-word; font-size:15px; color:#0f172a; }
+    .cta { display:inline-block; background:#059669; color:#fff; text-decoration:none; font-weight:600; padding:12px 28px; border-radius:999px; margin:14px 0 22px; }
+    .cta:hover { background:#047857; }
+    .note { font-size:14px; color:#475569; margin:0 0 26px; }
+    .signature { font-size:15px; color:#0f172a; line-height:1.8; }
+    .signature strong { font-size:16px; }
+    .footer { padding:22px 30px; background:#f1f5f9; text-align:center; font-size:13px; color:#64748b; border-top:1px solid #e2e8f0; }
+    @media (max-width:620px) { .content { padding:30px 22px; } .header { padding:30px 22px; } }
+  </style>
+</head>
+<body>
+  <div class="email-container">
+    <div class="header">
+      <h1>{{subject}}</h1>
+    </div>
+    <div class="content">
+      <p class="greeting">Hi {{to_name}},</p>
+      <p class="intro">You're invited to join <strong>{{tenant_display}}</strong> on our tuition platform.</p>
+
+      <div class="card">
+        <div class="label">Your role</div>
+        <p class="value">{{invite_role_label}}</p>
+      </div>
+
+      {{#has_invite_message}}
+      <div class="card">
+        <div class="label">Message from your team</div>
+        <p class="message">{{invite_message}}</p>
+      </div>
+      {{/has_invite_message}}
+
+      {{#expires_at_human}}
+      <div class="card">
+        <div class="label">Invite expires</div>
+        <p class="value">{{expires_at_human}}</p>
+      </div>
+      {{/expires_at_human}}
+
+      {{#invite_link}}
+      <a class="cta" href="{{invite_link}}" target="_blank" rel="noopener noreferrer">Accept invite</a>
+      {{/invite_link}}
+
+      <p class="note">If the button doesn't work, copy and paste this link into your browser:</p>
+      <p class="note" style="word-break:break-all;">{{invite_link}}</p>
+
+      <div class="signature">
+        <p>Thanks,</p>
+        <strong>{{from_name}}</strong><br />
+        <span>{{tenant_display}}</span>
+      </div>
+    </div>
+    <div class="footer">
+      <p>This automated email helps you join your coaching center.</p>
+      <p>If you weren't expecting it, ignore this message.</p>
+    </div>
+  </div>
+</body>
+</html>

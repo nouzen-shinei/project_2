@@ -1,0 +1,59 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: billing-stale-pending-job
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: billing-stale-pending-job@tution-app-6c0c3.iam.gserviceaccount.com
+          timeoutSeconds: 1800
+          containers:
+            - image: gcr.io/tution-app-6c0c3/backend-runtime:latest
+              command: ["npm"]
+              args: ["run", "billing:stale-pending"]
+              env:
+                - name: FIREBASE_PROJECT_ID
+                  value: tution-app-6c0c3
+                - name: FIREBASE_DATABASE_URL
+                  value: https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app
+                - name: FIREBASE_STORAGE_BUCKET
+                  value: tution-app-6c0c3.firebasestorage.app
+
+                - name: BILLING_STALE_PENDING_JOB_LABEL
+                  value: prod_stale_pending
+                - name: BILLING_STALE_PENDING_THRESHOLD_HOURS
+                  value: "24"
+                - name: BILLING_STALE_PENDING_TENANT_IDS
+                  value: ""
+                - name: BILLING_STALE_PENDING_MAX_TENANTS
+                  value: ""
+                - name: BILLING_STALE_PENDING_DRY_RUN
+                  value: "0"
+                - name: BILLING_STALE_PENDING_VERBOSE
+                  value: "0"
+
+                - name: BILLING_STALE_PENDING_TENANT_LEASE_MS
+                  value: "180000"
+
+                - name: BILLING_STALE_PENDING_RUN_LEASE_MS
+                  value: "7200000"
+
+                # Needed only to cancel Razorpay subscriptions (credentials should be injected via
+                # Cloud Run env overrides or Secret Manager, not committed).
+                - name: RAZORPAY_KEY_ID
+                  value: ""
+                - name: RAZORPAY_KEY_SECRET
+                  value: ""
+
+                # Needed only to cancel Google Play subscriptions. Prefer injecting these via
+                # Cloud Run env overrides or Secret Manager, not committing secrets.
+                - name: GOOGLE_PLAY_PACKAGE_NAME
+                  value: ""
+                - name: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
+                  value: ""

@@ -1,0 +1,61 @@
+# fly.toml generated for whatsapp backend-runtime
+app = "your-whatsapp-backend"  # change to unique globally
+primary_region = "sin"
+kill_signal = "SIGINT"
+kill_timeout = 15
+
+[build]
+  # Uses existing Dockerfile
+
+[env]
+  PORT = "8080"
+  WHATSAPP_QUEUE_CONCURRENCY = "4"
+  WHATSAPP_QUEUE_NAME = "wa-reminders"
+  JOB_RETENTION_MS = "604800000"
+  ALERT_QUEUE_DEPTH = "50"
+  ALERT_FAILURE_RATE = "0.05"
+  SHUTDOWN_TIMEOUT_MS = "10000"
+  EMAIL_BACKEND_BASE_URL = "https://my-email-backend.fly.dev"
+  ADMIN_JOIN_REQUEST_PATH = "/admin/settings/join-requests"
+
+[[services]]
+  internal_port = 8080
+  processes = ["app"]
+  protocol = "tcp"
+
+  [services.concurrency]
+    hard_limit = 50
+    soft_limit = 40
+    type = "connections"
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls","http"]
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+
+  [[services.http_checks]]
+    interval = "20s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/ready"
+    protocol = "http"
+
+  [[services.tcp_checks]]
+    interval = "30s"
+    timeout = "2s"
+    grace_period = "1m"
+
+[metrics]
+  port = 8080
+  path = "/metrics"

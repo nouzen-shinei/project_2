@@ -1,0 +1,29 @@
+name: OpenAPI Validate
+on:
+  push:
+    paths:
+      - 'openapi.yaml'
+      - '.github/workflows/openapi-validate.yml'
+  pull_request:
+    paths:
+      - 'openapi.yaml'
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies (clean)
+        run: npm ci --no-audit --no-fund
+      - name: Validate OpenAPI (spectral)
+        run: npx @stoplight/spectral-cli lint openapi.yaml
+      - name: Type check
+        run: npm run typecheck --if-present
+      - name: Lint
+        run: npm run lint --if-present
+      - name: Run tests
+        run: npm test --if-present -- --ci --reporters=default --colors

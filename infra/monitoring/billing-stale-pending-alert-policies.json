@@ -1,0 +1,46 @@
+{
+  "displayName": "Billing stale-pending: investigate immediately",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/tution-app-6c0c3/notificationChannels/5197969209122830959"
+  ],
+  "conditions": [
+    {
+      "displayName": "billing-stale-pending execution failed",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/billing_stale_pending_execution_failed\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    },
+    {
+      "displayName": "billing-stale-pending fatalError observed",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/billing_stale_pending_fatal_error\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "documentation": {
+    "content": "This is a CRITICAL alert for billing-stale-pending-job failures or fatalError summaries.\n\nRunbook:\n- Cloud Run Job: billing-stale-pending-job (asia-south1)\n- Check the latest execution logs; search for runId and fatalError.\n- Identify affected tenants from logs (tenantId) and confirm provider cancellation + downgrade behavior.\n",
+    "mimeType": "text/markdown"
+  }
+}

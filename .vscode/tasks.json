@@ -1,0 +1,115 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Development Server",
+			"type": "shell",
+			"command": "npm start",
+			"group": "build",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start Development Server",
+			"type": "shell",
+			"command": "npm start",
+			"isBackground": true,
+			"group": "build"
+		},
+		{
+			"label": "Start Development Server",
+			"type": "shell",
+			"command": "npm start",
+			"isBackground": true,
+			"group": "build"
+		},
+		{
+			"label": "Start Development Server",
+			"type": "shell",
+			"command": "npm start",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check Email Templates Render",
+			"type": "shell",
+			"command": "cd email-backend && node scripts/check-email-templates.js",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Check Email Templates Render (cjs)",
+			"type": "shell",
+			"command": "cd email-backend && node scripts/check-email-templates.cjs",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend Tests",
+			"type": "shell",
+			"command": "cd email-backend && npm test --silent",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend: send_template tests",
+			"type": "shell",
+			"command": "cd email-backend && npx vitest src/email/__tests__/send_template_new_kinds.test.ts --run",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend Test (send_template_new_kinds)",
+			"type": "shell",
+			"command": "cd email-backend && npm test --silent -- src/email/__tests__/send_template_new_kinds.test.ts",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Inspect Tenant Invite Rendered Link",
+			"type": "shell",
+			"command": "cd email-backend && node --input-type=module -e \"process.env.PUBLIC_WEB_APP_ORIGIN='https://tuitionmanager.app'; import { renderTemplate } from './dist/email/templates.js'; const r=renderTemplate('tenant_invite',{to_name:'Admin',tenant_name:'Central Coaching',from_name:'Central Coaching',invite_role:'admin',invite_link:'https://tuitionmanager.app/invite/abc123'}); const m=r.html.match(/href=\\\"([^\\\"]+)\\\"/); console.log('href:', m?m[1]:'(none)');\"",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend Test (send_template_new_kinds) rerun",
+			"type": "shell",
+			"command": "cd email-backend && npm test --silent -- src/email/__tests__/send_template_new_kinds.test.ts",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend Test (send_template_new_kinds) verbose",
+			"type": "shell",
+			"command": "cd email-backend && npm test -- src/email/__tests__/send_template_new_kinds.test.ts --reporter verbose",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend Test (send_template_new_kinds) verbose rerun",
+			"type": "shell",
+			"command": "cd email-backend && npm test -- src/email/__tests__/send_template_new_kinds.test.ts --reporter verbose",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Email Backend Full Tests",
+			"type": "shell",
+			"command": "cd email-backend && npm test --silent",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

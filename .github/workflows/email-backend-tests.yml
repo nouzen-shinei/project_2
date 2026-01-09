@@ -1,0 +1,46 @@
+name: Email Backend CI
+
+on:
+  push:
+    paths:
+      - 'email-backend/**'
+      - '.github/workflows/email-backend-tests.yml'
+  pull_request:
+    paths:
+      - 'email-backend/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: email-backend/package-lock.json
+
+      - name: Install deps
+        working-directory: email-backend
+        run: npm ci
+
+      - name: Run tests (with Redis integration)
+        working-directory: email-backend
+        env:
+          NODE_ENV: test
+          REDIS_URL: redis://localhost:6379
+          REDIS_RETRY_QUEUE: '1'
+        run: npm test --silent

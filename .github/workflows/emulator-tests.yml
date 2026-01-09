@@ -1,0 +1,46 @@
+name: Firestore Emulator Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  emulator-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start Firebase Emulator
+        run: |
+          npx firebase-tools emulators:start --only firestore --project demo-project &
+          # wait a bit for emulator to boot
+          sleep 5
+        env:
+          FIREBASE_CLI_PRETEND: 'true'
+
+      - name: Wait for emulator
+        run: |
+          # wait up to 20s for emulator to be ready
+          for i in {1..20}; do
+            nc -z localhost 8080 && echo "emulator ready" && break || echo "waiting..." && sleep 1
+          done
+
+      - name: Run unit + integration tests
+        env:
+          FIRESTORE_EMULATOR_HOST: localhost:8080
+        run: npm run test:unit
+
+      - name: Stop Firebase Emulator
+        run: |
+          # kill background emulator process
+          pkill -f "firebase-tools" || true

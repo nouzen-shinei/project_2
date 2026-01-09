@@ -1,0 +1,21 @@
+name: Publish OpenAPI
+on:
+  push:
+    paths:
+      - 'backend-runtime/openapi.yaml'
+  workflow_dispatch: {}
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate Redoc HTML
+        run: |
+          npm install -g redoc-cli@0.13.21
+          redoc-cli bundle backend-runtime/openapi.yaml -o openapi.html
+      - name: Deploy GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .
+          destination_dir: openapi

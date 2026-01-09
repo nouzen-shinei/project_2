@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{subject}}</title>
+  <style>
+    body { margin:0; padding:0; background:#f8fafc; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif; color:#111827; line-height:1.6; }
+    table { border-collapse:collapse; }
+    .container { width:100%; background:#f8fafc; padding:24px 0; }
+    .card { background:#ffffff; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden; max-width:640px; width:640px; }
+    .header { background:linear-gradient(135deg,#f59e0b,#ef4444); color:#ffffff; padding:28px 28px 22px; }
+    .brand { font-size:13px; letter-spacing:0.08em; text-transform:uppercase; opacity:0.92; margin:0 0 6px; }
+    .title { margin:0; font-size:22px; font-weight:800; line-height:1.25; }
+    .content { padding:26px 28px 8px; }
+    .lead { margin:0 0 14px; font-size:15px; }
+    .panel { border:1px solid #e5e7eb; border-radius:12px; padding:16px 16px; background:#f9fafb; margin:14px 0; }
+    .label { font-size:12px; letter-spacing:0.08em; text-transform:uppercase; color:#6b7280; font-weight:700; margin:0 0 6px; }
+    .value { margin:0; font-size:15px; color:#111827; }
+    .kv { width:100%; }
+    .k { width:40%; padding:6px 0; color:#6b7280; font-size:13px; }
+    .v { width:60%; padding:6px 0; color:#111827; font-size:13px; text-align:right; }
+    .pill { display:inline-block; padding:3px 10px; border-radius:999px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; font-size:12px; font-weight:700; }
+    .button { display:inline-block; background:#111827; color:#ffffff !important; text-decoration:none; font-weight:800; padding:12px 18px; border-radius:999px; }
+    .muted { color:#6b7280; font-size:13px; }
+    .hr { height:1px; background:#e5e7eb; margin:18px 0; }
+    .footer { padding:16px 28px 22px; background:#ffffff; }
+    .fineprint { font-size:12px; color:#6b7280; line-height:1.6; }
+    @media (max-width: 680px) {
+      .card { width:100% !important; border-radius:0 !important; }
+      .content, .header, .footer { padding-left:18px !important; padding-right:18px !important; }
+      .v { text-align:left !important; }
+    }
+  </style>
+</head>
+<body>
+  <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
+    Alert for {{metric_label}}{{#tenant_name}} • {{tenant_name}}{{/tenant_name}}{{#usage_percentage}} • {{usage_percentage}}{{/usage_percentage}}
+  </div>
+
+  <table role="presentation" class="container" width="100%" cellspacing="0" cellpadding="0">
+    <tr>
+      <td align="center">
+        <table role="presentation" class="card" width="640" cellspacing="0" cellpadding="0">
+          <tr>
+            <td class="header">
+              <p class="brand">Usage alert{{#tenant_name}} • {{tenant_name}}{{/tenant_name}}</p>
+              <h1 class="title">{{subject}}</h1>
+            </td>
+          </tr>
+
+          <tr>
+            <td class="content">
+              <p class="lead">Hi {{to_name}},</p>
+
+              <div class="panel">
+                <p class="label">Metric</p>
+                <p class="value"><strong>{{metric_label}}</strong>
+                  {{#threshold}}&nbsp; <span class="pill">{{threshold}}</span>{{/threshold}}
+                </p>
+                {{#summary_body}}<p class="muted" style="margin:8px 0 0;">{{summary_body}}</p>{{/summary_body}}
+              </div>
+
+              <div class="panel">
+                <p class="label">Details</p>
+                <table role="presentation" class="kv" width="100%" cellspacing="0" cellpadding="0">
+                  <tr><td class="k">Tenant</td><td class="v">{{tenant_name}}</td></tr>
+                  {{#current_value}}<tr><td class="k">Current</td><td class="v">{{current_value}}</td></tr>{{/current_value}}
+                  {{#usage_limit}}<tr><td class="k">Limit</td><td class="v">{{usage_limit}}</td></tr>{{/usage_limit}}
+                  {{#usage_percentage}}<tr><td class="k">Usage</td><td class="v">{{usage_percentage}}</td></tr>{{/usage_percentage}}
+                  {{#month_id}}<tr><td class="k">Month</td><td class="v">{{month_id}}</td></tr>{{/month_id}}
+                  {{#tenant_id}}<tr><td class="k">Tenant ID</td><td class="v">{{tenant_id}}</td></tr>{{/tenant_id}}
+                </table>
+              </div>
+
+              {{#alert_url}}
+              <div style="margin:16px 0 8px;">
+                <a class="button" href="{{alert_url}}" target="_blank" rel="noopener noreferrer">Open usage panel</a>
+              </div>
+              <p class="muted" style="margin:0 0 10px;">If the button doesn’t work, open: <a href="{{alert_url}}" target="_blank" rel="noopener noreferrer">{{alert_url}}</a></p>
+              {{/alert_url}}
+
+              <div class="hr"></div>
+              <p class="muted" style="margin:0 0 8px;">Tip: Review recent activity and billing/limits to avoid disruptions.</p>
+            </td>
+          </tr>
+
+          <tr>
+            <td class="footer">
+              <p class="fineprint" style="margin:0 0 6px;">
+                Sent to {{#to_email}}{{to_email}}{{/to_email}}{{^to_email}}your inbox{{/to_email}}.
+                {{#reply_to}}Need help? Reply to this email or contact {{reply_to}}.{{/reply_to}}
+                {{^reply_to}}{{#teacher_email}}Need help? Contact {{teacher_email}}.{{/teacher_email}}{{/reply_to}}
+              </p>
+              <p class="fineprint" style="margin:0;">{{from_name}}</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

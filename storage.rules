@@ -1,0 +1,22 @@
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Default: require authentication; prevent bucket listing
+    match /{allPaths=**} {
+      // Block listing to avoid metadata enumeration
+      allow list: if false;
+
+      // Allow SDK reads for authenticated users
+      allow get: if request.auth != null;
+
+      // Backend-mediated uploads: block client-side creates/updates.
+      // Note: Admin SDK bypasses these rules.
+      allow create, update: if false;
+
+      // Keep deletes enabled for now to avoid breaking existing cleanup flows.
+      allow delete: if request.auth != null;
+
+      // Note: Public token URLs from getDownloadURL() continue to work for anyone with the link,
+      // independent of these rules. Revoke access by deleting/rotating the object token.
+    }
+  }
+}

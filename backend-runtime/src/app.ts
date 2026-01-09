@@ -1,0 +1,14670 @@
+import 'dotenv/config';
+import express from 'express';
+import * as admin from 'firebase-admin';
+import crypto from 'crypto';
+import fetch from 'node-fetch';
+import { createGzip } from 'node:zlib';
+import { enqueueReminder, enqueueCustomMessage, enqueuePaymentConfirmation, getJobStatus, listJobStatus, getInMemoryQueueSnapshot, shutdownQueue } from './queueProvider';
+import { sendSMS as backendSendSMS, sendVoiceCall as backendSendVoiceCall } from './twilio';
+import { metricsText, inc, metricNames, getFailureRate, getWindowCount } from './metrics';
+import { findJobByMessageId } from './storage';
+import { z } from 'zod';
+import { cspMiddleware } from './csp';
+import { ensureFirebase } from './firebaseAdmin';
+import { getEmailBackendBaseUrl } from './runtimeEndpoints';
+import { getMaintenanceMode } from './maintenanceMode';
+import { finalizeReminderQuotaFromHistory } from './lib/reminderQuota';
+import { startBirthdayNotificationScheduler, runBirthdayNotificationJob, BirthdayJobOptions } from './birthdayNotificationJob';
+import { startDailyQuoteScheduler, runDailyQuoteJob, getDailyQuoteSchedulerStatus } from './dailyQuoteJob';
+import { startBillingBackfillScheduler, getBillingBackfillSchedulerStatus } from './billingBackfillJob';
+import { startPlayBillingReconcileScheduler, getPlayBillingReconcileSchedulerStatus } from './playBillingReconcileJob';
+import {
+  decodeInternalToken,
+  getConversationKey,
+  normalizeEmail,
+  verifyInternalToken,
+  watchConversationRealtime,
+} from './chatRealtime';
+import { checkChatRateLimit } from './chatRateLimiter';
+import { sendChatMessage, editChatMessage, deleteChatMessage, toggleChatMessageReaction, ChatMessageActionError } from './chatMessageWriter';
+import {
+  sendTeamMembershipChangeNotification,
+  sendTenantJoinRequestNotification,
+  sendTenantJoinRequestOutcomeNotification,
+} from './teamMembershipNotifier';
+import { sendTenantInviteEmail } from './tenantNotificationEmail';
+import { streamTenantExport, TenantExportAbortedError } from './lib/tenantExport';
+import { buildInvoiceStoragePath, ensureInvoicePdfInStorage } from './lib/invoicePdf';
+import {
+  getPlanLimits,
+  getUsagePercentage,
+  getUsageStatus,
+  type PlanId,
+  type PlanLimits,
+  type UsageStatus,
+} from './lib/planLimits';
+import {
+  createRazorpaySubscription,
+  cancelRazorpaySubscription,
+  fetchRazorpaySubscription,
+  resumeRazorpaySubscription,
+  handleRazorpayWebhook,
+  verifyRazorpayWebhookSignature,
+  type RazorpayWebhookEvent,
+} from './billing/razorpay';
+import { runBillingBackfill } from './jobs/billingBackfill';
+import { sendTenantBillingEventNotification } from './billing/billingNotifier';
+import { recordBillingOpsEvent, safePreview } from './billing/billingOps';
+import {
+  builtInFreePlan,
+  getPlanVariantById,
+  listCoupons,
+  listPlanVariants,
+  resolveCouponCode,
+  upsertCoupon,
+  upsertPlanVariant,
+} from './billing/catalog';
+import {
+  resolveEffectivePlanLimitsForTenant,
+  resolvePlanLimitsFromCatalog,
+  toTenantBillingLimitsSnapshot,
+} from './lib/effectivePlanLimits';
+
+type TenantMembershipRole = 'owner' | 'admin' | 'staff' | 'member';
+
+interface TenantJoinRequestRecord {
+  id: string;
+  tenantId: string;
+  tenantName?: string;
+  userId?: string;
+  email?: string;
+  displayName?: string;
+  message?: string;
+}
+
+type TenantJoinRequestLoader = (requestId: string) => Promise<TenantJoinRequestRecord | null>;
+
+interface TenantInviteRecord {
+  id: string;
+  tenantId: string;
+  tenantName?: string;
+  email: string;
+  role?: string;
+  token?: string;
+  expiresAt?: string;
+  invitationMessage?: string;
+}
+
+type TenantInviteLoader = (inviteId: string) => Promise<TenantInviteRecord | null>;
+type TenantInviteSendRecorder = (inviteId: string, actorId?: string) => Promise<void>;
+interface ExpoPushProxyExecutorResponse {
+  status: number;
+  ok: boolean;
+  body: any;
+  rawBody?: string;
+}
+type ExpoPushProxyExecutor = (options: {
+  payload: Record<string, any>;
+  endpoint: string;
+  timeoutMs: number;
+  fetchImpl: FetchLike;
+}) => Promise<ExpoPushProxyExecutorResponse>;
+
+const tenantRolePriority: Record<TenantMembershipRole, number> = {
+  member: 1,
+  staff: 2,
+  admin: 3,
+  owner: 4,
+};
+
+type TenantAccessContext = {
+  tenantId: string;
+  role: TenantMembershipRole;
+  membershipId: string | null;
+};
+
+declare module 'express-serve-static-core' {
+  interface Request {
+    authContext?: {
+      tokenType: 'master' | 'internal' | 'firebase';
+      uid?: string;
+      email?: string;
+    };
+    tenantAccess?: TenantAccessContext;
+  }
+}
+
+// Simple in-memory rate limiter (IP + endpoint). Suitable for low volume.
+interface RLBucket { tokens: number; updated: number }
+const rlStore = new Map<string, RLBucket>();
+function rateLimitMiddleware(opts: { windowMs: number; max: number }) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    // Allow skipping in tests
+    if (process.env.TEST_MODE === '1') return next();
+    const key = `${req.ip}:${req.path}`;
+    const now = Date.now();
+    const win = opts.windowMs;
+    let bucket = rlStore.get(key);
+    if (!bucket) { bucket = { tokens: opts.max, updated: now }; rlStore.set(key, bucket); }
+    // Refill
+    const elapsed = now - bucket.updated;
+    if (elapsed > win) { bucket.tokens = opts.max; bucket.updated = now; }
+    if (bucket.tokens <= 0) {
+      res.status(429).json({ error: 'rate_limited' });
+      return;
+    }
+    bucket.tokens -= 1;
+    next();
+  };
+}
+
+// Schemas
+const smsSchema = z.object({ to: z.string().min(5), message: z.string().min(1).max(1600) });
+const voiceSchema = z.object({
+  to: z.string().min(5),
+  message: z.string().min(1).max(3000),
+  language: z.enum(['english','hindi','both']).optional(),
+  voice: z.string().optional(),
+  hindiVoice: z.string().optional(),
+  englishVoice: z.string().optional(),
+  pauseSeconds: z.number().int().min(1).max(60).optional()
+});
+
+const reminderHistoryWriteSchema = z
+  .object({
+    batchId: z.string().min(1).max(120).optional(),
+    userId: z.string().min(1).max(200).optional(),
+    studentId: z.string().min(1).max(200).optional(),
+    studentName: z.string().min(1).max(200).optional(),
+    parentName: z.string().min(1).max(200).optional(),
+    parentContact: z.string().min(1).max(300).optional(),
+    parentEmail: z.string().email().optional(),
+    message: z.string().max(5000).optional(),
+    amount: z.number().optional(),
+    dueDate: z.string().max(50).optional(),
+    feeCategories: z.array(z.string().max(200)).max(100).optional(),
+    settings: z
+      .object({
+        useCustomMessage: z.boolean().optional(),
+        useCustomNotes: z.boolean().optional(),
+        language: z.enum(['english', 'hindi', 'both']).optional(),
+        coachingName: z.string().max(200).optional(),
+        teacherName: z.string().max(200).optional(),
+      })
+      .optional(),
+  })
+  .passthrough();
+
+const tenantScopedSmsSchema = smsSchema.extend({
+  tenantId: z.string().min(1),
+  quotaBatchId: z.string().min(1).max(120).optional(),
+  historyId: z.string().min(1).max(240).optional(),
+  history: reminderHistoryWriteSchema.optional(),
+});
+
+const tenantScopedVoiceSchema = voiceSchema.extend({
+  tenantId: z.string().min(1),
+  quotaBatchId: z.string().min(1).max(120).optional(),
+  historyId: z.string().min(1).max(240).optional(),
+  history: reminderHistoryWriteSchema.optional(),
+});
+
+const reminderQuotaReserveSchema = z.object({
+  tenantId: z.string().min(1),
+  batchId: z.string().min(1).max(120),
+  counts: z
+    .object({
+      email: z.number().int().min(0).max(100_000).optional(),
+      sms: z.number().int().min(0).max(100_000).optional(),
+      whatsapp: z.number().int().min(0).max(100_000).optional(),
+      voice: z.number().int().min(0).max(100_000).optional(),
+    })
+    .default({}),
+});
+
+const reminderBatchSendEmailTemplateSchema = z
+  .object({
+    template: z.enum(['fee_reminder', 'custom_message_bilingual']),
+    to_email: z.string().email(),
+    to_name: z.string().max(200).optional(),
+    subject: z.string().max(300).optional(),
+    student_name: z.string().max(200).optional(),
+    amount: z.string().max(50).optional(),
+    due_date: z.string().max(50).optional(),
+    custom_notes: z.string().max(2000).optional(),
+    custom_message: z.string().max(5000).optional(),
+    custom_message_english: z.string().max(5000).optional(),
+    custom_message_hindi: z.string().max(5000).optional(),
+    selectedLanguage: z.enum(['english', 'hindi', 'both']).optional(),
+    languageOrder: z.enum(['english-first', 'hindi-first']).optional(),
+    english_first: z.boolean().optional(),
+    coaching_name: z.string().max(200).optional(),
+    from_name: z.string().max(200).optional(),
+    teacher_name: z.string().max(200).optional(),
+    teacher_email: z.string().email().optional(),
+    reply_to: z.string().email().optional(),
+    show_coaching_name: z.boolean().optional(),
+    show_teacher_name: z.boolean().optional(),
+    tenant_id: z.string().min(1).max(100).optional(),
+    tenantId: z.string().min(1).max(100).optional(),
+  })
+  .passthrough();
+
+const reminderBatchSendItemSchema = z.discriminatedUnion('type', [
+  z
+    .object({
+      type: z.literal('sms'),
+      studentId: z.string().min(1).max(200),
+      to: z.string().min(5).max(50),
+      message: z.string().min(1).max(1600),
+      historyId: z.string().min(1).max(240).optional(),
+      history: reminderHistoryWriteSchema.optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal('voice'),
+      studentId: z.string().min(1).max(200),
+      to: z.string().min(5).max(50),
+      message: z.string().min(1).max(3000),
+      language: z.enum(['english', 'hindi', 'both']).optional(),
+      voice: z.string().optional(),
+      hindiVoice: z.string().optional(),
+      englishVoice: z.string().optional(),
+      pauseSeconds: z.number().int().min(1).max(60).optional(),
+      historyId: z.string().min(1).max(240).optional(),
+      history: reminderHistoryWriteSchema.optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal('whatsapp'),
+      studentId: z.string().min(1).max(200),
+      kind: z.enum(['fee', 'custom']),
+      to: z.string().min(5).max(50),
+      // fee fields
+      studentName: z.string().max(200).optional(),
+      amount: z.number().optional(),
+      dueDate: z.string().max(50).optional(),
+      parentName: z.string().max(200).optional(),
+      greeting: z.string().max(50).optional(),
+      customNotes: z.string().max(2000).optional(),
+      customNotesEnglish: z.string().max(2000).nullable().optional(),
+      customNotesHindi: z.string().max(2000).nullable().optional(),
+      // custom fields
+      message: z.string().max(5000).optional(),
+      englishMessage: z.string().max(5000).optional(),
+      hindiMessage: z.string().max(5000).optional(),
+      // common
+      teacherName: z.string().max(200).optional(),
+      coachingName: z.string().max(200).optional(),
+      selectedLanguage: z.enum(['english', 'hindi', 'both']).optional(),
+      languageOrder: z.enum(['english-first', 'hindi-first']).optional(),
+      historyId: z.string().min(1).max(240).optional(),
+      history: reminderHistoryWriteSchema.optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal('email'),
+      studentId: z.string().min(1).max(200),
+      email: reminderBatchSendEmailTemplateSchema,
+      historyId: z.string().min(1).max(240).optional(),
+      history: reminderHistoryWriteSchema.optional(),
+    })
+    .passthrough(),
+]);
+
+const reminderBatchSendSchema = z.object({
+  tenantId: z.string().min(1),
+  batchId: z.string().min(1).max(120),
+  items: z.array(reminderBatchSendItemSchema).min(1).max(10_000),
+});
+
+const reminderHistoryStatusQuerySchema = z.object({
+  tenantId: z.string().min(1).optional(),
+  historyIds: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+});
+
+const expoPushMessageSchema = z.object({
+  to: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+  title: z.string().optional(),
+  body: z.string().optional(),
+  data: z.record(z.any()).optional(),
+  sound: z.union([z.literal('default'), z.string()]).optional(),
+  subtitle: z.string().optional(),
+  channelId: z.string().optional(),
+  priority: z.enum(['default','normal','high']).optional(),
+  ttl: z.number().int().min(0).max(2419200).optional(),
+  expiration: z.union([z.number(), z.string()]).optional(),
+  badge: z.number().int().optional(),
+  mutableContent: z.boolean().optional(),
+  categoryId: z.string().optional(),
+  collapseId: z.string().optional(),
+  // Allow any additional Expo-supported properties without failing validation
+}).passthrough();
+
+const expoPushPayloadSchema = z.union([
+  expoPushMessageSchema,
+  z.object({
+    messages: z.array(expoPushMessageSchema).min(1).max(100),
+    dryRun: z.boolean().optional()
+  })
+]);
+
+const tenantScopedPushPayloadSchema = expoPushPayloadSchema.and(
+  z.object({ tenantId: z.string().min(1) })
+);
+
+const dailyQuoteTriggerSchema = z.object({
+  timeOfDay: z.enum(['morning', 'evening', 'immediate', 'auto']).optional(),
+  targetEmails: z.array(z.string().email()).min(1).max(200).optional(),
+  dryRun: z.boolean().optional(),
+  reason: z.string().optional(),
+  now: z.string().optional(),
+});
+
+const tenantScopedDailyQuoteTriggerSchema = dailyQuoteTriggerSchema.and(
+  z.object({ tenantId: z.string().min(1) })
+);
+
+const birthdayTriggerSchema = z.object({
+  email: z.string().email().optional(),
+  emails: z.array(z.string().email()).min(1).max(200).optional(),
+  deviceId: z.string().min(1).optional(),
+  deviceIds: z.array(z.string().min(1)).min(1).max(200).optional(),
+  dryRun: z.boolean().optional(),
+  forceSend: z.boolean().optional(),
+  skipWhatsApp: z.boolean().optional(),
+  suppressStateUpdates: z.boolean().optional(),
+  reason: z.string().optional(),
+  now: z.string().optional(),
+});
+
+const tenantScopedBirthdayTriggerSchema = birthdayTriggerSchema.and(
+  z.object({ tenantId: z.string().min(1) })
+);
+
+const devicePingSchema = z.object({
+  tenantId: z.string().trim().min(1),
+  userEmail: z.string().email(),
+  deviceId: z.string().trim().min(4).max(200),
+  pingType: z.enum(['register', 'heartbeat', 'full']).default('heartbeat'),
+  requestId: z.string().trim().max(200).optional(),
+  isOnline: z.boolean().optional(),
+});
+
+const chatDeltaSchema = z.object({
+  userEmail: z.string().email(),
+  partnerEmail: z.string().email(),
+  direction: z.enum(['latest', 'older', 'newer']).default('older'),
+  limit: z.number().int().min(1).max(200).default(50),
+  tenantId: z.string().min(1),
+  cursor: z
+    .object({
+      timestamp: z.string().optional(),
+      messageId: z.string().optional(),
+    })
+    .partial()
+    .optional(),
+});
+
+const chatAttachmentSchema = z.object({
+  url: z.string().url(),
+  fileName: z.string().min(1),
+  fileType: z.string().min(1),
+  fileSize: z.number().int().min(0).optional(),
+  thumbnailUrl: z.string().url().optional(),
+});
+
+const chatStickerSchema = z.object({
+  url: z.string().url(),
+  name: z.string().min(1),
+  pack: z.string().optional(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+});
+
+const chatGifSchema = z.object({
+  url: z.string().url(),
+  thumbnailUrl: z.string().url().optional(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  title: z.string().optional(),
+  source: z.string().optional(),
+});
+
+const chatMessagePayloadSchema = z
+  .object({
+    recipientId: z.string().min(1),
+    tenantId: z.string().min(1),
+    text: z.string().max(5000).optional(),
+    isSpecial: z.boolean().optional(),
+    fileUrl: z.string().url().optional(),
+    fileName: z.string().optional(),
+    fileType: z.string().optional(),
+    fileSize: z.number().int().min(0).optional(),
+    thumbnailUrl: z.string().url().optional(),
+    attachments: z.array(chatAttachmentSchema).max(10).optional(),
+    sticker: chatStickerSchema.optional(),
+    gif: chatGifSchema.optional(),
+    delivered: z.boolean().optional(),
+    read: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    const hasText = typeof value.text === 'string' && value.text.trim().length > 0;
+    const hasAttachment = Array.isArray(value.attachments) && value.attachments.length > 0;
+    const hasFile = typeof value.fileUrl === 'string' && value.fileUrl.length > 0;
+    const hasSticker = Boolean(value.sticker);
+    const hasGif = Boolean(value.gif);
+
+    if (!hasText && !hasAttachment && !hasFile && !hasSticker && !hasGif && !value.isSpecial) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Message content is empty',
+      });
+    }
+  });
+
+const chatMessageEditSchema = z.object({
+  text: z.string().min(1).max(5000),
+  tenantId: z.string().min(1),
+});
+
+const chatMessageReactionSchema = z.object({
+  tenantId: z.string().min(1),
+  reactionType: z.string().min(1).max(32),
+});
+
+const teamMembershipRoleEnum = z.enum(['owner', 'admin', 'staff', 'member', 'user']);
+const tenantMembershipRoleSchema = z.enum(['owner', 'admin', 'staff', 'member']);
+const tenantMembershipStatusSchema = z.enum(['active', 'pending_request', 'revoked', 'rejected']);
+
+const membershipActionMetadataSchema = z
+  .object({
+    reason: z.string().trim().max(200).optional(),
+    initiatedFrom: z.enum(['web', 'mobile', 'system']).optional(),
+    actorName: z.string().trim().max(120).optional(),
+  })
+  .optional();
+
+const membershipRoleUpdateSchema = z.object({
+  role: tenantMembershipRoleSchema,
+  metadata: membershipActionMetadataSchema,
+});
+
+const membershipStatusUpdateSchema = z.object({
+  status: tenantMembershipStatusSchema,
+  metadata: membershipActionMetadataSchema,
+});
+
+const tenantInviteCreateSchema = z.object({
+  email: z.string().email(),
+  role: tenantMembershipRoleSchema.default('member'),
+  expiresInDays: z.number().int().min(1).max(90).optional(),
+  message: z.string().trim().max(500).optional(),
+});
+
+const tenantInviteAcceptSchema = z.object({
+  token: z
+    .string()
+    .trim()
+    .min(8)
+    .max(200),
+});
+
+const joinRequestApprovalSchema = z.object({
+  role: tenantMembershipRoleSchema.default('staff'),
+  reviewerName: z.string().trim().max(120).optional(),
+  metadata: membershipActionMetadataSchema,
+});
+
+const joinRequestRejectionSchema = z.object({
+  reviewerName: z.string().trim().max(120).optional(),
+  metadata: membershipActionMetadataSchema,
+  reason: z.string().trim().max(200).optional(),
+});
+
+const teamMembershipEventSchema = z.object({
+  tenantId: z.string().min(1),
+  tenantName: z.string().min(1).max(160).optional(),
+  action: z.enum(['added', 'removed', 'role_changed']),
+  targetEmail: z.string().email(),
+  targetRole: teamMembershipRoleEnum.optional(),
+  previousRole: teamMembershipRoleEnum.optional(),
+  metadata: z
+    .object({
+      displayName: z.string().min(1).max(120).optional(),
+      reason: z.string().max(300).optional(),
+      initiatedFrom: z.enum(['web', 'mobile', 'system']).optional(),
+      actorName: z.string().min(1).max(120).optional(),
+    })
+    .partial()
+    .optional(),
+});
+
+const tenantJoinRequestNotifySchema = z.object({
+  tenantId: z.string().min(1),
+  requestId: z.string().min(6),
+});
+
+const tenantInviteNotifySchema = z.object({
+  tenantId: z.string().min(1),
+  inviteId: z.string().min(6),
+});
+
+const tenantJoinRequestOutcomeSchema = z.object({
+  tenantId: z.string().min(1),
+  requestId: z.string().min(6),
+  outcome: z.enum(['approved', 'rejected']),
+  assignedRole: teamMembershipRoleEnum.optional(),
+  reviewerName: z.string().min(1).max(120).optional(),
+});
+
+const tenantJoinCodeLookupSchema = z.object({
+  code: z
+    .string()
+    .min(4)
+    .max(32),
+});
+
+const tenantSearchSchema = z.object({
+  query: z.string().trim().max(80).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+});
+
+const tenantUserDevicesSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(200),
+});
+
+const tenantJoinCodeClaimSchema = tenantJoinCodeLookupSchema.extend({
+  displayName: z.string().min(1).max(120).optional(),
+  message: z.string().max(300).optional(),
+});
+
+const adminMembershipRoleOverrideSchema = z
+  .object({
+    tenantId: z.string().trim().min(6).max(120),
+    userId: z.string().trim().min(1).max(200),
+  })
+  .merge(membershipRoleUpdateSchema);
+
+const notificationPreferenceKeys = [
+  'membershipEventsEmail',
+  'membershipEventsPush',
+  'joinRequestEmail',
+  'joinRequestPush',
+  'usageAlertEmail',
+  'usageAlertWhatsApp',
+  'usageAlertSlack',
+] as const;
+type NotificationPreferenceKey = (typeof notificationPreferenceKeys)[number];
+
+const DEFAULT_INVITE_EXPIRY_DAYS = 7;
+
+const tenantNotificationPreferencesSchema = z
+  .object({
+    membershipEventsEmail: z.boolean().optional(),
+    membershipEventsPush: z.boolean().optional(),
+    joinRequestEmail: z.boolean().optional(),
+    joinRequestPush: z.boolean().optional(),
+    usageAlertEmail: z.boolean().optional(),
+    usageAlertWhatsApp: z.boolean().optional(),
+    usageAlertSlack: z.boolean().optional(),
+  })
+  .strict();
+
+const notificationPreferenceUpdateMetadataSchema = z
+  .object({
+    initiatedFrom: z
+      .string()
+      .trim()
+      .min(1)
+      .max(40)
+      .optional(),
+    actorName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(120)
+      .optional(),
+    reason: z
+      .string()
+      .trim()
+      .max(300)
+      .optional(),
+  })
+  .strict();
+
+const tenantNotificationPreferencesUpdateSchema = z.object({
+  notificationPreferences: tenantNotificationPreferencesSchema.refine(
+    (prefs) => notificationPreferenceKeys.some((key) => typeof prefs[key] === 'boolean'),
+    { message: 'at_least_one_preference' }
+  ),
+  metadata: notificationPreferenceUpdateMetadataSchema.optional(),
+});
+
+const defaultTenantNotificationPreferences: Record<NotificationPreferenceKey, boolean> = {
+  membershipEventsEmail: true,
+  membershipEventsPush: true,
+  joinRequestEmail: true,
+  joinRequestPush: true,
+  usageAlertEmail: true,
+  usageAlertWhatsApp: true,
+  usageAlertSlack: true,
+};
+
+function normalizeTenantCode(raw?: string): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toUpperCase();
+  return normalized.length >= 4 ? normalized : null;
+}
+
+function normalizeTenantNotificationPreferences(value: Record<string, any> | undefined | null): Record<NotificationPreferenceKey, boolean> {
+  const normalized: Record<NotificationPreferenceKey, boolean> = { ...defaultTenantNotificationPreferences };
+  if (value && typeof value === 'object') {
+    for (const key of notificationPreferenceKeys) {
+      const raw = value[key];
+      if (typeof raw === 'boolean') {
+        normalized[key] = raw;
+      }
+    }
+  }
+  return normalized;
+}
+
+interface TenantNotificationPreferencesRecord {
+  tenantId: string;
+  currentPreferences?: Record<string, any>;
+  update: (payload: {
+    notificationPreferences: Record<NotificationPreferenceKey, boolean>;
+    updatedAt: string;
+  }) => Promise<void>;
+}
+
+async function loadTenantNotificationPreferencesRecord(
+  tenantId: string
+): Promise<TenantNotificationPreferencesRecord | null> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const docRef = db.collection('tenants').doc(tenantId);
+  const snap = await docRef.get();
+  if (!snap.exists) {
+    return null;
+  }
+  const data = snap.data() || {};
+  return {
+    tenantId,
+    currentPreferences: (data.notificationPreferences as Record<string, any> | undefined) || undefined,
+    update: (payload) => docRef.update(stripUndefinedDeep(payload)).then(() => undefined),
+  };
+}
+
+/* c8 ignore start */
+async function loadTenantJoinRequestFromFirestore(requestId: string): Promise<TenantJoinRequestRecord | null> {
+  if (!requestId || typeof requestId !== 'string') {
+    return null;
+  }
+  ensureFirebase();
+  const db = admin.firestore();
+  const snap = await db.collection('tenantJoinRequests').doc(requestId).get();
+  if (!snap.exists) {
+    return null;
+  }
+  const data = snap.data() || {};
+  const tenantId = typeof data.tenantId === 'string' ? data.tenantId.trim() : '';
+  if (!tenantId) {
+    return null;
+  }
+  return {
+    id: snap.id,
+    tenantId,
+    tenantName: typeof data.tenantName === 'string' ? data.tenantName : undefined,
+    userId: typeof data.userId === 'string' ? data.userId : undefined,
+    email: typeof data.email === 'string' ? data.email : undefined,
+    displayName: typeof data.displayName === 'string' ? data.displayName : undefined,
+    message: typeof data.message === 'string' ? data.message : undefined,
+  };
+}
+
+async function loadTenantInviteFromFirestore(inviteId: string): Promise<TenantInviteRecord | null> {
+  if (!inviteId || typeof inviteId !== 'string') {
+    return null;
+  }
+  ensureFirebase();
+  const db = admin.firestore();
+  const snap = await db.collection('tenantInvites').doc(inviteId).get();
+  if (!snap.exists) {
+    return null;
+  }
+  const data = snap.data() || {};
+  const tenantId = typeof data.tenantId === 'string' ? data.tenantId.trim() : '';
+  const email = typeof data.email === 'string' ? data.email.trim() : '';
+  if (!tenantId || !email) {
+    return null;
+  }
+  return {
+    id: snap.id,
+    tenantId,
+    tenantName: typeof data.tenantName === 'string' ? data.tenantName : undefined,
+    email,
+    role: typeof data.role === 'string' ? data.role : undefined,
+    token: typeof data.token === 'string' ? data.token : undefined,
+    expiresAt: toIsoTimestamp(data.expiresAt) ?? undefined,
+    invitationMessage: typeof data.invitationMessage === 'string' ? data.invitationMessage : undefined,
+  };
+}
+
+/* c8 ignore stop */
+
+async function executeExpoPushProxyRequestDefault(options: {
+  payload: Record<string, any>;
+  endpoint: string;
+  timeoutMs: number;
+  fetchImpl: FetchLike;
+}): Promise<ExpoPushProxyExecutorResponse> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(options.timeoutMs, 1000));
+  try {
+    const expoRes = await options.fetchImpl(options.endpoint, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(options.payload),
+      signal: controller.signal,
+    });
+    const rawBody = await expoRes.text();
+    let parsedBody: any = {};
+    if (rawBody) {
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        parsedBody = { raw: rawBody };
+      }
+    }
+    return { status: expoRes.status, ok: expoRes.ok, body: parsedBody, rawBody };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function recordTenantInviteSendMetadata(inviteId: string, actorId?: string): Promise<void> {
+  if (!inviteId) {
+    return;
+  }
+  ensureFirebase();
+  const db = admin.firestore();
+  await db
+    .collection('tenantInvites')
+    .doc(inviteId)
+    .update({
+      lastSentAt: new Date().toISOString(),
+      lastSentBy: actorId || 'system',
+    });
+}
+
+function membershipDocId(tenantId: string, userId: string): string {
+  return `${tenantId}_${userId}`;
+}
+
+export class TenantAccessError extends Error {
+  status: number;
+  body: Record<string, unknown>;
+
+  constructor(status: number, body: Record<string, unknown>) {
+    super(body?.error ? String(body.error) : 'tenant_access_denied');
+    this.status = status;
+    this.body = body;
+  }
+}
+
+class TenantSeatLimitError extends Error {
+  limit: number | null;
+
+  constructor(limit: number | null) {
+    super('tenant_seat_limit_reached');
+    this.limit = limit;
+  }
+}
+
+class TenantReminderLimitError extends Error {
+  limit: number;
+  used: number;
+  channel?: string;
+
+  constructor(limit: number, used: number, channel?: string) {
+    super('tenant_reminder_limit_reached');
+    this.limit = limit;
+    this.used = used;
+    this.channel = channel;
+  }
+}
+
+class TenantReminderBatchLimitError extends Error {
+  limit: number;
+  used: number;
+  requested: number;
+  channel: string;
+
+  constructor(limit: number, used: number, requested: number, channel: string) {
+    super('tenant_reminder_limit_reached');
+    this.limit = limit;
+    this.used = used;
+    this.requested = requested;
+    this.channel = channel;
+  }
+}
+
+class TenantStudentLimitError extends Error {
+  limit: number;
+  used: number;
+
+  constructor(limit: number, used: number) {
+    super('tenant_student_limit_reached');
+    this.limit = limit;
+    this.used = used;
+  }
+}
+
+class TenantStorageLimitError extends Error {
+  limitBytes: number;
+  usedBytes: number;
+  incrementBytes: number;
+
+  constructor(limitBytes: number, usedBytes: number, incrementBytes: number) {
+    super('tenant_storage_limit_reached');
+    this.limitBytes = limitBytes;
+    this.usedBytes = usedBytes;
+    this.incrementBytes = incrementBytes;
+  }
+}
+
+type StorageUploadPurpose =
+  | 'chat'
+  | 'tenantLogo'
+  | 'noticeImage'
+  | 'noticeAudio'
+  | 'studentProfile'
+  | 'receipt'
+  | 'profilePicture';
+
+function sanitizeStorageSegment(value: string): string {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) return '';
+  return trimmed.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function inferExtensionFromContentType(contentType?: string | null, fallback = 'bin'): string {
+  const ct = (contentType ?? '').trim().toLowerCase();
+  if (ct === 'image/png') return 'png';
+  if (ct === 'image/jpeg' || ct === 'image/jpg') return 'jpg';
+  if (ct === 'image/webp') return 'webp';
+  if (ct === 'image/svg+xml') return 'svg';
+  if (ct === 'audio/mpeg' || ct === 'audio/mp3') return 'mp3';
+  if (ct === 'audio/wav') return 'wav';
+  if (ct === 'audio/ogg') return 'ogg';
+  if (ct === 'audio/mp4' || ct === 'audio/m4a') return 'm4a';
+  if (ct === 'application/pdf') return 'pdf';
+  return fallback;
+}
+
+async function sumStoragePrefixBytes(bucket: ReturnType<admin.storage.Storage['bucket']>, prefix: string): Promise<number> {
+  let total = 0;
+  let nextPageToken: string | undefined;
+  do {
+    const [files, , response] = await bucket.getFiles({ prefix, pageToken: nextPageToken });
+    files.forEach((file) => {
+      const sizeRaw = (file.metadata as any)?.size;
+      const size = typeof sizeRaw === 'string' ? Number(sizeRaw) : typeof sizeRaw === 'number' ? sizeRaw : 0;
+      if (Number.isFinite(size) && size > 0) {
+        total += size;
+      }
+    });
+    nextPageToken = (response as any)?.nextPageToken;
+  } while (nextPageToken);
+  return total;
+}
+
+async function estimateTenantStorageBytes(bucket: ReturnType<admin.storage.Storage['bucket']>, tenantId: string): Promise<number> {
+  const normalizedTenantId = tenantId.trim();
+  const prefixes = [
+    `tenant-branding/${normalizedTenantId}/`,
+    `chat-files/${normalizedTenantId}/`,
+    `notices/${normalizedTenantId}/`,
+    `receipts/${normalizedTenantId}/`,
+    `student_profiles/${normalizedTenantId}/`,
+    `profile-pictures/${normalizedTenantId}/`,
+  ];
+  const results = await Promise.all(prefixes.map((prefix) => sumStoragePrefixBytes(bucket, prefix).catch(() => 0)));
+  return results.reduce((acc, value) => acc + value, 0);
+}
+
+async function loadOrInitTenantStorageUsage(
+  db: admin.firestore.Firestore,
+  bucket: ReturnType<admin.storage.Storage['bucket']>,
+  tenantId: string
+): Promise<number> {
+  const usageRef = db.collection('tenantStorageUsage').doc(tenantId);
+  const snap = await usageRef.get();
+  if (snap.exists) {
+    const bytes = (snap.data() as any)?.bytes;
+    if (typeof bytes === 'number' && Number.isFinite(bytes) && bytes >= 0) {
+      return bytes;
+    }
+  }
+
+  const estimated = await estimateTenantStorageBytes(bucket, tenantId);
+  await usageRef.set(
+    {
+      tenantId,
+      bytes: estimated,
+      estimatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+  return estimated;
+}
+
+async function reserveTenantStorageBytes(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  incrementBytes: number,
+  limitBytes: number
+): Promise<{ usedBytes: number }>{
+  const usageRef = db.collection('tenantStorageUsage').doc(tenantId);
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(usageRef);
+    const current = snap.exists ? (snap.data() as any)?.bytes : undefined;
+    const usedBytes = typeof current === 'number' && Number.isFinite(current) && current >= 0 ? current : 0;
+    if (limitBytes > 0 && usedBytes + incrementBytes > limitBytes) {
+      throw new TenantStorageLimitError(limitBytes, usedBytes, incrementBytes);
+    }
+    tx.set(
+      usageRef,
+      {
+        tenantId,
+        bytes: usedBytes + incrementBytes,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    return { usedBytes };
+  });
+}
+
+async function releaseTenantStorageBytes(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  decrementBytes: number
+): Promise<void> {
+  if (decrementBytes <= 0) return;
+  const usageRef = db.collection('tenantStorageUsage').doc(tenantId);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(usageRef);
+    const current = snap.exists ? (snap.data() as any)?.bytes : undefined;
+    const usedBytes = typeof current === 'number' && Number.isFinite(current) && current >= 0 ? current : 0;
+    const next = Math.max(0, usedBytes - decrementBytes);
+    tx.set(
+      usageRef,
+      {
+        tenantId,
+        bytes: next,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function stripUndefinedDeep<T>(value: T): T {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => stripUndefinedDeep(entry))
+      .filter((entry) => entry !== undefined) as any;
+  }
+  if (typeof value === 'object') {
+    // Preserve non-plain objects (Firestore sentinels like FieldValue.serverTimestamp(),
+    // Timestamp, GeoPoint, DocumentReference, etc). Treat only POJOs as maps.
+    const proto = Object.getPrototypeOf(value);
+    if (proto && proto !== Object.prototype) {
+      return value;
+    }
+    const out: Record<string, any> = {};
+    for (const [key, entry] of Object.entries(value as any)) {
+      const cleaned = stripUndefinedDeep(entry);
+      if (cleaned !== undefined) {
+        out[key] = cleaned;
+      }
+    }
+    return out as any;
+  }
+  return value;
+}
+
+async function countQueryFast(query: admin.firestore.Query): Promise<number> {
+  const anyQuery = query as admin.firestore.Query & { count?: () => { get: () => Promise<{ data(): { count: number } }> } };
+  if (typeof anyQuery.count === 'function') {
+    const snapshot = await anyQuery.count().get();
+    return snapshot.data().count ?? 0;
+  }
+  const snapshot = await query.get();
+  return snapshot.size;
+}
+
+function monthBoundsUtc(monthId: string): { start: Date; end: Date } {
+  const year = Number(monthId.slice(0, 4));
+  const month = Number(monthId.slice(5, 7));
+  const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+  return { start, end };
+}
+
+async function resolveTenantPlanLimitsForEnforcement(
+  db: admin.firestore.Firestore,
+  tenantId: string
+): Promise<import('./lib/planLimits').PlanLimits> {
+  const tenantSnap = await db.collection('tenants').doc(tenantId).get();
+  const tenantData = tenantSnap.exists ? tenantSnap.data() || {} : {};
+  const quotasRaw = tenantData.quotas && typeof tenantData.quotas === 'object' ? (tenantData.quotas as any) : null;
+  return await resolveEffectivePlanLimitsForTenant(db, tenantId, {
+    billingTier: typeof tenantData.billingTier === 'string' ? tenantData.billingTier : null,
+    quotas: quotasRaw
+      ? {
+          maxStaff: typeof quotasRaw.maxStaff === 'number' ? quotasRaw.maxStaff : null,
+          maxStudents: typeof quotasRaw.maxStudents === 'number' ? quotasRaw.maxStudents : null,
+          maxMonthlyReminders: typeof quotasRaw.maxMonthlyReminders === 'number' ? quotasRaw.maxMonthlyReminders : null,
+          maxStorageMb: typeof quotasRaw.maxStorageMb === 'number' ? quotasRaw.maxStorageMb : null,
+        }
+      : null,
+  });
+}
+
+async function reconcileTenantReminderUsageToBillableOnly(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  monthId: string
+): Promise<void> {
+  if (process.env.DISABLE_REMINDER_USAGE_RECONCILE === '1') {
+    return;
+  }
+
+  // Many unit tests use lightweight Firestore stubs that don't implement chained query builders.
+  // Reconciliation is best-effort and should not run when query chaining isn't supported.
+  try {
+    const collectionAny = (db as any)?.collection?.('reminderHistory');
+    if (!collectionAny || typeof collectionAny.where !== 'function') {
+      return;
+    }
+    const chained = collectionAny.where('tenantId', '==', tenantId);
+    if (!chained || typeof chained.where !== 'function') {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  const usageRef = db.collection('tenantReminderUsage').doc(tenantId).collection('months').doc(monthId);
+  const existingSnap = await usageRef.get();
+  const existing = existingSnap.exists ? existingSnap.data() || {} : {};
+  if ((existing as any).countingMode === 'billable_success_only_v2') {
+    return;
+  }
+
+  const { start, end } = monthBoundsUtc(monthId);
+  const startTs = admin.firestore.Timestamp.fromDate(start);
+  const endTs = admin.firestore.Timestamp.fromDate(end);
+
+  const baseQuery = db
+    .collection('reminderHistory')
+    .where('tenantId', '==', tenantId)
+    .where('status', '==', 'success')
+    .where('createdAt', '>=', startTs)
+    .where('createdAt', '<', endTs)
+    // Align with existing composite indexes (tenantId + status + createdAt DESC).
+    .orderBy('createdAt', 'desc');
+
+  const total = await countQueryFast(baseQuery);
+  const channels: ReminderChannel[] = ['email', 'sms', 'whatsapp', 'voice'];
+  const channelCounts = await Promise.all(
+    channels.map(async (channel) => ({
+      channel,
+      count: await countQueryFast(baseQuery.where('reminderType', '==', channel)),
+    }))
+  );
+
+  const payload: Record<string, unknown> = {
+    tenantId,
+    month: monthId,
+    total,
+    countingMode: 'billable_success_only_v2',
+    migratedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  channelCounts.forEach((entry) => {
+    payload[entry.channel] = entry.count;
+  });
+  if (!existingSnap.exists) {
+    payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+
+  await usageRef.set(payload, { merge: true });
+}
+
+async function assertTenantReminderQuotaAvailable(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  reminderType: 'whatsapp' | 'sms' | 'email' | 'voice',
+  incrementBy = 1,
+  options?: {
+    historyId?: string;
+    history?: Record<string, any>;
+  }
+): Promise<void> {
+  if (incrementBy <= 0) {
+    return;
+  }
+
+  const planLimits = await resolveTenantPlanLimitsForEnforcement(db, tenantId);
+  const totalLimit = Number.isFinite(planLimits.reminders.total) ? planLimits.reminders.total : 0;
+  const channelLimitRaw = (planLimits.reminders as any)?.[reminderType];
+  const channelLimit = typeof channelLimitRaw === 'number' && Number.isFinite(channelLimitRaw) ? channelLimitRaw : 0;
+
+  if (totalLimit <= 0 && channelLimit <= 0) {
+    return;
+  }
+
+  const monthId = normalizeMonthId(null);
+  // One-time reconciliation for tenants that previously counted pending/failed against quota.
+  try {
+    await reconcileTenantReminderUsageToBillableOnly(db, tenantId, monthId);
+  } catch (e) {
+    console.warn('[reminder_quota] reconcile failed', e);
+  }
+  const ref = db.collection('tenantReminderUsage').doc(tenantId).collection('months').doc(monthId);
+
+  const historyId = typeof options?.historyId === 'string' ? options.historyId.trim() : '';
+  const historyRef = historyId ? db.collection('reminderHistory').doc(historyId) : null;
+  const historyPayload = options?.history && typeof options.history === 'object' ? (options.history as any) : null;
+
+  const inFlightTotalField = 'inFlightTotal';
+  const inFlightChannelField = `inFlight${reminderType[0].toUpperCase()}${reminderType.slice(1)}`;
+
+  await db.runTransaction(async (tx) => {
+    const [snap, historySnap] = await Promise.all([
+      tx.get(ref),
+      historyRef ? tx.get(historyRef) : Promise.resolve(null),
+    ]);
+    const data = snap.exists ? (snap.data() || {}) : {};
+    const totalUsed = typeof data.total === 'number' && Number.isFinite(data.total) ? data.total : 0;
+    const usedByChannel = typeof (data as any)[reminderType] === 'number' && Number.isFinite((data as any)[reminderType])
+      ? Number((data as any)[reminderType])
+      : 0;
+
+    const inFlightTotal =
+      typeof (data as any)[inFlightTotalField] === 'number' && Number.isFinite((data as any)[inFlightTotalField])
+        ? Number((data as any)[inFlightTotalField])
+        : 0;
+    const inFlightByChannel =
+      typeof (data as any)[inFlightChannelField] === 'number' && Number.isFinite((data as any)[inFlightChannelField])
+        ? Number((data as any)[inFlightChannelField])
+        : 0;
+
+    // Enforce quotas against billable usage + in-flight sends.
+    if (totalLimit > 0 && totalUsed + inFlightTotal + incrementBy > totalLimit) {
+      throw new TenantReminderLimitError(totalLimit, totalUsed + inFlightTotal, 'total');
+    }
+    if (channelLimit > 0 && usedByChannel + inFlightByChannel + incrementBy > channelLimit) {
+      throw new TenantReminderLimitError(channelLimit, usedByChannel + inFlightByChannel, reminderType);
+    }
+
+    const payload: Record<string, unknown> = {
+      tenantId,
+      month: monthId,
+      [inFlightTotalField]: admin.firestore.FieldValue.increment(incrementBy),
+      [inFlightChannelField]: admin.firestore.FieldValue.increment(incrementBy),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (!snap.exists) {
+      payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+
+    tx.set(ref, payload, { merge: true });
+
+    if (historyRef) {
+      const existing = historySnap && historySnap.exists ? historySnap.data() || {} : {};
+      const existingCreatedAt = (existing as any)?.createdAt;
+      const needsCreatedAt = !(existingCreatedAt instanceof admin.firestore.Timestamp);
+      const base: Record<string, unknown> = {
+        tenantId,
+        reminderType,
+        status: 'pending',
+        quota: {
+          tenantId,
+          monthId,
+          channel: reminderType,
+          inFlight: true,
+          billed: false,
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...(needsCreatedAt ? { createdAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
+      };
+      tx.set(historyRef, stripUndefinedDeep({ ...(historyPayload || {}), ...base }), { merge: true });
+    }
+  });
+}
+
+type ReminderChannel = 'email' | 'sms' | 'whatsapp' | 'voice';
+
+function normalizeReminderCount(value: unknown): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : 0;
+  return n > 0 ? n : 0;
+}
+
+function reminderReservationRef(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  monthId: string,
+  batchId: string
+) {
+  return db
+    .collection('tenantReminderReservations')
+    .doc(tenantId)
+    .collection('months')
+    .doc(monthId)
+    .collection('batches')
+    .doc(batchId);
+}
+
+async function reserveTenantReminderQuotaForBatch(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  batchId: string,
+  counts: Partial<Record<ReminderChannel, number>>
+): Promise<{ monthId: string; reserved: Record<ReminderChannel, number> }>{
+  const requested: Record<ReminderChannel, number> = {
+    email: normalizeReminderCount(counts.email),
+    sms: normalizeReminderCount(counts.sms),
+    whatsapp: normalizeReminderCount(counts.whatsapp),
+    voice: normalizeReminderCount(counts.voice),
+  };
+  const totalRequested = requested.email + requested.sms + requested.whatsapp + requested.voice;
+  const monthId = normalizeMonthId(null);
+  if (totalRequested <= 0) {
+    return { monthId, reserved: requested };
+  }
+
+  // One-time reconciliation for tenants that previously counted pending/failed against quota.
+  try {
+    await reconcileTenantReminderUsageToBillableOnly(db, tenantId, monthId);
+  } catch (e) {
+    console.warn('[reminder_quota] reconcile failed', e);
+  }
+
+  const planLimits = await resolveTenantPlanLimitsForEnforcement(db, tenantId);
+  const totalLimit = Number.isFinite(planLimits.reminders.total) ? planLimits.reminders.total : 0;
+
+  const usageRef = db.collection('tenantReminderUsage').doc(tenantId).collection('months').doc(monthId);
+  const reservationRef = reminderReservationRef(db, tenantId, monthId, batchId);
+
+  // Crash-safe: reserve tokens only temporarily. Usage is incremented when tokens are consumed.
+  const nowTs = admin.firestore.Timestamp.now();
+  const expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + 10 * 60_000); // 10 minutes
+  const reservationsQuery = db
+    .collection('tenantReminderReservations')
+    .doc(tenantId)
+    .collection('months')
+    .doc(monthId)
+    .collection('batches')
+    .where('expiresAt', '>', nowTs);
+
+  await db.runTransaction(async (tx) => {
+    const existingReservation = await tx.get(reservationRef);
+    if (existingReservation.exists) {
+      return;
+    }
+
+    const usageSnap = await tx.get(usageRef);
+    const usageData = usageSnap.exists ? usageSnap.data() || {} : {};
+    const totalUsed = typeof usageData.total === 'number' && Number.isFinite(usageData.total) ? usageData.total : 0;
+    const totalInFlight =
+      typeof (usageData as any).inFlightTotal === 'number' && Number.isFinite((usageData as any).inFlightTotal)
+        ? Number((usageData as any).inFlightTotal)
+        : 0;
+
+    // Sum outstanding (unexpired) reservations so app crashes/network retries don't permanently consume quota.
+    const reservationsSnap = await tx.get(reservationsQuery);
+    const reservedRemaining: Record<ReminderChannel, number> = { email: 0, sms: 0, whatsapp: 0, voice: 0 };
+    let totalReservedRemaining = 0;
+    reservationsSnap.forEach((doc) => {
+      if (doc.id === batchId) {
+        return;
+      }
+      const data = doc.data() || {};
+      const remaining = (data as any).remaining || {};
+      const totalRemaining =
+        typeof (data as any).totalRemaining === 'number' && Number.isFinite((data as any).totalRemaining)
+          ? Number((data as any).totalRemaining)
+          : 0;
+      totalReservedRemaining += Math.max(0, totalRemaining);
+      (['email', 'sms', 'whatsapp', 'voice'] as ReminderChannel[]).forEach((channel) => {
+        const v = typeof remaining[channel] === 'number' && Number.isFinite(remaining[channel]) ? Number(remaining[channel]) : 0;
+        reservedRemaining[channel] += Math.max(0, v);
+      });
+    });
+
+    if (totalLimit > 0 && totalUsed + totalInFlight + totalReservedRemaining + totalRequested > totalLimit) {
+      throw new TenantReminderBatchLimitError(
+        totalLimit,
+        totalUsed + totalInFlight + totalReservedRemaining,
+        totalRequested,
+        'total'
+      );
+    }
+
+    (['email', 'sms', 'whatsapp', 'voice'] as ReminderChannel[]).forEach((channel) => {
+      const incrementBy = requested[channel];
+      if (incrementBy <= 0) {
+        return;
+      }
+      const channelLimitRaw = (planLimits.reminders as any)?.[channel];
+      const channelLimit = typeof channelLimitRaw === 'number' && Number.isFinite(channelLimitRaw) ? channelLimitRaw : 0;
+      const usedByChannel =
+        typeof (usageData as any)[channel] === 'number' && Number.isFinite((usageData as any)[channel])
+          ? Number((usageData as any)[channel])
+          : 0;
+      const inFlightField = `inFlight${channel[0].toUpperCase()}${channel.slice(1)}`;
+      const inFlightByChannel =
+        typeof (usageData as any)[inFlightField] === 'number' && Number.isFinite((usageData as any)[inFlightField])
+          ? Number((usageData as any)[inFlightField])
+          : 0;
+      const reservedByChannel = reservedRemaining[channel] || 0;
+      if (channelLimit > 0 && usedByChannel + inFlightByChannel + reservedByChannel + incrementBy > channelLimit) {
+        throw new TenantReminderBatchLimitError(
+          channelLimit,
+          usedByChannel + inFlightByChannel + reservedByChannel,
+          incrementBy,
+          channel
+        );
+      }
+    });
+
+    tx.set(
+      reservationRef,
+      {
+        tenantId,
+        month: monthId,
+        batchId,
+        requested,
+        remaining: { ...requested },
+        totalRequested,
+        totalRemaining: totalRequested,
+        expiresAt,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: false }
+    );
+  });
+
+  return { monthId, reserved: requested };
+}
+
+async function consumeTenantReminderReservationToken(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  batchId: string,
+  channel: ReminderChannel,
+  options?: {
+    historyId?: string;
+    history?: Record<string, any>;
+  }
+): Promise<void> {
+  const monthId = normalizeMonthId(null);
+  const ref = reminderReservationRef(db, tenantId, monthId, batchId);
+  const usageRef = db.collection('tenantReminderUsage').doc(tenantId).collection('months').doc(monthId);
+  const historyId = typeof options?.historyId === 'string' ? options.historyId.trim() : '';
+  const historyPayload = options?.history && typeof options.history === 'object' ? (options.history as any) : null;
+  const historyRef = historyId ? db.collection('reminderHistory').doc(historyId) : null;
+
+  const nowTs = admin.firestore.Timestamp.now();
+
+  const coerceToAdminTimestamp = (raw: any): admin.firestore.Timestamp | null => {
+    if (!raw) return null;
+    if (raw instanceof admin.firestore.Timestamp) return raw;
+    if (typeof raw === 'string') {
+      const ms = Date.parse(raw);
+      if (Number.isFinite(ms)) return admin.firestore.Timestamp.fromMillis(ms);
+      return null;
+    }
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      // Heuristic: values > 1e12 are probably ms; otherwise seconds.
+      const ms = raw > 1e12 ? raw : raw * 1000;
+      return admin.firestore.Timestamp.fromMillis(ms);
+    }
+    if (typeof raw === 'object') {
+      const seconds = (raw as any).seconds;
+      const nanoseconds = (raw as any).nanoseconds;
+      if (typeof seconds === 'number' && Number.isFinite(seconds)) {
+        const ns = typeof nanoseconds === 'number' && Number.isFinite(nanoseconds) ? nanoseconds : 0;
+        return new admin.firestore.Timestamp(seconds, ns);
+      }
+    }
+    return null;
+  };
+
+  await db.runTransaction(async (tx) => {
+    const [snap, usageSnap, existingHistory] = await Promise.all([
+      tx.get(ref),
+      tx.get(usageRef),
+      historyRef ? tx.get(historyRef) : Promise.resolve(null),
+    ]);
+
+    if (!snap.exists) {
+      throw new TenantAccessError(409, { error: 'reminder_quota_reservation_missing' });
+    }
+    const data = snap.data() || {};
+    const expiresAtRaw = (data as any).expiresAt;
+    const expiresAt = expiresAtRaw instanceof admin.firestore.Timestamp ? expiresAtRaw : null;
+    if (expiresAt && expiresAt.toMillis() <= nowTs.toMillis()) {
+      throw new TenantAccessError(409, { error: 'reminder_quota_reservation_expired' });
+    }
+    const remaining = (data as any).remaining || {};
+    const remainingByChannel =
+      typeof remaining[channel] === 'number' && Number.isFinite(remaining[channel]) ? Number(remaining[channel]) : 0;
+    const totalRemaining =
+      typeof (data as any).totalRemaining === 'number' && Number.isFinite((data as any).totalRemaining)
+        ? Number((data as any).totalRemaining)
+        : 0;
+    if (remainingByChannel <= 0 || totalRemaining <= 0) {
+      throw new TenantAccessError(409, { error: 'reminder_quota_reservation_exhausted', channel });
+    }
+
+    // Reserve an in-flight slot (billable usage is recorded only on success).
+    const inFlightTotalField = 'inFlightTotal';
+    const inFlightChannelField = `inFlight${channel[0].toUpperCase()}${channel.slice(1)}`;
+    const usagePayload: Record<string, unknown> = {
+      tenantId,
+      month: monthId,
+      [inFlightTotalField]: admin.firestore.FieldValue.increment(1),
+      [inFlightChannelField]: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (!usageSnap.exists) {
+      usagePayload.createdAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+    tx.set(usageRef, usagePayload, { merge: true });
+
+    if (historyRef) {
+      const base: Record<string, unknown> = {
+        tenantId,
+        reminderType: channel,
+        status: 'pending',
+        quota: {
+          tenantId,
+          monthId,
+          batchId,
+          channel,
+          inFlight: true,
+          billed: false,
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      const existingData = existingHistory && existingHistory.exists ? existingHistory.data() || {} : null;
+      const existingCreatedAt = existingData ? (existingData as any).createdAt : null;
+      if (!existingHistory || !existingHistory.exists) {
+        base.createdAt = admin.firestore.FieldValue.serverTimestamp();
+      } else if (!(existingCreatedAt instanceof admin.firestore.Timestamp)) {
+        // Repair legacy/malformed createdAt values so queries that order/filter by createdAt work reliably.
+        const coerced = coerceToAdminTimestamp(existingCreatedAt);
+        base.createdAt = coerced || admin.firestore.FieldValue.serverTimestamp();
+      }
+      tx.set(historyRef, stripUndefinedDeep({ ...(historyPayload || {}), ...base }), { merge: true });
+    }
+
+    tx.set(
+      ref,
+      {
+        [`remaining.${channel}`]: admin.firestore.FieldValue.increment(-1),
+        totalRemaining: admin.firestore.FieldValue.increment(-1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+async function assertTenantStudentCreateAllowed(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  isActiveStudent: boolean
+): Promise<void> {
+  if (!isActiveStudent) {
+    return;
+  }
+  const planLimits = await resolveTenantPlanLimitsForEnforcement(db, tenantId);
+  const studentLimit = Number.isFinite(planLimits.students) ? planLimits.students : 0;
+  if (studentLimit <= 0) {
+    return;
+  }
+  const used = await countQueryFast(
+    db
+      .collection('students')
+      .where('tenantId', '==', tenantId)
+      .where('status', '==', 'active')
+  );
+  if (used >= studentLimit) {
+    throw new TenantStudentLimitError(studentLimit, used);
+  }
+}
+
+async function assertTenantStaffSeatAvailable(db: admin.firestore.Firestore, tenantId: string): Promise<void> {
+  const tenantRef = db.collection('tenants').doc(tenantId);
+  const tenantSnap = await tenantRef.get();
+  if (!tenantSnap.exists) {
+    throw new TenantAccessError(404, { error: 'tenant_not_found' });
+  }
+  const tenantData = tenantSnap.data() || {};
+  const quotasRaw = tenantData.quotas && typeof tenantData.quotas === 'object' ? (tenantData.quotas as any) : null;
+  const planLimits = await resolveEffectivePlanLimitsForTenant(db, tenantId, {
+    billingTier: typeof tenantData.billingTier === 'string' ? tenantData.billingTier : null,
+    quotas: quotasRaw
+      ? {
+          maxStaff: typeof quotasRaw.maxStaff === 'number' ? quotasRaw.maxStaff : null,
+          maxStudents: typeof quotasRaw.maxStudents === 'number' ? quotasRaw.maxStudents : null,
+          maxMonthlyReminders: typeof quotasRaw.maxMonthlyReminders === 'number' ? quotasRaw.maxMonthlyReminders : null,
+          maxStorageMb: typeof quotasRaw.maxStorageMb === 'number' ? quotasRaw.maxStorageMb : null,
+        }
+      : null,
+  });
+  const seatLimit = typeof planLimits.staffSeats === 'number' ? planLimits.staffSeats : null;
+  if (!seatLimit || seatLimit <= 0) {
+    return;
+  }
+
+  const isSeatRole = (role: unknown): boolean => {
+    const normalized = typeof role === 'string' ? role.trim().toLowerCase() : '';
+    return normalized === 'owner' || normalized === 'admin' || normalized === 'staff';
+  };
+
+  const activeMembersSnap = await db
+    .collection('tenantMemberships')
+    .where('tenantId', '==', tenantId)
+    .where('status', '==', 'active')
+    .get();
+  let activeSeatCount = 0;
+  activeMembersSnap.forEach((doc) => {
+    const data = doc.data() || {};
+    if (isSeatRole((data as any).role)) {
+      activeSeatCount += 1;
+    }
+  });
+
+  const pendingInvitesSnap = await db
+    .collection('tenantInvites')
+    .where('tenantId', '==', tenantId)
+    .where('status', '==', 'pending')
+    .get();
+  let pendingSeatInvites = 0;
+  pendingInvitesSnap.forEach((doc) => {
+    const data = doc.data() || {};
+    if (isSeatRole((data as any).role)) {
+      pendingSeatInvites += 1;
+    }
+  });
+
+  if (activeSeatCount + pendingSeatInvites >= seatLimit) {
+    throw new TenantSeatLimitError(seatLimit);
+  }
+}
+
+async function isTenantEmailActiveMember(tenantId: string, email: string): Promise<boolean> {
+  const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedTenantId || !normalizedEmail) {
+    return false;
+  }
+
+  ensureFirebase();
+  const db = admin.firestore();
+  const snapshot = await db
+    .collection('tenantMemberships')
+    .where('tenantId', '==', normalizedTenantId)
+    .where('status', '==', 'active')
+    .where('email', '==', normalizedEmail)
+    .limit(1)
+    .get();
+
+  return !snapshot.empty;
+}
+
+function tenantInviteDocId(tenantId: string, email: string): string {
+  const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+  const normalizedEmail = normalizeEmail(email);
+  // Firestore doc IDs cannot contain '/', but emails should not; still sanitize defensively.
+  const safeEmail = normalizedEmail.replace(/\//g, '_');
+  return `${normalizedTenantId}__${safeEmail}`;
+}
+
+const MEMBERSHIP_CACHE_TTL_MS = Math.max(Number(process.env.TENANT_MEMBERSHIP_CACHE_MS ?? 45_000), 5_000);
+const MEMBERSHIP_CACHE_MAX = Math.max(Number(process.env.TENANT_MEMBERSHIP_CACHE_MAX ?? 1000), 100);
+const membershipAccessCache = new Map<string, { role: TenantMembershipRole; expiresAt: number }>();
+
+function getMembershipCacheKey(tenantId: string, uid: string): string {
+  return `${tenantId}::${uid}`;
+}
+
+function pruneMembershipCache(now: number) {
+  for (const [key, entry] of membershipAccessCache.entries()) {
+    if (entry.expiresAt <= now) {
+      membershipAccessCache.delete(key);
+    }
+  }
+  if (membershipAccessCache.size <= MEMBERSHIP_CACHE_MAX) {
+    return;
+  }
+  const excess = membershipAccessCache.size - MEMBERSHIP_CACHE_MAX;
+  let removed = 0;
+  for (const key of membershipAccessCache.keys()) {
+    membershipAccessCache.delete(key);
+    removed += 1;
+    if (removed >= excess) {
+      break;
+    }
+  }
+}
+
+async function requireTenantMembershipAccess(
+  authContext: express.Request['authContext'],
+  tenantIdRaw: string,
+  options: { minRole?: TenantMembershipRole } = {}
+): Promise<{ tenantId: string; role: TenantMembershipRole; membershipId: string | null }> {
+  const normalizedTenantId = typeof tenantIdRaw === 'string' ? tenantIdRaw.trim() : '';
+  if (!normalizedTenantId) {
+    throw new TenantAccessError(400, { error: 'tenant_required' });
+  }
+
+  if (!authContext) {
+    throw new TenantAccessError(401, { error: 'unauthorized' });
+  }
+
+  if (authContext.tokenType === 'master') {
+    return { tenantId: normalizedTenantId, role: 'owner', membershipId: null };
+  }
+
+  const uid = authContext.uid;
+  if (!uid) {
+    throw new TenantAccessError(403, { error: 'not_authorized' });
+  }
+
+  ensureFirebase();
+  const db = admin.firestore();
+  const membershipId = membershipDocId(normalizedTenantId, uid);
+  const cacheKey = getMembershipCacheKey(normalizedTenantId, uid);
+  const now = Date.now();
+  const cached = membershipAccessCache.get(cacheKey);
+  let role: TenantMembershipRole | null = null;
+  if (cached && cached.expiresAt > now) {
+    role = cached.role;
+  } else {
+    const membershipSnap = await db.collection('tenantMemberships').doc(membershipId).get();
+    if (!membershipSnap.exists) {
+      throw new TenantAccessError(403, { error: 'tenant_membership_required' });
+    }
+    const membershipData = membershipSnap.data() || {};
+    const status = typeof membershipData.status === 'string' ? membershipData.status.toLowerCase() : '';
+    if (status !== 'active') {
+      throw new TenantAccessError(403, { error: 'tenant_membership_inactive' });
+    }
+
+    const rawRole = typeof membershipData.role === 'string' ? membershipData.role.toLowerCase() : 'member';
+    const allowedRoles: TenantMembershipRole[] = ['owner', 'admin', 'staff', 'member'];
+    role = (allowedRoles.includes(rawRole as TenantMembershipRole)
+      ? (rawRole as TenantMembershipRole)
+      : 'member');
+    membershipAccessCache.set(cacheKey, { role, expiresAt: now + MEMBERSHIP_CACHE_TTL_MS });
+    if (membershipAccessCache.size > MEMBERSHIP_CACHE_MAX * 1.2) {
+      pruneMembershipCache(now);
+    }
+  }
+
+  const minRole = options.minRole ?? 'staff';
+  const currentRank = tenantRolePriority[role] ?? 0;
+  const requiredRank = tenantRolePriority[minRole] ?? tenantRolePriority.staff;
+  if (currentRank < requiredRank) {
+    throw new TenantAccessError(403, {
+      error: 'tenant_role_insufficient',
+      requiredRole: minRole,
+      currentRole: role,
+    });
+  }
+
+  return { tenantId: normalizedTenantId, role, membershipId };
+}
+
+function respondTenantAccessError(res: express.Response, error: unknown): boolean {
+  if (error instanceof TenantAccessError) {
+    res.status(error.status).json(error.body);
+    return true;
+  }
+  return false;
+}
+
+type TenantIdResolver = (req: express.Request) => string | null | undefined;
+
+interface TenantAccessMiddlewareOptions {
+  resolveTenantId?: TenantIdResolver;
+  minRole?: TenantMembershipRole;
+  requireTenantId?: boolean;
+}
+
+function billingDelinquencyEnforcementEnabled(): boolean {
+  return process.env.BILLING_DELINQUENCY_ENFORCEMENT_ENABLED === '1';
+}
+
+function billingAutoDowngradeAfterGraceEnabled(): boolean {
+  // Default ON when delinquency enforcement is enabled.
+  // Set BILLING_AUTO_DOWNGRADE_AFTER_GRACE=0 to disable.
+  const raw = typeof process.env.BILLING_AUTO_DOWNGRADE_AFTER_GRACE === 'string' ? process.env.BILLING_AUTO_DOWNGRADE_AFTER_GRACE : '';
+  if (raw.trim() === '0') {
+    return false;
+  }
+  return true;
+}
+
+function billingDelinquencyGraceDays(): number {
+  const raw = Number(process.env.BILLING_DELINQUENCY_GRACE_DAYS ?? '7');
+  if (!Number.isFinite(raw) || raw < 0) {
+    return 7;
+  }
+  return Math.floor(raw);
+}
+
+function isBillingEnforcementExemptPath(path: string): boolean {
+  // Always allow billing endpoints so a tenant can recover by paying.
+  return typeof path === 'string' && path.startsWith('/billing/');
+}
+
+async function assertTenantBillingInGoodStanding(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  reqPath: string,
+  authContext: express.Request['authContext']
+): Promise<void> {
+  if (!billingDelinquencyEnforcementEnabled()) {
+    return;
+  }
+  if (!tenantId) {
+    return;
+  }
+  if (isBillingEnforcementExemptPath(reqPath)) {
+    return;
+  }
+  const tokenType = authContext?.tokenType;
+  if (tokenType === 'master' || tokenType === 'internal') {
+    return;
+  }
+
+  const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
+  if (!billingSnap.exists) {
+    return;
+  }
+  const data = billingSnap.data() || {};
+  const statusRaw = typeof (data as any).status === 'string' ? String((data as any).status).toLowerCase() : '';
+  const status = statusRaw === 'active' || statusRaw === 'delinquent' || statusRaw === 'canceled' || statusRaw === 'trial'
+    ? statusRaw
+    : '';
+
+  // If billing record claims free, don't block.
+  const planId = normalizePlanId((data as any).planId ?? (data as any).plan ?? 'free');
+  if (planId === 'free') {
+    return;
+  }
+  if (status !== 'delinquent') {
+    return;
+  }
+
+  const nowMs = Date.now();
+  const graceMs = billingDelinquencyGraceDays() * 24 * 60 * 60 * 1000;
+  const delinquentSinceMs =
+    (() => {
+      const iso = typeof (data as any).delinquentSinceIso === 'string' ? (data as any).delinquentSinceIso : undefined;
+      if (iso) {
+        const parsed = Date.parse(iso);
+        return Number.isNaN(parsed) ? undefined : parsed;
+      }
+      return timestampToMillis((data as any).delinquentSince) ?? timestampToMillis((data as any).updatedAt);
+    })();
+
+  if (typeof delinquentSinceMs === 'number' && Number.isFinite(delinquentSinceMs) && graceMs > 0) {
+    if (nowMs <= delinquentSinceMs + graceMs) {
+      return;
+    }
+  }
+
+  const graceUntilIso =
+    typeof delinquentSinceMs === 'number' && Number.isFinite(delinquentSinceMs)
+      ? new Date(delinquentSinceMs + graceMs).toISOString()
+      : null;
+
+  if (billingAutoDowngradeAfterGraceEnabled()) {
+    const billingProvider = typeof (data as any).billingProvider === 'string' ? String((data as any).billingProvider) : null;
+    const subscriptionIdRaw = typeof (data as any).subscriptionId === 'string' ? String((data as any).subscriptionId) : '';
+    const subscriptionId = subscriptionIdRaw.trim();
+    const fromPlanId = planId;
+
+    // Best-effort: cancel provider subscription so charges stop.
+    if (billingProvider === 'razorpay' && subscriptionId) {
+      try {
+        await cancelRazorpaySubscription({ subscriptionId, cancelAtCycleEnd: false });
+      } catch (error) {
+        console.warn('[billing_enforcement] razorpay cancel failed during auto downgrade', error);
+      }
+    }
+
+    try {
+      await db
+        .collection('tenantBilling')
+        .doc(tenantId)
+        .set(
+          {
+            planId: 'free',
+            planVariantId: null,
+            couponCode: null,
+            status: 'canceled',
+            renewalDate: null,
+            cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+            scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+            scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+            limitsSnapshot: admin.firestore.FieldValue.delete(),
+            limitsSnapshotAt: admin.firestore.FieldValue.delete(),
+            delinquentSince: admin.firestore.FieldValue.delete(),
+            delinquentSinceIso: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+      await db
+        .collection('tenants')
+        .doc(tenantId)
+        .set(
+          {
+            billingTier: 'free',
+            quotas: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+    } catch (error) {
+      console.error('[billing_enforcement] auto downgrade failed', error);
+      throw new TenantAccessError(500, { error: 'billing_auto_downgrade_failed' });
+    }
+
+    void sendTenantBillingEventNotification({
+      tenantId,
+      tenantName: undefined,
+      kind: 'downgrade_to_free_immediate',
+      title: 'Switched to Free plan',
+      body: 'Your payment was overdue past the grace period, so the plan has been switched to Free.',
+      priority: 'medium',
+      metadata: {
+        provider: billingProvider,
+        subscriptionId: subscriptionId || null,
+        fromPlanId,
+        reason: 'grace_expired',
+        graceUntil: graceUntilIso,
+      },
+    }).catch(() => undefined);
+
+    // Tenant is now Free; allow request to proceed.
+    return;
+  }
+
+  throw new TenantAccessError(402, {
+    error: 'billing_past_due',
+    status: 'delinquent',
+    graceUntil: graceUntilIso,
+  });
+}
+
+function defaultTenantIdResolver(req: express.Request): string | null {
+  const tenantId = (req.body && typeof (req.body as any).tenantId === 'string') ? (req.body as any).tenantId : undefined;
+  if (typeof tenantId === 'string') {
+    const normalized = tenantId.trim();
+    return normalized.length ? normalized : null;
+  }
+  return null;
+}
+
+function queryTenantIdResolver(paramName = 'tenantId'): TenantIdResolver {
+  return (req: express.Request): string | null => {
+    const rawValue = (req.query?.[paramName] ?? undefined) as unknown;
+    if (typeof rawValue === 'string') {
+      const normalized = rawValue.trim();
+      return normalized.length ? normalized : null;
+    }
+    if (Array.isArray(rawValue) && rawValue.length > 0) {
+      const first = String(rawValue[0]).trim();
+      return first.length ? first : null;
+    }
+    return null;
+  };
+}
+
+function paramsTenantIdResolver(paramName = 'tenantId'): TenantIdResolver {
+  return (req: express.Request): string | null => {
+    const params = req.params ?? {};
+    const rawValue = params[paramName];
+    if (typeof rawValue === 'string') {
+      const normalized = rawValue.trim();
+      return normalized.length ? normalized : null;
+    }
+    return null;
+  };
+}
+
+const standardQueryTenantResolver = queryTenantIdResolver();
+const standardParamsTenantResolver = paramsTenantIdResolver();
+function pathTenantIdResolver(path?: string | null): string | null {
+  if (!path) {
+    return null;
+  }
+  const match = path.match(/^\/tenants\/([^/]+)/i);
+  if (!match) {
+    return null;
+  }
+  const candidate = match[1]?.trim();
+  return candidate && candidate.length ? candidate : null;
+}
+
+function anyTenantIdResolver(req: express.Request): string | null {
+  const bodyTenant = defaultTenantIdResolver(req);
+  if (bodyTenant) {
+    return bodyTenant;
+  }
+  const queryTenant = standardQueryTenantResolver(req);
+  if (typeof queryTenant === 'string' && queryTenant.trim().length) {
+    return queryTenant;
+  }
+  const paramsTenant = standardParamsTenantResolver(req);
+  if (typeof paramsTenant === 'string' && paramsTenant.trim().length) {
+    return paramsTenant;
+  }
+  const pathTenant = pathTenantIdResolver(req.path);
+  if (pathTenant) {
+    return pathTenant;
+  }
+  return null;
+}
+
+function tenantAccessMiddleware(
+  options: TenantAccessMiddlewareOptions = {},
+  accessFn: typeof requireTenantMembershipAccess = requireTenantMembershipAccess,
+  getFirestore: () => admin.firestore.Firestore = () => {
+    ensureFirebase();
+    return admin.firestore();
+  }
+) {
+  const resolveTenantId = options.resolveTenantId ?? defaultTenantIdResolver;
+  const minRole = options.minRole ?? 'staff';
+  const requireTenantId = options.requireTenantId ?? true;
+
+  return async function tenantAccessGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
+    let tenantId: string | null | undefined = null;
+    try {
+      tenantId = resolveTenantId(req);
+    } catch (error) {
+      console.error('[tenant_access] failed to resolve tenantId', error);
+      return res.status(500).json({ error: 'tenant_resolution_failed' });
+    }
+
+    const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+    if (!normalizedTenantId) {
+      if (requireTenantId) {
+        return res.status(400).json({ error: 'tenant_required' });
+      }
+      return next();
+    }
+
+    const existingAccess = req.tenantAccess;
+    if (existingAccess && existingAccess.tenantId === normalizedTenantId) {
+      const currentRank = tenantRolePriority[existingAccess.role] ?? 0;
+      const requiredRank = tenantRolePriority[minRole] ?? tenantRolePriority.staff;
+      if (currentRank >= requiredRank) {
+        return next();
+      }
+      return res.status(403).json({
+        error: 'tenant_role_insufficient',
+        requiredRole: minRole,
+        currentRole: existingAccess.role,
+      });
+    }
+
+    try {
+      const access = await accessFn(req.authContext, normalizedTenantId, { minRole });
+      req.tenantAccess = access;
+
+      try {
+        const db = getFirestore();
+        await assertTenantBillingInGoodStanding(db, normalizedTenantId, req.path || '', req.authContext);
+      } catch (error) {
+        if (respondTenantAccessError(res, error)) {
+          return;
+        }
+        if (error instanceof TenantAccessError) {
+          return res.status(error.status).json(error.body);
+        }
+        console.error('[tenant_access] billing enforcement check failed', error);
+        return res.status(500).json({ error: 'billing_enforcement_failed' });
+      }
+
+      return next();
+    } catch (error) {
+      if (respondTenantAccessError(res, error)) {
+        return;
+      }
+      console.error('[tenant_access] tenant access check failed', error);
+      return res.status(500).json({ error: 'tenant_check_failed' });
+    }
+  };
+}
+
+type DevicePingType = 'register' | 'heartbeat' | 'full';
+
+function resolveDevicePingActivity(pingType: DevicePingType): string {
+  switch (pingType) {
+    case 'register':
+      return 'device_registration';
+    case 'full':
+      return 'full_update';
+    default:
+      return 'heartbeat';
+  }
+}
+
+function toIsoTimestamp(value: any): string | undefined {
+  if (!value) return undefined;
+  if (typeof value === 'string') {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value.toDate === 'function') {
+    try {
+      return value.toDate().toISOString();
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof value.seconds === 'number') {
+    const millis = value.seconds * 1000 + Math.floor((value.nanoseconds || 0) / 1e6);
+    return new Date(millis).toISOString();
+  }
+  return undefined;
+}
+
+function formatIsoIstForDisplay(iso: string | undefined | null): string | undefined {
+  if (!iso) return undefined;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+
+  try {
+    const formatter = new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+    const parts = formatter.formatToParts(date);
+    const map = new Map(parts.map((p) => [p.type, p.value] as const));
+    const dd = map.get('day');
+    const mon = map.get('month');
+    const yyyy = map.get('year');
+    const hour = map.get('hour');
+    const minute = map.get('minute');
+    const dayPeriod = map.get('dayPeriod');
+    if (dd && mon && yyyy && hour && minute && dayPeriod) {
+      return `${dd} ${mon} ${yyyy}, ${hour}:${minute} ${dayPeriod} IST`;
+    }
+  } catch {
+    // fall through
+  }
+
+  // Fallback: manual IST conversion (UTC+05:30)
+  const ist = new Date(date.getTime() + 5.5 * 60 * 60 * 1000);
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
+  const dd = String(ist.getUTCDate()).padStart(2, '0');
+  const mon = months[ist.getUTCMonth()] ?? '';
+  const yyyy = ist.getUTCFullYear();
+  let hour24 = ist.getUTCHours();
+  const minute = String(ist.getUTCMinutes()).padStart(2, '0');
+  const ampm = hour24 >= 12 ? 'PM' : 'AM';
+  hour24 = hour24 % 12;
+  const hour12 = hour24 === 0 ? 12 : hour24;
+  return `${dd} ${mon} ${yyyy}, ${hour12}:${minute} ${ampm} IST`;
+}
+
+function timestampToMillis(value: any): number | undefined {
+  const iso = toIsoTimestamp(value);
+  if (!iso) {
+    return undefined;
+  }
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+interface TenantAdminSummary {
+  id: string;
+  name?: string;
+  slug?: string;
+  code?: string;
+  status?: string;
+  billingTier?: string;
+  ownerEmail?: string;
+  ownerUserId?: string;
+  contactEmail?: string;
+  contactPhone?: string;
+  logoUrl?: string | null;
+  heroImageUrl?: string | null;
+  branding?: {
+    logoUrl?: string;
+    heroImageUrl?: string;
+    accentImageUrl?: string;
+    tagline?: string;
+    missionStatement?: string;
+  };
+  quotas?: {
+    maxStudents?: number;
+    maxStaff?: number;
+    maxMonthlyReminders?: number;
+    maxMonthlyWhatsappReminders?: number;
+    maxMonthlySmsReminders?: number;
+    maxMonthlyEmailReminders?: number;
+    maxMonthlyVoiceReminders?: number;
+    maxStorageMb?: number;
+  };
+  membershipCounts?: {
+    total?: number;
+    active?: number;
+    pending?: number;
+    owners?: number;
+    admins?: number;
+    staff?: number;
+  };
+  flags?: {
+    allowJoinRequests?: boolean;
+    notifyOnJoinRequest?: boolean;
+    notifyViaEmail?: boolean;
+  };
+  createdAt?: string;
+  updatedAt?: string;
+  seatUsage?: {
+    adminSeatsUsed: number | null;
+    adminSeatLimit: number | null;
+    remaining: number | null;
+  };
+}
+
+interface TenantSearchResponse {
+  results: TenantAdminSummary[];
+  total: number;
+  diagnostics: {
+    query?: string;
+    matchedBy: string[];
+    fallbackApplied: boolean;
+  };
+}
+
+interface TenantMembershipAdminRecord {
+  id: string;
+  tenantId: string;
+  userId?: string;
+  email?: string;
+  displayName?: string;
+  role?: string;
+  status?: string;
+  joinedVia?: string;
+  joinCodeId?: string;
+  invitedByUserId?: string;
+  invitedByEmail?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  lastActivityAt?: string;
+}
+
+interface MembershipSummaryBuckets {
+  count: number;
+  byRole: Record<string, number>;
+  byStatus: Record<string, number>;
+}
+
+interface TenantMembershipInspectorResponse {
+  tenant: TenantAdminSummary;
+  members: TenantMembershipAdminRecord[];
+  total: number;
+  hasMore: boolean;
+  stats: {
+    filtered: MembershipSummaryBuckets;
+    scanned: MembershipSummaryBuckets;
+    snapshot?: TenantAdminSummary['membershipCounts'];
+  };
+  filters: {
+    limit: number;
+    role: TenantMembershipRole | 'all';
+    status: string;
+    search?: string;
+  };
+}
+
+const tenantMembershipInspectorSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+  limit: z.number().int().min(1).max(200).optional(),
+  role: z.union([z.literal('all'), z.enum(['owner', 'admin', 'staff', 'member'])]).optional(),
+  status: z.string().trim().max(40).optional(),
+  search: z.string().trim().max(120).optional(),
+});
+
+interface TenantInviteAdminRecord {
+  id: string;
+  tenantId: string;
+  email?: string;
+  role?: string;
+  status?: string;
+  issuedBy?: string;
+  issuedAt?: string;
+  expiresAt?: string;
+  acceptedAt?: string;
+  acceptedBy?: string;
+  lastSentAt?: string;
+  lastSentBy?: string;
+  invitationMessage?: string;
+}
+
+interface TenantInviteInspectorResponse {
+  tenant: TenantAdminSummary;
+  invites: TenantInviteAdminRecord[];
+  total: number;
+  hasMore: boolean;
+  stats: {
+    byStatus: Record<string, number>;
+  };
+  filters: {
+    limit: number;
+    status: string;
+    search?: string;
+  };
+}
+
+const tenantInviteInspectorSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+  limit: z.number().int().min(1).max(200).optional(),
+  status: z.string().trim().max(40).optional(),
+  search: z.string().trim().max(120).optional(),
+});
+
+interface TenantAuditAdminRecord {
+  id: string;
+  tenantId: string;
+  action: string;
+  actorId?: string;
+  actorEmail?: string;
+  targetId?: string;
+  targetType?: string;
+  metadata?: Record<string, unknown>;
+  createdAt?: string;
+}
+
+interface TenantAuditInspectorResponse {
+  tenant: TenantAdminSummary;
+  entries: TenantAuditAdminRecord[];
+  total: number;
+  hasMore: boolean;
+  stats: {
+    byAction: Record<string, number>;
+  };
+  filters: {
+    limit: number;
+    action: string;
+    search?: string;
+  };
+}
+
+const tenantAuditInspectorSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+  limit: z.number().int().min(1).max(200).optional(),
+  action: z.string().trim().max(80).optional(),
+  search: z.string().trim().max(160).optional(),
+});
+ 
+interface NotificationHistoryAdminRecord {
+  id: string;
+  tenantId?: string | null;
+  tenantName?: string | null;
+  adminEmail?: string | null;
+  adminName?: string | null;
+  title: string;
+  body?: string;
+  type: string;
+  priority: string;
+  deliveryMethod?: string;
+  totalTargets: number;
+  successfulDeliveries: number;
+  failedDeliveries: number;
+  failureReasonSummary?: Record<string, number>;
+  onlineOnly?: boolean;
+  sentAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+interface NotificationHistoryInspectorResponse {
+  entries: NotificationHistoryAdminRecord[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+interface NotificationStatsInspectorResponse {
+  windowDays: number;
+  startDate: string;
+  totalNotifications: number;
+  totalRecipients: number;
+  successfulRecipients: number;
+  failedRecipients: number;
+  averageSuccessRate: number;
+  notificationsByType: Record<string, number>;
+  notificationsByPriority: Record<string, number>;
+  failureReasons: Record<string, number>;
+  tenantBreakdown: Array<{ tenantId: string; tenantName?: string | null; count: number; failedDeliveries: number }>;
+  lastSentAt?: string;
+}
+
+const notificationHistoryInspectorSchema = z.object({
+  tenantId: z.string().trim().min(2).max(128).optional(),
+  adminEmail: z.string().trim().email().optional(),
+  limit: z.number().int().min(10).max(200).optional(),
+  cursor: z.string().trim().optional(),
+});
+
+const notificationStatsInspectorSchema = z.object({
+  tenantId: z.string().trim().min(2).max(128).optional(),
+  adminEmail: z.string().trim().email().optional(),
+  days: z.number().int().min(1).max(180).optional(),
+});
+
+type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage';
+
+interface UsageStorageSource {
+  label: string;
+  bytes: number;
+}
+
+interface UsageDiagnostics {
+  warnings?: string[];
+  generatedAt?: string;
+}
+
+interface UsageMetricStatus {
+  value: number;
+  limit: number;
+  percentage: number;
+  status: UsageStatus;
+}
+
+type UsageMetricStatusMap = Partial<Record<UsageMetricKey, UsageMetricStatus>>;
+
+interface UsageAlertRecord {
+  id: string;
+  metric: UsageMetricKey;
+  type: 'warning' | 'critical';
+  createdAt: string;
+  acknowledgedAt?: string | null;
+  details?: string;
+  value?: number;
+  limit?: number;
+  ratio?: number;
+}
+
+interface UsageSummaryResponse {
+  tenantId: string;
+  month: string;
+  planId: PlanId;
+  planLimits: PlanLimits;
+  students: number;
+  studentsAdded: number;
+  staff: number;
+  staffBreakdown?: {
+    active: number;
+    pendingInvites: number;
+  };
+  reminders: {
+    total: number;
+    whatsapp: number;
+    sms: number;
+    email: number;
+    voice?: number;
+    other?: number;
+  };
+  paymentsReceived?: {
+    count: number;
+    amount: number;
+  };
+  noticePosts: number;
+  deviceActions: number;
+  chatMessages: number | null;
+  storageBytes: number;
+  storageSources: UsageStorageSource[];
+  alerts: UsageAlertRecord[];
+  metricsVersion?: number;
+  lastRefreshedAt?: string;
+  diagnostics?: UsageDiagnostics;
+  statuses: UsageMetricStatusMap;
+}
+
+interface UsageHistoryPoint {
+  month: string;
+  students: number;
+  studentsAdded?: number;
+  staff: number;
+  remindersTotal: number;
+  remindersWhatsApp?: number;
+  remindersSms?: number;
+  remindersEmail?: number;
+  storageBytes: number;
+  noticePosts?: number;
+  deviceActions?: number;
+  chatMessages?: number | null;
+  paymentsReceivedCount?: number;
+  paymentsReceivedAmount?: number;
+}
+
+interface BillingInvoiceRecord {
+  id: string;
+  invoiceNumber?: string;
+  amountInr: number;
+  status: 'paid' | 'open' | 'failed' | 'void' | 'uncollectible';
+  issuedAt?: string;
+  dueAt?: string;
+  downloadUrl?: string;
+  provider?: string;
+  planId?: string;
+  planVariantId?: string;
+  couponCode?: string;
+  isSynthetic?: boolean;
+  sourceEvent?: string;
+  providerPaymentId?: string;
+  providerSubscriptionId?: string;
+  subscriptionId?: string;
+  rawEvent?: string;
+  payerEmail?: string;
+  method?: string;
+  upiVpaMasked?: string;
+  cardLast4?: string;
+  cardNetwork?: string;
+  authorizedAt?: string;
+  capturedAt?: string;
+  failedAt?: string;
+  billingPeriodStart?: string;
+  billingPeriodEnd?: string;
+  createdByEmail?: string;
+  createdByRole?: string;
+  errorCode?: string;
+  errorDescription?: string;
+}
+
+interface BillingAuditEntryRecord {
+  id: string;
+  action: string;
+  actorEmail?: string;
+  createdAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface BillingHistoryCursor {
+  at: string;
+  id: string;
+}
+
+interface BillingHistoryPageInfo {
+  invoices: {
+    nextCursor?: BillingHistoryCursor;
+  };
+  changes: {
+    nextCursor?: BillingHistoryCursor;
+  };
+}
+
+interface BillingHistoryRecord {
+  tenantId: string;
+  invoices: BillingInvoiceRecord[];
+  changes: BillingAuditEntryRecord[];
+  totals?: {
+    invoices?: number;
+    changes?: number;
+  };
+  matchingTotals?: {
+    invoices?: number;
+    changes?: number;
+  };
+  pageInfo: BillingHistoryPageInfo;
+}
+
+const BILLING_ACTION_PREFIX_START = 'billing_';
+// One char after '_' in ASCII, used for Firestore prefix range query.
+const BILLING_ACTION_PREFIX_END = 'billing`';
+
+async function countTenantBillingInvoices(
+  db: FirebaseFirestore.Firestore,
+  tenantId: string,
+  options?: { status?: BillingInvoiceRecord['status'] }
+): Promise<number> {
+  let query: FirebaseFirestore.Query = db.collection('billingInvoices').doc(tenantId).collection('invoices');
+  if (options?.status) {
+    // Treat VOID as FAILED for filtering/counting in UI.
+    // This keeps totals consistent with the “Failed” filter while preserving the stored status.
+    if (options.status === 'failed') {
+      query = query.where('status', 'in', ['failed', 'void']);
+    } else {
+      query = query.where('status', '==', options.status);
+    }
+  }
+
+  const snap = await query.count().get();
+  const raw = (snap.data() as any)?.count;
+  return typeof raw === 'number' && Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : 0;
+}
+
+async function countTenantBillingAuditEntries(db: FirebaseFirestore.Firestore, tenantId: string): Promise<number> {
+  const query = db
+    .collection('tenantAuditLogs')
+    .where('tenantId', '==', tenantId)
+    .where('action', '>=', BILLING_ACTION_PREFIX_START)
+    .where('action', '<', BILLING_ACTION_PREFIX_END)
+    .orderBy('action');
+
+  const snap = await query.count().get();
+  const raw = (snap.data() as any)?.count;
+  return typeof raw === 'number' && Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : 0;
+}
+
+interface BillingSummaryRecord {
+  tenantId: string;
+  planId: PlanId;
+  planVariantId?: string;
+  status: 'trial' | 'active' | 'delinquent' | 'canceled';
+  renewalDate?: string;
+  checkoutRequired?: boolean;
+  invoices: BillingInvoiceRecord[];
+}
+
+interface BillingCurrentRecord {
+  tenantId: string;
+  planId: PlanId;
+  planVariantId?: string;
+  couponCode?: string;
+  // Where the active subscription is managed (when known).
+  // This is used by clients to route plan-management actions to the correct surface (web vs app).
+  subscriptionProvider?: 'razorpay' | 'google_play' | 'unknown';
+  status: 'trial' | 'active' | 'delinquent' | 'canceled';
+  renewalDate?: string;
+  checkoutRequired?: boolean;
+  checkoutRequiredSince?: string;
+  checkoutRequiredProvider?: string;
+  cancelAtCycleEnd?: boolean;
+  scheduledDowngradePlanId?: PlanId;
+  scheduledDowngradeAt?: string;
+}
+
+interface BillingCheckoutSessionRecord {
+  tenantId: string;
+  planId: PlanId;
+  provider: 'stripe' | 'razorpay';
+  successUrl?: string;
+  cancelUrl?: string;
+  checkoutUrl?: string;
+  metadata?: Record<string, string>;
+  createdAt: string;
+  createdBy: string;
+  createdByEmail?: string;
+  status: 'pending';
+}
+
+const MONTH_ID_REGEX = /^\d{4}-(0[1-9]|1[0-2])$/;
+const DEFAULT_USAGE_HISTORY_MONTHS = 6;
+const MAX_USAGE_HISTORY_MONTHS = 24;
+const BYTES_PER_MB = 1024 * 1024;
+
+const quotaValueSchema = z.union([z.number().int().min(0).max(1_000_000), z.null()]).optional();
+
+const tenantQuotaUpdateSchema = z
+  .object({
+    tenantId: z.string().trim().min(6).max(120),
+    quotas: z.object({
+      maxStudents: quotaValueSchema,
+      maxStaff: quotaValueSchema,
+      maxMonthlyReminders: quotaValueSchema,
+      maxMonthlyWhatsappReminders: quotaValueSchema,
+      maxMonthlySmsReminders: quotaValueSchema,
+      maxMonthlyEmailReminders: quotaValueSchema,
+      maxMonthlyVoiceReminders: quotaValueSchema,
+      maxStorageMb: quotaValueSchema,
+    }),
+    note: z.string().trim().max(300).optional(),
+  })
+  .refine((value) => Object.values(value.quotas).some((entry) => entry !== undefined), {
+    message: 'At least one quota must be provided',
+    path: ['quotas'],
+  });
+
+const tenantBillingPlanVariantUpdateSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+  planVariantId: z.string().trim().min(1).max(120),
+  note: z.string().trim().max(300).optional(),
+});
+
+const billingCheckoutSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120).optional(),
+  planId: z.enum(['free', 'pro', 'enterprise']).optional(),
+  planVariantId: z.string().trim().min(1).max(80).optional(),
+  couponCode: z.string().trim().max(40).optional(),
+  provider: z.enum(['stripe', 'razorpay']).default('stripe'),
+  successUrl: z.string().trim().url().optional(),
+  cancelUrl: z.string().trim().url().optional(),
+  metadata: z.record(z.string().trim().max(200)).optional(),
+});
+
+const billingCheckoutSessionPublicSchema = z.object({
+  sessionId: z.string().trim().min(8).max(200),
+  tenantId: z.string().trim().min(6).max(120).optional(),
+});
+
+const billingManageLinkSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+});
+
+const billingPlanVariantUpsertSchema = z.object({
+  id: z.string().trim().min(1).max(80),
+  planId: z.enum(['free', 'pro', 'enterprise']),
+  displayName: z.string().trim().min(1).max(80),
+  priceInr: z.number().int().min(0).max(500_000),
+  interval: z.enum(['month']).default('month'),
+  provider: z.enum(['razorpay']).default('razorpay'),
+  razorpayPlanId: z.string().trim().max(200).optional(),
+  // Optional Google Play product/subscription id for Android store billing.
+  playProductId: z.string().trim().max(120).optional(),
+  applyChangesMode: z.enum(['immediate', 'next_billing']).optional(),
+  decreasePolicy: z.enum(['soft', 'hard']).optional(),
+  active: z.boolean().default(true),
+  sortOrder: z.number().int().min(0).max(10_000).default(100),
+  limits: z
+    .object({
+      staffSeats: z.number().int().min(0).max(100_000).optional(),
+      students: z.number().int().min(0).max(1_000_000).optional(),
+      storageMb: z.number().int().min(0).max(5_000_000).optional(),
+      reminders: z
+        .object({
+          total: z.number().int().min(0).max(10_000_000).optional(),
+          whatsapp: z.number().int().min(0).max(10_000_000).optional(),
+          sms: z.number().int().min(0).max(10_000_000).optional(),
+          voice: z.number().int().min(0).max(10_000_000).optional(),
+          email: z.number().int().min(0).max(10_000_000).optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+});
+
+const billingCouponUpsertSchema = z.object({
+  id: z.string().trim().min(1).max(80),
+  code: z.string().trim().min(1).max(40),
+  mapsToPlanVariantId: z.string().trim().min(1).max(80),
+  active: z.boolean().default(true),
+  startsAt: z.string().trim().datetime().optional(),
+  endsAt: z.string().trim().datetime().optional(),
+});
+
+const billingLimitsSnapshotBackfillSchema = z
+  .object({
+    tenantId: z.string().trim().min(6).max(120).optional(),
+    limit: z.number().int().min(1).max(2000).optional(),
+    force: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+    confirm: z.boolean().optional(),
+  })
+  .refine((value) => {
+    const dryRun = value.confirm ? false : value.dryRun ?? true;
+    return dryRun || value.confirm === true;
+  }, {
+    message: 'Write mode requires confirm=true',
+    path: ['confirm'],
+  });
+
+const billingTenantBackfillSchema = z
+  .object({
+    tenantId: z.string().trim().min(6).max(120),
+    maxPaymentsPerSubscription: z.number().int().min(1).max(500).optional(),
+    dryRun: z.boolean().optional(),
+    verbose: z.boolean().optional(),
+    confirm: z.boolean().optional(),
+    jobLabel: z.string().trim().min(1).max(80).optional(),
+  })
+  .refine(
+    (value) => {
+      const dryRun = value.confirm ? false : value.dryRun ?? true;
+      return dryRun || value.confirm === true;
+    },
+    {
+      message: 'Write mode requires confirm=true',
+      path: ['confirm'],
+    }
+  );
+
+const billingSwitchToFreeSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+});
+
+const billingSwitchToFreeImmediateSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+});
+
+const billingCancelSwitchToFreeSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+});
+
+const playVerificationSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+  purchaseToken: z.string().trim().min(10),
+  // Google Play subscription/product id.
+  productId: z.string().trim().min(3).max(120),
+  // Billing catalog selection used to compute limits snapshot.
+  planVariantId: z.string().trim().min(1).max(80).optional(),
+  // Optional client-provided ids for logging/UI.
+  orderId: z.string().trim().max(200).optional(),
+});
+
+type GooglePlayServiceAccount = {
+  client_email: string;
+  private_key: string;
+  project_id?: string;
+};
+
+function parseGooglePlayServiceAccountFromEnv(): GooglePlayServiceAccount {
+  const raw = (process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON || '').trim();
+  if (!raw) {
+    throw new Error('google_play_unconfigured');
+  }
+
+  const parseJson = (text: string): GooglePlayServiceAccount => {
+    const parsed = JSON.parse(text) as any;
+    const email = typeof parsed?.client_email === 'string' ? parsed.client_email.trim() : '';
+    const key = typeof parsed?.private_key === 'string' ? parsed.private_key : '';
+    if (!email || !key) {
+      throw new Error('google_play_invalid_service_account');
+    }
+    return {
+      client_email: email,
+      private_key: key,
+      project_id: typeof parsed?.project_id === 'string' ? parsed.project_id : undefined,
+    };
+  };
+
+  if (raw.startsWith('{')) {
+    return parseJson(raw);
+  }
+
+  // Accept base64-encoded JSON as well.
+  try {
+    const decoded = Buffer.from(raw, 'base64').toString('utf8');
+    if (decoded.trim().startsWith('{')) {
+      return parseJson(decoded);
+    }
+  } catch {
+    // ignore
+  }
+
+  // Fall back to raw JSON parse to surface a helpful error.
+  return parseJson(raw);
+}
+
+type CachedGooglePlayToken = { accessToken: string; expiresAtMs: number };
+let cachedGooglePlayToken: CachedGooglePlayToken | null = null;
+
+async function getGooglePlayAccessToken(): Promise<string> {
+  const now = Date.now();
+  if (cachedGooglePlayToken && cachedGooglePlayToken.expiresAtMs - now > 30_000) {
+    return cachedGooglePlayToken.accessToken;
+  }
+
+  // Lazy import to keep top-level dependency surface small.
+  const { JWT } = await import('google-auth-library');
+
+  const sa = parseGooglePlayServiceAccountFromEnv();
+  const client = new JWT({
+    email: sa.client_email,
+    key: sa.private_key,
+    scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+  });
+
+  const auth = await client.authorize();
+  const token = typeof auth?.access_token === 'string' ? auth.access_token : '';
+  if (!token) {
+    throw new Error('google_play_token_failed');
+  }
+  const expiresAtMs = typeof auth?.expiry_date === 'number' && Number.isFinite(auth.expiry_date) ? auth.expiry_date : now + 50 * 60_000;
+  cachedGooglePlayToken = { accessToken: token, expiresAtMs };
+  return token;
+}
+
+type GooglePlaySubscriptionPurchase = {
+  orderId?: string;
+  expiryTimeMillis?: string;
+  acknowledgementState?: number;
+  paymentState?: number;
+  cancelReason?: number;
+  purchaseType?: number;
+  purchaseState?: number;
+  startTimeMillis?: string;
+};
+
+async function fetchGooglePlaySubscriptionPurchase(options: {
+  packageName: string;
+  productId: string;
+  purchaseToken: string;
+}): Promise<GooglePlaySubscriptionPurchase> {
+  if (process.env.TEST_MODE === '1') {
+    return {
+      orderId: `test_${options.purchaseToken}`,
+      expiryTimeMillis: String(Date.now() + 7 * 24 * 60 * 60_000),
+      acknowledgementState: 1,
+      paymentState: 1,
+    };
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(options.packageName)}` +
+    `/purchases/subscriptions/${encodeURIComponent(options.productId)}/tokens/${encodeURIComponent(options.purchaseToken)}`;
+
+  const resp = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  const text = await resp.text();
+  let json: any = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  if (!resp.ok) {
+    const err = new Error(text || `google_play_fetch_failed_${resp.status}`);
+    (err as any).status = resp.status;
+    (err as any).providerPayload = json;
+    throw err;
+  }
+  return (json || {}) as GooglePlaySubscriptionPurchase;
+}
+
+async function acknowledgeGooglePlaySubscription(options: {
+  packageName: string;
+  productId: string;
+  purchaseToken: string;
+}): Promise<void> {
+  if (process.env.TEST_MODE === '1') {
+    return;
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(options.packageName)}` +
+    `/purchases/subscriptions/${encodeURIComponent(options.productId)}/tokens/${encodeURIComponent(options.purchaseToken)}/acknowledge`;
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({}),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    const err = new Error(text || `google_play_ack_failed_${resp.status}`);
+    (err as any).status = resp.status;
+    throw err;
+  }
+}
+
+const appStoreVerificationSchema = z.object({
+  tenantId: z.string().trim().min(6).max(120),
+  transactionId: z.string().trim().min(6).max(120),
+  signedTransactionInfo: z.string().trim().min(20).optional(),
+  bundleId: z.string().trim().min(3).max(120).optional(),
+});
+
+function coerceNumber(value: any): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function coerceString(value: any): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizePlanId(value?: string | null): PlanId {
+  if (!value) {
+    return 'free';
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'pro' || normalized === 'enterprise') {
+    return normalized;
+  }
+  return 'free';
+}
+
+function formatMonthId(date: Date): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  return `${year}-${month}`;
+}
+
+function normalizeMonthId(value?: string | null): string {
+  if (value && MONTH_ID_REGEX.test(value)) {
+    return value;
+  }
+  return formatMonthId(new Date());
+}
+
+function buildMonthSeries(count: number): string[] {
+  const clamped = Math.max(1, Math.min(count, MAX_USAGE_HISTORY_MONTHS));
+  const months: string[] = [];
+  const cursor = new Date();
+  for (let i = 0; i < clamped; i += 1) {
+    months.push(formatMonthId(cursor));
+    cursor.setUTCMonth(cursor.getUTCMonth() - 1);
+  }
+  return months;
+}
+
+function safeNumber(value: any, fallback = 0): number {
+  const parsed = coerceNumber(value);
+  return typeof parsed === 'number' ? parsed : fallback;
+}
+
+function storageToBytes(snapshot: Record<string, any>): number {
+  const bytes = coerceNumber(snapshot.storageBytes);
+  if (typeof bytes === 'number') {
+    return bytes;
+  }
+  const mb = coerceNumber(snapshot.storageMb);
+  if (typeof mb === 'number') {
+    return mb * BYTES_PER_MB;
+  }
+  return 0;
+}
+
+function formatUsageMetricValue(metric: UsageMetricKey, value: number): string {
+  if (metric === 'storage') {
+    const gb = value / (1024 * 1024 * 1024);
+    if (gb >= 1) {
+      return `${gb.toFixed(1)} GB`;
+    }
+    const mb = value / (1024 * 1024);
+    return `${mb.toFixed(1)} MB`;
+  }
+  return value.toLocaleString('en-IN');
+}
+
+function buildUsageAlertDetails(
+  metric: UsageMetricKey,
+  monthId: string,
+  ratio: number,
+  value: number,
+  limit: number,
+  threshold: 'warning' | 'critical'
+): string {
+  const METRIC_LABELS: Record<UsageMetricKey, string> = {
+    students: 'Students',
+    staff: 'Team seats',
+    reminders: 'Reminders',
+    storage: 'Storage',
+  };
+  const metricLabel = METRIC_LABELS[metric] ?? metric;
+  const percentage = Math.round(ratio * 100);
+  const valueLabel = formatUsageMetricValue(metric, value);
+  const limitLabel = formatUsageMetricValue(metric, limit);
+  return threshold === 'critical'
+    ? `${metricLabel} usage reached ${valueLabel} (${percentage}% of ${limitLabel}) for ${monthId}. Clear space or upgrade to restore full access.`
+    : `${metricLabel} usage is at ${percentage}% (${valueLabel} of ${limitLabel}) for ${monthId}. Review usage before limits are enforced.`;
+}
+
+function deriveStaffCount(summary?: TenantAdminSummary | null): number {
+  if (!summary?.membershipCounts) {
+    return 0;
+  }
+  const owners = safeNumber(summary.membershipCounts.owners, 0);
+  const admins = safeNumber(summary.membershipCounts.admins, 0);
+  const staff = safeNumber(summary.membershipCounts.staff, 0);
+  return owners + admins + staff;
+}
+
+async function countActiveStaffSeatsLive(db: any, tenantId: string): Promise<number> {
+  try {
+    const snapshot = await db
+      .collection('tenantMemberships')
+      .where('tenantId', '==', tenantId)
+      .where('status', '==', 'active')
+      .get();
+    if (!snapshot || snapshot.empty) {
+      return 0;
+    }
+    let count = 0;
+    snapshot.forEach((doc: any) => {
+      const role = (doc?.data?.()?.role || '').toString().toLowerCase();
+      if (role === 'owner' || role === 'admin' || role === 'staff') {
+        count += 1;
+      }
+    });
+    return count;
+  } catch {
+    return -1;
+  }
+}
+
+type LiveCountCacheEntry = {
+  value: number;
+  fetchedAtMs: number;
+};
+
+const LIVE_COUNT_CACHE_TTL_MS = Math.max(0, Number(process.env.LIVE_COUNT_CACHE_TTL_MS ?? '10000'));
+const liveCountCache = new Map<string, LiveCountCacheEntry>();
+const liveCountInFlight = new Map<string, Promise<number>>();
+
+async function getCachedLiveCount(cacheKey: string, fetcher: () => Promise<number>): Promise<number> {
+  if (!Number.isFinite(LIVE_COUNT_CACHE_TTL_MS) || LIVE_COUNT_CACHE_TTL_MS <= 0) {
+    return fetcher();
+  }
+
+  const now = Date.now();
+  const cached = liveCountCache.get(cacheKey);
+  if (cached && now - cached.fetchedAtMs < LIVE_COUNT_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  const existing = liveCountInFlight.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const promise = (async () => {
+    try {
+      const value = await fetcher();
+      if (typeof value === 'number' && value >= 0) {
+        liveCountCache.set(cacheKey, { value, fetchedAtMs: Date.now() });
+      }
+      return value;
+    } finally {
+      liveCountInFlight.delete(cacheKey);
+    }
+  })();
+
+  liveCountInFlight.set(cacheKey, promise);
+  return promise;
+}
+
+function invalidateLiveCount(cacheKey: string): void {
+  liveCountCache.delete(cacheKey);
+  liveCountInFlight.delete(cacheKey);
+}
+
+async function countActiveStudentsLive(db: any, tenantId: string): Promise<number> {
+  try {
+    const snapshot = await db
+      .collection('students')
+      .where('tenantId', '==', tenantId)
+      .where('status', '==', 'active')
+      .get();
+    if (!snapshot || snapshot.empty) {
+      return 0;
+    }
+    return snapshot.size;
+  } catch {
+    return -1;
+  }
+}
+
+async function countActiveStaffSeatsLiveCached(db: any, tenantId: string): Promise<number> {
+  return getCachedLiveCount(`staffSeats:${tenantId}`, () => countActiveStaffSeatsLive(db, tenantId));
+}
+
+async function countPendingSeatInvitesLiveCached(db: any, tenantId: string): Promise<number> {
+  return getCachedLiveCount(`staffInvites:${tenantId}`, () => countPendingSeatInvitesLive(db, tenantId));
+}
+
+async function countActiveStudentsLiveCached(db: any, tenantId: string): Promise<number> {
+  return getCachedLiveCount(`students:${tenantId}`, () => countActiveStudentsLive(db, tenantId));
+}
+
+async function readTenantStorageBytesLive(db: any, tenantId: string): Promise<number> {
+  try {
+    const snap = await db.collection('tenantStorageUsage').doc(tenantId).get();
+    if (!snap.exists) {
+      return -1;
+    }
+    const bytes = (snap.data() as any)?.bytes;
+    if (typeof bytes === 'number' && Number.isFinite(bytes) && bytes >= 0) {
+      return bytes;
+    }
+    return -1;
+  } catch {
+    return -1;
+  }
+}
+
+async function readTenantStorageBytesLiveCached(db: any, tenantId: string): Promise<number> {
+  return getCachedLiveCount(`storageBytes:${tenantId}`, () => readTenantStorageBytesLive(db, tenantId));
+}
+
+async function countPendingSeatInvitesLive(db: any, tenantId: string): Promise<number> {
+  try {
+    const snapshot = await db
+      .collection('tenantInvites')
+      .where('tenantId', '==', tenantId)
+      .where('status', '==', 'pending')
+      .get();
+    if (!snapshot || snapshot.empty) {
+      return 0;
+    }
+    let count = 0;
+    snapshot.forEach((doc: any) => {
+      const role = (doc?.data?.()?.role || '').toString().toLowerCase();
+      if (role === 'owner' || role === 'admin' || role === 'staff') {
+        count += 1;
+      }
+    });
+    return count;
+  } catch {
+    return -1;
+  }
+}
+
+function buildUsageMetricStatus(value: number, limit: number): UsageMetricStatus | null {
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return null;
+  }
+  return {
+    value,
+    limit,
+    percentage: getUsagePercentage(value, limit),
+    status: getUsageStatus(value, limit),
+  } satisfies UsageMetricStatus;
+}
+
+function normalizeStorageSources(value: any): UsageStorageSource[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const normalized: UsageStorageSource[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const labelRaw = typeof entry.label === 'string' ? entry.label.trim() : '';
+    const label = labelRaw || 'unspecified';
+    const bytes = safeNumber(entry.bytes ?? entry.size ?? 0, 0);
+    normalized.push({ label, bytes });
+  }
+  return normalized;
+}
+
+function normalizeUsageDiagnostics(value: any): UsageDiagnostics | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const warnings = Array.isArray((value as any).warnings)
+    ? (value as any).warnings.filter((entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    : undefined;
+  const generatedAt = toIsoTimestamp((value as any).generatedAt);
+  if (!warnings?.length && !generatedAt) {
+    return undefined;
+  }
+  return {
+    warnings: warnings?.length ? warnings : undefined,
+    generatedAt,
+  } satisfies UsageDiagnostics;
+}
+
+async function loadUsageMonthSnapshot(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  monthId: string
+): Promise<{ ref: admin.firestore.DocumentReference | null; data: Record<string, any> }>
+{
+  const parentRef = db.collection('tenantUsage').doc(tenantId);
+  const candidates: admin.firestore.DocumentReference[] = [
+    parentRef.collection('months').doc(monthId),
+    db.collection('tenantUsage').doc(`${tenantId}_${monthId}`),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const snap = await candidate.get();
+      if (snap.exists) {
+        return { ref: candidate, data: snap.data() || {} };
+      }
+    } catch (error) {
+      console.warn('[usage] failed to load snapshot', candidate.path, error);
+    }
+  }
+
+  return { ref: null, data: {} };
+}
+
+async function loadUsageAlerts(
+  docRef: admin.firestore.DocumentReference | null,
+  monthId: string,
+  limit = 20
+): Promise<UsageAlertRecord[]>
+{
+  if (!docRef) {
+    return [];
+  }
+  try {
+    const snapshot = await docRef
+      .collection('alerts')
+      .orderBy('createdAt', 'desc')
+      .limit(limit)
+      .get();
+    if (snapshot.empty) {
+      return [];
+    }
+    return snapshot.docs.map((doc) => {
+      const data = doc.data() || {};
+      const metric = (typeof data.metric === 'string' ? data.metric : 'reminders') as UsageMetricKey;
+      const type = data.type === 'critical' ? 'critical' : 'warning';
+      return {
+        id: `${monthId}:${doc.id}`,
+        metric,
+        type,
+        createdAt: toIsoTimestamp(data.createdAt) ?? new Date().toISOString(),
+        acknowledgedAt: toIsoTimestamp(data.acknowledgedAt) ?? null,
+        details: typeof data.details === 'string' ? data.details : undefined,
+        value: coerceNumber(data.value),
+        limit: coerceNumber(data.limit),
+        ratio: coerceNumber(data.ratio),
+      } satisfies UsageAlertRecord;
+    });
+  } catch (error) {
+    console.warn('[usage] failed to load alerts', docRef.path, error);
+    return [];
+  }
+}
+
+async function loadBillingInvoices(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  limit = 10
+): Promise<BillingInvoiceRecord[]>
+{
+  try {
+    const snapshot = await db
+      .collection('billingInvoices')
+      .doc(tenantId)
+      .collection('invoices')
+      .orderBy('issuedAt', 'desc')
+      .limit(limit)
+      .get();
+    if (snapshot.empty) {
+      return [];
+    }
+    return snapshot.docs.map((doc) => {
+      const data = doc.data() || {};
+      return {
+        id: doc.id,
+        invoiceNumber: typeof data.invoiceNumber === 'string' ? data.invoiceNumber : undefined,
+        amountInr: safeNumber(data.amountInr ?? data.amount ?? 0, 0),
+        status: (data.status || 'open') as BillingInvoiceRecord['status'],
+        issuedAt: toIsoTimestamp(data.issuedAt) ?? undefined,
+        dueAt: toIsoTimestamp(data.dueAt) ?? undefined,
+        downloadUrl: typeof data.downloadUrl === 'string' ? data.downloadUrl : undefined,
+        provider: typeof data.provider === 'string' ? data.provider : undefined,
+        planId: typeof data.planId === 'string' ? data.planId : undefined,
+        planVariantId: typeof data.planVariantId === 'string' ? data.planVariantId : undefined,
+        couponCode: typeof data.couponCode === 'string' ? data.couponCode : undefined,
+        isSynthetic: typeof data.isSynthetic === 'boolean' ? data.isSynthetic : undefined,
+        sourceEvent: typeof data.sourceEvent === 'string' ? data.sourceEvent : undefined,
+        providerPaymentId: typeof data.providerPaymentId === 'string' ? data.providerPaymentId : undefined,
+        providerSubscriptionId: typeof data.providerSubscriptionId === 'string' ? data.providerSubscriptionId : undefined,
+        subscriptionId: typeof data.subscriptionId === 'string' ? data.subscriptionId : undefined,
+        rawEvent: typeof data.rawEvent === 'string' ? data.rawEvent : undefined,
+        payerEmail: typeof data.payerEmail === 'string' ? data.payerEmail : undefined,
+        method: typeof data.method === 'string' ? data.method : undefined,
+        upiVpaMasked: typeof data.upiVpaMasked === 'string' ? data.upiVpaMasked : undefined,
+        cardLast4: typeof data.cardLast4 === 'string' ? data.cardLast4 : undefined,
+        cardNetwork: typeof data.cardNetwork === 'string' ? data.cardNetwork : undefined,
+        authorizedAt: toIsoTimestamp(data.authorizedAt) ?? undefined,
+        capturedAt: toIsoTimestamp(data.capturedAt) ?? undefined,
+        failedAt: toIsoTimestamp(data.failedAt) ?? undefined,
+        billingPeriodStart: toIsoTimestamp(data.billingPeriodStart) ?? undefined,
+        billingPeriodEnd: toIsoTimestamp(data.billingPeriodEnd) ?? undefined,
+        createdByEmail: typeof data.createdByEmail === 'string' ? data.createdByEmail : undefined,
+        createdByRole: typeof data.createdByRole === 'string' ? data.createdByRole : undefined,
+        errorCode: typeof data.errorCode === 'string' ? data.errorCode : undefined,
+        errorDescription: typeof data.errorDescription === 'string' ? data.errorDescription : undefined,
+      } satisfies BillingInvoiceRecord;
+    });
+  } catch (error) {
+    console.warn('[billing] failed to load invoices for', tenantId, error);
+    return [];
+  }
+}
+
+async function loadBillingInvoicesPage(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  limit: number,
+  cursor?: BillingHistoryCursor,
+  options?: { status?: BillingInvoiceRecord['status'] }
+): Promise<{ invoices: BillingInvoiceRecord[]; nextCursor?: BillingHistoryCursor }>
+{
+  const normalizedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+  try {
+    let query: FirebaseFirestore.Query = db.collection('billingInvoices').doc(tenantId).collection('invoices');
+    if (options?.status) {
+      // Treat VOID as FAILED for filtering in UI.
+      if (options.status === 'failed') {
+        query = query.where('status', 'in', ['failed', 'void']);
+      } else {
+        query = query.where('status', '==', options.status);
+      }
+    }
+    query = query.orderBy('issuedAt', 'desc').orderBy(admin.firestore.FieldPath.documentId(), 'desc');
+
+    if (cursor?.at && cursor?.id) {
+      query = query.startAfter(cursor.at, cursor.id);
+    }
+
+    const snapshot = await query.limit(normalizedLimit + 1).get();
+    if (snapshot.empty) {
+      return { invoices: [] };
+    }
+
+    const docs = snapshot.docs.slice(0, normalizedLimit);
+    const invoices = docs.map((doc) => {
+      const data = doc.data() || {};
+      return {
+        id: doc.id,
+        invoiceNumber: typeof data.invoiceNumber === 'string' ? data.invoiceNumber : undefined,
+        amountInr: safeNumber(data.amountInr ?? data.amount ?? 0, 0),
+        status: (data.status || 'open') as BillingInvoiceRecord['status'],
+        issuedAt: toIsoTimestamp(data.issuedAt) ?? undefined,
+        dueAt: toIsoTimestamp(data.dueAt) ?? undefined,
+        downloadUrl: typeof data.downloadUrl === 'string' ? data.downloadUrl : undefined,
+        provider: typeof data.provider === 'string' ? data.provider : undefined,
+        planId: typeof data.planId === 'string' ? data.planId : undefined,
+        planVariantId: typeof data.planVariantId === 'string' ? data.planVariantId : undefined,
+        couponCode: typeof data.couponCode === 'string' ? data.couponCode : undefined,
+        isSynthetic: typeof data.isSynthetic === 'boolean' ? data.isSynthetic : undefined,
+        sourceEvent: typeof data.sourceEvent === 'string' ? data.sourceEvent : undefined,
+        providerPaymentId: typeof data.providerPaymentId === 'string' ? data.providerPaymentId : undefined,
+        providerSubscriptionId: typeof data.providerSubscriptionId === 'string' ? data.providerSubscriptionId : undefined,
+        subscriptionId: typeof data.subscriptionId === 'string' ? data.subscriptionId : undefined,
+        rawEvent: typeof data.rawEvent === 'string' ? data.rawEvent : undefined,
+        payerEmail: typeof data.payerEmail === 'string' ? data.payerEmail : undefined,
+        method: typeof data.method === 'string' ? data.method : undefined,
+        upiVpaMasked: typeof data.upiVpaMasked === 'string' ? data.upiVpaMasked : undefined,
+        cardLast4: typeof data.cardLast4 === 'string' ? data.cardLast4 : undefined,
+        cardNetwork: typeof data.cardNetwork === 'string' ? data.cardNetwork : undefined,
+        authorizedAt: toIsoTimestamp(data.authorizedAt) ?? undefined,
+        capturedAt: toIsoTimestamp(data.capturedAt) ?? undefined,
+        failedAt: toIsoTimestamp(data.failedAt) ?? undefined,
+        billingPeriodStart: toIsoTimestamp(data.billingPeriodStart) ?? undefined,
+        billingPeriodEnd: toIsoTimestamp(data.billingPeriodEnd) ?? undefined,
+        createdByEmail: typeof data.createdByEmail === 'string' ? data.createdByEmail : undefined,
+        createdByRole: typeof data.createdByRole === 'string' ? data.createdByRole : undefined,
+        errorCode: typeof data.errorCode === 'string' ? data.errorCode : undefined,
+        errorDescription: typeof data.errorDescription === 'string' ? data.errorDescription : undefined,
+      } satisfies BillingInvoiceRecord;
+    });
+
+    const hasMore = snapshot.docs.length > normalizedLimit;
+    if (!hasMore || invoices.length === 0) {
+      return { invoices };
+    }
+
+    const lastDoc = docs[docs.length - 1];
+    const lastData = lastDoc.data() || {};
+    const issuedAtRaw = typeof lastData.issuedAt === 'string' ? lastData.issuedAt : toIsoTimestamp(lastData.issuedAt);
+    const issuedAt = issuedAtRaw || '';
+    return {
+      invoices,
+      nextCursor: issuedAt ? { at: issuedAt, id: lastDoc.id } : { at: new Date(0).toISOString(), id: lastDoc.id },
+    };
+  } catch (error) {
+    console.warn('[billing] failed to load invoices page for', tenantId, error);
+    return { invoices: [] };
+  }
+}
+
+async function loadTenantBillingAuditEntries(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  limit = 50
+): Promise<BillingAuditEntryRecord[]>
+{
+  const normalizedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+  try {
+    // Avoid composite index requirements by querying by tenantId + createdAt desc,
+    // then filtering billing-related actions in-memory.
+    const snapshot = await db
+      .collection('tenantAuditLogs')
+      .where('tenantId', '==', tenantId)
+      .orderBy('createdAt', 'desc')
+      .limit(Math.max(200, normalizedLimit * 4))
+      .get();
+
+    if (snapshot.empty) {
+      return [];
+    }
+
+    const entries = snapshot.docs
+      .map((doc) => {
+        const data = doc.data() || {};
+        const action = typeof data.action === 'string' ? data.action : '';
+        return {
+          id: doc.id,
+          action,
+          actorEmail: typeof data.actorEmail === 'string' ? data.actorEmail : undefined,
+          createdAt: toIsoTimestamp(data.createdAt) ?? undefined,
+          metadata: typeof data.metadata === 'object' && data.metadata ? (data.metadata as Record<string, unknown>) : undefined,
+        } satisfies BillingAuditEntryRecord;
+      })
+      .filter((entry) => entry.action.startsWith('billing_'))
+      .slice(0, normalizedLimit);
+
+    return entries;
+  } catch (error) {
+    console.warn('[billing] failed to load billing audit entries for', tenantId, error);
+    return [];
+  }
+}
+
+async function loadTenantBillingAuditEntriesPage(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  limit: number,
+  cursor?: BillingHistoryCursor
+): Promise<{ changes: BillingAuditEntryRecord[]; nextCursor?: BillingHistoryCursor }>
+{
+  const normalizedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+  const batchSize = Math.max(50, Math.min(200, normalizedLimit * 6));
+
+  try {
+    let scanCursor = cursor;
+    const out: BillingAuditEntryRecord[] = [];
+    let hasMore = false;
+    let lastConsidered: { at: string; id: string } | null = null;
+
+    for (let i = 0; i < 5 && out.length < normalizedLimit; i += 1) {
+      let query = db
+        .collection('tenantAuditLogs')
+        .where('tenantId', '==', tenantId)
+        .orderBy('createdAt', 'desc')
+        .orderBy(admin.firestore.FieldPath.documentId(), 'desc');
+
+      if (scanCursor?.at && scanCursor?.id) {
+        query = query.startAfter(scanCursor.at, scanCursor.id);
+      }
+
+      const snapshot = await query.limit(batchSize).get();
+      if (snapshot.empty) {
+        hasMore = false;
+        break;
+      }
+
+      for (const doc of snapshot.docs) {
+        const data = doc.data() || {};
+        const createdAtRaw = typeof data.createdAt === 'string' ? data.createdAt : toIsoTimestamp(data.createdAt);
+        const createdAt = createdAtRaw || '';
+        lastConsidered = { at: createdAt || new Date(0).toISOString(), id: doc.id };
+
+        const action = typeof data.action === 'string' ? data.action : '';
+        if (!action.startsWith('billing_')) {
+          continue;
+        }
+
+        out.push({
+          id: doc.id,
+          action,
+          actorEmail: typeof data.actorEmail === 'string' ? data.actorEmail : undefined,
+          createdAt: toIsoTimestamp(data.createdAt) ?? undefined,
+          metadata:
+            typeof data.metadata === 'object' && data.metadata ? (data.metadata as Record<string, unknown>) : undefined,
+        } satisfies BillingAuditEntryRecord);
+
+        if (out.length >= normalizedLimit) {
+          hasMore = true;
+          break;
+        }
+      }
+
+      if (out.length >= normalizedLimit) {
+        break;
+      }
+
+      // If we fetched a full batch, there might be more.
+      hasMore = snapshot.docs.length >= batchSize;
+      if (!hasMore) {
+        break;
+      }
+      scanCursor = lastConsidered || scanCursor;
+    }
+
+    if (!hasMore || !lastConsidered) {
+      return { changes: out };
+    }
+
+    return { changes: out.slice(0, normalizedLimit), nextCursor: lastConsidered };
+  } catch (error) {
+    console.warn('[billing] failed to load billing audit entries page for', tenantId, error);
+    return { changes: [] };
+  }
+}
+
+async function loadTenantBillingSummary(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  fallbackPlanId: PlanId
+): Promise<BillingSummaryRecord>
+{
+  try {
+    const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
+    const data = billingSnap.exists ? billingSnap.data() || {} : {};
+    const planId = normalizePlanId((data.planId as string) || (data.plan as string) || fallbackPlanId);
+    const planVariantId = typeof data.planVariantId === 'string' && data.planVariantId.trim() ? data.planVariantId.trim() : undefined;
+    const statusRaw = typeof data.status === 'string' ? data.status.toLowerCase() : undefined;
+    const status = (statusRaw === 'active' || statusRaw === 'delinquent' || statusRaw === 'canceled'
+      ? statusRaw
+      : planId === 'free'
+        ? 'trial'
+        : 'active') as BillingSummaryRecord['status'];
+    const renewalDate = toIsoTimestamp(data.renewalDate ?? data.renewsAt ?? data.renewalAt) ?? undefined;
+    // A Free plan should never be shown as "pending".
+    const checkoutRequired = planId === 'free' ? false : typeof data.checkoutRequired === 'boolean' ? data.checkoutRequired : undefined;
+    const invoices = await loadBillingInvoices(db, tenantId);
+    return {
+      tenantId,
+      planId,
+      planVariantId,
+      status,
+      renewalDate,
+      ...(typeof checkoutRequired === 'boolean' ? { checkoutRequired } : {}),
+      invoices,
+    } satisfies BillingSummaryRecord;
+  } catch (error) {
+    console.warn('[billing] failed to load tenant billing summary', tenantId, error);
+    return {
+      tenantId,
+      planId: fallbackPlanId,
+      status: fallbackPlanId === 'free' ? 'trial' : 'active',
+      invoices: [],
+    } satisfies BillingSummaryRecord;
+  }
+}
+
+async function loadTenantCurrentBilling(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  fallbackPlanId: PlanId
+): Promise<BillingCurrentRecord>
+{
+  try {
+    const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
+    const data = billingSnap.exists ? billingSnap.data() || {} : {};
+    const planId = normalizePlanId((data.planId as string) || (data.plan as string) || fallbackPlanId);
+
+    const billingProviderRaw =
+      typeof (data as any).billingProvider === 'string' ? String((data as any).billingProvider).trim().toLowerCase() : '';
+    const subscriptionProvider =
+      billingProviderRaw === 'razorpay'
+        ? 'razorpay'
+        : billingProviderRaw === 'google_play' || billingProviderRaw === 'play'
+          ? 'google_play'
+          : billingProviderRaw
+            ? 'unknown'
+            : undefined;
+
+    const statusRaw = typeof data.status === 'string' ? data.status.toLowerCase() : undefined;
+    const status = (statusRaw === 'active' || statusRaw === 'delinquent' || statusRaw === 'canceled'
+      ? statusRaw
+      : planId === 'free'
+        ? 'trial'
+        : 'active') as BillingCurrentRecord['status'];
+    const renewalDate = toIsoTimestamp(data.renewalDate ?? data.renewsAt ?? data.renewalAt) ?? undefined;
+    const planVariantId = typeof data.planVariantId === 'string' && data.planVariantId.trim() ? data.planVariantId.trim() : undefined;
+    const couponCode = typeof data.couponCode === 'string' && data.couponCode.trim() ? data.couponCode.trim() : undefined;
+    const storedCheckoutRequired = typeof (data as any).checkoutRequired === 'boolean' ? (data as any).checkoutRequired : undefined;
+    const storedCheckoutRequiredProvider =
+      typeof (data as any).checkoutRequiredProvider === 'string' && (data as any).checkoutRequiredProvider.trim()
+        ? (data as any).checkoutRequiredProvider.trim()
+        : undefined;
+    const storedCheckoutRequiredSince =
+      toIsoTimestamp((data as any).checkoutRequiredSinceIso ?? (data as any).checkoutRequiredSince ?? (data as any).checkoutRequiredAtIso) ??
+      undefined;
+
+    let invoiceCheckoutRequired = false;
+    let invoiceCheckoutRequiredSince: string | undefined;
+    let invoiceCheckoutRequiredProvider: string | undefined;
+    try {
+      // If the tenant is on Free, do not surface any lingering open invoices as "payment pending".
+      if (planId !== 'free') {
+        const invoiceSnap = await db
+          .collection('billingInvoices')
+          .doc(tenantId)
+          .collection('invoices')
+          .where('status', '==', 'open')
+          .orderBy('issuedAt', 'desc')
+          .orderBy(admin.firestore.FieldPath.documentId(), 'desc')
+          .limit(1)
+          .get();
+        if (!invoiceSnap.empty) {
+          const inv = invoiceSnap.docs[0]?.data() || {};
+
+          // Razorpay UPI AutoPay/mandate flows can emit `subscription.authenticated` before actual
+          // payment capture. We record a synthetic "open" invoice for history, but it should not
+          // be treated as a pending/dues state that requires payment-method update.
+          const sourceEvent = typeof (inv as any).sourceEvent === 'string' ? String((inv as any).sourceEvent).trim() : '';
+          const rawEvent = typeof (inv as any).rawEvent === 'string' ? String((inv as any).rawEvent).trim() : '';
+          const isSynthetic = (inv as any).isSynthetic === true;
+          const isAutopayAuthenticated = (sourceEvent || rawEvent) === 'subscription.authenticated' && isSynthetic;
+
+          invoiceCheckoutRequired = true;
+          invoiceCheckoutRequiredSince = toIsoTimestamp((inv as any).issuedAt ?? (inv as any).createdAt) ?? undefined;
+          const invProvider = typeof (inv as any).provider === 'string' ? (inv as any).provider : undefined;
+          invoiceCheckoutRequiredProvider = isAutopayAuthenticated ? 'razorpay_autopay' : invProvider;
+        }
+      }
+    } catch (error) {
+      // Best-effort: still return stored checkoutRequired if present.
+      console.warn('[billing] failed to check open invoices for', tenantId, error);
+    }
+
+    const checkoutRequired = planId === 'free'
+      ? false
+      : invoiceCheckoutRequired || storedCheckoutRequired === true
+        ? true
+        : storedCheckoutRequired;
+    const checkoutRequiredSince = planId === 'free' ? undefined : invoiceCheckoutRequiredSince ?? storedCheckoutRequiredSince;
+    const checkoutRequiredProvider = planId === 'free' ? undefined : invoiceCheckoutRequiredProvider ?? storedCheckoutRequiredProvider;
+    const cancelAtCycleEnd = typeof (data as any).cancelAtCycleEnd === 'boolean' ? (data as any).cancelAtCycleEnd : undefined;
+    const scheduledDowngradePlanIdRaw =
+      typeof (data as any).scheduledDowngradePlanId === 'string' ? (data as any).scheduledDowngradePlanId.trim().toLowerCase() : '';
+    const scheduledDowngradePlanId =
+      scheduledDowngradePlanIdRaw === 'free' || scheduledDowngradePlanIdRaw === 'pro' || scheduledDowngradePlanIdRaw === 'enterprise'
+        ? (scheduledDowngradePlanIdRaw as PlanId)
+        : undefined;
+    const scheduledDowngradeAt =
+      typeof (data as any).scheduledDowngradeAt === 'string' && (data as any).scheduledDowngradeAt.trim()
+        ? (data as any).scheduledDowngradeAt.trim()
+        : undefined;
+    return {
+      tenantId,
+      planId,
+      planVariantId,
+      couponCode,
+      ...(subscriptionProvider ? { subscriptionProvider } : {}),
+      status,
+      renewalDate,
+      ...(typeof checkoutRequired === 'boolean' ? { checkoutRequired } : {}),
+      ...(checkoutRequiredSince ? { checkoutRequiredSince } : {}),
+      ...(checkoutRequiredProvider ? { checkoutRequiredProvider } : {}),
+      ...(typeof cancelAtCycleEnd === 'boolean' ? { cancelAtCycleEnd } : {}),
+      ...(scheduledDowngradePlanId ? { scheduledDowngradePlanId } : {}),
+      ...(scheduledDowngradeAt ? { scheduledDowngradeAt } : {}),
+    } satisfies BillingCurrentRecord;
+  } catch (error) {
+    console.warn('[billing] failed to load tenant current billing', tenantId, error);
+    return {
+      tenantId,
+      planId: fallbackPlanId,
+      status: fallbackPlanId === 'free' ? 'trial' : 'active',
+    } satisfies BillingCurrentRecord;
+  }
+}
+
+async function loadTenantAdminSummaryRecord(
+  db: admin.firestore.Firestore,
+  tenantId: string
+): Promise<TenantAdminSummary | null>
+{
+  try {
+    const tenantSnap = await db.collection('tenants').doc(tenantId).get();
+    if (!tenantSnap.exists) {
+      return null;
+    }
+    return serializeTenantAdminSummary(tenantSnap);
+  } catch (error) {
+    console.warn('[tenant_admin_summary] failed', tenantId, error);
+    return null;
+  }
+}
+
+function parseUsageAlertCompositeId(value: string): { monthId: string; alertId: string } | null {
+  const separatorIndex = value.indexOf(':');
+  if (separatorIndex <= 0) {
+    return null;
+  }
+  const monthId = value.slice(0, separatorIndex);
+  const alertId = value.slice(separatorIndex + 1);
+  if (!MONTH_ID_REGEX.test(monthId) || !alertId) {
+    return null;
+  }
+  return { monthId, alertId };
+}
+
+function billingWebhooksFeatureEnabled(): boolean {
+  return process.env.BILLING_WEBHOOKS_ENABLED === '1';
+}
+
+function extractRawBody(body: unknown): string {
+  if (!body) {
+    return '';
+  }
+  if (typeof body === 'string') {
+    return body;
+  }
+  if (body instanceof Buffer) {
+    return body.toString('utf8');
+  }
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return '';
+  }
+}
+
+function storeBillingFeatureEnabled(): boolean {
+  return process.env.STORE_BILLING_ENABLED === '1';
+}
+
+function serializeTenantAdminSummary(
+  doc: admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>
+): TenantAdminSummary {
+  const data = doc.data() || {};
+  const quotasRaw = typeof data.quotas === 'object' && data.quotas ? data.quotas : undefined;
+  const membershipCountsRaw =
+    typeof data.membershipCounts === 'object' && data.membershipCounts ? data.membershipCounts : undefined;
+  const settingsRaw = typeof data.settings === 'object' && data.settings ? data.settings : undefined;
+  const brandingRaw = typeof data.branding === 'object' && data.branding ? data.branding : undefined;
+
+  const owners = coerceNumber(membershipCountsRaw?.owners) ?? 0;
+  const admins = coerceNumber(membershipCountsRaw?.admins) ?? 0;
+  const staff = coerceNumber(membershipCountsRaw?.staff) ?? 0;
+  const adminSeatLimit = coerceNumber(quotasRaw?.maxStaff) ?? null;
+  const adminSeatsUsed = owners + admins + staff;
+  const remaining = adminSeatLimit === null ? null : Math.max(adminSeatLimit - adminSeatsUsed, 0);
+
+  const brandingNormalized = brandingRaw
+    ? {
+        logoUrl: coerceString(brandingRaw.logoUrl),
+        heroImageUrl: coerceString(brandingRaw.heroImageUrl),
+        accentImageUrl: coerceString(brandingRaw.accentImageUrl),
+        tagline: coerceString(brandingRaw.tagline),
+        missionStatement: coerceString(brandingRaw.missionStatement),
+      }
+    : undefined;
+  const resolvedLogoUrl = coerceString(data.logoUrl) ?? brandingNormalized?.logoUrl ?? null;
+  const resolvedHeroImageUrl = coerceString(data.heroImageUrl) ?? brandingNormalized?.heroImageUrl ?? null;
+
+  return {
+    id: doc.id,
+    name: typeof data.name === 'string' ? data.name : undefined,
+    slug: typeof data.slug === 'string' ? data.slug : undefined,
+    code: typeof data.code === 'string' ? data.code : undefined,
+    status: typeof data.status === 'string' ? data.status : undefined,
+    billingTier: typeof data.billingTier === 'string' ? data.billingTier : undefined,
+    ownerEmail: typeof data.ownerEmail === 'string' ? data.ownerEmail : undefined,
+    ownerUserId: typeof data.ownerUserId === 'string' ? data.ownerUserId : undefined,
+    contactEmail: typeof data.contactEmail === 'string' ? data.contactEmail : undefined,
+    contactPhone: typeof data.contactPhone === 'string' ? data.contactPhone : undefined,
+    logoUrl: resolvedLogoUrl,
+    heroImageUrl: resolvedHeroImageUrl,
+    quotas: quotasRaw
+      ? {
+          maxStudents: coerceNumber(quotasRaw.maxStudents),
+          maxStaff: coerceNumber(quotasRaw.maxStaff),
+          maxMonthlyReminders: coerceNumber(quotasRaw.maxMonthlyReminders),
+          maxMonthlyWhatsappReminders: coerceNumber(quotasRaw.maxMonthlyWhatsappReminders),
+          maxMonthlySmsReminders: coerceNumber(quotasRaw.maxMonthlySmsReminders),
+          maxMonthlyEmailReminders: coerceNumber(quotasRaw.maxMonthlyEmailReminders),
+          maxMonthlyVoiceReminders: coerceNumber(quotasRaw.maxMonthlyVoiceReminders),
+          maxStorageMb: coerceNumber(quotasRaw.maxStorageMb),
+        }
+      : undefined,
+    membershipCounts: membershipCountsRaw
+      ? {
+          total: coerceNumber(membershipCountsRaw.total),
+          active: coerceNumber(membershipCountsRaw.active),
+          pending: coerceNumber(membershipCountsRaw.pending),
+          owners,
+          admins,
+          staff,
+        }
+      : undefined,
+    flags: settingsRaw
+      ? {
+          allowJoinRequests: settingsRaw.allowJoinRequests,
+          notifyOnJoinRequest: settingsRaw.notifyOnJoinRequest,
+          notifyViaEmail: settingsRaw.notifyViaEmail,
+        }
+      : undefined,
+    createdAt: toIsoTimestamp(data.createdAt),
+    updatedAt: toIsoTimestamp(data.updatedAt),
+    seatUsage: {
+      adminSeatsUsed,
+      adminSeatLimit,
+      remaining,
+    },
+    branding: brandingNormalized,
+  };
+}
+
+function serializeTenantMembershipAdminRecord(
+  doc: admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>
+): TenantMembershipAdminRecord {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    tenantId: typeof data.tenantId === 'string' ? data.tenantId : '',
+    userId: typeof data.userId === 'string' ? data.userId : undefined,
+    email: typeof data.email === 'string' ? data.email : undefined,
+    displayName: typeof data.displayName === 'string' ? data.displayName : undefined,
+    role: typeof data.role === 'string' ? data.role : undefined,
+    status: typeof data.status === 'string' ? data.status : undefined,
+    joinedVia: typeof data.joinedVia === 'string' ? data.joinedVia : undefined,
+    joinCodeId: typeof data.joinCodeId === 'string' ? data.joinCodeId : undefined,
+    invitedByUserId: typeof data.invitedByUserId === 'string' ? data.invitedByUserId : undefined,
+    invitedByEmail: typeof data.invitedByEmail === 'string' ? data.invitedByEmail : undefined,
+    createdAt: toIsoTimestamp(data.createdAt),
+    updatedAt: toIsoTimestamp(data.updatedAt),
+    lastActivityAt: toIsoTimestamp(data.lastActivityAt ?? data.lastActiveAt),
+  };
+}
+
+function summarizeMemberships(list: TenantMembershipAdminRecord[]): MembershipSummaryBuckets {
+  const summary: MembershipSummaryBuckets = {
+    count: list.length,
+    byRole: {},
+    byStatus: {},
+  };
+  list.forEach((entry) => {
+    const roleKey = (entry.role || 'member').toLowerCase();
+    const statusKey = (entry.status || 'unknown').toLowerCase();
+    summary.byRole[roleKey] = (summary.byRole[roleKey] || 0) + 1;
+    summary.byStatus[statusKey] = (summary.byStatus[statusKey] || 0) + 1;
+  });
+  return summary;
+}
+
+function serializeTenantInviteRecord(
+  doc: admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>
+): TenantInviteAdminRecord {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    tenantId: typeof data.tenantId === 'string' ? data.tenantId : '',
+    email: typeof data.email === 'string' ? data.email : undefined,
+    role: typeof data.role === 'string' ? data.role : undefined,
+    status: typeof data.status === 'string' ? data.status : undefined,
+    issuedBy: typeof data.issuedBy === 'string' ? data.issuedBy : undefined,
+    issuedAt: toIsoTimestamp(data.issuedAt),
+    expiresAt: toIsoTimestamp(data.expiresAt),
+    acceptedAt: toIsoTimestamp(data.acceptedAt),
+    acceptedBy: typeof data.acceptedBy === 'string' ? data.acceptedBy : undefined,
+    lastSentAt: toIsoTimestamp(data.lastSentAt),
+    lastSentBy: typeof data.lastSentBy === 'string' ? data.lastSentBy : undefined,
+    invitationMessage: typeof data.invitationMessage === 'string' ? data.invitationMessage : undefined,
+  };
+}
+
+function summarizeInvites(list: TenantInviteAdminRecord[]): { byStatus: Record<string, number> } {
+  const summary: Record<string, number> = {};
+  list.forEach((entry) => {
+    const status = (entry.status || 'unknown').toLowerCase();
+    summary[status] = (summary[status] || 0) + 1;
+  });
+  return { byStatus: summary };
+}
+
+type QuotaFieldKey =
+  | 'maxStudents'
+  | 'maxStaff'
+  | 'maxMonthlyReminders'
+  | 'maxMonthlyWhatsappReminders'
+  | 'maxMonthlySmsReminders'
+  | 'maxMonthlyEmailReminders'
+  | 'maxMonthlyVoiceReminders'
+  | 'maxStorageMb';
+
+function buildQuotaPatch(input: Partial<Record<QuotaFieldKey, number | null>>): Record<QuotaFieldKey, number | null> {
+  const patch: Partial<Record<QuotaFieldKey, number | null>> = {};
+  (
+    [
+      'maxStudents',
+      'maxStaff',
+      'maxMonthlyReminders',
+      'maxMonthlyWhatsappReminders',
+      'maxMonthlySmsReminders',
+      'maxMonthlyEmailReminders',
+      'maxMonthlyVoiceReminders',
+      'maxStorageMb',
+    ] as QuotaFieldKey[]
+  ).forEach((key) => {
+    if (input[key] === undefined) {
+      return;
+    }
+    const value = input[key];
+    patch[key] = value === null ? null : Number(value);
+  });
+  return patch as Record<QuotaFieldKey, number | null>;
+}
+
+function serializeTenantAuditRecord(
+  doc: admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>
+): TenantAuditAdminRecord {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    tenantId: typeof data.tenantId === 'string' ? data.tenantId : '',
+    action: typeof data.action === 'string' ? data.action : 'unknown',
+    actorId: typeof data.actorId === 'string' ? data.actorId : undefined,
+    actorEmail: typeof data.actorEmail === 'string' ? data.actorEmail : undefined,
+    targetId: typeof data.targetId === 'string' ? data.targetId : undefined,
+    targetType: typeof data.targetType === 'string' ? data.targetType : undefined,
+    metadata: typeof data.metadata === 'object' && data.metadata ? data.metadata : undefined,
+    createdAt: toIsoTimestamp(data.createdAt),
+  };
+}
+
+function summarizeAuditEntries(list: TenantAuditAdminRecord[]): { byAction: Record<string, number> } {
+  const summary: Record<string, number> = {};
+  list.forEach((entry) => {
+    const action = (entry.action || 'unknown').toLowerCase();
+    summary[action] = (summary[action] || 0) + 1;
+  });
+  return { byAction: summary };
+}
+
+function serializeNotificationHistoryRecord(
+  doc: admin.firestore.QueryDocumentSnapshot<admin.firestore.DocumentData>
+): NotificationHistoryAdminRecord {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    tenantId: typeof data.tenantId === 'string' ? data.tenantId : null,
+    tenantName: typeof data.tenantName === 'string' ? data.tenantName : null,
+    adminEmail: typeof data.adminEmail === 'string' ? data.adminEmail : null,
+    adminName: typeof data.adminName === 'string' ? data.adminName : null,
+    title: typeof data.title === 'string' ? data.title : 'Untitled notification',
+    body: typeof data.body === 'string' ? data.body : undefined,
+    type: typeof data.type === 'string' ? data.type : 'info',
+    priority: typeof data.priority === 'string' ? data.priority : 'normal',
+    deliveryMethod: typeof data.deliveryMethod === 'string' ? data.deliveryMethod : undefined,
+    totalTargets: typeof data.totalTargets === 'number' ? data.totalTargets : 0,
+    successfulDeliveries: typeof data.successfulDeliveries === 'number' ? data.successfulDeliveries : 0,
+    failedDeliveries: typeof data.failedDeliveries === 'number' ? data.failedDeliveries : 0,
+    failureReasonSummary:
+      typeof data.failureReasonSummary === 'object' && data.failureReasonSummary ? data.failureReasonSummary : undefined,
+    onlineOnly: typeof data.onlineOnly === 'boolean' ? data.onlineOnly : undefined,
+    sentAt: toIsoTimestamp(data.sentAt),
+    createdAt: toIsoTimestamp(data.createdAt),
+    updatedAt: toIsoTimestamp(data.updatedAt),
+  };
+}
+
+async function runTenantMembershipInspector(options: {
+  tenantId: string;
+  limit: number;
+  role?: TenantMembershipRole | 'all';
+  status?: string;
+  search?: string;
+}): Promise<TenantMembershipInspectorResponse | null> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const normalizedTenantId = options.tenantId.trim();
+  const tenantDoc = await db.collection('tenants').doc(normalizedTenantId).get();
+  if (!tenantDoc.exists) {
+    return null;
+  }
+
+  const limit = Math.min(Math.max(options.limit, 1), 200);
+  const normalizedRole = options.role && options.role !== 'all' ? options.role : null;
+  const normalizedStatus = options.status && options.status.toLowerCase() !== 'all'
+    ? options.status.toLowerCase()
+    : null;
+  const normalizedSearch = (options.search || '').trim().toLowerCase();
+
+  let fetchLimit = limit;
+  if (normalizedRole) fetchLimit *= 2;
+  if (normalizedStatus) fetchLimit *= 2;
+  if (normalizedSearch) fetchLimit *= 4;
+  fetchLimit = Math.max(limit * 2, Math.min(fetchLimit, 500));
+
+  const membershipSnap = await db
+    .collection('tenantMemberships')
+    .where('tenantId', '==', normalizedTenantId)
+    .limit(fetchLimit)
+    .get();
+
+  const allMembers = membershipSnap.docs.map(serializeTenantMembershipAdminRecord);
+  const tenantSummary = serializeTenantAdminSummary(tenantDoc);
+
+  const filteredMembers = allMembers.filter((member) => {
+    if (normalizedRole) {
+      const role = (member.role || '').toLowerCase();
+      if (role !== normalizedRole) {
+        return false;
+      }
+    }
+    if (normalizedStatus) {
+      const status = (member.status || '').toLowerCase();
+      if (status !== normalizedStatus) {
+        return false;
+      }
+    }
+    if (normalizedSearch) {
+      const haystack = `${member.displayName || ''} ${member.email || ''} ${member.userId || ''}`.toLowerCase();
+      if (!haystack.includes(normalizedSearch)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  filteredMembers.sort((a, b) => {
+    const aTs = a.updatedAt || a.createdAt || '';
+    const bTs = b.updatedAt || b.createdAt || '';
+    return bTs.localeCompare(aTs);
+  });
+
+  const limitedMembers = filteredMembers.slice(0, limit);
+  const filteredSummary = summarizeMemberships(filteredMembers);
+  const scannedSummary = summarizeMemberships(allMembers);
+
+  return {
+    tenant: tenantSummary,
+    members: limitedMembers,
+    total: filteredMembers.length,
+    hasMore: filteredMembers.length > limit,
+    stats: {
+      filtered: filteredSummary,
+      scanned: scannedSummary,
+      snapshot: tenantSummary.membershipCounts,
+    },
+    filters: {
+      limit,
+      role: normalizedRole ?? 'all',
+      status: normalizedStatus ?? 'all',
+      search: normalizedSearch || undefined,
+    },
+  };
+}
+
+async function runTenantInviteInspector(options: {
+  tenantId: string;
+  limit: number;
+  status?: string;
+  search?: string;
+}): Promise<TenantInviteInspectorResponse | null> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const normalizedTenantId = options.tenantId.trim();
+  const tenantDoc = await db.collection('tenants').doc(normalizedTenantId).get();
+  if (!tenantDoc.exists) {
+    return null;
+  }
+
+  const limit = Math.min(Math.max(options.limit, 1), 200);
+  const normalizedStatus = options.status && options.status.toLowerCase() !== 'all'
+    ? options.status.toLowerCase()
+    : null;
+  const normalizedSearch = (options.search || '').trim().toLowerCase();
+
+  let fetchLimit = limit;
+  if (normalizedStatus) fetchLimit *= 2;
+  if (normalizedSearch) fetchLimit *= 3;
+  fetchLimit = Math.max(limit * 2, Math.min(fetchLimit, 400));
+
+  const inviteSnap = await db
+    .collection('tenantInvites')
+    .where('tenantId', '==', normalizedTenantId)
+    .limit(fetchLimit)
+    .get();
+
+  const allInvites = inviteSnap.docs.map(serializeTenantInviteRecord);
+  allInvites.sort((a, b) => {
+    const aTs = a.issuedAt || a.lastSentAt || a.expiresAt || '';
+    const bTs = b.issuedAt || b.lastSentAt || b.expiresAt || '';
+    return bTs.localeCompare(aTs);
+  });
+
+  const filteredInvites = allInvites.filter((invite) => {
+    if (normalizedStatus) {
+      const status = (invite.status || '').toLowerCase();
+      if (status !== normalizedStatus) {
+        return false;
+      }
+    }
+    if (normalizedSearch) {
+      const haystack = `${invite.email || ''} ${invite.invitationMessage || ''} ${invite.issuedBy || ''}`.toLowerCase();
+      if (!haystack.includes(normalizedSearch)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  const limitedInvites = filteredInvites.slice(0, limit);
+  const stats = summarizeInvites(filteredInvites);
+  const tenantSummary = serializeTenantAdminSummary(tenantDoc);
+
+  return {
+    tenant: tenantSummary,
+    invites: limitedInvites,
+    total: filteredInvites.length,
+    hasMore: filteredInvites.length > limit,
+    stats,
+    filters: {
+      limit,
+      status: normalizedStatus ?? 'all',
+      search: normalizedSearch || undefined,
+    },
+  };
+}
+
+async function runTenantAuditInspector(options: {
+  tenantId: string;
+  limit: number;
+  action?: string;
+  search?: string;
+}): Promise<TenantAuditInspectorResponse | null> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const normalizedTenantId = options.tenantId.trim();
+  const tenantDoc = await db.collection('tenants').doc(normalizedTenantId).get();
+  if (!tenantDoc.exists) {
+    return null;
+  }
+
+  const limit = Math.min(Math.max(options.limit, 1), 200);
+  const normalizedAction = options.action && options.action.toLowerCase() !== 'all'
+    ? options.action.toLowerCase()
+    : null;
+  const normalizedSearch = (options.search || '').trim().toLowerCase();
+
+  let fetchLimit = limit * 2;
+  if (normalizedAction) fetchLimit *= 2;
+  if (normalizedSearch) fetchLimit *= 2;
+  fetchLimit = Math.min(fetchLimit, 600);
+
+  const auditSnap = await db
+    .collection('tenantAuditLogs')
+    .where('tenantId', '==', normalizedTenantId)
+    .orderBy('createdAt', 'desc')
+    .limit(fetchLimit)
+    .get();
+
+  const entries = auditSnap.docs.map(serializeTenantAuditRecord);
+
+  const filtered = entries.filter((entry) => {
+    if (normalizedAction) {
+      const action = (entry.action || '').toLowerCase();
+      if (action !== normalizedAction) {
+        return false;
+      }
+    }
+    if (normalizedSearch) {
+      const haystack = `${entry.actorEmail || ''} ${entry.actorId || ''} ${entry.targetId || ''} ${
+        entry.targetType || ''
+      } ${JSON.stringify(entry.metadata || {})}`
+        .toLowerCase();
+      if (!haystack.includes(normalizedSearch)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  const limitedEntries = filtered.slice(0, limit);
+  const stats = summarizeAuditEntries(filtered);
+  const tenantSummary = serializeTenantAdminSummary(tenantDoc);
+
+  return {
+    tenant: tenantSummary,
+    entries: limitedEntries,
+    total: filtered.length,
+    hasMore: filtered.length > limit,
+    stats,
+    filters: {
+      limit,
+      action: normalizedAction ?? 'all',
+      search: normalizedSearch || undefined,
+    },
+  };
+}
+
+async function runNotificationHistoryInspector(options: {
+  tenantId?: string;
+  adminEmail?: string;
+  limit: number;
+  cursor?: string;
+}): Promise<NotificationHistoryInspectorResponse> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const limit = Math.min(Math.max(options.limit, 10), 200);
+  const normalizedTenantId = options.tenantId?.trim();
+  const normalizedAdmin = options.adminEmail?.trim();
+
+  let queryRef: admin.firestore.Query<admin.firestore.DocumentData> = db.collection('admin_notification_history');
+  if (normalizedTenantId) {
+    queryRef = queryRef.where('tenantId', '==', normalizedTenantId);
+  }
+  if (normalizedAdmin) {
+    queryRef = queryRef.where('adminEmail', '==', normalizedAdmin);
+  }
+
+  let cursorTimestamp: admin.firestore.Timestamp | null = null;
+  if (options.cursor) {
+    const parsed = new Date(options.cursor);
+    if (!Number.isNaN(parsed.getTime())) {
+      cursorTimestamp = admin.firestore.Timestamp.fromDate(parsed);
+    }
+  }
+
+  queryRef = queryRef.orderBy('sentAt', 'desc');
+  if (cursorTimestamp) {
+    queryRef = queryRef.where('sentAt', '<', cursorTimestamp);
+  }
+  queryRef = queryRef.limit(limit + 1);
+
+  const snap = await queryRef.get();
+  const docs = snap.docs;
+  const hasMore = docs.length > limit;
+  const trimmedDocs = hasMore ? docs.slice(0, limit) : docs;
+  const entries = trimmedDocs.map(serializeNotificationHistoryRecord);
+  const nextCursor = hasMore && entries.length ? entries[entries.length - 1]?.sentAt : undefined;
+
+  return {
+    entries,
+    hasMore,
+    nextCursor,
+  };
+}
+
+async function runNotificationStatsInspector(options: {
+  tenantId?: string;
+  adminEmail?: string;
+  days: number;
+}): Promise<NotificationStatsInspectorResponse> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const windowDays = Math.min(Math.max(options.days, 1), 180);
+  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  const normalizedTenantId = options.tenantId?.trim();
+  const normalizedAdmin = options.adminEmail?.trim();
+
+  let queryRef: admin.firestore.Query<admin.firestore.DocumentData> = db
+    .collection('admin_notification_history')
+    .where('sentAt', '>=', admin.firestore.Timestamp.fromDate(since));
+
+  if (normalizedTenantId) {
+    queryRef = queryRef.where('tenantId', '==', normalizedTenantId);
+  }
+
+  if (normalizedAdmin) {
+    queryRef = queryRef.where('adminEmail', '==', normalizedAdmin);
+  }
+
+  queryRef = queryRef.orderBy('sentAt', 'desc');
+
+  const snap = await queryRef.get();
+  const failureReasons: Record<string, number> = {};
+  const tenantMap = new Map<string, { tenantId: string; tenantName?: string | null; count: number; failedDeliveries: number }>();
+
+  let totalNotifications = 0;
+  let totalRecipients = 0;
+  let successfulRecipients = 0;
+  let failedRecipients = 0;
+  const byType: Record<string, number> = {};
+  const byPriority: Record<string, number> = {};
+  let lastSentAt: string | undefined;
+
+  snap.forEach((docSnap) => {
+    const data = docSnap.data() || {};
+    totalNotifications += 1;
+
+    const successes = typeof data.successfulDeliveries === 'number' ? data.successfulDeliveries : 0;
+    const failures = typeof data.failedDeliveries === 'number' ? data.failedDeliveries : 0;
+    const totalTargets = typeof data.totalTargets === 'number' ? data.totalTargets : undefined;
+    const fallbackTargets = successes + failures > 0
+      ? successes + failures
+      : ((Array.isArray(data.targetUsers) ? data.targetUsers.length : 0)
+        + (Array.isArray(data.targetDevices) ? data.targetDevices.length : 0));
+    const recipients = typeof totalTargets === 'number' ? totalTargets : fallbackTargets;
+
+    totalRecipients += recipients;
+    successfulRecipients += successes;
+    failedRecipients += failures;
+
+    const typeKey = (typeof data.type === 'string' && data.type.trim() ? data.type.trim().toLowerCase() : 'info');
+    byType[typeKey] = (byType[typeKey] || 0) + 1;
+    const priorityKey = (typeof data.priority === 'string' && data.priority.trim() ? data.priority.trim().toLowerCase() : 'normal');
+    byPriority[priorityKey] = (byPriority[priorityKey] || 0) + 1;
+
+    if (typeof data.failureReasonSummary === 'object' && data.failureReasonSummary) {
+      Object.entries(data.failureReasonSummary).forEach(([reason, count]) => {
+        if (!reason) return;
+        const numeric = typeof count === 'number' ? count : 0;
+        failureReasons[reason] = (failureReasons[reason] || 0) + numeric;
+      });
+    }
+
+    const tenantId = typeof data.tenantId === 'string' && data.tenantId.trim() ? data.tenantId.trim() : 'unknown';
+    const tenantEntry = tenantMap.get(tenantId) ?? {
+      tenantId,
+      tenantName: typeof data.tenantName === 'string' ? data.tenantName : null,
+      count: 0,
+      failedDeliveries: 0,
+    };
+    tenantEntry.count += 1;
+    tenantEntry.failedDeliveries += failures;
+    tenantMap.set(tenantId, tenantEntry);
+
+    const sentIso = toIsoTimestamp(data.sentAt);
+    if (sentIso && (!lastSentAt || sentIso > lastSentAt)) {
+      lastSentAt = sentIso;
+    }
+  });
+
+  const averageSuccessRate = totalRecipients > 0
+    ? Number(((successfulRecipients / totalRecipients) * 100).toFixed(2))
+    : 100;
+
+  const tenantBreakdown = Array.from(tenantMap.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 6);
+
+  return {
+    windowDays,
+    startDate: since.toISOString(),
+    totalNotifications,
+    totalRecipients,
+    successfulRecipients,
+    failedRecipients,
+    averageSuccessRate,
+    notificationsByType: byType,
+    notificationsByPriority: byPriority,
+    failureReasons,
+    tenantBreakdown,
+    lastSentAt,
+  };
+}
+
+async function runTenantDirectorySearch({
+  query,
+  limit,
+}: {
+  query?: string;
+  limit: number;
+}): Promise<TenantSearchResponse> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const normalizedQuery = (query || '').trim();
+  const matchedBy = new Set<string>();
+  const docMap = new Map<string, admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>>();
+
+  const limitRemaining = () => Math.max(0, limit - docMap.size);
+  const maybeAddDoc = (
+    snap: admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>,
+    reason: string
+  ) => {
+    if (!snap.exists || docMap.has(snap.id)) {
+      return false;
+    }
+    if (limitRemaining() <= 0) {
+      return false;
+    }
+    docMap.set(snap.id, snap);
+    matchedBy.add(reason);
+    return true;
+  };
+
+  const looksLikeTenantId = (value: string) => /^[a-zA-Z0-9_-]{12,}$/.test(value);
+  const looksLikeCode = (value: string) => /^[A-Z0-9]{5,10}$/.test(value);
+  const looksLikeSlug = (value: string) => /^[a-z0-9-]{3,40}$/.test(value);
+
+  if (normalizedQuery) {
+    if (looksLikeTenantId(normalizedQuery)) {
+      const direct = await db.collection('tenants').doc(normalizedQuery).get();
+      maybeAddDoc(direct, 'id');
+    }
+
+    if (limitRemaining() > 0 && looksLikeCode(normalizedQuery.toUpperCase())) {
+      const codeSnap = await db
+        .collection('tenants')
+        .where('code', '==', normalizedQuery.toUpperCase())
+        .limit(limitRemaining())
+        .get();
+      codeSnap.forEach((docSnap) => {
+        maybeAddDoc(docSnap, 'code');
+      });
+    }
+
+    if (limitRemaining() > 0 && looksLikeSlug(normalizedQuery.toLowerCase())) {
+      const slugSnap = await db
+        .collection('tenants')
+        .where('slug', '==', normalizedQuery.toLowerCase())
+        .limit(limitRemaining())
+        .get();
+      slugSnap.forEach((docSnap) => {
+        maybeAddDoc(docSnap, 'slug');
+      });
+    }
+
+    if (limitRemaining() > 0 && normalizedQuery.includes('@')) {
+      const normalizedEmail = normalizeEmail(normalizedQuery);
+      if (normalizedEmail) {
+        let directEmailHit = false;
+        const emailFields: Array<{ field: string; reason: string }> = [
+          { field: 'ownerEmail', reason: 'ownerEmail' },
+          { field: 'contactEmail', reason: 'contactEmail' },
+        ];
+        for (const { field, reason } of emailFields) {
+          if (limitRemaining() <= 0) break;
+          const snap = await db
+            .collection('tenants')
+            .where(field, '==', normalizedEmail)
+            .limit(limitRemaining())
+            .get();
+          snap.forEach((docSnap) => {
+            if (maybeAddDoc(docSnap, reason)) {
+              directEmailHit = true;
+            }
+          });
+        }
+
+        // Include membership-email matches when there's still room under the limit.
+        // Keep the membership fan-out query bounded; it can be large for shared emails.
+        if (limitRemaining() > 0) {
+          // Membership email fan-out can be large; keep it bounded and avoid N sequential reads.
+          const membershipQueryLimit = directEmailHit
+            ? Math.min(250, limitRemaining() * 5)
+            : Math.min(500, limitRemaining() * 10);
+          const membershipSnap = await db
+            .collection('tenantMemberships')
+            .where('email', '==', normalizedEmail)
+            .select('tenantId')
+            .limit(membershipQueryLimit)
+            .get();
+
+          const tenantIds: string[] = [];
+          const seenTenantIds = new Set<string>();
+          membershipSnap.forEach((docSnap) => {
+            if (limitRemaining() <= 0) return;
+            const tenantId = docSnap.get('tenantId');
+            if (typeof tenantId !== 'string') return;
+            const trimmed = tenantId.trim();
+            if (!trimmed || seenTenantIds.has(trimmed)) return;
+            seenTenantIds.add(trimmed);
+            tenantIds.push(trimmed);
+          });
+
+          if (tenantIds.length) {
+            const refs = tenantIds.slice(0, limitRemaining()).map((tenantId) => db.collection('tenants').doc(tenantId));
+            const snaps = await db.getAll(...refs);
+            snaps.forEach((tenantDoc) => {
+              maybeAddDoc(tenantDoc, 'membershipEmail');
+            });
+          }
+        }
+      }
+    }
+
+    const attemptNameSearch = async (prefix: string) => {
+      if (!prefix || limitRemaining() <= 0) return;
+      try {
+        const snap = await db
+          .collection('tenants')
+          .orderBy('name')
+          .startAt(prefix)
+          .endAt(prefix + '\uf8ff')
+          .limit(limitRemaining())
+          .get();
+        snap.forEach((docSnap) => {
+          maybeAddDoc(docSnap, 'name');
+        });
+      } catch (error) {
+        console.warn('[tenant_search] name prefix query failed', error);
+      }
+    };
+
+    if (limitRemaining() > 0 && normalizedQuery.length >= 3) {
+      await attemptNameSearch(normalizedQuery);
+      if (limitRemaining() > 0) {
+        const capitalized = normalizedQuery.replace(/^(\w)/, (match) => match.toUpperCase());
+        if (capitalized !== normalizedQuery) {
+          await attemptNameSearch(capitalized);
+        }
+      }
+    }
+  }
+
+  let fallbackApplied = false;
+  if (!normalizedQuery && limitRemaining() > 0) {
+    fallbackApplied = true;
+    const fallbackSnap = await db
+      .collection('tenants')
+      .orderBy('createdAt', 'desc')
+      .limit(limitRemaining())
+      .get();
+    fallbackSnap.forEach((docSnap) => {
+      maybeAddDoc(docSnap, 'recent');
+    });
+  }
+
+  const results = Array.from(docMap.values()).map(serializeTenantAdminSummary);
+
+  return {
+    results,
+    total: results.length,
+    diagnostics: {
+      query: normalizedQuery || undefined,
+      matchedBy: Array.from(matchedBy.values()),
+      fallbackApplied,
+    },
+  };
+}
+
+type JoinCodeValidationError =
+  | 'code_not_found'
+  | 'code_revoked'
+  | 'code_expired'
+  | 'code_limit_reached'
+  | 'tenant_not_found'
+  | 'tenant_unavailable';
+
+type JoinCodeValidationResult =
+  | {
+      ok: true;
+      codeDoc: admin.firestore.QueryDocumentSnapshot<admin.firestore.DocumentData>;
+      codeData: admin.firestore.DocumentData;
+      tenantSnap: admin.firestore.DocumentSnapshot<admin.firestore.DocumentData>;
+      tenantData: admin.firestore.DocumentData;
+    }
+  | {
+      ok: false;
+      error: JoinCodeValidationError;
+      tenantStatus?: string;
+    };
+
+async function validateJoinCode(
+  db: admin.firestore.Firestore,
+  normalizedCode: string,
+): Promise<JoinCodeValidationResult> {
+  const codeQuery = await db
+    .collection('tenantCodes')
+    .where('code', '==', normalizedCode)
+    .limit(1)
+    .get();
+  if (codeQuery.empty) {
+    return { ok: false, error: 'code_not_found' };
+  }
+
+  const codeDoc = codeQuery.docs[0];
+  const codeData = codeDoc.data() || {};
+  const tenantId = typeof codeData.tenantId === 'string' ? codeData.tenantId : '';
+  if (!tenantId) {
+    return { ok: false, error: 'tenant_not_found' };
+  }
+
+  const status = typeof codeData.status === 'string' ? codeData.status.toLowerCase() : 'active';
+  if (status === 'revoked') {
+    return { ok: false, error: 'code_revoked' };
+  }
+
+  const expiresMs = timestampToMillis(codeData.expiresAt);
+  if (typeof expiresMs === 'number' && expiresMs <= Date.now()) {
+    await codeDoc.ref
+      .update({ status: 'expired', updatedAt: new Date().toISOString() })
+      .catch(() => undefined);
+    return { ok: false, error: 'code_expired' };
+  }
+
+  const usageCap = typeof codeData.usageCap === 'number' ? codeData.usageCap : null;
+  const usageCount = typeof codeData.usageCount === 'number' ? codeData.usageCount : 0;
+  if (usageCap != null && usageCount >= usageCap) {
+    await codeDoc.ref
+      .update({ status: 'revoked', updatedAt: new Date().toISOString() })
+      .catch(() => undefined);
+    return { ok: false, error: 'code_limit_reached' };
+  }
+
+  const tenantSnap = await db.collection('tenants').doc(tenantId).get();
+  if (!tenantSnap.exists) {
+    return { ok: false, error: 'tenant_not_found' };
+  }
+
+  const tenantData = tenantSnap.data() || {};
+  const tenantStatus = typeof tenantData.status === 'string' ? tenantData.status.toLowerCase() : 'active';
+  if (tenantStatus !== 'active') {
+    return { ok: false, error: 'tenant_unavailable', tenantStatus };
+  }
+
+  return { ok: true, codeDoc, codeData, tenantSnap, tenantData };
+}
+
+function mapJoinCodeError(result: Extract<JoinCodeValidationResult, { ok: false }>): {
+  status: number;
+  body: Record<string, any>;
+} {
+  switch (result.error) {
+    case 'code_not_found':
+      return { status: 404, body: { error: 'code_not_found' } };
+    case 'code_revoked':
+      return { status: 410, body: { error: 'code_revoked' } };
+    case 'code_expired':
+      return { status: 410, body: { error: 'code_expired' } };
+    case 'tenant_not_found':
+      return { status: 404, body: { error: 'tenant_not_found' } };
+    case 'tenant_unavailable':
+      return { status: 403, body: { error: 'tenant_unavailable', status: result.tenantStatus } };
+    case 'code_limit_reached':
+      return { status: 410, body: { error: 'code_limit_reached' } };
+    default:
+      return { status: 400, body: { error: 'invalid_code' } };
+  }
+}
+
+type TenantMembershipAccessFn = (
+  authContext: express.Request['authContext'],
+  tenantIdRaw: string,
+  options?: { minRole?: TenantMembershipRole }
+) => Promise<{ tenantId: string; role: TenantMembershipRole; membershipId: string | null }>;
+
+type TenantEmailMemberChecker = (tenantId: string, email: string) => Promise<boolean>;
+
+type TenantAuditEventTargetType = 'reminder' | 'fee' | 'job' | 'attendance' | 'export' | 'tenant' | 'usage' | 'billing';
+type TenantAuditEventAction =
+  | 'reminder_queued'
+  | 'daily_quotes_triggered'
+  | 'birthday_job_triggered'
+  | 'tenant_data_exported'
+  | 'notification_preferences_updated'
+  | 'usage_alert_acknowledged'
+  | 'usage_refresh_requested'
+  | 'billing_checkout_started'
+  | 'billing_manage_link_requested'
+  | 'billing_play_verified'
+  | 'billing_downgrade_to_free'
+  | 'billing_downgrade_to_free_scheduled'
+  | 'billing_downgrade_to_free_cancelled';
+
+type LogTenantAuditEventFn = (options: {
+  tenantId: string;
+  action: TenantAuditEventAction;
+  authContext?: express.Request['authContext'];
+  metadata?: Record<string, unknown>;
+  targetId?: string;
+  targetType?: TenantAuditEventTargetType;
+}) => Promise<void>;
+
+type FetchLike = typeof fetch;
+
+type UsageSnapshotLoader = (
+  tenantId: string,
+  monthId: string
+) => Promise<{ ref: admin.firestore.DocumentReference | null; data: Record<string, any> }>;
+
+type UsageAlertsLoader = (
+  docRef: admin.firestore.DocumentReference | null,
+  monthId: string,
+  limit?: number
+) => Promise<UsageAlertRecord[]>;
+
+type TenantBillingSummaryLoader = (tenantId: string, fallbackPlanId: PlanId) => Promise<BillingSummaryRecord>;
+
+type TenantSummaryLoader = (tenantId: string) => Promise<TenantAdminSummary | null>;
+
+type BillingCheckoutSessionCreator = (record: BillingCheckoutSessionRecord) => Promise<{ sessionId: string }>;
+
+type FirestoreResolver = () => admin.firestore.Firestore;
+
+export interface CreateAppOptions {
+  overrides?: {
+    sendChatMessage?: typeof sendChatMessage;
+    requireTenantMembershipAccess?: TenantMembershipAccessFn;
+    isTenantEmailActiveMember?: TenantEmailMemberChecker;
+    runNotificationHistoryInspector?: typeof runNotificationHistoryInspector;
+    runNotificationStatsInspector?: typeof runNotificationStatsInspector;
+    runTenantMembershipInspector?: typeof runTenantMembershipInspector;
+    runTenantInviteInspector?: typeof runTenantInviteInspector;
+    runTenantAuditInspector?: typeof runTenantAuditInspector;
+    runDailyQuoteJob?: typeof runDailyQuoteJob;
+    runBirthdayNotificationJob?: typeof runBirthdayNotificationJob;
+    logTenantAuditEvent?: LogTenantAuditEventFn;
+    sendSMS?: typeof backendSendSMS;
+    sendVoiceCall?: typeof backendSendVoiceCall;
+    fetch?: FetchLike;
+    streamTenantExport?: typeof streamTenantExport;
+    enqueueReminder?: typeof enqueueReminder;
+    enqueueCustomMessage?: typeof enqueueCustomMessage;
+    enqueuePaymentConfirmation?: typeof enqueuePaymentConfirmation;
+    sendTeamMembershipChangeNotification?: typeof sendTeamMembershipChangeNotification;
+    sendTenantJoinRequestNotification?: typeof sendTenantJoinRequestNotification;
+    sendTenantJoinRequestOutcomeNotification?: typeof sendTenantJoinRequestOutcomeNotification;
+    loadTenantJoinRequest?: TenantJoinRequestLoader;
+    loadTenantInvite?: TenantInviteLoader;
+    recordTenantInviteSend?: TenantInviteSendRecorder;
+    sendTenantInviteEmail?: typeof sendTenantInviteEmail;
+    executeExpoPushProxyRequest?: ExpoPushProxyExecutor;
+    checkChatRateLimit?: typeof checkChatRateLimit;
+    loadTenantNotificationPreferencesRecord?: typeof loadTenantNotificationPreferencesRecord;
+    loadUsageMonthSnapshot?: UsageSnapshotLoader;
+    loadUsageAlerts?: UsageAlertsLoader;
+    loadTenantBillingSummary?: TenantBillingSummaryLoader;
+    loadTenantAdminSummary?: TenantSummaryLoader;
+    createBillingCheckoutSession?: BillingCheckoutSessionCreator;
+    createRazorpaySubscription?: typeof createRazorpaySubscription;
+    cancelRazorpaySubscription?: typeof cancelRazorpaySubscription;
+    resumeRazorpaySubscription?: typeof resumeRazorpaySubscription;
+    getFirestore?: FirestoreResolver;
+  };
+}
+
+export function createApp(options: CreateAppOptions = {}){
+  const app = express();
+  const isTestProcess = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+  const sendChatMessageImpl = options.overrides?.sendChatMessage ?? sendChatMessage;
+  const requireTenantMembershipAccessImpl = options.overrides?.requireTenantMembershipAccess ?? requireTenantMembershipAccess;
+  const isTenantEmailActiveMemberImpl = options.overrides?.isTenantEmailActiveMember ?? isTenantEmailActiveMember;
+  const runNotificationHistoryInspectorImpl = options.overrides?.runNotificationHistoryInspector ?? runNotificationHistoryInspector;
+  const runNotificationStatsInspectorImpl = options.overrides?.runNotificationStatsInspector ?? runNotificationStatsInspector;
+  const runTenantMembershipInspectorImpl = options.overrides?.runTenantMembershipInspector ?? runTenantMembershipInspector;
+  const runTenantInviteInspectorImpl = options.overrides?.runTenantInviteInspector ?? runTenantInviteInspector;
+  const runTenantAuditInspectorImpl = options.overrides?.runTenantAuditInspector ?? runTenantAuditInspector;
+  const runDailyQuoteJobImpl = options.overrides?.runDailyQuoteJob ?? runDailyQuoteJob;
+  const runBirthdayNotificationJobImpl = options.overrides?.runBirthdayNotificationJob ?? runBirthdayNotificationJob;
+  const logTenantAuditEventImpl = options.overrides?.logTenantAuditEvent ?? logTenantAuditEvent;
+  const sendSMSImpl = options.overrides?.sendSMS ?? backendSendSMS;
+  const sendVoiceCallImpl = options.overrides?.sendVoiceCall ?? backendSendVoiceCall;
+  const fetchImpl = options.overrides?.fetch ?? fetch;
+  const streamTenantExportImpl = options.overrides?.streamTenantExport ?? streamTenantExport;
+  const enqueueReminderImpl = options.overrides?.enqueueReminder ?? enqueueReminder;
+  const enqueueCustomMessageImpl = options.overrides?.enqueueCustomMessage ?? enqueueCustomMessage;
+  const enqueuePaymentConfirmationImpl = options.overrides?.enqueuePaymentConfirmation ?? enqueuePaymentConfirmation;
+  const checkChatRateLimitImpl = options.overrides?.checkChatRateLimit ?? checkChatRateLimit;
+  const sendTeamMembershipChangeNotificationImpl =
+    options.overrides?.sendTeamMembershipChangeNotification ?? sendTeamMembershipChangeNotification;
+  const sendTenantJoinRequestNotificationImpl =
+    options.overrides?.sendTenantJoinRequestNotification ?? sendTenantJoinRequestNotification;
+  const sendTenantJoinRequestOutcomeNotificationImpl =
+    options.overrides?.sendTenantJoinRequestOutcomeNotification ?? sendTenantJoinRequestOutcomeNotification;
+  const loadTenantJoinRequestImpl = options.overrides?.loadTenantJoinRequest ?? loadTenantJoinRequestFromFirestore;
+  const loadTenantInviteImpl = options.overrides?.loadTenantInvite ?? loadTenantInviteFromFirestore;
+  const recordTenantInviteSendImpl = options.overrides?.recordTenantInviteSend ?? recordTenantInviteSendMetadata;
+  const sendTenantInviteEmailImpl = options.overrides?.sendTenantInviteEmail ?? sendTenantInviteEmail;
+  const executeExpoPushProxyRequestImpl =
+    options.overrides?.executeExpoPushProxyRequest ?? executeExpoPushProxyRequestDefault;
+  const loadTenantNotificationPreferencesRecordImpl =
+    options.overrides?.loadTenantNotificationPreferencesRecord ?? loadTenantNotificationPreferencesRecord;
+  const cancelRazorpaySubscriptionImpl = options.overrides?.cancelRazorpaySubscription ?? cancelRazorpaySubscription;
+  const resumeRazorpaySubscriptionImpl = options.overrides?.resumeRazorpaySubscription ?? resumeRazorpaySubscription;
+  const getFirestoreImpl = options.overrides?.getFirestore ?? (() => {
+    ensureFirebase();
+    return admin.firestore();
+  });
+  const loadTenantAdminSummaryImpl =
+    options.overrides?.loadTenantAdminSummary ??
+    ((tenantId: string) => loadTenantAdminSummaryRecord(getFirestoreImpl(), tenantId));
+  const loadUsageMonthSnapshotImpl =
+    options.overrides?.loadUsageMonthSnapshot ??
+    ((tenantId: string, monthId: string) => loadUsageMonthSnapshot(getFirestoreImpl(), tenantId, monthId));
+  const loadUsageAlertsImpl = options.overrides?.loadUsageAlerts ?? ((docRef, monthId, limit) =>
+    loadUsageAlerts(docRef, monthId, limit)
+  );
+  const loadTenantBillingSummaryImpl =
+    options.overrides?.loadTenantBillingSummary ??
+    ((tenantId: string, fallbackPlanId: PlanId) => loadTenantBillingSummary(getFirestoreImpl(), tenantId, fallbackPlanId));
+  const createRazorpaySubscriptionImpl = options.overrides?.createRazorpaySubscription ?? createRazorpaySubscription;
+  const createBillingCheckoutSessionImpl =
+    options.overrides?.createBillingCheckoutSession ??
+    (async (record: BillingCheckoutSessionRecord) => {
+      const db = getFirestoreImpl();
+      const sessionRef = await db.collection('billingCheckoutSessions').add(stripUndefinedDeep(record));
+      return { sessionId: sessionRef.id };
+    });
+  const requireMemberTenantAccess = tenantAccessMiddleware({ minRole: 'member' }, requireTenantMembershipAccessImpl, getFirestoreImpl);
+  const requireMemberTenantAccessFromQuery = tenantAccessMiddleware(
+    { minRole: 'member', resolveTenantId: queryTenantIdResolver() },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const requireParamsMemberTenantAccess = tenantAccessMiddleware(
+    { resolveTenantId: paramsTenantIdResolver('tenantId'), minRole: 'member' },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const requireAdminTenantAccess = tenantAccessMiddleware({ minRole: 'admin' }, requireTenantMembershipAccessImpl, getFirestoreImpl);
+  const requireAdminTenantAccessFromQuery = tenantAccessMiddleware(
+    { minRole: 'admin', resolveTenantId: queryTenantIdResolver() },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const requireAdminTenantAccessAny = tenantAccessMiddleware(
+    { minRole: 'admin', resolveTenantId: anyTenantIdResolver },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const requireStaffTenantAccess = tenantAccessMiddleware({ minRole: 'staff' }, requireTenantMembershipAccessImpl, getFirestoreImpl);
+  const requireStaffTenantAccessFromQuery = tenantAccessMiddleware(
+    { minRole: 'staff', resolveTenantId: queryTenantIdResolver() },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const optionalQueryStaffTenantAccess = tenantAccessMiddleware(
+    { resolveTenantId: queryTenantIdResolver(), minRole: 'staff', requireTenantId: false },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const optionalBodyMemberTenantAccess = tenantAccessMiddleware(
+    { minRole: 'member', requireTenantId: false },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const optionalBodyStaffTenantAccess = tenantAccessMiddleware(
+    { minRole: 'staff', requireTenantId: false },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const requireParamsStaffTenantAccess = tenantAccessMiddleware(
+    { resolveTenantId: paramsTenantIdResolver('tenantId'), minRole: 'staff' },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const requireParamsAdminTenantAccess = tenantAccessMiddleware(
+    { resolveTenantId: paramsTenantIdResolver('tenantId'), minRole: 'admin' },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+  const defaultTenantGuard = tenantAccessMiddleware(
+    { minRole: 'member', resolveTenantId: anyTenantIdResolver },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
+
+  const defaultTenantGuardBypassPatterns = [
+    /^\/internal\/auth\/issue$/,
+    /^\/internal\/reminder-history\/email-result$/,
+    /^\/auth\/bridge$/,
+    /^\/admin\/tenants\/search$/,
+    /^\/admin\/tenants\/quotas$/,
+    /^\/webhooks\/whatsapp$/,
+    /^\/billing\/stripe\/webhook$/,
+    /^\/billing\/razorpay\/webhook$/,
+    /^\/billing\/catalog$/,
+    /^\/billing\/catalog\/admin$/,
+    /^\/billing\/catalog\/admin\//,
+    // Operator billing endpoints (tenantId is not required; protected by requireOperatorAuth)
+    /^\/billing\/admin\/limits-snapshot\/backfill$/,
+    /^\/billing\/admin\/backfill$/,
+    /^\/billing\/admin\/backfill\/status$/,
+    /^\/billing\/admin\/backfill\/runs$/,
+    /^\/billing\/admin\/ops-events$/,
+    /^\/billing\/admin\/metrics-summary$/,
+    /^\/billing\/checkout\/session-public$/,
+    /^\/billing\/play\/notifications$/,
+    /^\/billing\/appstore\/notifications$/,
+    /^\/chat\/stream$/,
+    /^\/admin\/notifications\/history$/,
+    /^\/admin\/notifications\/stats$/,
+    /^\/admin\/settings\/runtime-endpoints$/,
+    /^\/admin\/settings\/maintenance$/,
+    /^\/admin\/settings\/reminder-channels$/,
+    /^\/notifications\/daily-quotes\/status$/,
+    /^\/metrics$/,
+    /^\/ready$/,
+    /^\/health$/,
+    /^\/csp-report$/,
+    /^\/internal\/presence\/sweep$/,
+    /^\/notifications\/tenant-join-request$/,
+    /^\/tenants\/join-code\/resolve$/,
+    /^\/tenants\/join-code\/claim$/,
+    /^\/tenants\/invites\/accept$/,
+  ];
+
+  function shouldBypassDefaultTenantGuard(req: express.Request): boolean {
+    if (req.method === 'OPTIONS') {
+      return true;
+    }
+    const path = req.path || '';
+    return defaultTenantGuardBypassPatterns.some((pattern) => pattern.test(path));
+  }
+
+  app.use(express.json());
+  // Attach CSP headers early
+  app.use(cspMiddleware({
+    enableReportOnlyHeader: true,
+    // Allow Firebase Realtime Database long-poll script for web
+    extraScript: [
+      // Project RTDB domain
+      'https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app',
+      // Firebase RTDB JSONP can come from sharded frontends like s-gke-*.firebasedatabase.app
+      'https://*.firebasedatabase.app',
+      // Google APIs for sign-in
+      'https://apis.google.com'
+    ],
+    // Allow hidden iframes Firebase may use for long-poll control
+    extraFrame: [
+      'https://*.firebasedatabase.app',
+      'https://tution-app-6c0c3.firebaseapp.com'
+    ]
+  }));
+
+  /* c8 ignore start - CORS pattern matching branches excluded */
+  // --- CORS (copied from original) ---
+  app.use((req, res, next) => {
+    const cfg = process.env.CORS_ALLOW_ORIGINS || '*';
+    const origins = cfg.split(',').map(o => o.trim()).filter(Boolean);
+    const reqOrigin = (req.headers.origin as string | undefined) || '';
+    let allowOrigin = '';
+    if (cfg === '*') {
+      allowOrigin='*';
+    } else if (reqOrigin) {
+      if (origins.includes(reqOrigin)) allowOrigin = reqOrigin; else {
+        const devPatterns: RegExp[] = [/^https?:\/\/localhost(?::\d+)?$/i,/^https?:\/\/127\.0\.0\.1(?::\d+)?$/i,/^https?:\/\/192\.168\.[0-9]{1,3}\.[0-9]{1,3}(?::\d+)?$/i,/^https?:\/\/10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?::\d+)?$/i,/^exp:\/\//i];
+        const expoDevPorts=[19000,19006,19007,8081];
+        const matchesDevPattern = devPatterns.some(r=>r.test(reqOrigin));
+        const matchesExpoPort = (()=>{ try { const u=new URL(reqOrigin); return expoDevPorts.includes(Number(u.port)) || (u.hostname==='localhost' && u.port===''); } catch { return false; }})();
+        if(matchesDevPattern||matchesExpoPort) allowOrigin=reqOrigin;
+      }
+    }
+    if(allowOrigin){ res.setHeader('Access-Control-Allow-Origin', allowOrigin); res.setHeader('Vary','Origin'); }
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,PUT,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers','Content-Type,Authorization,X-Internal-Secret');
+    res.setHeader('Access-Control-Max-Age','600');
+    if(req.method==='OPTIONS') return res.sendStatus(204);
+    next();
+  });
+  /* c8 ignore stop */
+
+  // ----- Auth helpers -----
+  function signInternalToken(sub: string, ttlSec=300, email?: string){ const secret=process.env.INTERNAL_API_KEY!; const exp=Math.floor(Date.now()/1000)+ttlSec; const payloadData: Record<string, unknown> = {sub,exp}; if(email){ payloadData.email = email; } const payload=Buffer.from(JSON.stringify(payloadData)).toString('base64url'); const sig=crypto.createHmac('sha256',secret).update(payload).digest('base64url'); return `${payload}.${sig}`; }
+
+  async function resolveAuthenticatedEmail(authContext: express.Request['authContext']): Promise<string | null> {
+    if (!authContext) {
+      return null;
+    }
+
+    const directEmail = normalizeEmail(authContext.email);
+    if (directEmail) {
+      return directEmail;
+    }
+
+    if (!authContext.uid) {
+      return null;
+    }
+
+    try {
+      ensureFirebase();
+      const userRecord = await admin.auth().getUser(authContext.uid);
+      return normalizeEmail(userRecord.email || undefined) || null;
+    } catch (error) {
+      console.warn('[auth] failed to resolve user email', error);
+      return null;
+    }
+  }
+
+  function statusForChatActionError(error: ChatMessageActionError): number {
+    switch (error.code) {
+      case 'not_found':
+        return 404;
+      case 'invalid_payload':
+        return 400;
+      case 'not_authorized':
+      case 'not_allowed':
+        return 403;
+      case 'too_old':
+        return 409;
+      case 'already_deleted':
+        return 410;
+      default:
+        return 400;
+    }
+  }
+
+  async function logTenantAuditEvent(options: {
+    tenantId: string;
+    action: TenantAuditEventAction;
+    authContext?: express.Request['authContext'];
+    metadata?: Record<string, unknown>;
+    targetId?: string;
+    targetType?: TenantAuditEventTargetType;
+  }): Promise<void> {
+    const actorId = options.authContext?.uid || options.authContext?.tokenType || 'system';
+    const actorEmail = await resolveAuthenticatedEmail(options.authContext);
+    try {
+      ensureFirebase();
+      await admin.firestore().collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: options.tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: options.action,
+          targetId: options.targetId,
+          targetType: options.targetType ?? 'reminder',
+          metadata: options.metadata,
+          createdAt: new Date().toISOString(),
+        })
+      );
+    } catch (error) {
+      console.warn('[tenant_audit_log] failed', error);
+    }
+  }
+  app.post('/internal/auth/issue',(req,res)=>{ const master=process.env.INTERNAL_API_KEY; if(!master) return res.status(501).json({error:'not_enabled'}); if(req.headers['x-internal-secret']!==master) return res.status(401).json({error:'unauthorized'}); const ttl=300; const token=signInternalToken('system',ttl); res.json({ token, expiresIn: ttl, expiresAt: Date.now()+ttl*1000 }); });
+
+  // Firebase bridge
+  app.post('/auth/bridge', async (req,res)=>{
+    const start=Date.now();
+    try {
+      if(!process.env.INTERNAL_API_KEY) return res.status(501).json({error:'not_enabled'});
+      const authz=req.headers['authorization']?.toString();
+      let idToken = authz?.startsWith('Bearer ')? authz.slice(7): undefined;
+      if(!idToken) idToken=(req.body as any)?.firebaseIdToken;
+      if(!idToken) return res.status(401).json({error:'missing_id_token'});
+      ensureFirebase();
+  const decoded = await admin.auth().verifyIdToken(idToken);
+  const ttl=300; const internal=signInternalToken(decoded.uid, ttl, decoded.email);
+      res.json({ token: internal, expiresIn: ttl, expiresAt: Date.now()+ttl*1000 });
+    } catch(e:any){ console.error('[auth_bridge] verify failed:', e?.message); return res.status(401).json({error:'invalid_id_token'}); } finally { const dur=Date.now()-start; if(dur>1000) console.warn('[auth_bridge] slow', dur+'ms'); }
+  });
+
+  // Auth middleware
+  app.use((req,res,next)=>{
+    const master=process.env.INTERNAL_API_KEY; if(!master) return next();
+    const p=req.path; if(p==='/health'||p==='/ready'||p.startsWith('/webhooks/whatsapp')||p==='/auth/bridge') return next();
+    if(p==='/billing/stripe/webhook'||p==='/billing/razorpay/webhook'||p==='/billing/play/notifications'||p==='/billing/appstore/notifications') return next();
+    if(p==='/billing/checkout/session-public') return next();
+    if(p==='/chat/stream'){
+      const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+      if(token && verifyInternalToken(token)) return next();
+      return res.sendStatus(401);
+    }
+    const auth=req.headers['authorization']; if(!auth?.startsWith('Bearer ')) return res.sendStatus(401);
+    const cand=auth.slice(7);
+
+    if(cand===master){
+      req.authContext = { tokenType: 'master', uid: 'system' };
+      return next();
+    }
+
+    const payload = decodeInternalToken(cand);
+    if(payload){
+      req.authContext = {
+        tokenType: payload.master ? 'master' : 'internal',
+        uid: typeof payload.sub === 'string' ? payload.sub : undefined,
+        email: payload.email,
+      };
+      return next();
+    }
+
+    ensureFirebase();
+    return admin.auth().verifyIdToken(cand)
+      .then(decoded => {
+        req.authContext = {
+          tokenType: 'firebase',
+          uid: decoded.uid,
+          email: decoded.email || undefined,
+        };
+        next();
+      })
+      .catch(() => res.sendStatus(401));
+  });
+
+  // Maintenance mode enforcement (best-effort): block app-facing requests with 503.
+  // We intentionally allow admin/internal/health/metrics/webhooks so operators and
+  // provider callbacks keep working during maintenance.
+  app.use(async (req, res, next) => {
+    try {
+      if (req.method === 'OPTIONS') return next();
+
+      const p = (req.path || '').toString();
+      if (!p) return next();
+
+      const bypass =
+        p === '/health' ||
+        p === '/ready' ||
+        p === '/metrics' ||
+        p === '/csp-report' ||
+        p === '/auth/bridge' ||
+        p.startsWith('/admin/') ||
+        p === '/admin' ||
+        p.startsWith('/internal/') ||
+        p === '/internal' ||
+        p.startsWith('/webhooks/') ||
+        p === '/billing/catalog' ||
+        p === '/billing/checkout' ||
+        p.startsWith('/billing/checkout/') ||
+        p === '/billing/stripe/webhook' ||
+        p === '/billing/razorpay/webhook' ||
+        p === '/billing/play/notifications' ||
+        p === '/billing/appstore/notifications';
+
+      if (bypass) return next();
+
+      const mode = await getMaintenanceMode();
+      if (mode?.enabled) {
+        return res
+          .status(503)
+          .setHeader('Retry-After', '60')
+          .json({
+            error: 'maintenance',
+            message: mode.message || 'We are currently performing maintenance. Please try again shortly.',
+          });
+      }
+
+      return next();
+    } catch {
+      // Fail open: do not take down the API if Firestore is temporarily unreachable.
+      return next();
+    }
+  });
+
+  app.use((req, res, next) => {
+    if (shouldBypassDefaultTenantGuard(req)) {
+      return next();
+    }
+    return defaultTenantGuard(req, res, next);
+  });
+
+  function requireOperatorAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const tokenType = req.authContext?.tokenType;
+    if (tokenType === 'master' || tokenType === 'internal') {
+      return next();
+    }
+    return res.status(403).json({ error: 'not_authorized' });
+  }
+
+  const internalReminderHistoryEmailResultSchema = z.object({
+    historyId: z.string().min(1).max(240),
+    tenantId: z.string().min(1).max(120).optional(),
+    status: z.enum(['queued', 'success', 'failed']).optional(),
+    deliveryStatus: z.enum(['queued', 'retrying', 'sent', 'failed']).optional(),
+    emailId: z.string().min(1).max(500).optional(),
+    provider: z.string().min(1).max(100).optional(),
+    errorMessage: z.string().min(1).max(2000).optional(),
+  });
+
+  app.post('/internal/reminder-history/email-result', requireOperatorAuth, async (req, res) => {
+    const parsed = internalReminderHistoryEmailResultSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const { historyId, tenantId, status, deliveryStatus, emailId, provider, errorMessage } = parsed.data;
+    if (!status && !deliveryStatus && !emailId && !provider && !errorMessage && !tenantId) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const metadata: Record<string, unknown> = {};
+      if (typeof deliveryStatus === 'string') metadata.deliveryStatus = deliveryStatus;
+      if (typeof emailId === 'string') metadata.emailId = emailId;
+      if (typeof provider === 'string') metadata.provider = provider;
+
+      await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId.trim(), {
+        tenantId: tenantId || undefined,
+        reminderType: 'email',
+        status: status || undefined,
+        metadata: Object.keys(metadata).length ? metadata : undefined,
+        errorMessage: errorMessage || undefined,
+      });
+
+      const final =
+        status === 'success' || deliveryStatus === 'sent'
+          ? ('success' as const)
+          : status === 'failed' || deliveryStatus === 'failed'
+            ? ('failed' as const)
+            : null;
+
+      if (final) {
+        try {
+          await finalizeReminderQuotaFromHistory(getFirestoreImpl(), {
+            historyId: historyId.trim(),
+            finalStatus: final,
+            fallbackTenantId: tenantId || undefined,
+            fallbackChannel: 'email',
+          });
+        } catch (e) {
+          console.warn('[internal_email_result] quota finalize failed', e);
+        }
+      }
+
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[internal_email_result] reminderHistory update failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  app.post('/admin/tenants/search', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+    const parsed = tenantSearchSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    try {
+      const payload = await runTenantDirectorySearch({
+        query: parsed.data.query,
+        limit: parsed.data.limit ?? 20,
+      });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[tenant_search] failed', error);
+      return res.status(500).json({ error: 'search_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/memberships', optionalBodyStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const parsed = tenantMembershipInspectorSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    const tenantId = tenantAccess?.tenantId ?? parsed.data.tenantId;
+    if (!tenantId && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    try {
+      const payload = await runTenantMembershipInspectorImpl({
+        tenantId,
+        limit: parsed.data.limit ?? 75,
+        role: parsed.data.role,
+        status: parsed.data.status,
+        search: parsed.data.search,
+      });
+      if (!payload) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+      return res.json(payload);
+    } catch (error) {
+      console.error('[tenant_memberships] lookup failed', error);
+      return res.status(500).json({ error: 'membership_lookup_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/user-devices', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantUserDevicesSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+
+    const toIso = (value: any): string | undefined => {
+      if (!value) return undefined;
+      if (typeof value === 'string') return value;
+      if (typeof value?.toDate === 'function') {
+        try {
+          return value.toDate().toISOString();
+        } catch {
+          return undefined;
+        }
+      }
+      return undefined;
+    };
+
+    try {
+      const db = getFirestoreImpl();
+      const devicesSnap = await db
+        .collection('user_devices')
+        .doc(normalizedEmail)
+        .collection('devices')
+        .select(
+          'deviceId',
+          'isOnline',
+          'lastSeen',
+          'lastTenantPingAt',
+          'lastActivityType',
+          'lastPingType',
+          'activeTenantId',
+          'lastTenantId',
+          'tenantIds',
+          'notificationsEnabled',
+          'isDeleted',
+        )
+        .get();
+
+      const devices = devicesSnap.docs
+        .map((doc) => {
+          const data = doc.data() || {};
+          const deviceId = typeof data.deviceId === 'string' && data.deviceId.trim() ? data.deviceId.trim() : doc.id;
+          const tenantIds = Array.isArray(data.tenantIds)
+            ? data.tenantIds.filter((id: unknown) => typeof id === 'string' && id.trim()).map((id: string) => id.trim())
+            : [];
+          const activeTenantId = typeof data.activeTenantId === 'string' ? data.activeTenantId : undefined;
+          const lastTenantId = typeof data.lastTenantId === 'string' ? data.lastTenantId : undefined;
+          const isForTenant = tenantIds.includes(tenantId) || activeTenantId === tenantId || lastTenantId === tenantId;
+          if (!isForTenant) return null;
+
+          return {
+            deviceId,
+            isOnline: typeof data.isOnline === 'boolean' ? data.isOnline : undefined,
+            lastSeen: toIso(data.lastSeen),
+            lastTenantPingAt: toIso(data.lastTenantPingAt),
+            lastActivityType: typeof data.lastActivityType === 'string' ? data.lastActivityType : undefined,
+            lastPingType: typeof data.lastPingType === 'string' ? data.lastPingType : undefined,
+            activeTenantId,
+            lastTenantId,
+            tenantIds,
+            notificationsEnabled: typeof data.notificationsEnabled === 'boolean' ? data.notificationsEnabled : undefined,
+            isDeleted: typeof data.isDeleted === 'boolean' ? data.isDeleted : undefined,
+          };
+        })
+        .filter((row): row is NonNullable<typeof row> => Boolean(row));
+
+      devices.sort((a, b) => {
+        const aOnline = a.isOnline === true ? 1 : 0;
+        const bOnline = b.isOnline === true ? 1 : 0;
+        if (aOnline !== bOnline) return bOnline - aOnline;
+        const aSeen = a.lastSeen ? Date.parse(a.lastSeen) : 0;
+        const bSeen = b.lastSeen ? Date.parse(b.lastSeen) : 0;
+        return bSeen - aSeen;
+      });
+
+      return res.json({ ok: true, tenantId, email: normalizedEmail, devices });
+    } catch (error) {
+      console.error('[admin_user_devices] lookup failed', error);
+      return res.status(500).json({ error: 'device_lookup_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/memberships/role', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = adminMembershipRoleOverrideSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const targetUserId = parsed.data.userId.trim();
+    const desiredRole = parsed.data.role;
+
+    try {
+      const db = getFirestoreImpl();
+      const membershipId = membershipDocId(tenantId, targetUserId);
+      const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+      const membershipSnap = await membershipRef.get();
+      if (!membershipSnap.exists) {
+        return res.status(404).json({ error: 'membership_not_found' });
+      }
+
+      const membership = membershipSnap.data() || {};
+      const previousRoleResult = tenantMembershipRoleSchema.safeParse(
+        typeof membership.role === 'string' ? membership.role : 'member'
+      );
+      const previousRole = previousRoleResult.success ? previousRoleResult.data : 'member';
+
+      if (previousRole === desiredRole) {
+        return res.json({
+          ok: true,
+          changed: false,
+          membership: {
+            id: membershipId,
+            tenantId,
+            userId: targetUserId,
+            role: previousRole,
+            status: membership.status,
+          },
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      await membershipRef.update({ role: desiredRole, updatedAt: nowIso });
+
+      const actorId = authContext.uid || authContext.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const metadata = parsed.data.metadata || {};
+      const auditMetadata: Record<string, unknown> = {
+        previousRole,
+        newRole: desiredRole,
+        previousStatus: membership.status,
+        actorRole: 'master',
+      };
+      if (metadata.reason) {
+        auditMetadata.reason = metadata.reason;
+      }
+      if (metadata.initiatedFrom) {
+        auditMetadata.initiatedFrom = metadata.initiatedFrom;
+      }
+      if (metadata.actorName) {
+        auditMetadata.actorName = metadata.actorName;
+      }
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: 'membership_role_changed',
+          targetId: membershipId,
+          targetType: 'membership',
+          metadata: auditMetadata,
+          createdAt: nowIso,
+        })
+      );
+
+      const notificationMetadata: Record<string, any> = {
+        displayName: typeof membership.displayName === 'string' ? membership.displayName : undefined,
+        reason: metadata.reason ?? 'admin_console_role_override',
+        initiatedFrom: metadata.initiatedFrom ?? 'system',
+        actorName: metadata.actorName,
+      };
+
+      void sendTeamMembershipChangeNotificationImpl({
+        tenantId,
+        tenantName: typeof membership.tenantName === 'string' ? membership.tenantName : undefined,
+        action: 'role_changed',
+        targetEmail: membership.email,
+        targetRole: desiredRole,
+        previousRole,
+        metadata: notificationMetadata,
+      }).catch((error) => console.warn('[admin_membership_role_override] notify failed', error));
+
+      return res.json({
+        ok: true,
+        changed: true,
+        membership: {
+          id: membershipId,
+          tenantId,
+          userId: targetUserId,
+          role: desiredRole,
+          status: membership.status,
+          updatedAt: nowIso,
+        },
+      });
+    } catch (error) {
+      console.error('[admin_membership_role_override] failed', error);
+      return res.status(500).json({ error: 'role_update_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/invites', optionalBodyStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const parsed = tenantInviteInspectorSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    const tenantId = tenantAccess?.tenantId ?? parsed.data.tenantId;
+    if (!tenantId && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    try {
+      const payload = await runTenantInviteInspectorImpl({
+        tenantId,
+        limit: parsed.data.limit ?? 75,
+        status: parsed.data.status,
+        search: parsed.data.search,
+      });
+      if (!payload) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+      return res.json(payload);
+    } catch (error) {
+      console.error('[tenant_invites] lookup failed', error);
+      return res.status(500).json({ error: 'invite_lookup_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/audit', optionalBodyStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const parsed = tenantAuditInspectorSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    const tenantId = tenantAccess?.tenantId ?? parsed.data.tenantId;
+    if (!tenantId && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    try {
+      const payload = await runTenantAuditInspectorImpl({
+        tenantId,
+        limit: parsed.data.limit ?? 100,
+        action: parsed.data.action,
+        search: parsed.data.search,
+      });
+      if (!payload) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+      return res.json(payload);
+    } catch (error) {
+      console.error('[tenant_audit] lookup failed', error);
+      return res.status(500).json({ error: 'audit_lookup_failed' });
+    }
+  });
+
+  app.post('/admin/notifications/history', optionalBodyStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const parsed = notificationHistoryInspectorSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    const tenantId = tenantAccess?.tenantId ?? parsed.data.tenantId;
+    if (!tenantId && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    try {
+      const payload = await runNotificationHistoryInspectorImpl({
+        tenantId,
+        adminEmail: parsed.data.adminEmail,
+        limit: parsed.data.limit ?? 50,
+        cursor: parsed.data.cursor,
+      });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[notification_history] lookup failed', error);
+      return res.status(500).json({ error: 'notification_history_failed' });
+    }
+  });
+
+  app.post('/admin/notifications/stats', optionalBodyStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const parsed = notificationStatsInspectorSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    const tenantId = tenantAccess?.tenantId ?? parsed.data.tenantId;
+    if (!tenantId && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    try {
+      const payload = await runNotificationStatsInspectorImpl({
+        tenantId,
+        adminEmail: parsed.data.adminEmail,
+        days: parsed.data.days ?? 30,
+      });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[notification_stats] lookup failed', error);
+      return res.status(500).json({ error: 'notification_stats_failed' });
+    }
+  });
+
+  const runtimeEndpointsAdminUpdateSchema = z
+    .object({
+      apiBaseUrl: z.string().trim().min(1).optional(),
+      emailApiBaseUrl: z.string().trim().min(1).optional(),
+      notificationsApiBaseUrl: z.string().trim().min(1).optional(),
+      wabaApiBaseUrl: z.string().trim().min(1).optional(),
+      chatApiBaseUrl: z.string().trim().min(1).optional(),
+    })
+    .strict();
+
+  function normalizeRuntimeEndpointUrl(value: string | undefined): string | undefined {
+    if (value == null) return undefined;
+    const trimmed = String(value).trim().replace(/\/+$/, '');
+    return trimmed ? trimmed : undefined;
+  }
+
+  app.get('/admin/settings/runtime-endpoints', requireOperatorAuth, async (_req, res) => {
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appSettings').doc('runtimeEndpoints');
+      const snap = await ref.get();
+      const data = snap.exists ? (snap.data() as Record<string, unknown>) : null;
+      return res.json({ ok: true, data });
+    } catch (error) {
+      console.error('[admin_runtime_endpoints] fetch failed', error);
+      return res.status(500).json({ error: 'runtime_endpoints_fetch_failed' });
+    }
+  });
+
+  app.post('/admin/settings/runtime-endpoints', requireOperatorAuth, async (req, res) => {
+    const parsed = runtimeEndpointsAdminUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const patch: Record<string, string> = {};
+    const apiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.apiBaseUrl);
+    const emailApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.emailApiBaseUrl);
+    const notificationsApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.notificationsApiBaseUrl);
+    const wabaApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.wabaApiBaseUrl);
+    const chatApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.chatApiBaseUrl);
+
+    if (apiBaseUrl) patch.apiBaseUrl = apiBaseUrl;
+    if (emailApiBaseUrl) patch.emailApiBaseUrl = emailApiBaseUrl;
+    if (notificationsApiBaseUrl) patch.notificationsApiBaseUrl = notificationsApiBaseUrl;
+    if (wabaApiBaseUrl) patch.wabaApiBaseUrl = wabaApiBaseUrl;
+    if (chatApiBaseUrl) patch.chatApiBaseUrl = chatApiBaseUrl;
+
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appSettings').doc('runtimeEndpoints');
+      const now = new Date().toISOString();
+      const snap = await ref.get();
+      const isCreate = !snap.exists;
+      await ref.set({ ...patch, updatedAt: now, ...(isCreate ? { createdAt: now } : {}) }, { merge: true });
+      const updated = await ref.get();
+      return res.json({ ok: true, data: updated.data() ?? null });
+    } catch (error) {
+      console.error('[admin_runtime_endpoints] update failed', error);
+      return res.status(500).json({ error: 'runtime_endpoints_update_failed' });
+    }
+  });
+
+  const maintenanceModeAdminUpdateSchema = z
+    .object({
+      enabled: z.boolean().optional(),
+      message: z.string().optional(),
+    })
+    .strict();
+
+  app.get('/admin/settings/maintenance', requireOperatorAuth, async (_req, res) => {
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appConfig').doc('maintenance');
+      const snap = await ref.get();
+      const data = snap.exists ? (snap.data() as Record<string, unknown>) : null;
+      return res.json({ ok: true, data });
+    } catch (error) {
+      console.error('[admin_maintenance_mode] fetch failed', error);
+      return res.status(500).json({ error: 'maintenance_fetch_failed' });
+    }
+  });
+
+  app.post('/admin/settings/maintenance', requireOperatorAuth, async (req, res) => {
+    const parsed = maintenanceModeAdminUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const patch: Record<string, unknown> = {};
+    if (typeof parsed.data.enabled === 'boolean') {
+      patch.enabled = parsed.data.enabled;
+    }
+    if (typeof parsed.data.message === 'string') {
+      patch.message = parsed.data.message;
+    }
+
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appConfig').doc('maintenance');
+      const now = new Date().toISOString();
+      const snap = await ref.get();
+      const isCreate = !snap.exists;
+      await ref.set({ ...patch, updatedAt: now, ...(isCreate ? { createdAt: now } : {}) }, { merge: true });
+      const updated = await ref.get();
+      return res.json({ ok: true, data: updated.data() ?? null });
+    } catch (error) {
+      console.error('[admin_maintenance_mode] update failed', error);
+      return res.status(500).json({ error: 'maintenance_update_failed' });
+    }
+  });
+
+  const reminderChannelsAdminUpdateSchema = z
+    .object({
+      enabledChannels: z
+        .object({
+          email: z.boolean().optional(),
+          sms: z.boolean().optional(),
+          whatsapp: z.boolean().optional(),
+          voice: z.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      channelMessages: z
+        .object({
+          email: z.string().optional(),
+          sms: z.string().optional(),
+          whatsapp: z.string().optional(),
+          voice: z.string().optional(),
+        })
+        .strict()
+        .optional(),
+      hideDisabledReminderTypes: z.boolean().optional(),
+    })
+    .strict();
+
+  app.get('/admin/settings/reminder-channels', requireOperatorAuth, async (_req, res) => {
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appSettings').doc('reminderChannels');
+      const snap = await ref.get();
+      const data = snap.exists ? (snap.data() as Record<string, unknown>) : null;
+      return res.json({ ok: true, data });
+    } catch (error) {
+      console.error('[admin_reminder_channels] fetch failed', error);
+      return res.status(500).json({ error: 'reminder_channels_fetch_failed' });
+    }
+  });
+
+  app.post('/admin/settings/reminder-channels', requireOperatorAuth, async (req, res) => {
+    const parsed = reminderChannelsAdminUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const patch: Record<string, unknown> = {};
+    if (parsed.data.enabledChannels && Object.keys(parsed.data.enabledChannels).length) {
+      patch.enabledChannels = parsed.data.enabledChannels;
+    }
+    if (parsed.data.channelMessages && Object.keys(parsed.data.channelMessages).length) {
+      patch.channelMessages = parsed.data.channelMessages;
+    }
+    if (typeof parsed.data.hideDisabledReminderTypes === 'boolean') {
+      patch.hideDisabledReminderTypes = parsed.data.hideDisabledReminderTypes;
+    }
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appSettings').doc('reminderChannels');
+      const now = new Date().toISOString();
+      const snap = await ref.get();
+      const isCreate = !snap.exists;
+      await ref.set({ ...patch, updatedAt: now, ...(isCreate ? { createdAt: now } : {}) }, { merge: true });
+      const updated = await ref.get();
+      return res.json({ ok: true, data: updated.data() ?? null });
+    } catch (error) {
+      console.error('[admin_reminder_channels] update failed', error);
+      return res.status(500).json({ error: 'reminder_channels_update_failed' });
+    }
+  });
+
+  const tenantReminderSettingsQuerySchema = z
+    .object({
+      tenantId: z.string().trim().min(1),
+    })
+    .strict();
+
+  const tenantReminderSettingsUpdateSchema = z
+    .object({
+      tenantId: z.string().trim().min(1),
+      enabledChannels: z
+        .object({
+          email: z.boolean().optional(),
+          sms: z.boolean().optional(),
+          whatsapp: z.boolean().optional(),
+          voice: z.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      channelMessages: z
+        .object({
+          email: z.string().optional(),
+          sms: z.string().optional(),
+          whatsapp: z.string().optional(),
+          voice: z.string().optional(),
+        })
+        .strict()
+        .optional(),
+      // When null, the tenant override is cleared (inherit global).
+      hideDisabledReminderTypes: z.boolean().nullable().optional(),
+    })
+    .strict();
+
+  type ReminderChannelPolicy = {
+    enabled: Record<'email' | 'sms' | 'whatsapp' | 'voice', boolean>;
+    messages: Partial<Record<'email' | 'sms' | 'whatsapp' | 'voice', string>>;
+  };
+
+  async function getGlobalReminderChannelPolicy(db: admin.firestore.Firestore): Promise<ReminderChannelPolicy> {
+    const ref = db.collection('appSettings').doc('reminderChannels');
+    const snap = await ref.get();
+    const data = snap.exists ? (snap.data() as any) : null;
+    const enabled = data?.enabledChannels as any;
+    const messages = data?.channelMessages as any;
+    return {
+      enabled: {
+        email: enabled?.email !== false,
+        sms: enabled?.sms !== false,
+        whatsapp: enabled?.whatsapp !== false,
+        voice: enabled?.voice !== false,
+      },
+      messages: {
+        email: typeof messages?.email === 'string' ? messages.email : undefined,
+        sms: typeof messages?.sms === 'string' ? messages.sms : undefined,
+        whatsapp: typeof messages?.whatsapp === 'string' ? messages.whatsapp : undefined,
+        voice: typeof messages?.voice === 'string' ? messages.voice : undefined,
+      },
+    };
+  }
+
+  async function getTenantReminderChannelPolicy(
+    db: admin.firestore.Firestore,
+    tenantId: string,
+  ): Promise<ReminderChannelPolicy> {
+    const ref = db.collection('tenants').doc(tenantId).collection('settings').doc('reminders');
+    const snap = await ref.get();
+    const data = snap.exists ? (snap.data() as any) : null;
+    const enabled = data?.enabledChannels as any;
+    const messages = data?.channelMessages as any;
+
+    return {
+      enabled: {
+        email: enabled?.email !== false,
+        sms: enabled?.sms !== false,
+        whatsapp: enabled?.whatsapp !== false,
+        voice: enabled?.voice !== false,
+      },
+      messages: {
+        email: typeof messages?.email === 'string' ? messages.email : undefined,
+        sms: typeof messages?.sms === 'string' ? messages.sms : undefined,
+        whatsapp: typeof messages?.whatsapp === 'string' ? messages.whatsapp : undefined,
+        voice: typeof messages?.voice === 'string' ? messages.voice : undefined,
+      },
+    };
+  }
+
+  async function getEffectiveReminderChannelPolicy(
+    db: admin.firestore.Firestore,
+    tenantId: string,
+  ): Promise<ReminderChannelPolicy> {
+    const [global, tenant] = await Promise.all([
+      getGlobalReminderChannelPolicy(db),
+      getTenantReminderChannelPolicy(db, tenantId),
+    ]);
+
+    const enabled: ReminderChannelPolicy['enabled'] = {
+      email: global.enabled.email && tenant.enabled.email,
+      sms: global.enabled.sms && tenant.enabled.sms,
+      whatsapp: global.enabled.whatsapp && tenant.enabled.whatsapp,
+      voice: global.enabled.voice && tenant.enabled.voice,
+    };
+
+    // Prefer tenant message if present; else fall back to global message.
+    const messages: ReminderChannelPolicy['messages'] = {
+      email: (tenant.messages.email || '').trim() ? tenant.messages.email : global.messages.email,
+      sms: (tenant.messages.sms || '').trim() ? tenant.messages.sms : global.messages.sms,
+      whatsapp: (tenant.messages.whatsapp || '').trim() ? tenant.messages.whatsapp : global.messages.whatsapp,
+      voice: (tenant.messages.voice || '').trim() ? tenant.messages.voice : global.messages.voice,
+    };
+
+    return { enabled, messages };
+  }
+
+  function computeDisabledReminderChannels(
+    enabled: Record<'email' | 'sms' | 'whatsapp' | 'voice', boolean>,
+    requested: Partial<Record<'email' | 'sms' | 'whatsapp' | 'voice', number>>,
+  ): Array<'email' | 'sms' | 'whatsapp' | 'voice'> {
+    const disabled: Array<'email' | 'sms' | 'whatsapp' | 'voice'> = [];
+    (['email', 'sms', 'whatsapp', 'voice'] as const).forEach((channel) => {
+      const count = requested[channel] || 0;
+      if (count > 0 && !enabled[channel]) disabled.push(channel);
+    });
+    return disabled;
+  }
+
+  app.get('/admin/tenants/reminder-settings', requireOperatorAuth, async (req, res) => {
+    const parsed = tenantReminderSettingsQuerySchema.safeParse({
+      tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+    });
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('tenants').doc(parsed.data.tenantId).collection('settings').doc('reminders');
+      const snap = await ref.get();
+      const data = snap.exists ? (snap.data() as Record<string, unknown>) : null;
+      return res.json({ ok: true, data });
+    } catch (error) {
+      console.error('[admin_tenant_reminder_settings] fetch failed', error);
+      return res.status(500).json({ error: 'tenant_reminder_settings_fetch_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/reminder-settings', requireOperatorAuth, async (req, res) => {
+    const parsed = tenantReminderSettingsUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const patch: Record<string, unknown> = {};
+    if (parsed.data.enabledChannels && Object.keys(parsed.data.enabledChannels).length) {
+      patch.enabledChannels = parsed.data.enabledChannels;
+    }
+    if (parsed.data.channelMessages && Object.keys(parsed.data.channelMessages).length) {
+      patch.channelMessages = parsed.data.channelMessages;
+    }
+    if (parsed.data.hideDisabledReminderTypes === null) {
+      ensureFirebase();
+      patch.hideDisabledReminderTypes = admin.firestore.FieldValue.delete();
+    } else if (typeof parsed.data.hideDisabledReminderTypes === 'boolean') {
+      patch.hideDisabledReminderTypes = parsed.data.hideDisabledReminderTypes;
+    }
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('tenants').doc(parsed.data.tenantId).collection('settings').doc('reminders');
+      const now = new Date().toISOString();
+      const snap = await ref.get();
+      const isCreate = !snap.exists;
+      await ref.set({ ...patch, updatedAt: now, ...(isCreate ? { createdAt: now } : {}) }, { merge: true });
+      const updated = await ref.get();
+      return res.json({ ok: true, data: updated.data() ?? null });
+    } catch (error) {
+      console.error('[admin_tenant_reminder_settings] update failed', error);
+      return res.status(500).json({ error: 'tenant_reminder_settings_update_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/quotas', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantQuotaUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const tenantId = parsed.data.tenantId.trim();
+      const tenantRef = db.collection('tenants').doc(tenantId);
+      const tenantSnap = await tenantRef.get();
+      if (!tenantSnap.exists) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      const quotaPatch = buildQuotaPatch(parsed.data.quotas);
+      if (!Object.keys(quotaPatch).length) {
+        return res.status(400).json({ error: 'no_quota_values' });
+      }
+
+      const currentData = tenantSnap.data() || {};
+      const existingQuotas =
+        typeof currentData.quotas === 'object' && currentData.quotas ? { ...currentData.quotas } : {};
+      const updatedQuotas = { ...existingQuotas, ...quotaPatch };
+      const nowIso = new Date().toISOString();
+
+      await tenantRef.set(
+        {
+          quotas: updatedQuotas,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      const actorId = authContext.uid || authContext.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: 'quota_override',
+          targetId: tenantId,
+          targetType: 'quota',
+          metadata: {
+            before: existingQuotas,
+            after: updatedQuotas,
+            patch: quotaPatch,
+            note: parsed.data.note,
+          },
+          createdAt: nowIso,
+        })
+      );
+
+      const updatedSnap = await tenantRef.get();
+      const summary = serializeTenantAdminSummary(updatedSnap);
+      return res.json({ ok: true, tenant: summary });
+    } catch (error) {
+      console.error('[tenant_quota_override] failed', error);
+      return res.status(500).json({ error: 'quota_override_failed' });
+    }
+  });
+
+  app.post('/admin/tenants/billing/plan-variant', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantBillingPlanVariantUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const tenantId = parsed.data.tenantId.trim();
+      const planVariantId = parsed.data.planVariantId.trim();
+
+      const tenantRef = db.collection('tenants').doc(tenantId);
+      const billingRef = db.collection('tenantBilling').doc(tenantId);
+
+      const tenantSnap = await tenantRef.get();
+      if (!tenantSnap.exists) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      const variant = await getPlanVariantById(db, planVariantId);
+      if (!variant) {
+        return res.status(400).json({ error: 'plan_variant_not_found' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextPlanId = normalizePlanId(variant.planId);
+      const nextStatus: 'trial' | 'active' = nextPlanId === 'free' ? 'trial' : 'active';
+
+      const beforeTenant = tenantSnap.data() || {};
+      const beforeBillingSnap = await billingRef.get();
+      const beforeBilling = beforeBillingSnap.exists ? beforeBillingSnap.data() || {} : {};
+
+      const beforePlanId = normalizePlanId(
+        (beforeBilling as any).planId ?? (beforeBilling as any).plan ?? (beforeTenant as any).billingTier ?? null
+      );
+      const beforePlanVariantId =
+        typeof (beforeBilling as any).planVariantId === 'string' ? String((beforeBilling as any).planVariantId) : null;
+      const didPlanChange = beforePlanId !== nextPlanId || beforePlanVariantId !== variant.id;
+
+      await db.runTransaction(async (tx) => {
+        tx.set(
+          billingRef,
+          {
+            planId: nextPlanId,
+            planVariantId: variant.id,
+            status: nextStatus,
+            checkoutRequired: false,
+            updatedAt: nowIso,
+            // Clear delinquency signals when an operator assigns a plan.
+            delinquentSinceIso: admin.firestore.FieldValue.delete(),
+            delinquentSince: admin.firestore.FieldValue.delete(),
+          },
+          { merge: true }
+        );
+
+        tx.set(
+          tenantRef,
+          {
+            billingTier: nextPlanId,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+      });
+
+      const actorId = authContext.uid || authContext.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: 'billing_plan_override',
+          targetId: tenantId,
+          targetType: 'billing',
+          metadata: {
+            beforeTenant: {
+              billingTier: (beforeTenant as any).billingTier,
+            },
+            afterTenant: {
+              billingTier: nextPlanId,
+            },
+            beforeBilling: {
+              planId: (beforeBilling as any).planId ?? (beforeBilling as any).plan,
+              planVariantId: (beforeBilling as any).planVariantId,
+              status: (beforeBilling as any).status,
+              checkoutRequired: (beforeBilling as any).checkoutRequired,
+              renewalDate:
+                (beforeBilling as any).renewalDate ?? (beforeBilling as any).renewsAt ?? (beforeBilling as any).renewalAt,
+            },
+            afterBilling: {
+              planId: nextPlanId,
+              planVariantId: variant.id,
+              status: nextStatus,
+              checkoutRequired: false,
+            },
+            note: parsed.data.note,
+          },
+          createdAt: nowIso,
+        })
+      );
+
+      if (didPlanChange) {
+        const planLabel = nextPlanId === 'free' ? 'Free' : nextPlanId === 'pro' ? 'Pro' : 'Enterprise';
+        void sendTenantBillingEventNotification({
+          tenantId,
+          kind: 'plan_overridden',
+          title: 'Plan updated',
+          body: `This coaching center has been switched to the ${planLabel} plan.`,
+          priority: 'medium',
+          metadata: {
+            source: 'admin_console',
+            fromPlanId: beforePlanId,
+            fromPlanVariantId: beforePlanVariantId,
+            toPlanId: nextPlanId,
+            toPlanVariantId: variant.id,
+            note: parsed.data.note ?? null,
+            actorId,
+            actorEmail: actorEmail || null,
+            actorRole: authContext.tokenType,
+          },
+        }).catch(() => undefined);
+      }
+
+      const updatedSnap = await tenantRef.get();
+      const summary = serializeTenantAdminSummary(updatedSnap);
+      return res.json({ ok: true, tenant: summary });
+    } catch (error) {
+      console.error('[tenant_billing_plan_override] failed', error);
+      return res.status(500).json({ error: 'tenant_billing_plan_override_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/preferences', requireParamsStaffTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const requestedTenantId = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!requestedTenantId || requestedTenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const parsed = tenantNotificationPreferencesUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const preferenceMetadata = parsed.data.metadata ?? {};
+
+    try {
+      const tenantRecord = await loadTenantNotificationPreferencesRecordImpl(tenantAccess.tenantId);
+      if (!tenantRecord) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      const currentPrefs = normalizeTenantNotificationPreferences(
+        tenantRecord.currentPreferences || undefined
+      );
+      const patch = parsed.data.notificationPreferences;
+      const updatedPrefs = { ...currentPrefs };
+      const changedKeys: NotificationPreferenceKey[] = [];
+      for (const key of notificationPreferenceKeys) {
+        if (typeof patch[key] === 'boolean') {
+          const nextValue = patch[key] as boolean;
+          if (updatedPrefs[key] !== nextValue) {
+            changedKeys.push(key);
+          }
+          updatedPrefs[key] = nextValue;
+        }
+      }
+
+      if (!changedKeys.length) {
+        return res.json({ ok: true, notificationPreferences: updatedPrefs, changedKeys: [] });
+      }
+
+      const nowIso = new Date().toISOString();
+      await tenantRecord.update({
+        notificationPreferences: updatedPrefs,
+        updatedAt: nowIso,
+      });
+
+      const auditMetadata: Record<string, unknown> = {
+        changedKeys,
+        before: currentPrefs,
+        after: updatedPrefs,
+        actorRole: tenantAccess.role,
+        actorMembershipId: tenantAccess.membershipId,
+      };
+
+      const initiatedFrom = typeof preferenceMetadata.initiatedFrom === 'string' ? preferenceMetadata.initiatedFrom.trim() : '';
+      if (initiatedFrom) {
+        auditMetadata.initiatedFrom = initiatedFrom;
+      }
+      if (typeof preferenceMetadata.actorName === 'string' && preferenceMetadata.actorName.trim()) {
+        auditMetadata.actorName = preferenceMetadata.actorName.trim();
+      }
+      if (typeof preferenceMetadata.reason === 'string' && preferenceMetadata.reason.trim()) {
+        auditMetadata.reason = preferenceMetadata.reason.trim();
+      }
+
+      const clientVersionHeader = req.headers['x-app-version'];
+      const clientVersion = typeof clientVersionHeader === 'string' ? clientVersionHeader.trim() : '';
+      if (clientVersion) {
+        auditMetadata.clientVersion = clientVersion;
+      }
+
+      await logTenantAuditEventImpl({
+        tenantId: tenantAccess.tenantId,
+        action: 'notification_preferences_updated',
+        authContext: req.authContext,
+        metadata: auditMetadata,
+        targetId: tenantAccess.tenantId,
+        targetType: 'tenant',
+      });
+
+      return res.json({ ok: true, notificationPreferences: updatedPrefs, changedKeys });
+    } catch (error) {
+      console.error('[tenant_preferences] update failed', error);
+      return res.status(500).json({ error: 'preferences_update_failed' });
+    }
+  });
+
+  app.delete('/tenants/:tenantId/notices/:noticeId', requireParamsMemberTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    const authContext = req.authContext;
+    if (!tenantAccess) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const tenantId = tenantAccess.tenantId;
+    const actorUid = authContext.uid;
+    const actorRole = tenantAccess.role;
+    const noticeId = typeof req.params.noticeId === 'string' ? req.params.noticeId.trim() : '';
+    if (!noticeId) {
+      return res.status(400).json({ error: 'notice_required' });
+    }
+
+    const db = getFirestoreImpl();
+    const noticeRef = db.collection('notices').doc(noticeId);
+
+    const normalizeCreatorRole = (value: unknown): TenantMembershipRole | 'system' | null => {
+      const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+      if (!raw) return null;
+      if (raw === 'system') return 'system';
+      if (raw === 'owner' || raw === 'admin' || raw === 'staff' || raw === 'member') return raw;
+      return null;
+    };
+
+    const resolveStoragePath = (explicitPath: unknown, downloadUrl: unknown): string | null => {
+      const path = typeof explicitPath === 'string' ? explicitPath.trim() : '';
+      if (path) return path;
+      const urlRaw = typeof downloadUrl === 'string' ? downloadUrl.trim() : '';
+      if (!urlRaw) return null;
+      try {
+        const url = new URL(urlRaw);
+        const match = url.pathname.match(/\/o\/(.+?)(\?|$)/);
+        if (match?.[1]) {
+          return decodeURIComponent(match[1]);
+        }
+      } catch {
+        // ignore
+      }
+      return null;
+    };
+
+    try {
+      const snap = await noticeRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'notice_not_found' });
+      }
+
+      const notice = snap.data() || {};
+      const noticeTenantId = typeof (notice as any).tenantId === 'string' ? (notice as any).tenantId : '';
+      if (noticeTenantId && noticeTenantId !== tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const creatorUid = typeof (notice as any).createdBy === 'string' ? (notice as any).createdBy : '';
+      let creatorRole = normalizeCreatorRole((notice as any).createdByRole);
+      if (!creatorRole && creatorUid === 'system') {
+        creatorRole = 'system';
+      }
+      if (!creatorRole && creatorUid) {
+        try {
+          const membershipId = membershipDocId(tenantId, creatorUid);
+          const membershipSnap = await db.collection('tenantMemberships').doc(membershipId).get();
+          if (membershipSnap.exists) {
+            const membership = membershipSnap.data() || {};
+            creatorRole = normalizeCreatorRole((membership as any).role);
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const allowed = (() => {
+        if (actorRole === 'owner') {
+          return true;
+        }
+        if (actorRole === 'admin') {
+          if (creatorUid === 'system' || creatorRole === 'system') {
+            return true;
+          }
+          // If we can't determine creator role, be conservative and deny.
+          if (!creatorRole) {
+            return false;
+          }
+          return creatorRole !== 'owner';
+        }
+        // staff/member: only their own posts
+        return creatorUid && creatorUid === actorUid;
+      })();
+
+      if (!allowed) {
+        return res.status(403).json({ error: 'not_allowed' });
+      }
+
+      // Best-effort storage cleanup.
+      try {
+        ensureFirebase();
+        const bucket = admin.storage().bucket();
+
+        const imagePath = resolveStoragePath((notice as any).imageStoragePath, (notice as any).imageUrl);
+        const audioPath = resolveStoragePath((notice as any).audioStoragePath, (notice as any).audioUrl);
+        const deletes: Array<Promise<any>> = [];
+        if (imagePath) {
+          deletes.push(bucket.file(imagePath).delete({ ignoreNotFound: true } as any));
+        }
+        if (audioPath) {
+          deletes.push(bucket.file(audioPath).delete({ ignoreNotFound: true } as any));
+        }
+        await Promise.allSettled(deletes);
+      } catch (error) {
+        console.warn('[notices_delete] storage cleanup failed', error);
+      }
+
+      await noticeRef.delete();
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[notices_delete] failed', error);
+      return res.status(500).json({ error: 'delete_failed' });
+    }
+  });
+
+  app.post('/tenants/invites/accept', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantInviteAcceptSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const token = parsed.data.token.trim().toLowerCase();
+    try {
+      const db = getFirestoreImpl();
+      const inviteQuerySnap = await db
+        .collection('tenantInvites')
+        .where('token', '==', token)
+        .limit(1)
+        .get();
+      if (inviteQuerySnap.empty) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+
+      const inviteDoc = inviteQuerySnap.docs[0];
+      const inviteData = inviteDoc.data() || {};
+      const tenantId = typeof inviteData.tenantId === 'string' ? inviteData.tenantId.trim() : '';
+      if (!tenantId) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+
+      const userEmail = await resolveAuthenticatedEmail(authContext);
+      if (!userEmail) {
+        return res.status(400).json({ error: 'email_required' });
+      }
+
+      const inviteEmailRaw = typeof inviteData.email === 'string' ? inviteData.email : '';
+      const inviteEmail = normalizeEmail(inviteEmailRaw);
+      if (inviteEmail && inviteEmail !== userEmail) {
+        return res.status(403).json({ error: 'invite_email_mismatch', expectedEmail: inviteEmail });
+      }
+
+      const inviteStatus = typeof inviteData.status === 'string' ? inviteData.status : 'pending';
+      if (inviteStatus === 'revoked') {
+        return res.status(409).json({ error: 'invite_revoked' });
+      }
+      if (inviteStatus === 'accepted') {
+        return res.status(409).json({ error: 'invite_already_used' });
+      }
+
+      const now = Date.now();
+      const expiresAtIso = typeof inviteData.expiresAt === 'string' ? inviteData.expiresAt : null;
+      const expiresAtTs = expiresAtIso ? Date.parse(expiresAtIso) : NaN;
+      if (inviteStatus === 'expired' || (!Number.isNaN(expiresAtTs) && expiresAtTs < now)) {
+        if (inviteStatus !== 'expired') {
+          await inviteDoc.ref.update({ status: 'expired', updatedAt: new Date(now).toISOString() });
+        }
+        return res.status(410).json({ error: 'invite_expired' });
+      }
+
+      const membershipId = membershipDocId(tenantId, authContext.uid);
+      const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+      const membershipSnap = await membershipRef.get();
+      const existingMembership = membershipSnap.exists ? membershipSnap.data() || {} : null;
+      const alreadyActive = existingMembership?.status === 'active';
+
+      const nowIso = new Date().toISOString();
+      const role = typeof inviteData.role === 'string' ? (inviteData.role as TenantMembershipRole) : 'member';
+      const membershipPayload: Record<string, any> = {
+        tenantId,
+        userId: authContext.uid,
+        email: userEmail,
+        role,
+        status: 'active',
+        updatedAt: nowIso,
+      };
+
+      if (!existingMembership) {
+        membershipPayload.createdAt = nowIso;
+        membershipPayload.statusHistory = [
+          {
+            status: 'active',
+            at: nowIso,
+            actorId: authContext.uid,
+            actorEmail: userEmail,
+            reason: 'invite_accepted',
+          },
+        ];
+      } else if (!alreadyActive) {
+        membershipPayload.statusHistory = admin.firestore.FieldValue.arrayUnion({
+          status: 'active',
+          at: nowIso,
+          actorId: authContext.uid,
+          actorEmail: userEmail,
+          reason: `status_changed_from_${existingMembership.status || 'unknown'}`,
+        });
+      }
+
+      await membershipRef.set(membershipPayload, { merge: true });
+      await inviteDoc.ref.update({
+        status: 'accepted',
+        acceptedAt: nowIso,
+        acceptedBy: authContext.uid,
+        updatedAt: nowIso,
+      });
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId: authContext.uid,
+          actorEmail: userEmail,
+          action: 'membership_invited',
+          targetId: inviteDoc.id,
+          targetType: 'invite',
+          metadata: { outcome: 'accepted', inviteEmail: inviteEmail || undefined },
+          createdAt: nowIso,
+        })
+      );
+
+      return res.json({
+        ok: true,
+        tenantId,
+        inviteId: inviteDoc.id,
+        membership: {
+          id: membershipId,
+          tenantId,
+          userId: authContext.uid,
+          email: userEmail,
+          role,
+          status: 'active',
+          createdAt: membershipPayload.createdAt ?? existingMembership?.createdAt ?? nowIso,
+          updatedAt: nowIso,
+        },
+      });
+    } catch (error) {
+      console.error('[tenant_invite_accept] failed', error);
+      return res.status(500).json({ error: 'invite_accept_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/invites', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const parsed = tenantInviteCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const desiredRole = parsed.data.role ?? 'member';
+    const actorIsOwner = tenantAccess.role === 'owner' || req.authContext?.tokenType === 'master';
+    if (desiredRole === 'owner' && !actorIsOwner) {
+      return res.status(403).json({ error: 'owner_role_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const inviteeEmail = normalizeEmail(parsed.data.email);
+      if (!inviteeEmail) {
+        return res.status(400).json({ error: 'email_required' });
+      }
+
+      const alreadyMember = await isTenantEmailActiveMember(tenantAccess.tenantId, inviteeEmail);
+      if (alreadyMember) {
+        return res.status(409).json({ error: 'membership_exists_for_email' });
+      }
+
+      // Enforce one invite record per tenant+email. If a new invite is created for the same email,
+      // we overwrite the existing record (and delete any legacy duplicates).
+      const canonicalInviteId = tenantInviteDocId(tenantAccess.tenantId, inviteeEmail);
+      const inviteRef = db.collection('tenantInvites').doc(canonicalInviteId);
+
+      const needsSeat = desiredRole === 'owner' || desiredRole === 'admin' || desiredRole === 'staff';
+
+      // If the email already has a pending seat invite, renewing it should not require an extra seat.
+      let alreadyReservedSeatForEmail = false;
+      try {
+        const existingInviteSnap = await db
+          .collection('tenantInvites')
+          .where('tenantId', '==', tenantAccess.tenantId)
+          .where('email', '==', inviteeEmail)
+          .limit(50)
+          .get();
+        existingInviteSnap.forEach((docSnap) => {
+          const data = docSnap.data() || {};
+          const status = typeof (data as any).status === 'string' ? String((data as any).status).toLowerCase() : '';
+          const role = typeof (data as any).role === 'string' ? String((data as any).role).toLowerCase() : '';
+          if (status === 'pending' && (role === 'owner' || role === 'admin' || role === 'staff')) {
+            alreadyReservedSeatForEmail = true;
+          }
+        });
+      } catch {
+        // Non-fatal; proceed with standard enforcement.
+      }
+
+      if (needsSeat && !alreadyReservedSeatForEmail) {
+        try {
+          await assertTenantStaffSeatAvailable(db, tenantAccess.tenantId);
+        } catch (error) {
+          if (error instanceof TenantSeatLimitError) {
+            return res.status(409).json({ error: 'seat_limit_reached', limit: error.limit });
+          }
+          throw error;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const expiresInDays = parsed.data.expiresInDays ?? DEFAULT_INVITE_EXPIRY_DAYS;
+      const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+      const inviteData = {
+        tenantId: tenantAccess.tenantId,
+        email: inviteeEmail,
+        role: desiredRole,
+        status: 'pending',
+        token: crypto.randomBytes(16).toString('hex'),
+        issuedBy: req.authContext?.uid || 'system',
+        issuedAt: nowIso,
+        expiresAt,
+        lastSentAt: nowIso,
+        lastSentBy: req.authContext?.uid || 'system',
+        invitationMessage: parsed.data.message ?? null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      } satisfies Record<string, unknown>;
+
+      // Overwrite the canonical invite doc, and delete any other legacy duplicates for this email.
+      await db.runTransaction(async (tx) => {
+        const dupSnap = await tx.get(
+          db
+            .collection('tenantInvites')
+            .where('tenantId', '==', tenantAccess.tenantId)
+            .where('email', '==', inviteeEmail)
+            .limit(50),
+        );
+        dupSnap.docs.forEach((docSnap) => {
+          if (docSnap.id !== canonicalInviteId) {
+            tx.delete(docSnap.ref);
+          }
+        });
+        tx.set(inviteRef, inviteData, { merge: false });
+      });
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: req.authContext?.uid || req.authContext?.tokenType || 'system',
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: 'membership_invited',
+          targetId: canonicalInviteId,
+          targetType: 'invite',
+          metadata: { email: inviteeEmail, role: desiredRole, outcome: 'created' },
+          createdAt: nowIso,
+        })
+      );
+
+      return res.json({
+        ok: true,
+        invite: {
+          id: canonicalInviteId,
+          ...inviteData,
+        },
+      });
+    } catch (error) {
+      console.error('[tenant_invite_create] failed', error);
+      return res.status(500).json({ error: 'invite_create_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/invites/:inviteId/resend', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    const inviteId = typeof req.params?.inviteId === 'string' ? req.params.inviteId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    if (!inviteId) {
+      return res.status(400).json({ error: 'invite_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const inviteRef = db.collection('tenantInvites').doc(inviteId);
+      const inviteSnap = await inviteRef.get();
+      if (!inviteSnap.exists) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+      const invite = inviteSnap.data() || {};
+      if (invite.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+      if (invite.status && invite.status !== 'pending') {
+        return res.status(409).json({ error: 'invite_not_pending' });
+      }
+      const inviteRole = typeof invite.role === 'string' ? (invite.role as TenantMembershipRole) : 'member';
+      const actorIsOwner = tenantAccess.role === 'owner' || req.authContext?.tokenType === 'master';
+      if (inviteRole === 'owner' && !actorIsOwner) {
+        return res.status(403).json({ error: 'owner_role_required' });
+      }
+
+      const nowIso = new Date().toISOString();
+      await inviteRef.update({ lastSentAt: nowIso, lastSentBy: req.authContext?.uid || 'system' });
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: req.authContext?.uid || req.authContext?.tokenType || 'system',
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: 'membership_invited',
+          targetId: inviteId,
+          targetType: 'invite',
+          metadata: { outcome: 'resent' },
+          createdAt: nowIso,
+        })
+      );
+
+      return res.json({
+        ok: true,
+        invite: {
+          id: inviteId,
+          ...invite,
+          lastSentAt: nowIso,
+          lastSentBy: req.authContext?.uid || 'system',
+        },
+      });
+    } catch (error) {
+      console.error('[tenant_invite_resend] failed', error);
+      return res.status(500).json({ error: 'invite_resend_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/invites/:inviteId/revoke', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    const inviteId = typeof req.params?.inviteId === 'string' ? req.params.inviteId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    if (!inviteId) {
+      return res.status(400).json({ error: 'invite_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const inviteRef = db.collection('tenantInvites').doc(inviteId);
+      const inviteSnap = await inviteRef.get();
+      if (!inviteSnap.exists) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+      const invite = inviteSnap.data() || {};
+      if (invite.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+      if (invite.status && invite.status !== 'pending') {
+        return res.status(409).json({ error: 'invite_not_pending' });
+      }
+      const inviteRole = typeof invite.role === 'string' ? (invite.role as TenantMembershipRole) : 'member';
+      const actorIsOwner = tenantAccess.role === 'owner' || req.authContext?.tokenType === 'master';
+      if (inviteRole === 'owner' && !actorIsOwner) {
+        return res.status(403).json({ error: 'owner_role_required' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const revokedBy = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      await inviteRef.update({
+        status: 'revoked',
+        revokedAt: nowIso,
+        revokedBy,
+        updatedAt: nowIso,
+      });
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: revokedBy,
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: 'membership_invited',
+          targetId: inviteId,
+          targetType: 'invite',
+          metadata: { outcome: 'revoked' },
+          createdAt: nowIso,
+        })
+      );
+
+      return res.json({
+        ok: true,
+        invite: {
+          id: inviteId,
+          ...invite,
+          status: 'revoked',
+          revokedAt: nowIso,
+          revokedBy,
+          updatedAt: nowIso,
+        },
+      });
+    } catch (error) {
+      console.error('[tenant_invite_revoke] failed', error);
+      return res.status(500).json({ error: 'invite_revoke_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/join-requests/:requestId/approve', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    const requestId = typeof req.params?.requestId === 'string' ? req.params.requestId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    if (!requestId) {
+      return res.status(400).json({ error: 'request_required' });
+    }
+
+    const parsed = joinRequestApprovalSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const desiredRole = parsed.data.role ?? 'staff';
+    const actorIsOwner = tenantAccess.role === 'owner' || req.authContext?.tokenType === 'master';
+    if (desiredRole === 'owner' && !actorIsOwner) {
+      return res.status(403).json({ error: 'owner_role_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const requestRef = db.collection('tenantJoinRequests').doc(requestId);
+      const membershipCollection = db.collection('tenantMemberships');
+      const requestSnap = await requestRef.get();
+      if (!requestSnap.exists) {
+        return res.status(404).json({ error: 'request_not_found' });
+      }
+      const request = requestSnap.data() || {};
+      if (request.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+      if (request.status && request.status !== 'pending') {
+        return res.status(409).json({ error: 'request_already_reviewed' });
+      }
+      const targetUserId = typeof request.userId === 'string' ? request.userId.trim() : '';
+      const targetEmailRaw = typeof request.email === 'string' ? request.email.trim() : '';
+      if (!targetUserId || !targetEmailRaw) {
+        return res.status(400).json({ error: 'request_missing_user' });
+      }
+      const normalizedEmail = targetEmailRaw.toLowerCase();
+      const membershipId = membershipDocId(tenantAccess.tenantId, targetUserId);
+      const membershipRef = membershipCollection.doc(membershipId);
+      const membershipSnap = await membershipRef.get();
+      const membershipExisting = membershipSnap.exists ? membershipSnap.data() || {} : null;
+      const membershipStatus = typeof membershipExisting?.status === 'string' ? membershipExisting.status : null;
+      const needsSeat = desiredRole === 'owner' || desiredRole === 'admin' || desiredRole === 'staff';
+      const needsSeatCheck = needsSeat && (!membershipExisting || membershipStatus !== 'active');
+      if (needsSeatCheck) {
+        try {
+          await assertTenantStaffSeatAvailable(db, tenantAccess.tenantId);
+        } catch (error) {
+          if (error instanceof TenantSeatLimitError) {
+            return res.status(409).json({ error: 'seat_limit_reached', limit: error.limit });
+          }
+          throw error;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const actorId = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const actorUid = req.authContext?.uid || null;
+      const actorRole = tenantAccess.role;
+      const actorMembershipId = tenantAccess.membershipId;
+      const reviewerName = parsed.data.reviewerName || parsed.data.metadata?.actorName;
+      const displayName = typeof request.displayName === 'string' && request.displayName.trim().length
+        ? request.displayName.trim()
+        : normalizedEmail;
+
+      const statusEvent: Record<string, any> = stripUndefinedDeep({
+        status: 'active',
+        at: nowIso,
+        actorId,
+        actorEmail: actorEmail || undefined,
+        reason: parsed.data.metadata?.reason ?? 'join_request_approved',
+      });
+      if (reviewerName) {
+        statusEvent.actorName = reviewerName;
+      }
+      if (parsed.data.metadata?.initiatedFrom) {
+        statusEvent.initiatedFrom = parsed.data.metadata.initiatedFrom;
+      }
+
+      const membershipPayload: Record<string, any> = {
+        tenantId: tenantAccess.tenantId,
+        userId: targetUserId,
+        email: normalizedEmail,
+        displayName,
+        role: desiredRole,
+        status: 'active',
+        updatedAt: nowIso,
+      };
+      if (!membershipExisting) {
+        membershipPayload.createdAt = nowIso;
+        membershipPayload.statusHistory = [statusEvent];
+      } else {
+        membershipPayload.statusHistory = admin.firestore.FieldValue.arrayUnion(statusEvent);
+      }
+
+      await db.runTransaction(async (tx) => {
+        const freshRequestSnap = await tx.get(requestRef);
+        if (!freshRequestSnap.exists) {
+          throw new TenantAccessError(404, { error: 'request_not_found' });
+        }
+        const freshRequest = freshRequestSnap.data() || {};
+        if (freshRequest.status && freshRequest.status !== 'pending') {
+          throw new TenantAccessError(409, { error: 'request_already_reviewed' });
+        }
+        tx.set(membershipRef, membershipPayload, { merge: true });
+        tx.update(requestRef, {
+          status: 'approved',
+          reviewedAt: nowIso,
+          reviewedBy: actorId,
+          assignedRole: desiredRole,
+        });
+      });
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: 'join_request_reviewed',
+          targetId: requestId,
+          targetType: 'joinRequest',
+          metadata: { outcome: 'approved', role: desiredRole },
+          createdAt: nowIso,
+        })
+      );
+
+      const notificationMetadata: Record<string, any> = {
+        displayName,
+        reason: parsed.data.metadata?.reason ?? 'join_request_approved',
+        initiatedFrom: parsed.data.metadata?.initiatedFrom ?? 'system',
+        actorName: reviewerName,
+      };
+
+      void sendTeamMembershipChangeNotificationImpl({
+        tenantId: tenantAccess.tenantId,
+        tenantName: typeof request.tenantName === 'string' ? request.tenantName : undefined,
+        action: membershipExisting ? 'role_changed' : 'added',
+        targetEmail: normalizedEmail,
+        targetRole: desiredRole,
+        metadata: notificationMetadata,
+      }).catch((error) => console.warn('[join_request_approve] notify team failed', error));
+
+      void sendTenantJoinRequestOutcomeNotificationImpl({
+        tenantId: tenantAccess.tenantId,
+        tenantName: typeof request.tenantName === 'string' ? request.tenantName : undefined,
+        requestId,
+        outcome: 'approved',
+        assignedRole: desiredRole,
+        reviewerName,
+        requesterEmail: normalizedEmail,
+        requesterName: typeof request.displayName === 'string' ? request.displayName : undefined,
+      }).catch((error) => console.warn('[join_request_approve] notify requester failed', error));
+
+      return res.json({
+        ok: true,
+        membership: {
+          id: membershipId,
+          tenantId: tenantAccess.tenantId,
+          userId: targetUserId,
+          email: normalizedEmail,
+          role: desiredRole,
+          status: 'active',
+          updatedAt: nowIso,
+        },
+      });
+    } catch (error) {
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.error('[join_request_approve] failed', error);
+      return res.status(500).json({ error: 'join_request_approve_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/join-requests/:requestId/reject', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    const requestId = typeof req.params?.requestId === 'string' ? req.params.requestId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    if (!requestId) {
+      return res.status(400).json({ error: 'request_required' });
+    }
+
+    const parsed = joinRequestRejectionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const requestRef = db.collection('tenantJoinRequests').doc(requestId);
+      const requestSnap = await requestRef.get();
+      if (!requestSnap.exists) {
+        return res.status(404).json({ error: 'request_not_found' });
+      }
+      const request = requestSnap.data() || {};
+      if (request.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+      if (request.status && request.status !== 'pending') {
+        return res.status(409).json({ error: 'request_already_reviewed' });
+      }
+      const requesterEmail = typeof request.email === 'string' ? request.email.trim().toLowerCase() : '';
+      if (!requesterEmail) {
+        return res.status(400).json({ error: 'requester_email_unavailable' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const actorId = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const reviewerName = parsed.data.reviewerName || parsed.data.metadata?.actorName;
+
+      await requestRef.update({
+        status: 'rejected',
+        reviewedAt: nowIso,
+        reviewedBy: actorId,
+      });
+
+      const targetUserId = typeof request.userId === 'string' ? request.userId : null;
+      if (targetUserId) {
+        const membershipId = membershipDocId(tenantAccess.tenantId, targetUserId);
+        const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+        const membershipSnap = await membershipRef.get();
+        if (membershipSnap.exists) {
+          const membership = membershipSnap.data() || {};
+          if (membership.status === 'pending_request') {
+            const statusEvent: Record<string, any> = stripUndefinedDeep({
+              status: 'rejected',
+              at: nowIso,
+              actorId,
+              actorEmail: actorEmail || undefined,
+              reason: parsed.data.reason ?? 'join_request_rejected',
+            });
+            if (reviewerName) {
+              statusEvent.actorName = reviewerName;
+            }
+            if (parsed.data.metadata?.initiatedFrom) {
+              statusEvent.initiatedFrom = parsed.data.metadata.initiatedFrom;
+            }
+            await membershipRef.update({
+              status: 'rejected',
+              updatedAt: nowIso,
+              statusHistory: admin.firestore.FieldValue.arrayUnion(statusEvent),
+            });
+          }
+        }
+      }
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: 'join_request_reviewed',
+          targetId: requestId,
+          targetType: 'joinRequest',
+          metadata: { outcome: 'rejected' },
+          createdAt: nowIso,
+        })
+      );
+
+      void sendTenantJoinRequestOutcomeNotificationImpl({
+        tenantId: tenantAccess.tenantId,
+        tenantName: typeof request.tenantName === 'string' ? request.tenantName : undefined,
+        requestId,
+        outcome: 'rejected',
+        reviewerName,
+        requesterEmail,
+        requesterName: typeof request.displayName === 'string' ? request.displayName : undefined,
+      }).catch((error) => console.warn('[join_request_reject] notify requester failed', error));
+
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[join_request_reject] failed', error);
+      return res.status(500).json({ error: 'join_request_reject_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/memberships/:userId/role', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const targetUserId = typeof req.params?.userId === 'string' ? req.params.userId.trim() : '';
+    if (!targetUserId) {
+      return res.status(400).json({ error: 'user_required' });
+    }
+
+    const parsed = membershipRoleUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const desiredRole = parsed.data.role;
+    const actorRole = tenantAccess.role;
+    const actorIsOwner = actorRole === 'owner' || req.authContext?.tokenType === 'master';
+    if (desiredRole === 'owner' && !actorIsOwner) {
+      return res.status(403).json({ error: 'owner_role_required' });
+    }
+
+    const membershipId = membershipDocId(tenantAccess.tenantId, targetUserId);
+    const actorMembershipId = tenantAccess.membershipId;
+    if (typeof actorMembershipId === 'string' && actorMembershipId === membershipId) {
+      return res.status(403).json({ error: 'self_role_change_forbidden' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+      const membershipSnap = await membershipRef.get();
+      if (!membershipSnap.exists) {
+        return res.status(404).json({ error: 'membership_not_found' });
+      }
+
+      const membership = membershipSnap.data() || {};
+      const previousRoleResult = tenantMembershipRoleSchema.safeParse(
+        typeof membership.role === 'string' ? membership.role : 'member'
+      );
+      const previousRole = previousRoleResult.success ? previousRoleResult.data : 'member';
+      if (previousRole === 'owner' && !actorIsOwner) {
+        return res.status(403).json({ error: 'owner_role_required' });
+      }
+      if (previousRole === desiredRole) {
+        return res.json({
+          ok: true,
+          changed: false,
+          membership: {
+            id: membershipId,
+            tenantId: tenantAccess.tenantId,
+            userId: targetUserId,
+            role: previousRole,
+            status: membership.status,
+          },
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      await membershipRef.update({ role: desiredRole, updatedAt: nowIso });
+
+      const actorId = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const metadata = parsed.data.metadata || {};
+      const auditMetadata: Record<string, unknown> = {
+        previousRole,
+        newRole: desiredRole,
+        previousStatus: membership.status,
+        actorRole,
+      };
+      if (metadata.reason) {
+        auditMetadata.reason = metadata.reason;
+      }
+      if (metadata.initiatedFrom) {
+        auditMetadata.initiatedFrom = metadata.initiatedFrom;
+      }
+      if (metadata.actorName) {
+        auditMetadata.actorName = metadata.actorName;
+      }
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: 'membership_role_changed',
+          targetId: membershipId,
+          targetType: 'membership',
+          metadata: auditMetadata,
+          createdAt: nowIso,
+        })
+      );
+
+      const notificationMetadata: Record<string, any> = {
+        displayName: typeof membership.displayName === 'string' ? membership.displayName : undefined,
+        reason: metadata.reason ?? 'manual_role_update',
+        initiatedFrom: metadata.initiatedFrom ?? 'system',
+        actorName: metadata.actorName,
+      };
+
+      void sendTeamMembershipChangeNotificationImpl({
+        tenantId: tenantAccess.tenantId,
+        tenantName: typeof membership.tenantName === 'string' ? membership.tenantName : undefined,
+        action: 'role_changed',
+        targetEmail: membership.email,
+        targetRole: desiredRole,
+        previousRole,
+        metadata: notificationMetadata,
+      }).catch((error) => console.warn('[tenant_membership_role] notify failed', error));
+
+      return res.json({
+        ok: true,
+        changed: true,
+        membership: {
+          id: membershipId,
+          tenantId: tenantAccess.tenantId,
+          userId: targetUserId,
+          role: desiredRole,
+          status: membership.status,
+          updatedAt: nowIso,
+        },
+      });
+    } catch (error) {
+      console.error('[tenant_membership_role] update failed', error);
+      return res.status(500).json({ error: 'role_update_failed' });
+    }
+  });
+
+  app.post('/tenants/:tenantId/memberships/:userId/status', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const targetUserId = typeof req.params?.userId === 'string' ? req.params.userId.trim() : '';
+    if (!targetUserId) {
+      return res.status(400).json({ error: 'user_required' });
+    }
+
+    const parsed = membershipStatusUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const desiredStatus = parsed.data.status;
+    const actorRole = tenantAccess.role;
+    const actorIsOwner = actorRole === 'owner' || req.authContext?.tokenType === 'master';
+    const membershipId = membershipDocId(tenantAccess.tenantId, targetUserId);
+    const actorMembershipId = tenantAccess.membershipId;
+    const isSelfTarget = typeof actorMembershipId === 'string' && actorMembershipId === membershipId;
+    const isRemovalStatus = desiredStatus === 'revoked' || desiredStatus === 'rejected';
+    if (isSelfTarget && isRemovalStatus) {
+      return res.status(403).json({ error: 'self_removal_forbidden' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+      const membershipSnap = await membershipRef.get();
+      if (!membershipSnap.exists) {
+        return res.status(404).json({ error: 'membership_not_found' });
+      }
+
+      const membership = membershipSnap.data() || {};
+      const previousStatus = typeof membership.status === 'string' ? membership.status : 'unknown';
+      const targetRoleResult = tenantMembershipRoleSchema.safeParse(
+        typeof membership.role === 'string' ? membership.role : 'member'
+      );
+      const targetRole = targetRoleResult.success ? targetRoleResult.data : 'member';
+      if (targetRole === 'owner' && !actorIsOwner && desiredStatus !== 'active') {
+        return res.status(403).json({ error: 'owner_role_required' });
+      }
+      if (previousStatus === desiredStatus) {
+        return res.json({
+          ok: true,
+          changed: false,
+          membership: {
+            id: membershipId,
+            tenantId: tenantAccess.tenantId,
+            userId: targetUserId,
+            role: targetRole,
+            status: previousStatus,
+          },
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const actorId = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const metadata = parsed.data.metadata || {};
+      const statusEvent: Record<string, any> = stripUndefinedDeep({
+        status: desiredStatus,
+        at: nowIso,
+        actorId,
+        actorEmail: actorEmail || undefined,
+        reason: metadata.reason ?? 'membership_status_updated',
+      });
+      if (metadata.actorName) {
+        statusEvent.actorName = metadata.actorName;
+      }
+      await membershipRef.update({
+        status: desiredStatus,
+        updatedAt: nowIso,
+        statusHistory: admin.firestore.FieldValue.arrayUnion(statusEvent),
+      });
+
+      const auditMetadata: Record<string, unknown> = {
+        previousStatus,
+        newStatus: desiredStatus,
+        previousRole: targetRole,
+        actorRole,
+      };
+      if (metadata.reason) {
+        auditMetadata.reason = metadata.reason;
+      }
+      if (metadata.initiatedFrom) {
+        auditMetadata.initiatedFrom = metadata.initiatedFrom;
+      }
+      if (metadata.actorName) {
+        auditMetadata.actorName = metadata.actorName;
+      }
+
+      const auditAction = desiredStatus === 'revoked' || desiredStatus === 'rejected'
+        ? 'membership_revoked'
+        : 'membership_status_changed';
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId,
+          actorEmail: actorEmail || undefined,
+          action: auditAction,
+          targetId: membershipId,
+          targetType: 'membership',
+          metadata: auditMetadata,
+          createdAt: nowIso,
+        })
+      );
+
+      if (desiredStatus === 'revoked' || desiredStatus === 'rejected') {
+        const notificationMetadata: Record<string, any> = {
+          displayName: typeof membership.displayName === 'string' ? membership.displayName : undefined,
+          reason: metadata.reason ?? 'membership_revoked',
+          initiatedFrom: metadata.initiatedFrom ?? 'system',
+          actorName: metadata.actorName,
+        };
+        void sendTeamMembershipChangeNotificationImpl({
+          tenantId: tenantAccess.tenantId,
+          tenantName: typeof membership.tenantName === 'string' ? membership.tenantName : undefined,
+          action: 'removed',
+          targetEmail: membership.email,
+          targetRole,
+          metadata: notificationMetadata,
+        }).catch((error) => console.warn('[tenant_membership_status] notify failed', error));
+      }
+
+      return res.json({
+        ok: true,
+        changed: true,
+        membership: {
+          id: membershipId,
+          tenantId: tenantAccess.tenantId,
+          userId: targetUserId,
+          role: targetRole,
+          status: desiredStatus,
+          updatedAt: nowIso,
+        },
+      });
+    } catch (error) {
+      console.error('[tenant_membership_status] update failed', error);
+      return res.status(500).json({ error: 'status_update_failed' });
+    }
+  });
+
+  app.post('/chat/messages', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatMessagePayloadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const senderEmail = await resolveAuthenticatedEmail(authContext);
+
+    if (!senderEmail) {
+      return res.status(400).json({ error: 'sender_email_unavailable' });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const tenantId = tenantAccess.tenantId;
+
+    const normalizedRecipient = normalizeEmail(parsed.data.recipientId);
+    if (!normalizedRecipient) {
+      return res.status(400).json({ error: 'invalid_recipient' });
+    }
+
+    const recipientIsMember = await isTenantEmailActiveMemberImpl(tenantId, normalizedRecipient);
+    if (!recipientIsMember) {
+      return res.status(403).json({ error: 'recipient_not_in_tenant' });
+    }
+
+    if (authContext.tokenType !== 'master') {
+      const rateResult = await checkChatRateLimitImpl(senderEmail);
+      if (!rateResult.allowed) {
+        const now = Date.now();
+        const blockedUntil = rateResult.blockedUntil ?? null;
+        const retryAfterMs = blockedUntil && blockedUntil > now ? blockedUntil - now : 0;
+        if (retryAfterMs > 0) {
+          res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+        }
+        return res.status(429).json({
+          error: 'rate_limited',
+          retryAfterMs,
+          blockedUntil,
+        });
+      }
+    }
+
+    try {
+      const payload = parsed.data;
+      const message = await sendChatMessageImpl({
+        senderEmail,
+        recipientEmail: normalizedRecipient,
+        tenantId,
+        text: payload.text,
+        isSpecial: payload.isSpecial,
+        fileUrl: payload.fileUrl,
+        fileName: payload.fileName,
+        fileType: payload.fileType,
+        fileSize: payload.fileSize,
+        thumbnailUrl: payload.thumbnailUrl,
+        attachments: payload.attachments,
+        sticker: payload.sticker,
+        gif: payload.gif,
+        delivered: payload.delivered,
+        read: payload.read,
+      });
+
+      return res.json({ ok: true, message });
+    } catch (error) {
+      console.error('[chat_messages] send failed', error);
+      return res.status(500).json({ error: 'send_failed' });
+    }
+  });
+
+  app.post('/notifications/team-membership', requireStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = teamMembershipEventSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const normalizedTenantId = parsed.data.tenantId.trim();
+    if (tenantAccess.tenantId !== normalizedTenantId && authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    try {
+      const result = await sendTeamMembershipChangeNotificationImpl({
+        ...parsed.data,
+        tenantId: normalizedTenantId,
+        actorEmail,
+      });
+      return res.json(result);
+    } catch (error) {
+      console.error('[team-membership] notification dispatch failed', error);
+      return res.status(500).json({ error: 'dispatch_failed' });
+    }
+  });
+
+  app.post('/notifications/tenant-join-request', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantJoinRequestNotifySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const requestRecord = await loadTenantJoinRequestImpl(parsed.data.requestId);
+      if (!requestRecord) {
+        return res.status(404).json({ error: 'request_not_found' });
+      }
+
+      const expectedTenantId = parsed.data.tenantId.trim();
+      if (!expectedTenantId) {
+        return res.status(400).json({ error: 'tenant_required' });
+      }
+
+      if (requestRecord.tenantId !== expectedTenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const isRequester = requestRecord.userId === authContext.uid;
+      if (!isRequester && authContext.tokenType !== 'master') {
+        try {
+          await requireTenantMembershipAccessImpl(authContext, requestRecord.tenantId, { minRole: 'admin' });
+        } catch (error) {
+          if (respondTenantAccessError(res, error)) {
+            return;
+          }
+          console.error('[tenant-join-request] tenant access check failed', error);
+          return res.status(500).json({ error: 'tenant_check_failed' });
+        }
+      }
+
+      const requesterEmail =
+        typeof requestRecord.email === 'string' && requestRecord.email
+          ? requestRecord.email
+          : await resolveAuthenticatedEmail(authContext);
+      if (!requesterEmail) {
+        return res.status(400).json({ error: 'requester_email_unavailable' });
+      }
+
+      const result = await sendTenantJoinRequestNotificationImpl({
+        tenantId: requestRecord.tenantId,
+        tenantName: requestRecord.tenantName,
+        requestId: requestRecord.id,
+        requesterEmail,
+        requesterName: requestRecord.displayName,
+        message: requestRecord.message,
+      });
+      return res.json(result);
+    } catch (error) {
+      console.error('[tenant-join-request] notification dispatch failed', error);
+      return res.status(500).json({ error: 'dispatch_failed' });
+    }
+  });
+
+  app.post('/notifications/tenant-join-request/outcome', requireStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantJoinRequestOutcomeSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const tenantAccess = req.tenantAccess;
+      if (!tenantAccess) {
+        return res.status(500).json({ error: 'tenant_guard_missing' });
+      }
+      const normalizedTenantId = parsed.data.tenantId.trim();
+      if (tenantAccess.tenantId !== normalizedTenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const requestRecord = await loadTenantJoinRequestImpl(parsed.data.requestId);
+      if (!requestRecord) {
+        return res.status(404).json({ error: 'request_not_found' });
+      }
+      if (requestRecord.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const requesterEmail = typeof requestRecord.email === 'string' ? requestRecord.email.trim() : '';
+      if (!requesterEmail) {
+        return res.status(400).json({ error: 'requester_email_unavailable' });
+      }
+
+      const reviewerEmail = await resolveAuthenticatedEmail(authContext);
+      const result = await sendTenantJoinRequestOutcomeNotificationImpl({
+        tenantId: requestRecord.tenantId,
+        tenantName: requestRecord.tenantName,
+        requestId: requestRecord.id,
+        requesterEmail,
+        requesterName: requestRecord.displayName,
+        reviewerEmail: reviewerEmail ?? undefined,
+        reviewerName: parsed.data.reviewerName,
+        outcome: parsed.data.outcome,
+        assignedRole: parsed.data.assignedRole,
+      });
+      return res.json(result);
+    } catch (error) {
+      console.error('[tenant-join-request-outcome] notification dispatch failed', error);
+      return res.status(500).json({ error: 'dispatch_failed' });
+    }
+  });
+
+  app.post('/notifications/tenant-invite', requireStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantInviteNotifySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const tenantAccess = req.tenantAccess;
+      if (!tenantAccess) {
+        return res.status(500).json({ error: 'tenant_guard_missing' });
+      }
+
+      const normalizedTenantId = parsed.data.tenantId.trim();
+      if (tenantAccess.tenantId !== normalizedTenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const inviteRecord = await loadTenantInviteImpl(parsed.data.inviteId);
+      if (!inviteRecord) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+      if (inviteRecord.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+      if (!inviteRecord.token) {
+        return res.status(400).json({ error: 'invite_token_missing' });
+      }
+
+      const result = await sendTenantInviteEmailImpl({
+        tenantId: inviteRecord.tenantId,
+        tenantName: inviteRecord.tenantName,
+        inviteId: inviteRecord.id,
+        inviteToken: inviteRecord.token,
+        inviteeEmail: inviteRecord.email,
+        role: inviteRecord.role ?? 'member',
+        expiresAt: inviteRecord.expiresAt,
+        message: inviteRecord.invitationMessage,
+      });
+
+      await recordTenantInviteSendImpl(inviteRecord.id, authContext.uid);
+      return res.json(result);
+    } catch (error) {
+      console.error('[tenant-invite] notification dispatch failed', error);
+      return res.status(500).json({ error: 'dispatch_failed' });
+    }
+  });
+
+  app.post('/tenants/join-code/resolve', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantJoinCodeLookupSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedCode = normalizeTenantCode(parsed.data.code);
+    if (!normalizedCode) {
+      return res.status(400).json({ error: 'invalid_code' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const validation = await validateJoinCode(db, normalizedCode);
+      if (!validation.ok) {
+        const { status, body } = mapJoinCodeError(validation);
+        return res.status(status).json(body);
+      }
+
+      const { codeDoc, codeData, tenantSnap, tenantData } = validation;
+      const membershipId = membershipDocId(tenantSnap.id, authContext.uid);
+      const membershipSnap = await db.collection('tenantMemberships').doc(membershipId).get();
+      let membership: Record<string, any> | null = null;
+      if (membershipSnap.exists) {
+        const membershipData = membershipSnap.data() || {};
+        membership = {
+          id: membershipSnap.id,
+          email: membershipData.email,
+          role: membershipData.role,
+          status: membershipData.status,
+          createdAt: toIsoTimestamp(membershipData.createdAt) ?? null,
+          updatedAt: toIsoTimestamp(membershipData.updatedAt) ?? null,
+        };
+      }
+
+      return res.json({
+        tenant: {
+          id: tenantSnap.id,
+          name: tenantData.name,
+          slug: tenantData.slug,
+          status: tenantData.status,
+          logoUrl: tenantData.logoUrl || tenantData.branding?.logoUrl || null,
+          heroImageUrl: tenantData.heroImageUrl || tenantData.branding?.heroImageUrl || null,
+          theme: tenantData.theme || null,
+          branding: tenantData.branding || undefined,
+          settings: tenantData.settings || undefined,
+          defaultCurrency: tenantData.defaultCurrency,
+          timezone: tenantData.timezone,
+        },
+        code: {
+          id: codeDoc.id,
+          status: codeData.status || 'active',
+          createdAt: toIsoTimestamp(codeData.createdAt) ?? null,
+          expiresAt: toIsoTimestamp(codeData.expiresAt) ?? null,
+          lastUsedAt: toIsoTimestamp(codeData.lastUsedAt) ?? null,
+          usageCount: typeof codeData.usageCount === 'number' ? codeData.usageCount : 0,
+          usageCap: typeof codeData.usageCap === 'number' ? codeData.usageCap : null,
+        },
+        membership,
+      });
+    } catch (error) {
+      console.error('[tenant-join-code] lookup failed', error);
+      return res.status(500).json({ error: 'lookup_failed' });
+    }
+  });
+
+  app.post('/tenants/join-code/claim', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantJoinCodeClaimSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedCode = normalizeTenantCode(parsed.data.code);
+    if (!normalizedCode) {
+      return res.status(400).json({ error: 'invalid_code' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const userEmail = await resolveAuthenticatedEmail(authContext);
+      if (!userEmail) {
+        return res.status(400).json({ error: 'email_required' });
+      }
+
+      const validation = await validateJoinCode(db, normalizedCode);
+      if (!validation.ok) {
+        const { status, body } = mapJoinCodeError(validation);
+        return res.status(status).json(body);
+      }
+
+      const { codeDoc, codeData, tenantSnap, tenantData } = validation;
+      const membershipId = membershipDocId(tenantSnap.id, authContext.uid);
+      const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+      const membershipSnap = await membershipRef.get();
+      const existingMembership = membershipSnap.exists ? membershipSnap.data() || {} : null;
+
+      if (existingMembership && existingMembership.status === 'active') {
+        return res.status(409).json({
+          error: 'already_member',
+          message: 'You are already a member of this coaching center.',
+        });
+      }
+      if (existingMembership && existingMembership.status === 'pending_request') {
+        return res.status(409).json({
+          error: 'join_request_pending',
+          message: 'Your request to join this coaching center is still pending review.',
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const existingCreatedAt = existingMembership
+        ? toIsoTimestamp(existingMembership.createdAt) ?? nowIso
+        : nowIso;
+      const preferredDisplayName = (parsed.data.displayName?.trim() || existingMembership?.displayName || '').trim();
+      const fallbackName = userEmail.split('@')[0] || userEmail;
+      const displayName = (preferredDisplayName || fallbackName).slice(0, 120);
+      const role = existingMembership?.role || 'member';
+      const message = parsed.data.message?.trim();
+      const requestExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      const joinRequestsRef = db.collection('tenantJoinRequests');
+      const existingRequestSnap = await joinRequestsRef
+        .where('tenantId', '==', tenantSnap.id)
+        .where('userId', '==', authContext.uid)
+        .where('status', '==', 'pending')
+        .limit(1)
+        .get();
+
+      let joinRequestDocRef: admin.firestore.DocumentReference<admin.firestore.DocumentData>;
+      let joinRequestData: Record<string, any>;
+      let createdNewJoinRequest = false;
+
+      if (!existingRequestSnap.empty) {
+        return res.status(409).json({
+          error: 'join_request_pending',
+          message: 'You already have a pending request for this coaching center.',
+        });
+      } else {
+        createdNewJoinRequest = true;
+        const joinRequestPayload = {
+          tenantId: tenantSnap.id,
+          tenantName: tenantData.name,
+          userId: authContext.uid,
+          email: userEmail.toLowerCase(),
+          displayName,
+          message: message || null,
+          status: 'pending',
+          requestedAt: nowIso,
+          expiresAt: requestExpiresAt,
+          joinCodeId: codeDoc.id,
+          joinCodeValue: normalizedCode,
+          joinCodeStatusSnapshot: codeData.status || 'active',
+          joinCodeUsageCap: typeof codeData.usageCap === 'number' ? codeData.usageCap : null,
+          joinCodeUsageCount: typeof codeData.usageCount === 'number' ? codeData.usageCount : 0,
+        };
+        joinRequestDocRef = await joinRequestsRef.add(joinRequestPayload);
+        joinRequestData = { id: joinRequestDocRef.id, ...joinRequestPayload };
+      }
+
+      const membershipPayload: Record<string, any> = {
+        tenantId: tenantSnap.id,
+        userId: authContext.uid,
+        email: userEmail.toLowerCase(),
+        displayName,
+        role,
+        status: 'pending_request',
+        joinedVia: 'join_code',
+        joinCodeId: codeDoc.id,
+        requestedAt: joinRequestData.requestedAt || nowIso,
+        createdAt: existingCreatedAt,
+        updatedAt: nowIso,
+      };
+
+      const pendingStatusEvent: Record<string, any> = {
+        status: 'pending_request',
+        at: nowIso,
+        actorId: authContext.uid,
+        actorEmail: userEmail.toLowerCase(),
+        reason: 'join_code_claim',
+      };
+      if (displayName) {
+        pendingStatusEvent.actorName = displayName;
+      }
+
+      if (!existingMembership) {
+        membershipPayload.statusHistory = [pendingStatusEvent];
+      } else if (existingMembership.status !== 'pending_request') {
+        membershipPayload.statusHistory = admin.firestore.FieldValue.arrayUnion(pendingStatusEvent);
+      }
+
+      await membershipRef.set(membershipPayload, { merge: true });
+
+      if (createdNewJoinRequest) {
+        void sendTenantJoinRequestNotificationImpl({
+          tenantId: tenantSnap.id,
+          tenantName: tenantData.name,
+          requestId: joinRequestData.id,
+          requesterEmail: userEmail.toLowerCase(),
+          requesterName: displayName,
+          message: message || undefined,
+        }).catch((error) => console.warn('[tenant-join-code] join request notify failed', error));
+      }
+
+      const usageCap = typeof codeData.usageCap === 'number' ? codeData.usageCap : null;
+      const updatedUsageCount = typeof codeData.usageCount === 'number' ? codeData.usageCount + 1 : 1;
+      const codeUpdate: Record<string, any> = {
+        usageCount: updatedUsageCount,
+        lastUsedAt: nowIso,
+      };
+      if (usageCap != null && updatedUsageCount >= usageCap) {
+        codeUpdate.status = 'revoked';
+        codeUpdate.updatedAt = nowIso;
+      }
+      await codeDoc.ref.update(codeUpdate);
+
+      const auditMetadata: Record<string, unknown> = {
+        via: 'join_code',
+        codeId: codeDoc.id,
+      };
+      if (message) {
+        auditMetadata.message = message;
+      }
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantSnap.id,
+          actorId: authContext.uid,
+          actorEmail: userEmail,
+          action: 'join_request_submitted',
+          targetId: joinRequestData.id,
+          targetType: 'joinRequest',
+          metadata: auditMetadata,
+          createdAt: nowIso,
+        })
+      );
+
+      const membershipResponse = {
+        id: membershipId,
+        tenantId: tenantSnap.id,
+        userId: authContext.uid,
+        email: membershipPayload.email,
+        displayName,
+        role,
+        status: 'pending_request',
+        createdAt: existingCreatedAt,
+        updatedAt: nowIso,
+      };
+
+      const joinRequestResponse = {
+        id: joinRequestData.id,
+        status: joinRequestData.status,
+        requestedAt: toIsoTimestamp(joinRequestData.requestedAt) ?? nowIso,
+        reviewedAt: toIsoTimestamp(joinRequestData.reviewedAt) ?? null,
+        message: typeof joinRequestData.message === 'string' ? joinRequestData.message : null,
+        expiresAt: toIsoTimestamp(joinRequestData.expiresAt) ?? null,
+      };
+
+      return res.json({
+        ok: true,
+        pendingRequest: true,
+        tenant: {
+          id: tenantSnap.id,
+          name: tenantData.name,
+          slug: tenantData.slug,
+          status: tenantData.status,
+          logoUrl: tenantData.logoUrl || tenantData.branding?.logoUrl || null,
+          heroImageUrl: tenantData.heroImageUrl || tenantData.branding?.heroImageUrl || null,
+          theme: tenantData.theme || null,
+          branding: tenantData.branding || undefined,
+          settings: tenantData.settings || undefined,
+          defaultCurrency: tenantData.defaultCurrency,
+          timezone: tenantData.timezone,
+        },
+        membership: membershipResponse,
+        joinRequest: joinRequestResponse,
+        code: {
+          id: codeDoc.id,
+          status:
+            usageCap != null && updatedUsageCount >= usageCap ? 'revoked' : codeData.status || 'active',
+          createdAt: toIsoTimestamp(codeData.createdAt) ?? null,
+          expiresAt: toIsoTimestamp(codeData.expiresAt) ?? null,
+          usageCount: updatedUsageCount,
+          usageCap,
+        },
+      });
+    } catch (error) {
+      console.error('[tenant-join-code] claim failed', error);
+      return res.status(500).json({ error: 'claim_failed' });
+    }
+  });
+
+  app.post('/tenants/join-code/resolve', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantJoinCodeLookupSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedCode = normalizeTenantCode(parsed.data.code);
+    if (!normalizedCode) {
+      return res.status(400).json({ error: 'invalid_code' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const codeQuery = await db.collection('tenantCodes').where('code', '==', normalizedCode).limit(1).get();
+      if (codeQuery.empty) {
+        return res.status(404).json({ error: 'code_not_found' });
+      }
+
+      const codeDoc = codeQuery.docs[0];
+      const codeData = codeDoc.data() as Record<string, any>;
+      const tenantId = typeof codeData.tenantId === 'string' ? codeData.tenantId : '';
+      if (!tenantId) {
+        console.warn('[tenant-join-code] code missing tenantId', codeDoc.id);
+        return res.status(404).json({ error: 'code_not_found' });
+      }
+
+      const nowMs = Date.now();
+      const expiresMs = timestampToMillis(codeData.expiresAt);
+      const isRevoked = (codeData.status || '').toLowerCase() === 'revoked';
+      if (isRevoked) {
+        return res.status(410).json({ error: 'code_revoked' });
+      }
+      if (typeof expiresMs === 'number' && expiresMs <= nowMs) {
+        const patch = { status: 'expired', updatedAt: new Date().toISOString() };
+        codeDoc.ref.update(stripUndefinedDeep(patch)).catch(() => undefined);
+        return res.status(410).json({ error: 'code_expired' });
+      }
+
+      const tenantSnap = await db.collection('tenants').doc(tenantId).get();
+      if (!tenantSnap.exists) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      const tenantData = tenantSnap.data() as Record<string, any>;
+      const tenantStatus = (tenantData.status || 'active').toLowerCase();
+      if (tenantStatus !== 'active') {
+        return res.status(403).json({ error: 'tenant_unavailable', status: tenantStatus });
+      }
+
+      let membership: Record<string, any> | null = null;
+      const membershipId = membershipDocId(tenantId, authContext.uid);
+      const membershipSnap = await db.collection('tenantMemberships').doc(membershipId).get();
+      if (membershipSnap.exists) {
+        const membershipData = membershipSnap.data() as Record<string, any>;
+        membership = {
+          id: membershipSnap.id,
+          role: membershipData.role,
+          status: membershipData.status,
+          createdAt: toIsoTimestamp(membershipData.createdAt) ?? null,
+          updatedAt: toIsoTimestamp(membershipData.updatedAt) ?? null,
+        };
+      }
+
+      const responseBody = {
+        tenant: {
+          id: tenantSnap.id,
+          name: tenantData.name,
+          slug: tenantData.slug,
+          status: tenantData.status,
+          logoUrl: tenantData.logoUrl || tenantData.branding?.logoUrl || null,
+          heroImageUrl: tenantData.heroImageUrl || tenantData.branding?.heroImageUrl || null,
+          theme: tenantData.theme || null,
+          branding: tenantData.branding || undefined,
+          settings: tenantData.settings || undefined,
+          defaultCurrency: tenantData.defaultCurrency,
+          timezone: tenantData.timezone,
+        },
+        code: {
+          id: codeDoc.id,
+          status: codeData.status || 'active',
+          createdAt: toIsoTimestamp(codeData.createdAt) ?? null,
+          expiresAt: toIsoTimestamp(codeData.expiresAt) ?? null,
+          lastUsedAt: toIsoTimestamp(codeData.lastUsedAt) ?? null,
+          usageCount: typeof codeData.usageCount === 'number' ? codeData.usageCount : 0,
+          usageCap: typeof codeData.usageCap === 'number' ? codeData.usageCap : null,
+        },
+        membership,
+      };
+
+      return res.json(responseBody);
+    } catch (error) {
+      console.error('[tenant-join-code] lookup failed', error);
+      return res.status(500).json({ error: 'lookup_failed' });
+    }
+  });
+
+  app.patch('/chat/messages/:id', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const messageId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    if (!messageId) {
+      return res.status(400).json({ error: 'missing_message_id' });
+    }
+
+    const parsed = chatMessageEditSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const editorEmail = await resolveAuthenticatedEmail(authContext);
+    const force = authContext.tokenType === 'master';
+
+    try {
+      const message = await editChatMessage({
+        messageId,
+        editorEmail: editorEmail || undefined,
+        text: parsed.data.text,
+        tenantId: tenantAccess.tenantId,
+        force,
+      });
+      return res.json({ ok: true, message });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_messages_edit] failed', error);
+      return res.status(500).json({ error: 'edit_failed' });
+    }
+  });
+
+  app.post('/chat/messages/:id/reactions', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const messageId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    if (!messageId) {
+      return res.status(400).json({ error: 'missing_message_id' });
+    }
+
+    const parsed = chatMessageReactionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    try {
+      const result = await toggleChatMessageReaction({
+        messageId,
+        tenantId: tenantAccess.tenantId,
+        actorEmail,
+        reactionType: parsed.data.reactionType,
+      });
+
+      return res.json({ ok: true, updatedUsers: result.updatedUsers, reactions: result.reactions });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_messages_reactions] failed', error);
+      return res.status(500).json({ error: 'reaction_failed' });
+    }
+  });
+
+  app.delete('/chat/messages/:id', requireMemberTenantAccessFromQuery, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const messageId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    if (!messageId) {
+      return res.status(400).json({ error: 'missing_message_id' });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const requesterEmail = await resolveAuthenticatedEmail(authContext);
+    const force = authContext.tokenType === 'master';
+
+    try {
+      const message = await deleteChatMessage({
+        messageId,
+        requesterEmail: requesterEmail || undefined,
+        tenantId: tenantAccess.tenantId,
+        force,
+      });
+      return res.json({ ok: true, message });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_messages_delete] failed', error);
+      return res.status(500).json({ error: 'delete_failed' });
+    }
+  });
+
+  // ----- Webhooks (unchanged logic) -----
+  app.get('/webhooks/whatsapp', (req,res)=>{ const mode=req.query['hub.mode']; const token=req.query['hub.verify_token']; const challenge=req.query['hub.challenge']; if(mode==='subscribe' && token===process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN) return res.status(200).send(challenge); return res.sendStatus(403); });
+  app.post('/webhooks/whatsapp', express.raw({type:'application/json'}),(req,res)=>{ try { const raw=req.body instanceof Buffer? req.body.toString('utf8') : (req as any).rawBody||''; if(process.env.META_APP_SECRET){ const sig=req.headers['x-hub-signature-256'] as string|undefined; if(!verifySignature(raw,sig)) return res.sendStatus(401);} let body:any={}; try{ body=JSON.parse(raw);}catch{} const statuses=extractStatuses(body); statuses.forEach(s=>{ const jobId=findJobByMessageId(s.id); if(jobId){ inc(metricNames.messageStatus,{status:s.status}); }}); return res.sendStatus(200);} catch { return res.sendStatus(200);} });
+
+  /* c8 ignore start - webhook helper branches */
+  function verifySignature(raw:string,sig?:string){ if(!sig) return false; try { const h=crypto.createHmac('sha256', process.env.META_APP_SECRET!); h.update(raw); const expected='sha256='+h.digest('hex'); return timingSafeEq(expected,sig);} catch { return false; } }
+  function timingSafeEq(a:string,b:string){ const A=Buffer.from(a); const B=Buffer.from(b); if(A.length!==B.length) return false; return crypto.timingSafeEqual(A,B);}    
+  function extractStatuses(body:any){ const out:{id:string;status:string}[]=[]; const entries=body?.entry||[]; entries.forEach((e:any)=> e.changes?.forEach((c:any)=>{ c.value?.statuses?.forEach((st:any)=>{ if(st.id&&st.status) out.push({id:st.id,status:st.status}); }); })); return out; }
+  /* c8 ignore stop */
+
+  // ----- Reminder quota reservation (batch, all-or-nothing) -----
+  app.post('/reminders/quota/reserve-batch', requireStaffTenantAccess, async (req, res) => {
+    const parsed = reminderQuotaReserveSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      ensureFirebase();
+      const adminDb = admin.firestore();
+      const policy = await getEffectiveReminderChannelPolicy(adminDb, normalizedTenantId);
+      const disabled = computeDisabledReminderChannels(policy.enabled, parsed.data.counts as any);
+      if (disabled.length) {
+        return res.status(400).json({
+          error: 'reminder_channels_disabled',
+          disabled,
+          message: 'One or more reminder channels are disabled.',
+          channelMessages: policy.messages,
+        });
+      }
+    } catch (error) {
+      console.warn('[reminders_quota_reserve_batch] channel gate check failed', error);
+    }
+
+    try {
+      const result = await reserveTenantReminderQuotaForBatch(
+        getFirestoreImpl(),
+        normalizedTenantId,
+        parsed.data.batchId,
+        parsed.data.counts
+      );
+      return res.json({ ok: true, monthId: result.monthId, reserved: result.reserved, batchId: parsed.data.batchId });
+    } catch (error) {
+      if (error instanceof TenantReminderBatchLimitError) {
+        const remaining = Math.max(0, error.limit - error.used);
+        return res.status(409).json({
+          error: 'reminder_limit_reached',
+          channel: error.channel,
+          limit: error.limit,
+          used: error.used,
+          requested: error.requested,
+          remaining,
+        });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[reminders_quota_reserve_batch] failed', error);
+      return res.status(503).json({ error: 'reminder_quota_reserve_failed' });
+    }
+  });
+
+  function normalizeBaseUrl(raw?: string | null): string | null {
+    if (!raw) {
+      return null;
+    }
+    const trimmed = raw.trim().replace(/\/$/, '');
+    return trimmed.length ? trimmed : null;
+  }
+
+  async function getEmailBackendConfigForReminderSends(): Promise<{ url: string; headers: Record<string, string> } | null> {
+    if (isTestProcess) {
+      return null;
+    }
+
+    const remoteBase = await getEmailBackendBaseUrl();
+    const base =
+      normalizeBaseUrl(remoteBase) ||
+      normalizeBaseUrl(process.env.EMAIL_BACKEND_BASE_URL) ||
+      normalizeBaseUrl(process.env.EXPO_PUBLIC_EMAIL_API_BASE_URL);
+    if (!base) {
+      return null;
+    }
+
+    const internalKey = process.env.EMAIL_BACKEND_INTERNAL_KEY || process.env.INTERNAL_API_KEY;
+    const bearerToken = process.env.EMAIL_BACKEND_BEARER;
+    if (!internalKey && !bearerToken) {
+      return null;
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (internalKey) {
+      headers['x-internal-key'] = internalKey;
+    }
+    if (bearerToken) {
+      headers.Authorization = `Bearer ${bearerToken}`;
+    }
+
+    return {
+      url: `${base}/email/send-template`,
+      headers,
+    };
+  }
+
+  const coerceToAdminTimestamp = (raw: any): admin.firestore.Timestamp | null => {
+    if (!raw) return null;
+    if (raw instanceof admin.firestore.Timestamp) return raw;
+    if (typeof raw === 'string') {
+      const ms = Date.parse(raw);
+      if (Number.isFinite(ms)) return admin.firestore.Timestamp.fromMillis(ms);
+      return null;
+    }
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      const ms = raw > 1e12 ? raw : raw * 1000;
+      return admin.firestore.Timestamp.fromMillis(ms);
+    }
+    if (typeof raw === 'object') {
+      const seconds = (raw as any).seconds;
+      const nanoseconds = (raw as any).nanoseconds;
+      if (typeof seconds === 'number' && Number.isFinite(seconds)) {
+        const ns = typeof nanoseconds === 'number' && Number.isFinite(nanoseconds) ? nanoseconds : 0;
+        return new admin.firestore.Timestamp(seconds, ns);
+      }
+    }
+    return null;
+  };
+
+  async function upsertReminderHistoryWithDates(
+    db: admin.firestore.Firestore,
+    historyId: string,
+    data: Record<string, any>
+  ): Promise<void> {
+    const trimmed = (historyId || '').trim();
+    if (!trimmed) return;
+    const ref = db.collection('reminderHistory').doc(trimmed);
+
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const existing = snap.exists ? snap.data() || {} : null;
+      const existingCreatedAt = existing ? (existing as any).createdAt : null;
+
+      let createdAtWrite: any = undefined;
+      if (!snap.exists) {
+        createdAtWrite = admin.firestore.FieldValue.serverTimestamp();
+      } else if (!(existingCreatedAt instanceof admin.firestore.Timestamp)) {
+        createdAtWrite = coerceToAdminTimestamp(existingCreatedAt) || admin.firestore.FieldValue.serverTimestamp();
+      }
+
+      tx.set(
+        ref,
+        stripUndefinedDeep({
+          ...data,
+          ...(createdAtWrite ? { createdAt: createdAtWrite } : {}),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }),
+        { merge: true }
+      );
+    });
+  }
+
+  app.get('/reminders/history/status', requireStaffTenantAccessFromQuery, async (req, res) => {
+    const parsed = reminderHistoryStatusQuerySchema.safeParse({
+      tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : undefined,
+      historyIds: req.query.historyIds,
+    });
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const rawIds = parsed.data.historyIds;
+    const splitIds = (value: string) =>
+      value
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+    const historyIds = (Array.isArray(rawIds) ? rawIds.flatMap(splitIds) : splitIds(rawIds)).slice(0, 1000);
+    if (!historyIds.length) {
+      return res.status(400).json({ error: 'validation_failed', issues: [{ message: 'historyIds required' }] });
+    }
+
+    const db = getFirestoreImpl();
+    const refs = historyIds.map((id) => db.collection('reminderHistory').doc(id));
+
+    const deriveStatusFromHistory = (historyData: any): 'pending' | 'queued' | 'success' | 'failed' => {
+      const st = typeof historyData?.status === 'string' ? historyData.status : 'pending';
+      if (st === 'success') return 'success';
+      if (st === 'failed') return 'failed';
+      const delivery = historyData?.metadata?.deliveryStatus;
+      if (delivery === 'queued') return 'queued';
+      return 'pending';
+    };
+
+    try {
+      const snaps = await db.getAll(...refs);
+      const results = snaps.map((snap, idx) => {
+        const historyId = historyIds[idx];
+        if (!snap.exists) {
+          return {
+            historyId,
+            status: 'pending' as const,
+            message: 'Not found yet',
+          };
+        }
+        const data = snap.data() || {};
+        const status = deriveStatusFromHistory(data);
+        const message =
+          typeof (data as any)?.errorMessage === 'string'
+            ? (data as any).errorMessage
+            : status === 'success'
+              ? 'Sent successfully'
+              : status === 'queued'
+                ? 'Queued for send'
+                : status === 'failed'
+                  ? 'Failed to send'
+                  : 'Pending';
+        return {
+          historyId,
+          status,
+          message,
+        };
+      });
+
+      return res.json({ results });
+    } catch (error) {
+      console.warn('[reminders_history_status] failed', error);
+      return res.status(503).json({ error: 'status_lookup_failed' });
+    }
+  });
+
+  app.post('/reminders/batch/send', requireStaffTenantAccess, async (req, res) => {
+    const parsed = reminderBatchSendSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const batchId = parsed.data.batchId;
+    const items = parsed.data.items;
+    const actorUid = req.authContext?.uid;
+
+    const counts: Partial<Record<ReminderChannel, number>> = { email: 0, sms: 0, whatsapp: 0, voice: 0 };
+    for (const item of items) {
+      if (item.type === 'sms') counts.sms = (counts.sms || 0) + 1;
+      if (item.type === 'voice') counts.voice = (counts.voice || 0) + 1;
+      if (item.type === 'whatsapp') counts.whatsapp = (counts.whatsapp || 0) + 1;
+      if (item.type === 'email') counts.email = (counts.email || 0) + 1;
+    }
+
+    try {
+      const policy = await getEffectiveReminderChannelPolicy(getFirestoreImpl(), normalizedTenantId);
+      const disabled = computeDisabledReminderChannels(policy.enabled, counts as any);
+      if (disabled.length) {
+        return res.status(400).json({
+          error: 'reminder_channels_disabled',
+          disabled,
+          message: 'One or more reminder channels are disabled.',
+          channelMessages: policy.messages,
+        });
+      }
+    } catch (error) {
+      console.warn('[reminders_batch_send] channel gate check failed', error);
+    }
+
+    let monthId = normalizeMonthId(null);
+    try {
+      const result = await reserveTenantReminderQuotaForBatch(getFirestoreImpl(), normalizedTenantId, batchId, counts);
+      monthId = result.monthId;
+    } catch (error) {
+      if (error instanceof TenantReminderBatchLimitError) {
+        const remaining = Math.max(0, error.limit - error.used);
+        return res.status(409).json({
+          error: 'reminder_limit_reached',
+          channel: error.channel,
+          limit: error.limit,
+          used: error.used,
+          requested: error.requested,
+          remaining,
+        });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[reminders_batch_send] quota reserve failed', error);
+      return res.status(503).json({ error: 'reminder_quota_reserve_failed' });
+    }
+
+    const db = getFirestoreImpl();
+    const emailBackend = await getEmailBackendConfigForReminderSends();
+    const results: Array<{
+      studentId: string;
+      type: 'email' | 'sms' | 'whatsapp' | 'voice';
+      status: 'pending' | 'queued' | 'success' | 'failed' | 'skipped';
+      message?: string;
+      jobId?: string;
+    }> = [];
+
+    const deriveStatusFromHistory = (historyData: any): 'pending' | 'queued' | 'success' | 'failed' => {
+      const st = typeof historyData?.status === 'string' ? historyData.status : 'pending';
+      if (st === 'success') return 'success';
+      if (st === 'failed') return 'failed';
+      const delivery = historyData?.metadata?.deliveryStatus;
+      if (delivery === 'queued') return 'queued';
+      return 'pending';
+    };
+
+    for (const item of items) {
+      const studentId = item.studentId;
+      const historyId = typeof (item as any).historyId === 'string' ? String((item as any).historyId).trim() : '';
+      const rawHistory = (item as any).history;
+      const history = rawHistory && typeof rawHistory === 'object' ? (rawHistory as any) : undefined;
+      const historyWithActor = history
+        ? stripUndefinedDeep({ ...history, userId: (history as any)?.userId || actorUid })
+        : actorUid
+          ? ({ userId: actorUid } as any)
+          : undefined;
+
+      try {
+        if (historyId) {
+          const existing = await db.collection('reminderHistory').doc(historyId).get();
+          if (existing.exists) {
+            const st = deriveStatusFromHistory(existing.data() || {});
+            results.push({ studentId, type: item.type, status: st });
+            continue;
+          }
+        }
+
+        if (item.type === 'sms') {
+          await consumeTenantReminderReservationToken(db, normalizedTenantId, batchId, 'sms', {
+            historyId: historyId || undefined,
+            history: historyWithActor || undefined,
+          });
+
+          const sendResult = await sendSMSImpl({ to: item.to, message: item.message });
+          if (historyId) {
+            try {
+              await upsertReminderHistoryWithDates(db, historyId, {
+                ...(historyWithActor || {}),
+                tenantId: normalizedTenantId,
+                reminderType: 'sms',
+                status: sendResult.success ? 'success' : 'failed',
+                message: item.message,
+                metadata: {
+                  deliveryStatus: sendResult.success ? 'sent' : 'failed',
+                  twilioSid: sendResult.success ? sendResult.sid : undefined,
+                },
+                errorMessage: sendResult.success ? undefined : (sendResult as any)?.error || 'send_failed',
+              });
+            } catch (e) {
+              console.warn('[reminders_batch_send] sms reminderHistory update failed', e);
+            }
+
+            try {
+              await finalizeReminderQuotaFromHistory(db, {
+                historyId,
+                finalStatus: sendResult.success ? 'success' : 'failed',
+                fallbackTenantId: normalizedTenantId,
+                fallbackChannel: 'sms',
+                fallbackMonthId: monthId,
+              });
+            } catch (e) {
+              console.warn('[reminders_batch_send] sms quota finalize failed', e);
+            }
+          }
+
+          results.push({
+            studentId,
+            type: 'sms',
+            status: sendResult.success ? 'success' : 'failed',
+            message: sendResult.success ? 'Sent successfully' : (sendResult as any)?.error || 'send_failed',
+          });
+          continue;
+        }
+
+        if (item.type === 'voice') {
+          await consumeTenantReminderReservationToken(db, normalizedTenantId, batchId, 'voice', {
+            historyId: historyId || undefined,
+            history: historyWithActor || undefined,
+          });
+
+          const sendResult = await sendVoiceCallImpl({
+            to: item.to,
+            message: item.message,
+            language: item.language,
+            voice: item.voice,
+            hindiVoice: item.hindiVoice,
+            englishVoice: item.englishVoice,
+            pauseSeconds: item.pauseSeconds,
+          });
+
+          if (historyId) {
+            try {
+              await upsertReminderHistoryWithDates(db, historyId, {
+                ...(historyWithActor || {}),
+                tenantId: normalizedTenantId,
+                reminderType: 'voice',
+                status: sendResult.success ? 'success' : 'failed',
+                message: item.message,
+                metadata: {
+                  deliveryStatus: sendResult.success ? 'sent' : 'failed',
+                  twilioSid: sendResult.success ? sendResult.sid : undefined,
+                },
+                errorMessage: sendResult.success ? undefined : (sendResult as any)?.error || 'send_failed',
+              });
+            } catch (e) {
+              console.warn('[reminders_batch_send] voice reminderHistory update failed', e);
+            }
+
+            try {
+              await finalizeReminderQuotaFromHistory(db, {
+                historyId,
+                finalStatus: sendResult.success ? 'success' : 'failed',
+                fallbackTenantId: normalizedTenantId,
+                fallbackChannel: 'voice',
+                fallbackMonthId: monthId,
+              });
+            } catch (e) {
+              console.warn('[reminders_batch_send] voice quota finalize failed', e);
+            }
+          }
+
+          results.push({
+            studentId,
+            type: 'voice',
+            status: sendResult.success ? 'success' : 'failed',
+            message: sendResult.success ? 'Sent successfully' : (sendResult as any)?.error || 'send_failed',
+          });
+          continue;
+        }
+
+        if (item.type === 'whatsapp') {
+          await consumeTenantReminderReservationToken(db, normalizedTenantId, batchId, 'whatsapp', {
+            historyId: historyId || undefined,
+            history: historyWithActor || undefined,
+          });
+
+          let jobId = '';
+          if (item.kind === 'fee') {
+            if (!item.studentName || typeof item.amount !== 'number' || !item.dueDate) {
+              results.push({ studentId, type: 'whatsapp', status: 'failed', message: 'missing_fields' });
+              continue;
+            }
+            jobId = enqueueReminderImpl({
+              tenantId: normalizedTenantId,
+              to: item.to,
+              parentName: item.parentName,
+              studentName: item.studentName,
+              amount: item.amount,
+              dueDate: item.dueDate,
+              greeting: item.greeting,
+              customNotes: item.customNotes,
+              customNotesEnglish: item.customNotesEnglish,
+              customNotesHindi: item.customNotesHindi,
+              teacherName: item.teacherName,
+              coachingName: item.coachingName,
+              selectedLanguage: item.selectedLanguage,
+              languageOrder: item.languageOrder,
+              historyId: historyId || undefined,
+              history: historyWithActor || undefined,
+            } as any);
+          } else {
+            if (!item.message) {
+              results.push({ studentId, type: 'whatsapp', status: 'failed', message: 'missing_fields' });
+              continue;
+            }
+            jobId = enqueueCustomMessageImpl({
+              tenantId: normalizedTenantId,
+              to: item.to,
+              message: item.message,
+              englishMessage: item.englishMessage,
+              hindiMessage: item.hindiMessage,
+              teacherName: item.teacherName,
+              coachingName: item.coachingName,
+              selectedLanguage: item.selectedLanguage,
+              languageOrder: item.languageOrder,
+              historyId: historyId || undefined,
+              history: historyWithActor || undefined,
+            } as any);
+          }
+
+          if (historyId) {
+            try {
+              await db
+                .collection('reminderHistory')
+                .doc(historyId)
+                .set(
+                  stripUndefinedDeep({
+                    ...(historyWithActor || {}),
+                    tenantId: normalizedTenantId,
+                    reminderType: 'whatsapp',
+                    status: 'pending',
+                    metadata: { messageId: jobId, deliveryStatus: 'queued' },
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  }),
+                  { merge: true }
+                );
+            } catch (e) {
+              console.warn('[reminders_batch_send] whatsapp reminderHistory update failed', e);
+            }
+          }
+
+          void logTenantAuditEventImpl({
+            tenantId: normalizedTenantId,
+            action: 'reminder_queued',
+            authContext: req.authContext,
+            targetId: jobId,
+            metadata: {
+              channel: item.kind === 'fee' ? 'whatsapp_fee' : 'whatsapp_custom',
+              destination: item.to,
+            },
+          });
+
+          results.push({ studentId, type: 'whatsapp', status: 'queued', jobId, message: 'Queued for send' });
+          continue;
+        }
+
+        if (item.type === 'email') {
+          if (!emailBackend) {
+            if (historyId) {
+              try {
+                await upsertReminderHistoryWithDates(db, historyId, {
+                  ...(historyWithActor || {}),
+                  tenantId: normalizedTenantId,
+                  reminderType: 'email',
+                  status: 'failed',
+                  errorMessage: 'email_backend_not_configured',
+                });
+              } catch (e) {
+                console.warn('[reminders_batch_send] email reminderHistory update failed (no backend)', e);
+              }
+            }
+            results.push({ studentId, type: 'email', status: 'failed', message: 'email_backend_not_configured' });
+            continue;
+          }
+
+          // Create history entry + consume quota token before attempting send.
+          await consumeTenantReminderReservationToken(db, normalizedTenantId, batchId, 'email', {
+            historyId: historyId || undefined,
+            history: historyWithActor || undefined,
+          });
+
+          const payload = {
+            ...item.email,
+            tenant_id: normalizedTenantId,
+            historyId: historyId || undefined,
+          };
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 12_000);
+          let emailResp: any;
+          try {
+            const response = await fetch(emailBackend.url, {
+              method: 'POST',
+              signal: controller.signal,
+              headers: {
+                ...emailBackend.headers,
+                'x-tenant': normalizedTenantId,
+              },
+              body: JSON.stringify(payload),
+            });
+            const text = await response.text();
+            try {
+              emailResp = text ? JSON.parse(text) : null;
+            } catch {
+              emailResp = { text };
+            }
+
+            if (response.ok) {
+              if (historyId) {
+                try {
+                  await upsertReminderHistoryWithDates(db, historyId, {
+                    ...(historyWithActor || {}),
+                    tenantId: normalizedTenantId,
+                    reminderType: 'email',
+                    status: response.status === 202 ? 'queued' : 'success',
+                    metadata: {
+                      emailId: (emailResp as any)?.id || (emailResp as any)?.emailId || undefined,
+                      deliveryStatus: response.status === 202 ? 'queued' : 'sent',
+                    },
+                  });
+                } catch (e) {
+                  console.warn('[reminders_batch_send] email reminderHistory update failed', e);
+                }
+
+                // For 202 (queued), keep in-flight until /internal/reminder-history/email-result finalizes.
+                if (response.status !== 202) {
+                  try {
+                    await finalizeReminderQuotaFromHistory(db, {
+                      historyId,
+                      finalStatus: 'success',
+                      fallbackTenantId: normalizedTenantId,
+                      fallbackChannel: 'email',
+                      fallbackMonthId: monthId,
+                    });
+                  } catch (e) {
+                    console.warn('[reminders_batch_send] email quota finalize failed', e);
+                  }
+                }
+              }
+              results.push({
+                studentId,
+                type: 'email',
+                status: response.status === 202 ? 'queued' : 'success',
+                message: response.status === 202 ? 'Queued for send' : 'Sent successfully',
+              });
+            } else {
+              if (historyId) {
+                try {
+                  await upsertReminderHistoryWithDates(db, historyId, {
+                    ...(historyWithActor || {}),
+                    tenantId: normalizedTenantId,
+                    reminderType: 'email',
+                    status: 'failed',
+                    metadata: { deliveryStatus: 'failed' },
+                    errorMessage:
+                      typeof (emailResp as any)?.error === 'string' ? (emailResp as any).error : `email_failed_${response.status}`,
+                  });
+                } catch (e) {
+                  console.warn('[reminders_batch_send] email reminderHistory update failed', e);
+                }
+
+                try {
+                  await finalizeReminderQuotaFromHistory(db, {
+                    historyId,
+                    finalStatus: 'failed',
+                    fallbackTenantId: normalizedTenantId,
+                    fallbackChannel: 'email',
+                    fallbackMonthId: monthId,
+                  });
+                } catch (e) {
+                  console.warn('[reminders_batch_send] email quota finalize failed (non-2xx)', e);
+                }
+              }
+              results.push({
+                studentId,
+                type: 'email',
+                status: 'failed',
+                message: typeof emailResp?.error === 'string' ? emailResp.error : `email_failed_${response.status}`,
+              });
+            }
+          } catch (error) {
+            if (historyId) {
+              try {
+                await upsertReminderHistoryWithDates(db, historyId, {
+                  ...(historyWithActor || {}),
+                  tenantId: normalizedTenantId,
+                  reminderType: 'email',
+                  status: 'failed',
+                  metadata: { deliveryStatus: 'failed' },
+                  errorMessage: 'email_send_failed',
+                });
+              } catch (e) {
+                console.warn('[reminders_batch_send] email reminderHistory update failed (send error)', e);
+              }
+
+              try {
+                await finalizeReminderQuotaFromHistory(db, {
+                  historyId,
+                  finalStatus: 'failed',
+                  fallbackTenantId: normalizedTenantId,
+                  fallbackChannel: 'email',
+                  fallbackMonthId: monthId,
+                });
+              } catch (e) {
+                console.warn('[reminders_batch_send] email quota finalize failed (send error)', e);
+              }
+            }
+            results.push({ studentId, type: 'email', status: 'failed', message: 'email_send_failed' });
+          } finally {
+            clearTimeout(timeout);
+          }
+          continue;
+        }
+
+        results.push({ studentId, type: (item as any).type, status: 'failed', message: 'unsupported_type' });
+      } catch (error) {
+        if (error instanceof TenantAccessError) {
+          results.push({
+            studentId,
+            type: item.type,
+            status: 'failed',
+            message: typeof (error.body as any)?.error === 'string' ? (error.body as any).error : 'tenant_access_error',
+          });
+          continue;
+        }
+        console.warn('[reminders_batch_send] item failed', { type: (item as any)?.type, studentId }, error);
+        results.push({ studentId, type: item.type, status: 'failed', message: 'send_failed' });
+      }
+    }
+
+    return res.json({ ok: true, tenantId: normalizedTenantId, batchId, monthId, results });
+  });
+
+  // ----- WhatsApp queue endpoints (light validation) -----
+  app.post('/whatsapp/queue/fee-reminder', requireStaffTenantAccess, async (req,res)=>{
+    const { to, studentName, amount, dueDate, tenantId, quotaBatchId, historyId, history } = req.body||{};
+    if(!to||!studentName||typeof amount!=='number'||!dueDate||typeof tenantId!=='string') {
+      return res.status(400).json({error:'missing_fields'});
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const normalizedTenantId = tenantAccess.tenantId;
+    const actorUid = req.authContext?.uid;
+    const historyWithActor = history && typeof history === 'object'
+      ? stripUndefinedDeep({ ...(history as any), userId: (history as any)?.userId || actorUid })
+      : actorUid
+        ? ({ userId: actorUid } as any)
+        : undefined;
+    const providedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    try {
+      if (typeof quotaBatchId === 'string' && quotaBatchId.trim()) {
+        await consumeTenantReminderReservationToken(getFirestoreImpl(), normalizedTenantId, quotaBatchId.trim(), 'whatsapp', {
+          historyId: typeof historyId === 'string' ? historyId : undefined,
+          history: historyWithActor || undefined,
+        });
+      } else {
+        await assertTenantReminderQuotaAvailable(getFirestoreImpl(), normalizedTenantId, 'whatsapp', 1, {
+          historyId: typeof historyId === 'string' ? historyId : undefined,
+          history: historyWithActor || undefined,
+        });
+      }
+    } catch (error) {
+      if (error instanceof TenantReminderLimitError) {
+        return res.status(409).json({ error: 'reminder_limit_reached', limit: error.limit, used: error.used, channel: error.channel });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[whatsapp_queue_fee] reminder quota check failed', error);
+      const isTestMode = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+      if (!isTestMode) {
+        return res.status(503).json({ error: 'reminder_quota_check_failed' });
+      }
+    }
+    const id = enqueueReminderImpl({ ...req.body, tenantId: normalizedTenantId });
+
+    if (typeof historyId === 'string' && historyId.trim()) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId.trim(), {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'whatsapp',
+          status: 'pending',
+          metadata: { messageId: id, deliveryStatus: 'queued' },
+        });
+      } catch (e) {
+        console.warn('[whatsapp_queue_fee] reminderHistory update failed', e);
+      }
+    }
+    void logTenantAuditEventImpl({
+      tenantId: normalizedTenantId,
+      action: 'reminder_queued',
+      authContext: req.authContext,
+      targetId: id,
+      metadata: {
+        channel: 'whatsapp_fee',
+        destination: to,
+        studentName,
+        amount,
+        dueDate,
+      },
+    });
+    res.json({jobId:id});
+  });
+
+  app.post('/whatsapp/queue/custom-message', requireStaffTenantAccess, async (req,res)=>{
+    const { to, message, tenantId, quotaBatchId, historyId, history } = req.body||{};
+    if(!to||!message||typeof tenantId!=='string') {
+      return res.status(400).json({error:'missing_fields'});
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const normalizedTenantId = tenantAccess.tenantId;
+    const actorUid = req.authContext?.uid;
+    const historyWithActor = history && typeof history === 'object'
+      ? stripUndefinedDeep({ ...(history as any), userId: (history as any)?.userId || actorUid })
+      : actorUid
+        ? ({ userId: actorUid } as any)
+        : undefined;
+    const providedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    try {
+      if (typeof quotaBatchId === 'string' && quotaBatchId.trim()) {
+        await consumeTenantReminderReservationToken(getFirestoreImpl(), normalizedTenantId, quotaBatchId.trim(), 'whatsapp', {
+          historyId: typeof historyId === 'string' ? historyId : undefined,
+          history: historyWithActor || undefined,
+        });
+      } else {
+        await assertTenantReminderQuotaAvailable(getFirestoreImpl(), normalizedTenantId, 'whatsapp', 1, {
+          historyId: typeof historyId === 'string' ? historyId : undefined,
+          history: historyWithActor || undefined,
+        });
+      }
+    } catch (error) {
+      if (error instanceof TenantReminderLimitError) {
+        return res.status(409).json({ error: 'reminder_limit_reached', limit: error.limit, used: error.used, channel: error.channel });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[whatsapp_queue_custom] reminder quota check failed', error);
+      const isTestMode = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+      if (!isTestMode) {
+        return res.status(503).json({ error: 'reminder_quota_check_failed' });
+      }
+    }
+    const id = enqueueCustomMessageImpl({ ...req.body, tenantId: normalizedTenantId });
+
+    if (typeof historyId === 'string' && historyId.trim()) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId.trim(), {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'whatsapp',
+          status: 'pending',
+          metadata: { messageId: id, deliveryStatus: 'queued' },
+        });
+      } catch (e) {
+        console.warn('[whatsapp_queue_custom] reminderHistory update failed', e);
+      }
+    }
+    void logTenantAuditEventImpl({
+      tenantId: normalizedTenantId,
+      action: 'reminder_queued',
+      authContext: req.authContext,
+      targetId: id,
+      metadata: {
+        channel: 'whatsapp_custom',
+        destination: to,
+      },
+    });
+    res.json({jobId:id});
+  });
+
+  app.post('/whatsapp/queue/payment-confirmation', requireStaffTenantAccess, async (req,res)=>{
+    const { to, studentName, amount, paymentDate, tenantId, quotaBatchId, historyId, history } = req.body||{};
+    if(!to||!studentName||typeof amount!=='number'||!paymentDate||typeof tenantId!=='string') {
+      return res.status(400).json({error:'missing_fields'});
+    }
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const normalizedTenantId = tenantAccess.tenantId;
+    const actorUid = req.authContext?.uid;
+    const historyWithActor = history && typeof history === 'object'
+      ? stripUndefinedDeep({ ...(history as any), userId: (history as any)?.userId || actorUid })
+      : actorUid
+        ? ({ userId: actorUid } as any)
+        : undefined;
+    const providedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    try {
+      if (typeof quotaBatchId === 'string' && quotaBatchId.trim()) {
+        await consumeTenantReminderReservationToken(getFirestoreImpl(), normalizedTenantId, quotaBatchId.trim(), 'whatsapp', {
+          historyId: typeof historyId === 'string' ? historyId : undefined,
+          history: historyWithActor || undefined,
+        });
+      } else {
+        await assertTenantReminderQuotaAvailable(getFirestoreImpl(), normalizedTenantId, 'whatsapp', 1, {
+          historyId: typeof historyId === 'string' ? historyId : undefined,
+          history: historyWithActor || undefined,
+        });
+      }
+    } catch (error) {
+      if (error instanceof TenantReminderLimitError) {
+        return res.status(409).json({ error: 'reminder_limit_reached', limit: error.limit, used: error.used, channel: error.channel });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[whatsapp_queue_payment] reminder quota check failed', error);
+      const isTestMode = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+      if (!isTestMode) {
+        return res.status(503).json({ error: 'reminder_quota_check_failed' });
+      }
+    }
+    const id = enqueuePaymentConfirmationImpl({ ...req.body, tenantId: normalizedTenantId });
+
+    if (typeof historyId === 'string' && historyId.trim()) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId.trim(), {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'whatsapp',
+          status: 'pending',
+          metadata: { messageId: id, deliveryStatus: 'queued' },
+        });
+      } catch (e) {
+        console.warn('[whatsapp_queue_payment] reminderHistory update failed', e);
+      }
+    }
+    void logTenantAuditEventImpl({
+      tenantId: normalizedTenantId,
+      action: 'reminder_queued',
+      authContext: req.authContext,
+      targetId: id,
+      metadata: {
+        channel: 'whatsapp_payment_confirmation',
+        destination: to,
+        studentName,
+        amount,
+        paymentDate,
+      },
+      targetType: 'fee',
+    });
+    res.json({jobId:id});
+  });
+
+  // ----- Usage & billing admin endpoints -----
+  app.post('/storage/reconcile', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = z
+      .object({
+        tenantId: z.string().min(1),
+      })
+      .safeParse({
+        tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+      });
+
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = parsed.data.tenantId.trim();
+    if (providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    ensureFirebase();
+    const bucketConfigured = typeof admin.app().options.storageBucket === 'string';
+    if (!bucketConfigured) {
+      return res.status(501).json({ error: 'storage_bucket_not_configured' });
+    }
+    const bucket = admin.storage().bucket();
+    const db = getFirestoreImpl();
+
+    try {
+      const planLimits = await resolveTenantPlanLimitsForEnforcement(db, normalizedTenantId);
+      const limitBytes =
+        typeof planLimits.storageBytes === 'number' && Number.isFinite(planLimits.storageBytes)
+          ? planLimits.storageBytes
+          : 0;
+
+      const bytes = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+      await db
+        .collection('tenantStorageUsage')
+        .doc(normalizedTenantId)
+        .set(
+          {
+            tenantId: normalizedTenantId,
+            bytes,
+            estimatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            reconciledAt: admin.firestore.FieldValue.serverTimestamp(),
+            reconciledBy: req.authContext?.uid ?? 'system',
+          },
+          { merge: true }
+        );
+
+      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+
+      return res.json({ tenantId: normalizedTenantId, bytes, limitBytes });
+    } catch (error) {
+      console.warn('[storage_reconcile] failed', error);
+      return res.status(503).json({ error: 'storage_reconcile_failed' });
+    }
+  });
+
+  app.post('/storage/upload', requireStaffTenantAccessFromQuery, express.raw({ type: '*/*', limit: '55mb' }), async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = z
+      .object({
+        tenantId: z.string().min(1),
+        purpose: z.enum(['chat', 'tenantLogo', 'noticeImage', 'noticeAudio', 'studentProfile', 'receipt', 'profilePicture']),
+        conversationFolder: z.string().optional(),
+        feeId: z.string().optional(),
+        email: z.string().optional(),
+        filename: z.string().optional(),
+      })
+      .safeParse({
+        tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+        purpose: typeof req.query.purpose === 'string' ? req.query.purpose : '',
+        conversationFolder: typeof req.query.conversationFolder === 'string' ? req.query.conversationFolder : undefined,
+        feeId: typeof req.query.feeId === 'string' ? req.query.feeId : undefined,
+        email: typeof req.query.email === 'string' ? req.query.email : undefined,
+        filename: typeof req.query.filename === 'string' ? req.query.filename : undefined,
+      });
+
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = parsed.data.tenantId.trim();
+    if (providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    ensureFirebase();
+    const bucketConfigured = typeof admin.app().options.storageBucket === 'string';
+    if (!bucketConfigured) {
+      return res.status(501).json({ error: 'storage_bucket_not_configured' });
+    }
+    const bucket = admin.storage().bucket();
+    const db = getFirestoreImpl();
+
+    const contentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : 'application/octet-stream';
+    const body = req.body as Buffer;
+    const bytes = Buffer.isBuffer(body) ? body.length : 0;
+    if (!bytes) {
+      return res.status(400).json({ error: 'missing_file_body' });
+    }
+
+    const MAX_BYTES = 50 * 1024 * 1024;
+    if (bytes > MAX_BYTES) {
+      return res.status(413).json({ error: 'file_too_large', maxBytes: MAX_BYTES });
+    }
+
+    const planLimits = await resolveTenantPlanLimitsForEnforcement(db, normalizedTenantId);
+    const limitBytes =
+      typeof planLimits.storageBytes === 'number' && Number.isFinite(planLimits.storageBytes)
+        ? planLimits.storageBytes
+        : 0;
+
+    // Initialize usage doc from live bucket estimate on first use.
+    try {
+      await loadOrInitTenantStorageUsage(db, bucket, normalizedTenantId);
+    } catch (error) {
+      console.warn('[storage_upload] unable to init storage usage; failing closed', error);
+      return res.status(503).json({ error: 'storage_quota_check_failed' });
+    }
+
+    // Reserve bytes transactionally to avoid concurrency overruns.
+    try {
+      await reserveTenantStorageBytes(db, normalizedTenantId, bytes, limitBytes);
+      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+    } catch (error) {
+      if (error instanceof TenantStorageLimitError) {
+        // Reconcile once (deletions might have happened) and retry.
+        try {
+          const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+          await db.collection('tenantStorageUsage').doc(normalizedTenantId).set(
+            {
+              tenantId: normalizedTenantId,
+              bytes: reconciled,
+              estimatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+          await reserveTenantStorageBytes(db, normalizedTenantId, bytes, limitBytes);
+          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+        } catch {
+          return res.status(409).json({
+            error: 'storage_limit_reached',
+            limitBytes: error.limitBytes,
+            usedBytes: error.usedBytes,
+            incrementBytes: error.incrementBytes,
+          });
+        }
+      }
+      console.warn('[storage_upload] reserve failed', error);
+      return res.status(503).json({ error: 'storage_quota_check_failed' });
+    }
+
+    const timestamp = Date.now();
+    const filename = sanitizeStorageSegment(parsed.data.filename || 'file');
+    const extFallback = filename.split('.').pop() || 'bin';
+    const ext = inferExtensionFromContentType(contentType, extFallback);
+    const safeExt = sanitizeStorageSegment(ext) || 'bin';
+
+    let objectPath = '';
+    const purpose: StorageUploadPurpose = parsed.data.purpose;
+    if (purpose === 'chat') {
+      const conversationFolder = sanitizeStorageSegment(parsed.data.conversationFolder || 'unassigned') || 'unassigned';
+      const safeName = filename || `file.${safeExt}`;
+      objectPath = `chat-files/${normalizedTenantId}/${conversationFolder}/${timestamp}_${safeName}`;
+    } else if (purpose === 'tenantLogo') {
+      objectPath = `tenant-branding/${normalizedTenantId}/logo_${timestamp}.${safeExt}`;
+    } else if (purpose === 'noticeImage') {
+      objectPath = `notices/${normalizedTenantId}/notice_${timestamp}_${crypto.randomBytes(3).toString('hex')}.${safeExt}`;
+    } else if (purpose === 'noticeAudio') {
+      objectPath = `notices/${normalizedTenantId}/audio/notice_audio_${timestamp}_${crypto.randomBytes(3).toString('hex')}.${safeExt}`;
+    } else if (purpose === 'studentProfile') {
+      objectPath = `student_profiles/${normalizedTenantId}/${timestamp}_profile.${safeExt}`;
+    } else if (purpose === 'receipt') {
+      const feeId = sanitizeStorageSegment(parsed.data.feeId || 'unknown') || 'unknown';
+      const safeName = filename || `receipt.${safeExt}`;
+      objectPath = `receipts/${normalizedTenantId}/${feeId}/${timestamp}_${safeName}`;
+    } else if (purpose === 'profilePicture') {
+      const emailKey = sanitizeStorageSegment((parsed.data.email || '').toLowerCase().replace(/\s+/g, ''));
+      if (!emailKey) {
+        await releaseTenantStorageBytes(db, normalizedTenantId, bytes);
+        invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+        return res.status(400).json({ error: 'missing_email' });
+      }
+      objectPath = `profile-pictures/${normalizedTenantId}/${emailKey}.jpg`;
+    }
+
+    if (!objectPath) {
+      await releaseTenantStorageBytes(db, normalizedTenantId, bytes);
+      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+      return res.status(400).json({ error: 'invalid_upload_purpose' });
+    }
+
+    const downloadToken = typeof (crypto as any).randomUUID === 'function' ? (crypto as any).randomUUID() : crypto.randomBytes(16).toString('hex');
+    try {
+      const file = bucket.file(objectPath);
+      await file.save(body, {
+        resumable: false,
+        contentType,
+        metadata: {
+          metadata: {
+            firebaseStorageDownloadTokens: downloadToken,
+          },
+        },
+      });
+
+      const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(objectPath)}?alt=media&token=${downloadToken}`;
+      return res.json({ url, path: objectPath, bytes, contentType });
+    } catch (error) {
+      await releaseTenantStorageBytes(db, normalizedTenantId, bytes).catch(() => undefined);
+      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+      console.error('[storage_upload] upload failed', error);
+      return res.status(500).json({ error: 'upload_failed' });
+    }
+  });
+
+  app.post('/students/create', requireStaffTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const tenantIdRaw = typeof (req.body as any)?.tenantId === 'string' ? (req.body as any).tenantId : '';
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = tenantIdRaw.trim();
+    if (!providedTenantId) {
+      return res.status(400).json({ error: 'missing_tenant_id' });
+    }
+    if (providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const studentDataRaw = (req.body as any)?.studentData;
+    if (!studentDataRaw || typeof studentDataRaw !== 'object') {
+      return res.status(400).json({ error: 'missing_student_data' });
+    }
+    const name = typeof (studentDataRaw as any).name === 'string' ? (studentDataRaw as any).name.trim() : '';
+    if (!name) {
+      return res.status(400).json({ error: 'missing_student_name' });
+    }
+
+    const statusRaw = typeof (studentDataRaw as any).status === 'string' ? (studentDataRaw as any).status.trim().toLowerCase() : '';
+    const isActiveStudent = statusRaw ? statusRaw === 'active' : true;
+
+    try {
+      const db = getFirestoreImpl();
+      await assertTenantStudentCreateAllowed(db, normalizedTenantId, isActiveStudent);
+
+      const nowIso = new Date().toISOString();
+      const createdBy = typeof (req.body as any)?.createdBy === 'string' ? (req.body as any).createdBy : undefined;
+      const record = stripUndefinedDeep({
+        tenantId: normalizedTenantId,
+        ...studentDataRaw,
+        name,
+        status: statusRaw || (studentDataRaw as any).status || 'active',
+        order: typeof (studentDataRaw as any).order === 'number' ? (studentDataRaw as any).order : Date.now(),
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: createdBy || (req.authContext?.uid ?? 'system'),
+      });
+
+      const ref = await db.collection('students').add(record as any);
+      invalidateLiveCount(`students:${tenantAccess.tenantId}`);
+      return res.json({ id: ref.id });
+    } catch (error) {
+      if (error instanceof TenantStudentLimitError) {
+        return res.status(409).json({ error: 'student_limit_reached', limit: error.limit, used: error.used });
+      }
+      console.error('[students_create] failed', error);
+      return res.status(500).json({ error: 'student_create_failed' });
+    }
+  });
+  app.get('/usage/current', requireStaffTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const monthParam = typeof req.query.month === 'string' ? req.query.month : null;
+    const planParam = typeof req.query.planId === 'string' ? req.query.planId : null;
+    const monthId = normalizeMonthId(monthParam);
+
+    try {
+      const tenantSummary = await loadTenantAdminSummaryImpl(tenantAccess.tenantId);
+      if (!tenantSummary) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      const db = getFirestoreImpl();
+
+      const planLimits = planParam
+        ? getPlanLimits(planParam)
+        : await resolveEffectivePlanLimitsForTenant(db, tenantAccess.tenantId, {
+            billingTier: tenantSummary.billingTier ?? null,
+            quotas: tenantSummary.quotas ?? null,
+          });
+      const planId = planLimits.id;
+      const { ref: usageDocRef, data: usageData } = await loadUsageMonthSnapshotImpl(tenantAccess.tenantId, monthId);
+      const alertsRaw = await loadUsageAlertsImpl(usageDocRef, monthId);
+
+      const remindersSource = (usageData.remindersSent ?? usageData.reminders ?? {}) as Record<string, any>;
+      const reminders = {
+        total: 0,
+        whatsapp: safeNumber(remindersSource.whatsapp),
+        sms: safeNumber(remindersSource.sms),
+        email: safeNumber(remindersSource.email),
+        voice: safeNumber(remindersSource.voice ?? remindersSource.voiceCall),
+        other: safeNumber(remindersSource.other),
+      };
+      reminders.total = safeNumber(
+        remindersSource.total,
+        reminders.whatsapp + reminders.sms + reminders.email + reminders.voice + reminders.other
+      );
+
+      const canViewPayments = tenantAccess.role === 'owner' || tenantAccess.role === 'admin';
+      const paymentsReceived = canViewPayments
+        ? (() => {
+            const paymentsSource = (usageData.paymentsReceived ?? {}) as Record<string, any>;
+            return {
+              count: safeNumber(paymentsSource.count ?? usageData.paymentsReceivedCount),
+              amount: safeNumber(paymentsSource.amount ?? usageData.paymentsReceivedAmount),
+            };
+          })()
+        : undefined;
+
+      const studentsFallback = safeNumber(tenantSummary.membershipCounts?.total);
+      const staffFallback = deriveStaffCount(tenantSummary);
+
+      // Seats are a "current state" metric; prefer a live count for the current month
+      // so UI doesn't drift when rollups lag or fail.
+      const currentMonthId = formatMonthId(new Date());
+      const shouldUseLiveStaffSeats = !monthParam || monthId === currentMonthId;
+      const shouldUseLiveStudents = !monthParam || monthId === currentMonthId;
+      const shouldUseLiveStorageBytes = !monthParam || monthId === currentMonthId;
+      let liveStaffSeats: number | null = null;
+      let livePendingSeatInvites: number | null = null;
+      let liveActiveStudents: number | null = null;
+      let liveStorageBytes: number | null = null;
+      if (shouldUseLiveStaffSeats) {
+        const live = await countActiveStaffSeatsLiveCached(db, tenantAccess.tenantId);
+        liveStaffSeats = live >= 0 ? live : null;
+
+        const pending = await countPendingSeatInvitesLiveCached(db, tenantAccess.tenantId);
+        livePendingSeatInvites = pending >= 0 ? pending : null;
+      }
+
+      if (shouldUseLiveStudents) {
+        const live = await countActiveStudentsLiveCached(db, tenantAccess.tenantId);
+        liveActiveStudents = live >= 0 ? live : null;
+      }
+
+      if (shouldUseLiveStorageBytes) {
+        const live = await readTenantStorageBytesLiveCached(db, tenantAccess.tenantId);
+        liveStorageBytes = live >= 0 ? live : null;
+      }
+
+      const studentsValue = safeNumber(
+        liveActiveStudents ?? usageData.activeStudents ?? usageData.students ?? usageData.studentCount,
+        studentsFallback
+      );
+      const staffActiveValue = safeNumber(
+        liveStaffSeats ?? usageData.staffSeatsUsed ?? usageData.staff ?? usageData.activeStaff,
+        staffFallback
+      );
+      const staffPendingInvitesValue = safeNumber(livePendingSeatInvites, 0);
+      const staffValue = staffActiveValue + staffPendingInvitesValue;
+      const studentsAdded = safeNumber(
+        usageData.studentsAdded ?? usageData.newStudents ?? usageData.studentsAddedThisMonth
+      );
+      const noticePosts = safeNumber(usageData.noticePosts ?? usageData.noticeCount);
+      const deviceActions = safeNumber(usageData.deviceActions ?? usageData.deviceActionCount);
+      const chatMessagesValue = coerceNumber(usageData.chatMessages ?? usageData.chatMessageCount);
+      const metricsVersion = coerceNumber(usageData.metricsVersion);
+      const lastRefreshedAt = toIsoTimestamp(usageData.lastRefreshedAt ?? usageData.updatedAt);
+      const storageBytes = safeNumber(liveStorageBytes ?? storageToBytes(usageData), storageToBytes(usageData));
+      const storageSources = normalizeStorageSources(usageData.storageSources);
+      const diagnostics = normalizeUsageDiagnostics(usageData.rollupDiagnostics);
+
+      const summary: UsageSummaryResponse = {
+        tenantId: tenantAccess.tenantId,
+        month: monthId,
+        planId,
+        planLimits,
+        students: studentsValue,
+        studentsAdded,
+        staff: staffValue,
+        staffBreakdown: {
+          active: staffActiveValue,
+          pendingInvites: staffPendingInvitesValue,
+        },
+        reminders,
+        paymentsReceived,
+        noticePosts,
+        deviceActions,
+        chatMessages: typeof chatMessagesValue === 'number' ? chatMessagesValue : null,
+        storageBytes,
+        storageSources,
+        alerts: alertsRaw,
+        metricsVersion: typeof metricsVersion === 'number' ? metricsVersion : undefined,
+        lastRefreshedAt,
+        diagnostics,
+        statuses: {},
+      };
+
+      const metricSnapshots: Partial<Record<UsageMetricKey, { value: number; limit: number }>> = {
+        students: { value: summary.students, limit: planLimits.students },
+        staff: { value: summary.staff, limit: planLimits.staffSeats },
+        reminders: { value: summary.reminders.total, limit: planLimits.reminders.total },
+        storage: { value: summary.storageBytes, limit: planLimits.storageBytes },
+      };
+
+      const alerts = alertsRaw.flatMap((alert) => {
+        const snapshot = metricSnapshots[alert.metric];
+        if (!snapshot || snapshot.limit <= 0) {
+          return [alert];
+        }
+
+        const ratio = snapshot.value / snapshot.limit;
+        const computedThreshold =
+          ratio >= planLimits.criticalThreshold
+            ? 'critical'
+            : ratio >= planLimits.warningThreshold
+              ? 'warning'
+              : null;
+
+        // If the metric is now below the warning threshold and this alert was never acknowledged,
+        // treat it as resolved so the UI doesn't show stale banners/details.
+        if (!computedThreshold && !alert.acknowledgedAt) {
+          return [];
+        }
+
+        const nextType = computedThreshold ?? alert.type;
+        const nextDetails = computedThreshold
+          ? buildUsageAlertDetails(alert.metric, monthId, ratio, snapshot.value, snapshot.limit, computedThreshold)
+          : alert.details;
+
+        return [
+          {
+            ...alert,
+            type: nextType,
+            value: snapshot.value,
+            limit: snapshot.limit,
+            ratio,
+            details: nextDetails,
+          },
+        ];
+      });
+
+      summary.alerts = alerts;
+
+      const statuses: UsageMetricStatusMap = {};
+      const studentStatus = buildUsageMetricStatus(summary.students, planLimits.students);
+      if (studentStatus) statuses.students = studentStatus;
+      const staffStatus = buildUsageMetricStatus(summary.staff, planLimits.staffSeats);
+      if (staffStatus) statuses.staff = staffStatus;
+      const reminderStatus = buildUsageMetricStatus(summary.reminders.total, planLimits.reminders.total);
+      if (reminderStatus) statuses.reminders = reminderStatus;
+      const storageStatus = buildUsageMetricStatus(summary.storageBytes, planLimits.storageBytes);
+      if (storageStatus) statuses.storage = storageStatus;
+      summary.statuses = statuses;
+
+      return res.json(summary);
+    } catch (error) {
+      console.error('[usage_current] failed', error);
+      return res.status(500).json({ error: 'usage_snapshot_failed' });
+    }
+  });
+
+  app.get('/usage/history', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const monthsParam = Number(req.query.months);
+    const monthsCount = Number.isFinite(monthsParam) ? Number(monthsParam) : DEFAULT_USAGE_HISTORY_MONTHS;
+    const monthIds = buildMonthSeries(monthsCount);
+
+    try {
+      const snapshots = await Promise.all(
+        monthIds.map((monthId) => loadUsageMonthSnapshotImpl(tenantAccess.tenantId, monthId))
+      );
+      const history: UsageHistoryPoint[] = monthIds.map((monthId, index) => {
+        const snapshot = snapshots[index]?.data ?? {};
+        const remindersSource = (snapshot.remindersSent ?? snapshot.reminders ?? {}) as Record<string, any>;
+        return {
+          month: monthId,
+          students: safeNumber(snapshot.activeStudents ?? snapshot.students ?? snapshot.studentCount),
+          studentsAdded: safeNumber(snapshot.studentsAdded ?? snapshot.newStudents ?? snapshot.studentsAddedThisMonth),
+          staff: safeNumber(snapshot.staffSeatsUsed ?? snapshot.staff ?? snapshot.activeStaff),
+          remindersTotal: safeNumber(remindersSource.total),
+          remindersWhatsApp: safeNumber(remindersSource.whatsapp),
+          remindersSms: safeNumber(remindersSource.sms),
+          remindersEmail: safeNumber(remindersSource.email),
+          storageBytes: storageToBytes(snapshot),
+          noticePosts: safeNumber(snapshot.noticePosts ?? snapshot.noticeCount),
+          deviceActions: safeNumber(snapshot.deviceActions ?? snapshot.deviceActionCount),
+          chatMessages: coerceNumber(snapshot.chatMessages ?? snapshot.chatMessageCount) ?? null,
+        } satisfies UsageHistoryPoint;
+      });
+      return res.json(history);
+    } catch (error) {
+      console.error('[usage_history] failed', error);
+      return res.status(500).json({ error: 'usage_history_failed' });
+    }
+  });
+
+  app.post('/usage/alerts/:alertId/ack', requireAdminTenantAccessAny, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = parseUsageAlertCompositeId(req.params.alertId || '');
+    if (!parsed) {
+      return res.status(400).json({ error: 'invalid_alert_id' });
+    }
+
+    try {
+      const { ref: usageDocRef } = await loadUsageMonthSnapshotImpl(tenantAccess.tenantId, parsed.monthId);
+      if (!usageDocRef) {
+        return res.status(404).json({ error: 'usage_snapshot_missing' });
+      }
+      const alertRef = usageDocRef.collection('alerts').doc(parsed.alertId);
+      const alertSnap = await alertRef.get();
+      if (!alertSnap.exists) {
+        return res.status(404).json({ error: 'alert_not_found' });
+      }
+      const acknowledgedAt = new Date().toISOString();
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const acknowledgementPayload: Record<string, unknown> = {
+        acknowledgedAt,
+        acknowledgedBy: req.authContext?.uid || 'system',
+        acknowledgedByEmail: actorEmail || undefined,
+      };
+      const ackMetadata = ((alertSnap.data()?.notifications as Record<string, unknown> | undefined)?.ack ?? null) as
+        | Record<string, unknown>
+        | null;
+      if (ackMetadata) {
+        acknowledgementPayload['notifications.ack.pending'] = false;
+        acknowledgementPayload['notifications.ack.closedAt'] = acknowledgedAt;
+        acknowledgementPayload['notifications.ack.closedAtTimestamp'] = admin.firestore.FieldValue.serverTimestamp();
+      }
+      await alertRef.set(acknowledgementPayload, { merge: true });
+      void logTenantAuditEventImpl({
+        tenantId: tenantAccess.tenantId,
+        action: 'usage_alert_acknowledged',
+        authContext: req.authContext,
+        metadata: { alertId: parsed.alertId, monthId: parsed.monthId },
+        targetId: parsed.alertId,
+        targetType: 'usage',
+      });
+      return res.json({ ok: true, acknowledgedAt });
+    } catch (error) {
+      console.error('[usage_alert_ack] failed', error);
+      return res.status(500).json({ error: 'alert_ack_failed' });
+    }
+  });
+
+  app.post('/usage/refresh', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const monthPayload = typeof (req.body as any)?.month === 'string' ? (req.body as any).month : null;
+    const monthParam = monthPayload ?? (typeof req.query.month === 'string' ? req.query.month : null);
+    const monthId = normalizeMonthId(monthParam);
+
+    try {
+      const db = getFirestoreImpl();
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const requestRef = await db.collection('tenantUsageRefreshRequests').add({
+        tenantId: tenantAccess.tenantId,
+        month: monthId,
+        status: 'pending',
+        requestedAt: admin.firestore.FieldValue.serverTimestamp(),
+        requestedBy: req.authContext?.uid ?? 'system',
+        requestedByEmail: actorEmail ?? null,
+        source: (req.headers['x-client-name'] as string) || 'mobile_admin_panel',
+      });
+
+      void logTenantAuditEventImpl({
+        tenantId: tenantAccess.tenantId,
+        action: 'usage_refresh_requested',
+        authContext: req.authContext,
+        targetId: requestRef.id,
+        targetType: 'usage',
+        metadata: {
+          monthId,
+          requestId: requestRef.id,
+        },
+      });
+
+      return res.json({ ok: true, requestId: requestRef.id, month: monthId });
+    } catch (error) {
+      console.error('[usage_refresh_request] failed', error);
+      return res.status(500).json({ error: 'usage_refresh_request_failed' });
+    }
+  });
+
+  app.get('/billing/summary', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const planParam = typeof req.query.planId === 'string' ? req.query.planId : null;
+
+    try {
+      const db = getFirestoreImpl();
+      const tenantSummary = await loadTenantAdminSummaryImpl(tenantAccess.tenantId);
+      if (!tenantSummary) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      const planLimits = planParam
+        ? await (async () => {
+            const normalizedPlanId = normalizePlanId(planParam);
+            let limits = getPlanLimits(normalizedPlanId);
+
+            // Keep /billing/summary?planId=<tier> consistent with canonical editable tier variants
+            // (doc ids: 'free' | 'pro' | 'enterprise').
+            try {
+              const tierVariant = await getPlanVariantById(db, normalizedPlanId);
+              const variantLimits = tierVariant?.planId === normalizedPlanId ? tierVariant.limits : undefined;
+              if (variantLimits && typeof variantLimits === 'object') {
+                const staffSeats = coerceNumber((variantLimits as any).staffSeats);
+                const students = coerceNumber((variantLimits as any).students);
+                const storageMb = coerceNumber((variantLimits as any).storageMb);
+
+                const reminders = (variantLimits as any).reminders;
+                const remindersTotal = coerceNumber(reminders?.total);
+                const remindersWhatsapp = coerceNumber(reminders?.whatsapp);
+                const remindersSms = coerceNumber(reminders?.sms);
+                const remindersVoice = coerceNumber(reminders?.voice);
+                const remindersEmail = coerceNumber(reminders?.email);
+
+                limits = {
+                  ...limits,
+                  staffSeats:
+                    typeof staffSeats === 'number' && staffSeats >= 0 ? Math.trunc(staffSeats) : limits.staffSeats,
+                  students: typeof students === 'number' && students >= 0 ? Math.trunc(students) : limits.students,
+                  reminders: {
+                    ...limits.reminders,
+                    total:
+                      typeof remindersTotal === 'number' && remindersTotal >= 0
+                        ? Math.trunc(remindersTotal)
+                        : limits.reminders.total,
+                    whatsapp:
+                      typeof remindersWhatsapp === 'number' && remindersWhatsapp >= 0
+                        ? Math.trunc(remindersWhatsapp)
+                        : limits.reminders.whatsapp,
+                    sms:
+                      typeof remindersSms === 'number' && remindersSms >= 0 ? Math.trunc(remindersSms) : limits.reminders.sms,
+                    voice:
+                      typeof remindersVoice === 'number' && remindersVoice >= 0
+                        ? Math.trunc(remindersVoice)
+                        : limits.reminders.voice,
+                    email:
+                      typeof remindersEmail === 'number' && remindersEmail >= 0
+                        ? Math.trunc(remindersEmail)
+                        : limits.reminders.email,
+                  },
+                  storageBytes:
+                    typeof storageMb === 'number' && storageMb >= 0 ? Math.round(storageMb * 1024 * 1024) : limits.storageBytes,
+                };
+              }
+            } catch {
+              // Ignore catalog lookup failures; fall back to defaults.
+            }
+
+            return limits;
+          })()
+        : await resolveEffectivePlanLimitsForTenant(db, tenantAccess.tenantId, {
+            billingTier: tenantSummary.billingTier ?? null,
+            quotas: tenantSummary.quotas ?? null,
+          });
+      const summary = await loadTenantBillingSummaryImpl(tenantAccess.tenantId, planLimits.id);
+      return res.json(summary);
+    } catch (error) {
+      console.error('[billing_summary] failed', error);
+      return res.status(500).json({ error: 'billing_summary_failed' });
+    }
+  });
+
+  app.get('/billing/history', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const pageSizeParam = typeof req.query.pageSize === 'string' ? req.query.pageSize : null;
+    const limitInvoicesParam = typeof req.query.limitInvoices === 'string' ? req.query.limitInvoices : null;
+    const limitChangesParam = typeof req.query.limitChanges === 'string' ? req.query.limitChanges : null;
+    const pageSize = Math.max(1, Math.min(200, Math.trunc(coerceNumber(pageSizeParam) ?? 10)));
+    const limitInvoicesRaw = Math.trunc(coerceNumber(limitInvoicesParam) ?? pageSize);
+    const limitChangesRaw = Math.trunc(coerceNumber(limitChangesParam) ?? pageSize);
+    const limitInvoices = Math.max(0, Math.min(200, limitInvoicesRaw));
+    const limitChanges = Math.max(0, Math.min(200, limitChangesRaw));
+
+    const cursorInvoiceAt = typeof req.query.cursorInvoiceAt === 'string' ? req.query.cursorInvoiceAt : null;
+    const cursorInvoiceId = typeof req.query.cursorInvoiceId === 'string' ? req.query.cursorInvoiceId : null;
+    const cursorChangeAt = typeof req.query.cursorChangeAt === 'string' ? req.query.cursorChangeAt : null;
+    const cursorChangeId = typeof req.query.cursorChangeId === 'string' ? req.query.cursorChangeId : null;
+
+    const invoiceStatusParam = typeof req.query.invoiceStatus === 'string' ? req.query.invoiceStatus : null;
+    const invoiceStatusRaw = invoiceStatusParam?.trim() || '';
+    // Treat VOID as FAILED everywhere.
+    // We still accept `invoiceStatus=void` for backward compatibility, but normalize it.
+    const invoiceStatusNormalized = invoiceStatusRaw === 'void' ? 'failed' : invoiceStatusRaw;
+    const invoiceStatus = (
+      invoiceStatusNormalized === 'paid' ||
+      invoiceStatusNormalized === 'open' ||
+      invoiceStatusNormalized === 'failed' ||
+      invoiceStatusNormalized === 'uncollectible'
+        ? (invoiceStatusNormalized as BillingInvoiceRecord['status'])
+        : undefined
+    );
+
+    const invoiceCursor = cursorInvoiceAt && cursorInvoiceId ? { at: cursorInvoiceAt, id: cursorInvoiceId } : undefined;
+    const changeCursor = cursorChangeAt && cursorChangeId ? { at: cursorChangeAt, id: cursorChangeId } : undefined;
+
+    const includeTotalsParam = typeof req.query.includeTotals === 'string' ? req.query.includeTotals : null;
+    const includeTotals = includeTotalsParam === null ? false : includeTotalsParam !== '0';
+
+    try {
+      const db = getFirestoreImpl();
+      const includeInvoiceTotals = includeTotals && limitInvoices > 0 && !invoiceCursor;
+      const includeChangeTotals = includeTotals && limitChanges > 0 && !changeCursor;
+      const includeInvoiceMatchingTotals = includeInvoiceTotals && Boolean(invoiceStatus);
+
+      const [invoicePage, changePage, invoicesTotal, changesTotal, invoicesMatchingTotal] = await Promise.all([
+        limitInvoices > 0
+          ? loadBillingInvoicesPage(db, tenantAccess.tenantId, limitInvoices, invoiceCursor, { status: invoiceStatus })
+          : Promise.resolve({ invoices: [] as BillingInvoiceRecord[], nextCursor: undefined }),
+        limitChanges > 0
+          ? loadTenantBillingAuditEntriesPage(db, tenantAccess.tenantId, limitChanges, changeCursor)
+          : Promise.resolve({ changes: [] as BillingAuditEntryRecord[], nextCursor: undefined }),
+        includeInvoiceTotals
+          ? countTenantBillingInvoices(db, tenantAccess.tenantId).catch((error) => {
+              console.warn('[billing_history] invoice totals failed', error);
+              return undefined as unknown as number;
+            })
+          : Promise.resolve(undefined as unknown as number),
+        includeChangeTotals
+          ? countTenantBillingAuditEntries(db, tenantAccess.tenantId).catch((error) => {
+              console.warn('[billing_history] change totals failed', error);
+              return undefined as unknown as number;
+            })
+          : Promise.resolve(undefined as unknown as number),
+        includeInvoiceMatchingTotals
+          ? countTenantBillingInvoices(db, tenantAccess.tenantId, { status: invoiceStatus }).catch((error) => {
+              console.warn('[billing_history] invoice matching totals failed', error);
+              return undefined as unknown as number;
+            })
+          : Promise.resolve(undefined as unknown as number),
+      ]);
+
+      const totals: { invoices?: number; changes?: number } = {};
+      if (includeInvoiceTotals && typeof invoicesTotal === 'number' && Number.isFinite(invoicesTotal)) {
+        totals.invoices = Math.max(0, Math.trunc(invoicesTotal));
+      }
+      if (includeChangeTotals && typeof changesTotal === 'number' && Number.isFinite(changesTotal)) {
+        totals.changes = Math.max(0, Math.trunc(changesTotal));
+      }
+
+      const matchingTotals: { invoices?: number; changes?: number } = {};
+      if (
+        includeInvoiceMatchingTotals &&
+        typeof invoicesMatchingTotal === 'number' &&
+        Number.isFinite(invoicesMatchingTotal)
+      ) {
+        matchingTotals.invoices = Math.max(0, Math.trunc(invoicesMatchingTotal));
+      }
+
+      return res.json({
+        tenantId: tenantAccess.tenantId,
+        invoices: invoicePage.invoices,
+        changes: changePage.changes,
+        totals: Object.keys(totals).length ? totals : undefined,
+        matchingTotals: Object.keys(matchingTotals).length ? matchingTotals : undefined,
+        pageInfo: {
+          invoices: { nextCursor: invoicePage.nextCursor },
+          changes: { nextCursor: changePage.nextCursor },
+        },
+      } satisfies BillingHistoryRecord);
+    } catch (error) {
+      console.error('[billing_history] failed', error);
+      return res.status(500).json({ error: 'billing_history_failed' });
+    }
+  });
+
+  app.get('/billing/invoice/download-url', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const INVOICE_PDF_VERSION = 2;
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = z
+      .object({
+        tenantId: z.string().trim().min(1),
+        invoiceId: z.string().trim().min(1),
+        force: z
+          .preprocess((value) => {
+            if (value === undefined || value === null) return undefined;
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'number') return value !== 0;
+            if (typeof value === 'string') {
+              const v = value.trim().toLowerCase();
+              if (!v) return undefined;
+              return v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on';
+            }
+            return undefined;
+          }, z.boolean().optional())
+          .optional(),
+      })
+      .safeParse({
+        tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+        invoiceId: typeof req.query.invoiceId === 'string' ? req.query.invoiceId : '',
+        force: (req.query as any).force,
+      });
+
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = tenantAccess.tenantId;
+    if (parsed.data.tenantId !== tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    ensureFirebase();
+    const bucketConfigured = typeof admin.app().options.storageBucket === 'string';
+    if (!bucketConfigured) {
+      return res.status(501).json({ error: 'storage_bucket_not_configured' });
+    }
+    const bucket = admin.storage().bucket();
+    const db = getFirestoreImpl();
+
+    try {
+      const invoiceRef = db.collection('billingInvoices').doc(tenantId).collection('invoices').doc(parsed.data.invoiceId);
+      const snap = await invoiceRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'invoice_not_found' });
+      }
+
+      const data = snap.data() || {};
+      const existingUrl = typeof (data as any).downloadUrl === 'string' ? (data as any).downloadUrl.trim() : '';
+      const existingPdfVersion = typeof (data as any).invoicePdfVersion === 'number' ? (data as any).invoicePdfVersion : null;
+      const forceRegenerate = parsed.data.force === true;
+      let shouldRegenerate = forceRegenerate || !existingUrl || existingPdfVersion !== INVOICE_PDF_VERSION;
+
+      const amountInrRaw = (data as any).amountInr ?? (data as any).amount ?? 0;
+      const amountInr = typeof amountInrRaw === 'number' && Number.isFinite(amountInrRaw) ? Math.round(amountInrRaw) : 0;
+
+      const tenantSnap = await db.collection('tenants').doc(tenantId).get().catch(() => null as any);
+      const tenantData = tenantSnap && tenantSnap.exists ? (tenantSnap.data() as any) : null;
+      const coachingName =
+        tenantData && typeof tenantData.coachingName === 'string'
+          ? tenantData.coachingName
+          : tenantData && typeof tenantData.name === 'string'
+            ? tenantData.name
+            : undefined;
+
+      const issuedAt = typeof (data as any).issuedAt === 'string' ? (data as any).issuedAt : undefined;
+      const dueAt = typeof (data as any).dueAt === 'string' ? (data as any).dueAt : undefined;
+
+      const billingPeriodStartRaw = typeof (data as any).billingPeriodStart === 'string' ? (data as any).billingPeriodStart : undefined;
+      const billingPeriodEndRaw = typeof (data as any).billingPeriodEnd === 'string' ? (data as any).billingPeriodEnd : undefined;
+
+      let billingPeriodStart: string | undefined = billingPeriodStartRaw;
+      let billingPeriodEnd: string | undefined = billingPeriodEndRaw;
+      if (!billingPeriodStart && !billingPeriodEnd) {
+        const billingSnap = await db.collection('tenantBilling').doc(tenantId).get().catch(() => null as any);
+        const billingData = billingSnap && billingSnap.exists ? (billingSnap.data() as any) : null;
+        const renewalDate = billingData && typeof billingData.renewalDate === 'string' ? billingData.renewalDate : undefined;
+        // Best-effort: use payment/issue date and next billing date.
+        if (issuedAt) billingPeriodStart = issuedAt;
+        if (renewalDate) billingPeriodEnd = renewalDate;
+      }
+
+      function formatInvoiceNumber(sequence: number, atIso?: string): string {
+        const d = atIso ? new Date(atIso) : new Date();
+        const year = Number.isFinite(d.getTime()) ? d.getFullYear() : new Date().getFullYear();
+        return `INV-${year}-${String(Math.max(0, Math.trunc(sequence))).padStart(6, '0')}`;
+      }
+
+      // Ensure we have a human-friendly invoice number stored.
+      const existingInvoiceNumber =
+        typeof (data as any).invoiceNumber === 'string' && String((data as any).invoiceNumber).trim()
+          ? String((data as any).invoiceNumber).trim()
+          : '';
+
+      const invoiceNumber = existingInvoiceNumber
+        ? existingInvoiceNumber
+        : await db.runTransaction(async (tx) => {
+            const invSnap = await tx.get(invoiceRef);
+            const invData = invSnap.data() || {};
+            const already =
+              typeof (invData as any).invoiceNumber === 'string' && String((invData as any).invoiceNumber).trim()
+                ? String((invData as any).invoiceNumber).trim()
+                : '';
+            if (already) return already;
+
+            const counterRef = db.collection('systemCounters').doc('invoiceNumber');
+            const counterSnap = await tx.get(counterRef);
+            const counterData = counterSnap.exists ? (counterSnap.data() as any) : {};
+            const currentSeqRaw = counterData && typeof counterData.sequence === 'number' ? counterData.sequence : 0;
+            const nextSeq = Math.max(0, Math.trunc(currentSeqRaw)) + 1;
+            const nextNumber = formatInvoiceNumber(nextSeq, issuedAt);
+            tx.set(counterRef, { sequence: nextSeq, updatedAt: new Date().toISOString() }, { merge: true });
+            tx.set(invoiceRef, { invoiceNumber: nextNumber }, { merge: true });
+            return nextNumber;
+          });
+
+      if (!shouldRegenerate) {
+        const storedPathRaw = typeof (data as any).invoicePdfPath === 'string' ? String((data as any).invoicePdfPath).trim() : '';
+        const storagePath = storedPathRaw || buildInvoiceStoragePath(tenantId, snap.id);
+        const [exists] = await bucket.file(storagePath).exists().catch(() => [false as boolean]);
+        if (exists) {
+          // Refresh the token URL so the caller always receives a working link.
+          const refreshed = await ensureInvoicePdfInStorage({
+            bucket,
+            tenantId,
+            force: false,
+            invoice: {
+              tenantId,
+              coachingName,
+              invoiceId: snap.id,
+              invoiceNumber,
+              amountInr,
+              status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
+              issuedAt,
+              dueAt,
+              planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
+              planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
+              couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
+              payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
+              method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
+              cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
+              cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
+              upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
+              billingPeriodStart,
+              billingPeriodEnd,
+              provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
+              providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
+              providerSubscriptionId:
+                typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
+              subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
+            },
+          });
+
+          await invoiceRef.set(
+            {
+              downloadUrl: refreshed.downloadUrl,
+              invoicePdfPath: refreshed.path,
+              invoicePdfGeneratedAt: new Date().toISOString(),
+              invoicePdfVersion: INVOICE_PDF_VERSION,
+              invoiceNumber,
+              ...(billingPeriodStart ? { billingPeriodStart } : {}),
+              ...(billingPeriodEnd ? { billingPeriodEnd } : {}),
+            },
+            { merge: true }
+          );
+
+          return res.json({ ok: true, downloadUrl: refreshed.downloadUrl });
+        }
+        shouldRegenerate = true;
+      }
+
+      const { downloadUrl, path } = await ensureInvoicePdfInStorage({
+        bucket,
+        tenantId,
+        force: true,
+        invoice: {
+          tenantId,
+          coachingName,
+          invoiceId: snap.id,
+          invoiceNumber,
+          amountInr,
+          status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
+          issuedAt,
+          dueAt,
+          planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
+          planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
+          couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
+          payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
+          method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
+          cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
+          cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
+          upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
+          billingPeriodStart,
+          billingPeriodEnd,
+          provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
+          providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
+          providerSubscriptionId:
+            typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
+          subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
+        },
+      });
+
+      await invoiceRef.set(
+        {
+          downloadUrl,
+          invoicePdfPath: path,
+          invoicePdfGeneratedAt: new Date().toISOString(),
+          invoicePdfVersion: INVOICE_PDF_VERSION,
+          invoiceNumber,
+          ...(billingPeriodStart ? { billingPeriodStart } : {}),
+          ...(billingPeriodEnd ? { billingPeriodEnd } : {}),
+        },
+        { merge: true }
+      );
+
+      return res.json({ ok: true, downloadUrl });
+    } catch (error) {
+      console.error('[billing_invoice_download_url] failed', error);
+      return res.status(500).json({ error: 'billing_invoice_download_failed' });
+    }
+  });
+
+  // Direct invoice PDF download (browser-friendly). Regenerates when missing/outdated.
+  app.get('/billing/invoice/download', requireAdminTenantAccessFromQuery, async (req, res) => {
+    const INVOICE_PDF_VERSION = 2;
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = z
+      .object({
+        tenantId: z.string().trim().min(1),
+        invoiceId: z.string().trim().min(1),
+        force: z
+          .preprocess((value) => {
+            if (value === undefined || value === null) return undefined;
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'number') return value !== 0;
+            if (typeof value === 'string') {
+              const v = value.trim().toLowerCase();
+              if (!v) return undefined;
+              return v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on';
+            }
+            return undefined;
+          }, z.boolean().optional())
+          .optional(),
+      })
+      .safeParse({
+        tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+        invoiceId: typeof req.query.invoiceId === 'string' ? req.query.invoiceId : '',
+        force: (req.query as any).force,
+      });
+
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = tenantAccess.tenantId;
+    if (parsed.data.tenantId !== tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    ensureFirebase();
+    const bucketConfigured = typeof admin.app().options.storageBucket === 'string';
+    if (!bucketConfigured) {
+      return res.status(501).json({ error: 'storage_bucket_not_configured' });
+    }
+
+    const bucket = admin.storage().bucket();
+    const db = getFirestoreImpl();
+
+    try {
+      const invoiceRef = db.collection('billingInvoices').doc(tenantId).collection('invoices').doc(parsed.data.invoiceId);
+      const snap = await invoiceRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'invoice_not_found' });
+      }
+
+      const data = snap.data() || {};
+      const existingPdfVersion = typeof (data as any).invoicePdfVersion === 'number' ? (data as any).invoicePdfVersion : null;
+      const forceRegenerate = parsed.data.force === true;
+
+      const amountInrRaw = (data as any).amountInr ?? (data as any).amount ?? 0;
+      const amountInr = typeof amountInrRaw === 'number' && Number.isFinite(amountInrRaw) ? Math.round(amountInrRaw) : 0;
+
+      const tenantSnap = await db.collection('tenants').doc(tenantId).get().catch(() => null as any);
+      const tenantData = tenantSnap && tenantSnap.exists ? (tenantSnap.data() as any) : null;
+      const coachingName =
+        tenantData && typeof tenantData.coachingName === 'string'
+          ? tenantData.coachingName
+          : tenantData && typeof tenantData.name === 'string'
+            ? tenantData.name
+            : undefined;
+
+      const issuedAt = typeof (data as any).issuedAt === 'string' ? (data as any).issuedAt : undefined;
+      const dueAt = typeof (data as any).dueAt === 'string' ? (data as any).dueAt : undefined;
+
+      const billingPeriodStartRaw =
+        typeof (data as any).billingPeriodStart === 'string' ? (data as any).billingPeriodStart : undefined;
+      const billingPeriodEndRaw = typeof (data as any).billingPeriodEnd === 'string' ? (data as any).billingPeriodEnd : undefined;
+
+      let billingPeriodStart: string | undefined = billingPeriodStartRaw;
+      let billingPeriodEnd: string | undefined = billingPeriodEndRaw;
+      if (!billingPeriodStart && !billingPeriodEnd) {
+        const billingSnap = await db.collection('tenantBilling').doc(tenantId).get().catch(() => null as any);
+        const billingData = billingSnap && billingSnap.exists ? (billingSnap.data() as any) : null;
+        const renewalDate = billingData && typeof billingData.renewalDate === 'string' ? billingData.renewalDate : undefined;
+        if (issuedAt) billingPeriodStart = issuedAt;
+        if (renewalDate) billingPeriodEnd = renewalDate;
+      }
+
+      function formatInvoiceNumber(sequence: number, atIso?: string): string {
+        const d = atIso ? new Date(atIso) : new Date();
+        const year = Number.isFinite(d.getTime()) ? d.getFullYear() : new Date().getFullYear();
+        return `INV-${year}-${String(Math.max(0, Math.trunc(sequence))).padStart(6, '0')}`;
+      }
+
+      const existingInvoiceNumber =
+        typeof (data as any).invoiceNumber === 'string' && String((data as any).invoiceNumber).trim()
+          ? String((data as any).invoiceNumber).trim()
+          : '';
+
+      const invoiceNumber = existingInvoiceNumber
+        ? existingInvoiceNumber
+        : await db.runTransaction(async (tx) => {
+            const invSnap = await tx.get(invoiceRef);
+            const invData = invSnap.data() || {};
+            const already =
+              typeof (invData as any).invoiceNumber === 'string' && String((invData as any).invoiceNumber).trim()
+                ? String((invData as any).invoiceNumber).trim()
+                : '';
+            if (already) return already;
+
+            const counterRef = db.collection('systemCounters').doc('invoiceNumber');
+            const counterSnap = await tx.get(counterRef);
+            const counterData = counterSnap.exists ? (counterSnap.data() as any) : {};
+            const currentSeqRaw = counterData && typeof counterData.sequence === 'number' ? counterData.sequence : 0;
+            const nextSeq = Math.max(0, Math.trunc(currentSeqRaw)) + 1;
+            const nextNumber = formatInvoiceNumber(nextSeq, issuedAt);
+            tx.set(counterRef, { sequence: nextSeq, updatedAt: new Date().toISOString() }, { merge: true });
+            tx.set(invoiceRef, { invoiceNumber: nextNumber }, { merge: true });
+            return nextNumber;
+          });
+
+      const storedPathRaw = typeof (data as any).invoicePdfPath === 'string' ? String((data as any).invoicePdfPath).trim() : '';
+      const storagePath = storedPathRaw || buildInvoiceStoragePath(tenantId, snap.id);
+      const file = bucket.file(storagePath);
+      const [exists] = await file.exists().catch(() => [false as boolean]);
+
+      const shouldRegenerate = forceRegenerate || !exists || existingPdfVersion !== INVOICE_PDF_VERSION;
+      if (shouldRegenerate) {
+        const refreshed = await ensureInvoicePdfInStorage({
+          bucket,
+          tenantId,
+          force: true,
+          invoice: {
+            tenantId,
+            coachingName,
+            invoiceId: snap.id,
+            invoiceNumber,
+            amountInr,
+            status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
+            issuedAt,
+            dueAt,
+            planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
+            planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
+            couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
+            payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
+            method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
+            cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
+            cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
+            upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
+            billingPeriodStart,
+            billingPeriodEnd,
+            provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
+            providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
+            providerSubscriptionId:
+              typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
+            subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
+          },
+        });
+
+        await invoiceRef.set(
+          {
+            downloadUrl: refreshed.downloadUrl,
+            invoicePdfPath: refreshed.path,
+            invoicePdfGeneratedAt: new Date().toISOString(),
+            invoicePdfVersion: INVOICE_PDF_VERSION,
+            invoiceNumber,
+            ...(billingPeriodStart ? { billingPeriodStart } : {}),
+            ...(billingPeriodEnd ? { billingPeriodEnd } : {}),
+          },
+          { merge: true }
+        );
+      }
+
+      const filename = `${invoiceNumber || snap.id}.pdf`;
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/\"/g, '')}"`);
+      res.setHeader('Cache-Control', 'private, max-age=0, no-store');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+
+      const finalPath = shouldRegenerate ? buildInvoiceStoragePath(tenantId, snap.id) : storagePath;
+      const finalFile = bucket.file(finalPath);
+
+      const stream = finalFile.createReadStream();
+      stream.on('error', (err) => {
+        console.error('[billing_invoice_download] stream failed', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'billing_invoice_stream_failed' });
+        } else {
+          res.end();
+        }
+      });
+      stream.pipe(res);
+    } catch (error) {
+      console.error('[billing_invoice_download] failed', error);
+      return res.status(500).json({ error: 'billing_invoice_download_failed' });
+    }
+  });
+
+  app.get('/billing/current', requireMemberTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    try {
+      const tenantSummary = await loadTenantAdminSummaryImpl(tenantAccess.tenantId);
+      const fallbackPlanId = getPlanLimits(tenantSummary?.billingTier ?? 'free').id;
+      const current = await loadTenantCurrentBilling(getFirestoreImpl(), tenantAccess.tenantId, fallbackPlanId);
+      return res.json(current);
+    } catch (error) {
+      console.error('[billing_current] failed', error);
+      return res.status(500).json({ error: 'billing_current_failed' });
+    }
+  });
+
+  app.get('/billing/catalog', async (req, res) => {
+    try {
+      const db = getFirestoreImpl();
+      const configured = await listPlanVariants(db, { includeInactive: false });
+
+      // Public catalog: expose Free + all active Pro variants.
+      // Enterprise is intentionally hidden from the public catalog (sales-assisted / manual upgrade flow).
+      const free = configured.find((entry) => entry.id === 'free') ?? builtInFreePlan();
+      const proVariants = configured
+        .filter((entry) => entry.planId === 'pro')
+        .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+
+      return res.json({ plans: [free, ...proVariants] });
+    } catch (error) {
+      console.error('[billing_catalog] failed', error);
+      return res.status(500).json({ error: 'billing_catalog_failed' });
+    }
+  });
+
+  app.get('/billing/catalog/admin', requireOperatorAuth, async (req, res) => {
+    try {
+      const db = getFirestoreImpl();
+      const plans = await listPlanVariants(db, { includeInactive: true });
+      const coupons = await listCoupons(db, { includeInactive: true });
+      const hasFree = plans.some((entry) => entry.id === 'free');
+      const allPlans = hasFree ? plans : [builtInFreePlan(), ...plans];
+      return res.json({ plans: allPlans, coupons });
+    } catch (error) {
+      console.error('[billing_catalog_admin] failed', error);
+      return res.status(500).json({ error: 'billing_catalog_admin_failed' });
+    }
+  });
+
+  app.post('/billing/catalog/admin/plans/upsert', requireOperatorAuth, async (req, res) => {
+    const parsed = billingPlanVariantUpsertSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    try {
+      const db = getFirestoreImpl();
+      const payload = parsed.data;
+      const isFreePlan = payload.id === 'free' || payload.planId === 'free';
+      const upsertPayload: Parameters<typeof upsertPlanVariant>[1] = {
+        id: payload.id,
+        planId: isFreePlan ? 'free' : payload.planId,
+        displayName: payload.displayName,
+        currency: 'INR',
+        priceInr: isFreePlan ? 0 : payload.priceInr,
+        interval: payload.interval,
+        provider: payload.provider,
+        limits: payload.limits,
+        applyChangesMode: isFreePlan ? 'immediate' : payload.applyChangesMode,
+        decreasePolicy: payload.decreasePolicy,
+        active: isFreePlan ? true : payload.active,
+        sortOrder: isFreePlan ? 0 : payload.sortOrder,
+      };
+
+      if (!isFreePlan && typeof payload.razorpayPlanId === 'string' && payload.razorpayPlanId.trim()) {
+        upsertPayload.razorpayPlanId = payload.razorpayPlanId;
+      }
+
+      if (!isFreePlan && typeof payload.playProductId === 'string' && payload.playProductId.trim()) {
+        (upsertPayload as any).playProductId = payload.playProductId;
+      }
+
+      await upsertPlanVariant(db, upsertPayload);
+
+      // Return the saved record so the admin console can confirm persistence.
+      const saved = await getPlanVariantById(db, upsertPayload.id);
+      return res.json({ ok: true, plan: saved });
+    } catch (error) {
+      console.error('[billing_catalog_plan_upsert] failed', error);
+      return res.status(500).json({ error: 'billing_catalog_plan_upsert_failed' });
+    }
+  });
+
+  app.post('/billing/catalog/admin/coupons/upsert', requireOperatorAuth, async (req, res) => {
+    const parsed = billingCouponUpsertSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    try {
+      const db = getFirestoreImpl();
+      const payload = parsed.data;
+      await upsertCoupon(db, {
+        id: payload.id,
+        code: payload.code,
+        mapsToPlanVariantId: payload.mapsToPlanVariantId,
+        active: payload.active,
+        startsAt: payload.startsAt,
+        endsAt: payload.endsAt,
+      });
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[billing_catalog_coupon_upsert] failed', error);
+      return res.status(500).json({ error: 'billing_catalog_coupon_upsert_failed' });
+    }
+  });
+
+  // Backfill tenantBilling.limitsSnapshot so next_billing (and soft decrease) behavior can work
+  // immediately for existing paid tenants (before their next renewal webhook).
+  app.post('/billing/admin/limits-snapshot/backfill', requireOperatorAuth, async (req, res) => {
+    const parsed = billingLimitsSnapshotBackfillSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const payload = parsed.data;
+    const dryRun = payload.confirm ? false : payload.dryRun ?? true;
+    const force = payload.force === true;
+    const limit = typeof payload.limit === 'number' ? payload.limit : 200;
+
+    try {
+      const db = getFirestoreImpl();
+
+      let docs: Array<admin.firestore.DocumentSnapshot<admin.firestore.DocumentData> & { ref?: any }> = [];
+      if (payload.tenantId) {
+        const ref = db.collection('tenantBilling').doc(payload.tenantId);
+        const snap = await ref.get();
+        // Align with query snapshots that provide ref.
+        (snap as any).ref = ref;
+        docs = [snap as any];
+      } else {
+        let query: any = db.collection('tenantBilling');
+        if (limit) {
+          query = query.limit(limit);
+        }
+        const snap = await query.get();
+        docs = (snap?.docs || []) as any;
+      }
+
+      let scanned = 0;
+      let skippedFree = 0;
+      let skippedExisting = 0;
+      let updated = 0;
+      let errors = 0;
+      const errorSamples: Array<{ tenantId: string; error: string }> = [];
+
+      for (const docSnap of docs) {
+        scanned += 1;
+        const tenantId = docSnap.id;
+        const data = (docSnap.exists ? docSnap.data() || {} : {}) as Record<string, any>;
+
+        const planId = normalizePlanId(data.planId ?? data.plan);
+        if (planId === 'free') {
+          skippedFree += 1;
+          continue;
+        }
+
+        const hasSnapshot = Boolean(data.limitsSnapshot && typeof data.limitsSnapshot === 'object');
+        if (hasSnapshot && !force) {
+          skippedExisting += 1;
+          continue;
+        }
+
+        const planVariantId = typeof data.planVariantId === 'string' && data.planVariantId.trim() ? data.planVariantId.trim() : null;
+
+        try {
+          const resolved = await resolvePlanLimitsFromCatalog(db, { planId, planVariantId });
+          const limitsSnapshot = toTenantBillingLimitsSnapshot(resolved);
+          if (!dryRun) {
+            const ref = (docSnap as any).ref || db.collection('tenantBilling').doc(tenantId);
+            await ref.set(
+              {
+                limitsSnapshot,
+                limitsSnapshotAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+          updated += 1;
+        } catch (error: any) {
+          errors += 1;
+          if (errorSamples.length < 5) {
+            errorSamples.push({ tenantId, error: String(error?.message || error) });
+          }
+        }
+      }
+
+      return res.json({
+        ok: true,
+        dryRun,
+        force,
+        limit: payload.tenantId ? 1 : limit,
+        scanned,
+        updated,
+        skippedFree,
+        skippedExisting,
+        errors,
+        errorSamples,
+      });
+    } catch (error) {
+      console.error('[billing_limits_snapshot_backfill] failed', error);
+      return res.status(500).json({ error: 'billing_limits_snapshot_backfill_failed' });
+    }
+  });
+
+  // Manual backfill trigger for a single tenant.
+  // Runs the Razorpay reconciliation flow (subscription + payments) and upserts invoices + billing state.
+  app.post('/billing/admin/backfill', requireOperatorAuth, async (req, res) => {
+    const parsed = billingTenantBackfillSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const payload = parsed.data;
+    const dryRun = payload.confirm ? false : payload.dryRun ?? true;
+    const verbose = payload.verbose === true;
+    const maxPaymentsPerSubscription =
+      typeof payload.maxPaymentsPerSubscription === 'number' ? payload.maxPaymentsPerSubscription : 200;
+    const jobLabel = payload.jobLabel || 'manual_api';
+
+    try {
+      const db = getFirestoreImpl();
+      const runnerId = req.authContext?.uid || 'operator_api';
+
+      const stats = await runBillingBackfill(db, {
+        tenantIds: [payload.tenantId],
+        maxPaymentsPerSubscription,
+        dryRun,
+        verbose,
+        jobLabel,
+        runnerId,
+      });
+
+      return res.json({
+        ok: true,
+        dryRun,
+        runId: stats.runId,
+        tenantsProcessed: stats.tenantsProcessed,
+        invoicesUpserted: stats.invoicesUpserted,
+        invoicesPatched: stats.invoicesPatched,
+        billingDocsUpdated: stats.billingDocsUpdated,
+        tenantDocsUpdated: stats.tenantDocsUpdated,
+        reconciliation: stats.reconciliation,
+        reconciliationTenantsPreview: stats.reconciliationTenantsPreview,
+        errors: stats.errors.length,
+        errorsPreview: stats.errors.slice(0, 10),
+      });
+    } catch (error) {
+      console.error('[billing_manual_backfill] failed', error);
+      return res.status(500).json({ error: 'billing_manual_backfill_failed' });
+    }
+  });
+
+  app.get('/billing/admin/ops-events', requireOperatorAuth, async (req, res) => {
+    const limitRaw = typeof req.query.limit === 'string' ? req.query.limit : '';
+    const beforeRaw = typeof req.query.before === 'string' ? req.query.before : '';
+    const tenantIdRaw = typeof req.query.tenantId === 'string' ? req.query.tenantId : '';
+
+    const limit = Math.max(1, Math.min(200, Number(limitRaw || '50') || 50));
+    const before = beforeRaw && beforeRaw.trim() ? beforeRaw.trim() : null;
+    const tenantId = tenantIdRaw && tenantIdRaw.trim() ? tenantIdRaw.trim() : null;
+
+    try {
+      const db = getFirestoreImpl();
+      const fetchLimit = tenantId ? Math.min(500, limit * 5) : limit;
+      let query: FirebaseFirestore.Query = db.collection('billingOpsEvents');
+      if (before) {
+        query = query.where('createdAtIso', '<', before);
+      }
+      query = query.orderBy('createdAtIso', 'desc').limit(fetchLimit);
+      const snap = await query.get();
+      let items = snap.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
+      if (tenantId) {
+        items = items.filter((row) => row.tenantId === tenantId);
+      }
+      items = items.slice(0, limit);
+      const nextCursor = items.length > 0 ? (items[items.length - 1] as any).createdAtIso || null : null;
+      return res.json({ ok: true, items, nextCursor });
+    } catch (error) {
+      console.error('[billing_ops_events_list] failed', error);
+      return res.status(500).json({ error: 'billing_ops_events_list_failed' });
+    }
+  });
+
+  app.get('/billing/admin/backfill/runs', requireOperatorAuth, async (req, res) => {
+    const limitRaw = typeof req.query.limit === 'string' ? req.query.limit : '';
+    const beforeRaw = typeof req.query.before === 'string' ? req.query.before : '';
+
+    const limit = Math.max(1, Math.min(200, Number(limitRaw || '50') || 50));
+    const before = beforeRaw && beforeRaw.trim() ? beforeRaw.trim() : null;
+
+    try {
+      const db = getFirestoreImpl();
+      let query: FirebaseFirestore.Query = db.collection('billingBackfillRuns');
+      if (before) {
+        query = query.where('startedAtIso', '<', before);
+      }
+      query = query.orderBy('startedAtIso', 'desc').limit(limit);
+      const snap = await query.get();
+      const items = snap.docs.map((doc) => ({ id: doc.id, ...(doc.data() as any) }));
+      const nextCursor = items.length > 0 ? (items[items.length - 1] as any).startedAtIso || null : null;
+      return res.json({ ok: true, items, nextCursor });
+    } catch (error) {
+      console.error('[billing_backfill_runs_list] failed', error);
+      return res.status(500).json({ error: 'billing_backfill_runs_list_failed' });
+    }
+  });
+
+  app.post('/billing/checkout', requireAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = billingCheckoutSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const payload = parsed.data;
+    if (payload.tenantId && payload.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    const planId = normalizePlanId(payload.planId);
+    const provider = payload.provider ?? 'razorpay';
+    if (provider !== 'razorpay') {
+      return res.status(400).json({ error: 'provider_not_supported', message: 'Only Razorpay is supported.' });
+    }
+    const baseCheckoutUrl = process.env.BILLING_CHECKOUT_BASE_URL || 'https://billing.tuitionmanager.app/checkout';
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const actorUid = req.authContext?.uid || null;
+      const actorRole = tenantAccess.role;
+      const actorMembershipId = tenantAccess.membershipId;
+
+      // IMPORTANT: Avoid creating duplicate Razorpay subscriptions.
+      // 1) If a checkout is already in progress (lock is active), return the existing checkout URL.
+      // 2) If this tenant already has a pending Razorpay subscription/attempt (checkoutRequired=true),
+      //    reuse the existing attempt/session (or create a new hosted checkout session pointing to the same
+      //    Razorpay subscription id) instead of creating a new subscription.
+      const db = getFirestoreImpl();
+      const nowIso = new Date().toISOString();
+      const lockRef = db.collection('billingCheckoutLocks').doc(tenantAccess.tenantId);
+      const billingRef = db.collection('tenantBilling').doc(tenantAccess.tenantId);
+
+      const [existingLockSnap, billingSnap] = await Promise.all([lockRef.get(), billingRef.get()]);
+      if (existingLockSnap && existingLockSnap.exists) {
+        const existing = (existingLockSnap.data && existingLockSnap.data()) || {};
+        const existingExpiresAt = typeof existing.expiresAt === 'string' ? existing.expiresAt : '';
+        if (existingExpiresAt && existingExpiresAt > nowIso) {
+          return res.status(409).json({
+            error: 'billing_checkout_in_progress',
+            message: 'Another admin has already started a payment for this coaching center. Please wait for it to complete.',
+            ...(typeof existing.sessionId === 'string' && existing.sessionId ? { sessionId: existing.sessionId } : {}),
+            ...(typeof existing.checkoutUrl === 'string' && existing.checkoutUrl ? { checkoutUrl: existing.checkoutUrl } : {}),
+            expiresAt: existingExpiresAt,
+            ...(typeof existing.startedByEmail === 'string' && existing.startedByEmail ? { startedByEmail: existing.startedByEmail } : {}),
+          });
+        }
+      }
+
+      const billing = billingSnap.exists ? billingSnap.data() || {} : {};
+      const existingBillingProvider =
+        typeof (billing as any).billingProvider === 'string' ? String((billing as any).billingProvider).toLowerCase() : '';
+      const existingCheckoutRequired = (billing as any).checkoutRequired === true;
+      const existingSubscriptionId =
+        typeof (billing as any).subscriptionId === 'string' ? String((billing as any).subscriptionId).trim() : '';
+      const existingBillingAttemptId =
+        typeof (billing as any).billingAttemptId === 'string' ? String((billing as any).billingAttemptId).trim() : '';
+      const pendingPlanVariantId =
+        typeof (billing as any).pendingPlanVariantId === 'string' ? String((billing as any).pendingPlanVariantId).trim() : '';
+      const requestedPlanVariantId = typeof payload.planVariantId === 'string' ? payload.planVariantId.trim() : '';
+
+      const canReuseExistingPendingSubscription =
+        provider === 'razorpay' &&
+        existingCheckoutRequired &&
+        existingBillingProvider === 'razorpay' &&
+        Boolean(existingSubscriptionId) &&
+        // Only reuse automatically if the caller isn't trying to change variants.
+        (!requestedPlanVariantId || !pendingPlanVariantId || requestedPlanVariantId === pendingPlanVariantId);
+
+      if (canReuseExistingPendingSubscription) {
+        const lockTtlMinutesRaw = Number.parseInt((process.env.BILLING_CHECKOUT_LOCK_TTL_MINUTES || '').trim() || '15', 10);
+        const lockTtlMinutes = Number.isFinite(lockTtlMinutesRaw)
+          ? Math.max(1, Math.min(120, lockTtlMinutesRaw))
+          : 15;
+        const reuseMinCreatedAtIso = new Date(Date.now() - lockTtlMinutes * 60 * 1000).toISOString();
+
+        // If we still have the original checkout session url, return it as-is.
+        if (existingBillingAttemptId) {
+          const existingSessionSnap = await db.collection('billingCheckoutSessions').doc(existingBillingAttemptId).get();
+          const existingSession = existingSessionSnap.exists ? existingSessionSnap.data() || {} : {};
+          const existingCheckoutUrl = typeof (existingSession as any).checkoutUrl === 'string' ? (existingSession as any).checkoutUrl.trim() : '';
+          const existingCreatedAt = typeof (existingSession as any).createdAt === 'string' ? String((existingSession as any).createdAt).trim() : '';
+          // Only reuse a recent session URL; older sessions commonly show checkout_session_expired.
+          if (existingCheckoutUrl && (!existingCreatedAt || existingCreatedAt >= reuseMinCreatedAtIso)) {
+            return res.json({
+              checkoutUrl: existingCheckoutUrl,
+              provider: 'razorpay',
+              sessionId: existingBillingAttemptId,
+              providerSessionId: existingSubscriptionId,
+            });
+          }
+        }
+
+        // Otherwise, create a new hosted checkout session that points to the SAME Razorpay subscription id.
+        // This avoids creating duplicate subscriptions when the tenant is already in an authenticated/pending state.
+        const sessionRef = db.collection('billingCheckoutSessions').doc();
+        const sessionId = sessionRef.id;
+        const billingAttemptId = sessionId;
+
+        const preferHostedCheckout =
+          provider === 'razorpay' && Boolean(payload.successUrl || payload.cancelUrl) && Boolean(baseCheckoutUrl);
+        const checkoutUrl = `${baseCheckoutUrl}?sessionId=${encodeURIComponent(sessionId)}&tenantId=${encodeURIComponent(
+          tenantAccess.tenantId
+        )}`;
+
+        const expiresAtIso = new Date(Date.now() + lockTtlMinutes * 60 * 1000).toISOString();
+
+        const effectiveReusePlanId =
+          typeof (billing as any).pendingPlanId === 'string' && String((billing as any).pendingPlanId).trim()
+            ? normalizePlanId(String((billing as any).pendingPlanId))
+            : planId;
+
+        const record: BillingCheckoutSessionRecord = {
+          tenantId: tenantAccess.tenantId,
+          planId: effectiveReusePlanId,
+          provider,
+          ...(payload.successUrl ? { successUrl: payload.successUrl } : {}),
+          ...(payload.cancelUrl ? { cancelUrl: payload.cancelUrl } : {}),
+          metadata: {
+            ...(payload.metadata || {}),
+            razorpaySubscriptionId: existingSubscriptionId,
+            ...(pendingPlanVariantId ? { planVariantId: pendingPlanVariantId } : {}),
+            planId: effectiveReusePlanId,
+          },
+          createdAt: nowIso,
+          createdBy: req.authContext?.uid || 'system',
+          ...(actorEmail ? { createdByEmail: actorEmail } : {}),
+          status: 'pending',
+        };
+
+        if (!preferHostedCheckout) {
+          // For now, always return hosted checkout URL; it is the only flow we can safely reuse without provider calls.
+          // (If this ever needs to support non-hosted flows, add a provider-side retry link fetcher.)
+        }
+
+        await Promise.all([
+          sessionRef.set({ ...record, checkoutUrl }, { merge: false }),
+          lockRef.set(
+            {
+              tenantId: tenantAccess.tenantId,
+              provider,
+              planId: effectiveReusePlanId,
+              sessionId,
+              checkoutUrl,
+              startedAt: nowIso,
+              expiresAt: expiresAtIso,
+              startedBy: req.authContext?.uid || 'system',
+              ...(actorEmail ? { startedByEmail: actorEmail } : {}),
+              providerSessionId: existingSubscriptionId,
+              billingAttemptId,
+            },
+            { merge: false }
+          ),
+        ]);
+
+        void logTenantAuditEventImpl({
+          tenantId: tenantAccess.tenantId,
+          action: 'billing_checkout_started',
+          authContext: req.authContext,
+          metadata: {
+            provider,
+            planId: effectiveReusePlanId,
+            sessionId,
+            actorRole,
+            actorMembershipId,
+            razorpaySubscriptionId: existingSubscriptionId,
+            reused: true,
+            ...(existingBillingAttemptId ? { reusedFromSessionId: existingBillingAttemptId } : {}),
+          },
+          targetId: sessionId,
+          targetType: 'billing',
+        });
+
+        return res.json({
+          checkoutUrl,
+          provider,
+          sessionId,
+          providerSessionId: existingSubscriptionId,
+        });
+      }
+
+      if (provider === 'razorpay' && planId === 'free') {
+        return res.status(400).json({ error: 'invalid_plan', message: 'Free plan does not require checkout' });
+      }
+
+      let razorpaySubscription:
+        | {
+            subscriptionId: string;
+            shortUrl?: string;
+          }
+        | undefined;
+
+      if (provider === 'razorpay') {
+        try {
+          const db = getFirestoreImpl();
+          const activePlans = await listPlanVariants(db, { includeInactive: false });
+          if (!activePlans.length) {
+            return res.status(503).json({ error: 'billing_catalog_unconfigured' });
+          }
+          const coupons = await listCoupons(db, { includeInactive: false });
+
+          let selectedVariant = payload.planVariantId
+            ? activePlans.find((entry) => entry.id === payload.planVariantId)
+            : // If caller only specifies planId (recommended long-term), default to canonical variant id === planId.
+              (planId !== 'free' ? activePlans.find((entry) => entry.id === planId) : undefined);
+
+          if (!selectedVariant && !payload.couponCode) {
+            return res.status(400).json({ error: 'plan_variant_required' });
+          }
+
+          if (!selectedVariant) {
+            // If coupon is present, it may resolve to a variant below.
+            if (!payload.couponCode) {
+              return res.status(400).json({ error: 'invalid_plan_variant' });
+            }
+          }
+
+          const resolvedCoupon = resolveCouponCode(coupons, payload.couponCode);
+          if (resolvedCoupon) {
+            const mapped = activePlans.find((entry) => entry.id === resolvedCoupon.mapsToPlanVariantId);
+            if (!mapped || !mapped.active) {
+              return res.status(400).json({ error: 'invalid_coupon' });
+            }
+            selectedVariant = mapped;
+          } else if (payload.couponCode) {
+            return res.status(400).json({ error: 'invalid_coupon' });
+          }
+
+          if (!selectedVariant) {
+            return res.status(400).json({ error: 'invalid_plan_variant' });
+          }
+
+          if (selectedVariant.planId === 'free') {
+            return res.status(400).json({ error: 'invalid_plan', message: 'Free plan does not require checkout' });
+          }
+
+          const razorpayPlanIdOverride = selectedVariant.razorpayPlanId;
+          if (!razorpayPlanIdOverride) {
+            return res.status(503).json({ error: 'razorpay_unconfigured', message: 'Missing Razorpay plan mapping' });
+          }
+
+          const created = await createRazorpaySubscriptionImpl({
+            tenantId: tenantAccess.tenantId,
+            planId: selectedVariant.planId,
+            planVariantId: selectedVariant.id,
+            couponCode: resolvedCoupon?.code,
+            razorpayPlanIdOverride,
+            customerEmail: actorEmail || null,
+            notes: {
+              createdByEmail: actorEmail || 'unknown',
+              ...(actorUid ? { createdByUid: actorUid } : {}),
+              createdByRole: actorRole,
+              ...(actorMembershipId ? { createdByMembershipId: actorMembershipId } : {}),
+            },
+          });
+          razorpaySubscription = { subscriptionId: created.subscriptionId, shortUrl: created.shortUrl };
+
+          // Store the effective selection in metadata for future reconciliation.
+          payload.metadata = {
+            ...(payload.metadata || {}),
+            planVariantId: selectedVariant.id,
+            planId: selectedVariant.planId,
+            ...(resolvedCoupon?.code ? { couponCode: resolvedCoupon.code } : {}),
+          };
+        } catch (error) {
+          console.error('[billing_checkout] razorpay subscription create failed', error);
+          return res.status(503).json({ error: 'razorpay_unconfigured' });
+        }
+      }
+
+      const effectivePlanId =
+        provider === 'razorpay' && payload.metadata && typeof payload.metadata.planId === 'string'
+          ? normalizePlanId(payload.metadata.planId)
+          : planId;
+
+      // Note: nowIso is already computed above (used for lock/pending reuse checks).
+      const record: BillingCheckoutSessionRecord = {
+        tenantId: tenantAccess.tenantId,
+        planId: effectivePlanId,
+        provider,
+        ...(payload.successUrl ? { successUrl: payload.successUrl } : {}),
+        ...(payload.cancelUrl ? { cancelUrl: payload.cancelUrl } : {}),
+        ...(() => {
+          const metadata = {
+            ...(payload.metadata || {}),
+            ...(razorpaySubscription?.subscriptionId ? { razorpaySubscriptionId: razorpaySubscription.subscriptionId } : {}),
+          };
+          return Object.keys(metadata).length ? { metadata } : {};
+        })(),
+        createdAt: nowIso,
+        createdBy: req.authContext?.uid || 'system',
+        ...(actorEmail ? { createdByEmail: actorEmail } : {}),
+        status: 'pending',
+      };
+      // db is already initialized above.
+
+      const lockTtlMinutesRaw = Number.parseInt((process.env.BILLING_CHECKOUT_LOCK_TTL_MINUTES || '').trim() || '15', 10);
+      const lockTtlMinutes = Number.isFinite(lockTtlMinutesRaw)
+        ? Math.max(1, Math.min(120, lockTtlMinutesRaw))
+        : 15;
+      const expiresAtIso = new Date(Date.now() + lockTtlMinutes * 60 * 1000).toISOString();
+
+      // lockRef and billingRef are already initialized above.
+      const result = await db.runTransaction(async (tx: any) => {
+        const existingSnap = await tx.get(lockRef);
+        if (existingSnap && existingSnap.exists) {
+          const existing = (existingSnap.data && existingSnap.data()) || {};
+          const existingExpiresAt = typeof existing.expiresAt === 'string' ? existing.expiresAt : '';
+          if (existingExpiresAt && existingExpiresAt > nowIso) {
+            return {
+              locked: true as const,
+              sessionId: typeof existing.sessionId === 'string' ? existing.sessionId : null,
+              checkoutUrl: typeof existing.checkoutUrl === 'string' ? existing.checkoutUrl : null,
+              expiresAt: existingExpiresAt,
+              startedByEmail: typeof existing.startedByEmail === 'string' ? existing.startedByEmail : null,
+            };
+          }
+        }
+
+        // Generate a Firestore doc id without writing.
+        const sessionRef = db.collection('billingCheckoutSessions').doc();
+        const sessionId = sessionRef.id;
+        const billingAttemptId = sessionId;
+
+        const preferHostedCheckout =
+          provider === 'razorpay' && Boolean(payload.successUrl || payload.cancelUrl) && Boolean(baseCheckoutUrl);
+
+        const checkoutUrl = preferHostedCheckout
+          ? `${baseCheckoutUrl}?sessionId=${encodeURIComponent(sessionId)}&tenantId=${encodeURIComponent(tenantAccess.tenantId)}`
+          : provider === 'razorpay' && razorpaySubscription?.shortUrl
+            ? razorpaySubscription.shortUrl
+            : `${baseCheckoutUrl}?sessionId=${encodeURIComponent(sessionId)}&tenantId=${encodeURIComponent(
+                tenantAccess.tenantId
+              )}&planId=${planId}`;
+
+        tx.set(sessionRef, { ...record, checkoutUrl }, { merge: false });
+        tx.set(
+          lockRef,
+          {
+            tenantId: tenantAccess.tenantId,
+            provider,
+            planId: effectivePlanId,
+            sessionId,
+            checkoutUrl,
+            startedAt: nowIso,
+            expiresAt: expiresAtIso,
+            startedBy: req.authContext?.uid || 'system',
+            ...(actorEmail ? { startedByEmail: actorEmail } : {}),
+            ...(razorpaySubscription?.subscriptionId ? { providerSessionId: razorpaySubscription.subscriptionId } : {}),
+            billingAttemptId,
+          },
+          { merge: false }
+        );
+
+        // Persist a durable "payment pending" marker so:
+        // - the app can show a banner without invoice scans,
+        // - the 24h stale-pending sweeper can cancel this subscription if no payment occurs.
+        if (provider === 'razorpay' && effectivePlanId !== 'free') {
+          tx.set(
+            billingRef,
+            stripUndefinedDeep({
+              checkoutRequired: true,
+              checkoutRequiredProvider: 'razorpay',
+              checkoutRequiredSinceIso: nowIso,
+              billingAttemptId,
+              billingProvider: 'razorpay',
+              ...(razorpaySubscription?.subscriptionId ? { subscriptionId: razorpaySubscription.subscriptionId } : {}),
+              // Best-effort: remember plan intent for history/debugging.
+              ...(payload.metadata && typeof payload.metadata.planVariantId === 'string' ? { pendingPlanVariantId: payload.metadata.planVariantId } : {}),
+              ...(payload.metadata && typeof payload.metadata.planId === 'string' ? { pendingPlanId: payload.metadata.planId } : {}),
+              ...(payload.metadata && typeof payload.metadata.couponCode === 'string' ? { pendingCouponCode: payload.metadata.couponCode } : {}),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            }),
+            { merge: true }
+          );
+        }
+        return { locked: false as const, sessionId, checkoutUrl };
+      });
+
+      if (result.locked) {
+        return res.status(409).json({
+          error: 'billing_checkout_in_progress',
+          message: 'Another admin has already started a payment for this coaching center. Please wait for it to complete.',
+          ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+          ...(result.checkoutUrl ? { checkoutUrl: result.checkoutUrl } : {}),
+          expiresAt: result.expiresAt,
+          ...(result.startedByEmail ? { startedByEmail: result.startedByEmail } : {}),
+        });
+      }
+
+      void logTenantAuditEventImpl({
+        tenantId: tenantAccess.tenantId,
+        action: 'billing_checkout_started',
+        authContext: req.authContext,
+        metadata: {
+          provider,
+          planId,
+          sessionId: result.sessionId,
+          actorRole,
+          actorMembershipId,
+          ...(razorpaySubscription?.subscriptionId ? { razorpaySubscriptionId: razorpaySubscription.subscriptionId } : {}),
+        },
+        targetId: result.sessionId,
+        targetType: 'billing',
+      });
+      return res.json({
+        checkoutUrl: result.checkoutUrl,
+        provider,
+        sessionId: result.sessionId,
+        ...(razorpaySubscription?.subscriptionId ? { providerSessionId: razorpaySubscription.subscriptionId } : {}),
+      });
+    } catch (error) {
+      console.error('[billing_checkout] failed', error);
+      return res.status(500).json({ error: 'checkout_init_failed' });
+    }
+  });
+
+  // Returns a Razorpay management link (short_url) for the existing subscription, if present.
+  // This is used for "Update payment method" / "Retry" flows without creating a new subscription.
+  app.post('/billing/manage-link', requireAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = billingManageLinkSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    if (tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
+      const billing = billingSnap.exists ? billingSnap.data() || {} : {};
+
+      const providerRaw =
+        typeof (billing as any).billingProvider === 'string' ? String((billing as any).billingProvider).trim().toLowerCase() : '';
+
+      if (providerRaw === 'google_play') {
+        return res.status(409).json({
+          error: 'google_play_manage_required',
+          message:
+            'This subscription is managed by Google Play. Please use the mobile app / Google Play to update payment method, cancel, or change your subscription, then refresh billing.',
+        });
+      }
+
+      // Backward compatibility: allow missing provider for older billing records.
+      // Only block if provider is explicitly set to a non-Razorpay value.
+      if (providerRaw && providerRaw !== 'razorpay') {
+        return res.status(409).json({ error: 'billing_provider_missing' });
+      }
+
+      let subscriptionId = typeof (billing as any).subscriptionId === 'string' ? String((billing as any).subscriptionId).trim() : '';
+
+      // Best-effort fallback: derive subscription id from the latest billing attempt session metadata.
+      if (!subscriptionId) {
+        const billingAttemptId =
+          typeof (billing as any).billingAttemptId === 'string' ? String((billing as any).billingAttemptId).trim() : '';
+        if (billingAttemptId) {
+          const sessionSnap = await db.collection('billingCheckoutSessions').doc(billingAttemptId).get();
+          const session = sessionSnap.exists ? sessionSnap.data() || {} : {};
+          const meta = (session as any).metadata || {};
+          const fromMeta = typeof meta.razorpaySubscriptionId === 'string' ? String(meta.razorpaySubscriptionId).trim() : '';
+          if (fromMeta) {
+            subscriptionId = fromMeta;
+          }
+        }
+      }
+
+      if (!subscriptionId) {
+        return res.status(409).json({ error: 'subscription_missing' });
+      }
+
+      const fetched = await fetchRazorpaySubscription({ subscriptionId });
+      const url = (fetched.shortUrl || '').trim();
+      if (!url) {
+        return res.status(404).json({ error: 'manage_link_unavailable' });
+      }
+
+      void logTenantAuditEventImpl({
+        tenantId,
+        action: 'billing_manage_link_requested',
+        authContext: req.authContext,
+        metadata: {
+          provider: 'razorpay',
+          subscriptionId,
+          status: fetched.status || null,
+        },
+        targetId: subscriptionId,
+        targetType: 'billing',
+      });
+
+      return res.json({ ok: true, provider: 'razorpay', url, subscriptionId });
+    } catch (error) {
+      console.error('[billing_manage_link] failed', error);
+      return res.status(500).json({ error: 'billing_manage_link_failed' });
+    }
+  });
+
+  // Public checkout session fetcher for the hosted web checkout UI.
+  // This endpoint is intentionally public: the `sessionId` is an unguessable Firestore doc id,
+  // and we enforce a short TTL using BILLING_CHECKOUT_LOCK_TTL_MINUTES.
+  app.get('/billing/checkout/session-public', async (req, res) => {
+    const parsed = billingCheckoutSessionPublicSchema.safeParse({
+      sessionId: req.query?.sessionId,
+      tenantId: req.query?.tenantId,
+    });
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const { sessionId, tenantId } = parsed.data;
+    try {
+      const db = getFirestoreImpl();
+      const snap = await db.collection('billingCheckoutSessions').doc(sessionId).get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'checkout_session_not_found' });
+      }
+
+      const data = (snap.data && snap.data()) || {};
+      const sessionTenantId = typeof data.tenantId === 'string' ? data.tenantId : '';
+      if (tenantId && tenantId !== sessionTenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const createdAtIso = typeof data.createdAt === 'string' ? data.createdAt : '';
+      const createdAtMs = createdAtIso ? Date.parse(createdAtIso) : NaN;
+      if (!Number.isFinite(createdAtMs)) {
+        return res.status(410).json({ error: 'checkout_session_expired' });
+      }
+
+      const lockTtlMinutesRaw = Number.parseInt((process.env.BILLING_CHECKOUT_LOCK_TTL_MINUTES || '').trim() || '15', 10);
+      const lockTtlMinutes = Number.isFinite(lockTtlMinutesRaw)
+        ? Math.max(1, Math.min(120, lockTtlMinutesRaw))
+        : 15;
+
+      const expiresAtMs = createdAtMs + lockTtlMinutes * 60 * 1000;
+      if (Date.now() > expiresAtMs) {
+        return res.status(410).json({ error: 'checkout_session_expired' });
+      }
+
+      const provider = data.provider === 'razorpay' ? 'razorpay' : null;
+      if (!provider) {
+        return res.status(400).json({ error: 'provider_not_supported' });
+      }
+
+      const keyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+      if (!keyId) {
+        return res.status(503).json({ error: 'razorpay_unconfigured' });
+      }
+
+      const meta = (data.metadata && typeof data.metadata === 'object' ? data.metadata : {}) as Record<string, any>;
+      const subscriptionId = typeof meta.razorpaySubscriptionId === 'string' ? meta.razorpaySubscriptionId.trim() : '';
+      if (!subscriptionId) {
+        return res.status(409).json({ error: 'subscription_missing' });
+      }
+
+      const planId: PlanId = normalizePlanId(data.planId);
+      const planVariantId = typeof meta.planVariantId === 'string' ? meta.planVariantId.trim() : '';
+      const successUrl = typeof data.successUrl === 'string' ? data.successUrl : undefined;
+      const cancelUrl = typeof data.cancelUrl === 'string' ? data.cancelUrl : undefined;
+      const createdByEmail = typeof data.createdByEmail === 'string' ? data.createdByEmail : undefined;
+
+      return res.json({
+        provider,
+        sessionId,
+        tenantId: sessionTenantId,
+        planId,
+        ...(planVariantId ? { planVariantId } : {}),
+        razorpay: {
+          keyId,
+          subscriptionId,
+        },
+        ...(successUrl ? { successUrl } : {}),
+        ...(cancelUrl ? { cancelUrl } : {}),
+        ...(createdByEmail ? { createdByEmail } : {}),
+      });
+    } catch (error) {
+      console.error('[billing_checkout_session_public] failed', error);
+      return res.status(500).json({ error: 'checkout_session_failed' });
+    }
+  });
+
+  app.post('/billing/switch-to-free', requireAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = billingSwitchToFreeSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    if (tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const actorId = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const actorRole = tenantAccess.role;
+      const actorMembershipId = tenantAccess.membershipId;
+      const billingRef = db.collection('tenantBilling').doc(tenantId);
+      const tenantRef = db.collection('tenants').doc(tenantId);
+
+      const billingSnap = await billingRef.get();
+      const billingData = billingSnap.exists ? billingSnap.data() || {} : {};
+      const currentPlanId = normalizePlanId((billingData as any).planId ?? (billingData as any).plan ?? 'free');
+      if (currentPlanId === 'free') {
+        return res.json({ ok: true, planId: 'free' });
+      }
+
+      const alreadyScheduled = Boolean((billingData as any).cancelAtCycleEnd) && ((billingData as any).scheduledDowngradePlanId === 'free');
+      if (alreadyScheduled) {
+        const existingAt = toIsoTimestamp((billingData as any).scheduledDowngradeAt ?? (billingData as any).renewalDate) ?? null;
+        return res.json({
+          ok: true,
+          scheduled: true,
+          scheduledDowngradePlanId: 'free',
+          ...(existingAt ? { scheduledDowngradeAt: existingAt } : {}),
+        });
+      }
+
+      const billingProvider = typeof (billingData as any).billingProvider === 'string' ? (billingData as any).billingProvider : null;
+      const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
+      const renewalDate = toIsoTimestamp((billingData as any).renewalDate ?? (billingData as any).renewsAt ?? (billingData as any).renewalAt) ?? null;
+
+      // Google Play subscriptions cannot be cancelled/updated by the backend.
+      // Prevent downgrading in-app while the Play subscription may still be active and billable.
+      if (String(billingProvider || '').toLowerCase() === 'google_play' && subscriptionId) {
+        return res.status(409).json({
+          error: 'google_play_manage_required',
+          message:
+            'This subscription is managed by Google Play. Please cancel it in Google Play first (and update payment method there if needed), then return to the app and refresh billing.',
+        });
+      }
+
+      // Google Play subscriptions cannot be cancelled/updated by the backend.
+      // Prevent immediate downgrade in-app while the Play subscription may still be active and billable.
+      if (String(billingProvider || '').toLowerCase() === 'google_play' && subscriptionId) {
+        return res.status(409).json({
+          error: 'google_play_manage_required',
+          message:
+            'This subscription is managed by Google Play. Please cancel it in Google Play first, then return to the app and refresh billing.',
+        });
+      }
+
+      // If this tenant is billed via Razorpay and we have a subscription id, schedule cancellation
+      // at the end of the current billing cycle so there are no further charges.
+      if (billingProvider === 'razorpay' && subscriptionId) {
+        try {
+          await cancelRazorpaySubscriptionImpl({ subscriptionId, cancelAtCycleEnd: true });
+        } catch (error) {
+          const status = typeof (error as any)?.status === 'number' ? (error as any).status : null;
+          const providerPayload = (error as any)?.providerPayload;
+          const providerCode = typeof providerPayload?.error?.code === 'string' ? String(providerPayload.error.code) : '';
+          const providerDescription = typeof providerPayload?.error?.description === 'string' ? String(providerPayload.error.description) : '';
+          const isNoBillingCycleError =
+            status === 400 &&
+            providerCode === 'BAD_REQUEST_ERROR' &&
+            providerDescription.toLowerCase().includes('no billing cycle is going on');
+
+          if (isNoBillingCycleError) {
+            // This commonly happens when UPI AutoPay is authenticated but the first charge hasn't happened yet.
+            // Razorpay does not allow cancelling the subscription until a billing cycle starts.
+            return res.status(409).json({
+              error: 'razorpay_cancel_not_available',
+              message: 'This subscription cannot be cancelled yet because the first billing cycle has not started. Please wait for payment confirmation, then try again.',
+            });
+          }
+          console.error('[billing_switch_to_free] razorpay cancel failed', error);
+          return res.status(503).json({ error: 'razorpay_cancel_failed' });
+        }
+
+        await billingRef.set(
+          {
+            cancelAtCycleEnd: true,
+            scheduledDowngradePlanId: 'free',
+            scheduledDowngradeAt: renewalDate,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        void logTenantAuditEventImpl({
+          tenantId,
+          action: 'billing_downgrade_to_free_scheduled',
+          authContext: req.authContext,
+          metadata: {
+            fromPlanId: currentPlanId,
+            provider: billingProvider,
+            subscriptionId,
+            ...(renewalDate ? { effectiveAt: renewalDate } : {}),
+          },
+          targetId: tenantId,
+          targetType: 'billing',
+        });
+
+        void sendTenantBillingEventNotification({
+          tenantId,
+          kind: 'downgrade_to_free_scheduled',
+          title: 'Downgrade to Free scheduled',
+          body: (() => {
+            const lines: string[] = ['This coaching center will switch to the Free plan.'];
+            const when = formatIsoIstForDisplay(renewalDate ?? undefined);
+            if (when) {
+              lines.push(`Switch date: ${when}.`);
+            } else {
+              lines.push('Switch date: end of the current billing cycle.');
+            }
+            return lines.join('\n');
+          })(),
+          priority: 'medium',
+          metadata: {
+            provider: billingProvider,
+            subscriptionId,
+            fromPlanId: currentPlanId,
+            scheduledAt: renewalDate,
+            actorId,
+            actorEmail: actorEmail || null,
+            actorRole,
+            actorMembershipId,
+          },
+        }).catch(() => undefined);
+
+        return res.json({
+          ok: true,
+          scheduled: true,
+          scheduledDowngradePlanId: 'free',
+          ...(renewalDate ? { scheduledDowngradeAt: renewalDate } : {}),
+        });
+      }
+
+      // No active subscription to cancel: downgrade immediately (best-effort).
+      await db.runTransaction(async (tx: any) => {
+        const tenantSnap = await tx.get(tenantRef);
+        if (!tenantSnap.exists) {
+          throw new Error('tenant_missing');
+        }
+
+        tx.set(
+          billingRef,
+          {
+            planId: 'free',
+            planVariantId: null,
+            couponCode: null,
+            status: 'canceled',
+            renewalDate: null,
+            checkoutRequired: admin.firestore.FieldValue.delete(),
+            checkoutRequiredProvider: admin.firestore.FieldValue.delete(),
+            checkoutRequiredSinceIso: admin.firestore.FieldValue.delete(),
+            billingAttemptId: admin.firestore.FieldValue.delete(),
+            pendingPlanVariantId: admin.firestore.FieldValue.delete(),
+            pendingPlanId: admin.firestore.FieldValue.delete(),
+            pendingCouponCode: admin.firestore.FieldValue.delete(),
+            billingProvider: admin.firestore.FieldValue.delete(),
+            subscriptionId: admin.firestore.FieldValue.delete(),
+            cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+            scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+            scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+            limitsSnapshot: admin.firestore.FieldValue.delete(),
+            limitsSnapshotAt: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        tx.set(
+          tenantRef,
+          {
+            billingTier: 'free',
+            quotas: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      });
+
+      void logTenantAuditEventImpl({
+        tenantId,
+        action: 'billing_downgrade_to_free',
+        authContext: req.authContext,
+        metadata: {
+          fromPlanId: currentPlanId,
+          provider: billingProvider,
+          mode: 'immediate',
+          ...(subscriptionId ? { subscriptionId } : {}),
+        },
+        targetId: tenantId,
+        targetType: 'billing',
+      });
+
+      void sendTenantBillingEventNotification({
+        tenantId,
+        kind: 'downgrade_to_free_immediate',
+        title: 'Switched to Free plan',
+        body: 'This coaching center has been switched to the Free plan.',
+        priority: 'medium',
+        metadata: {
+          provider: billingProvider,
+          subscriptionId: subscriptionId || null,
+          fromPlanId: currentPlanId,
+          actorId,
+          actorEmail: actorEmail || null,
+          actorRole,
+          actorMembershipId,
+        },
+      }).catch(() => undefined);
+
+      return res.json({ ok: true, scheduled: false, planId: 'free' });
+    } catch (error: any) {
+      const msg = String(error?.message || error);
+      if (msg === 'tenant_missing') {
+        return res.status(404).json({ error: 'tenant_missing' });
+      }
+      console.error('[billing_switch_to_free] failed', error);
+      return res.status(500).json({ error: 'billing_switch_to_free_failed' });
+    }
+  });
+
+  // Cancel the current paid plan immediately (best-effort) and switch to Free right away.
+  // This will cancel the provider subscription with cancelAtCycleEnd=false when possible.
+  app.post('/billing/switch-to-free/immediate', requireAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = billingSwitchToFreeImmediateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    if (tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const actorId = req.authContext?.uid || req.authContext?.tokenType || 'system';
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const actorRole = tenantAccess.role;
+      const actorMembershipId = tenantAccess.membershipId;
+
+      const billingRef = db.collection('tenantBilling').doc(tenantId);
+      const tenantRef = db.collection('tenants').doc(tenantId);
+
+      const billingSnap = await billingRef.get();
+      const billingData = billingSnap.exists ? billingSnap.data() || {} : {};
+      const currentPlanId = normalizePlanId((billingData as any).planId ?? (billingData as any).plan ?? 'free');
+      if (currentPlanId === 'free') {
+        return res.json({ ok: true, scheduled: false, planId: 'free' });
+      }
+
+      const billingProvider = typeof (billingData as any).billingProvider === 'string' ? (billingData as any).billingProvider : null;
+      const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
+
+      if (billingProvider === 'razorpay' && subscriptionId) {
+        try {
+          await cancelRazorpaySubscriptionImpl({ subscriptionId, cancelAtCycleEnd: false });
+        } catch (error) {
+          const status = typeof (error as any)?.status === 'number' ? (error as any).status : null;
+          const providerPayload = (error as any)?.providerPayload;
+          const providerCode = typeof providerPayload?.error?.code === 'string' ? String(providerPayload.error.code) : '';
+          const providerDescription = typeof providerPayload?.error?.description === 'string' ? String(providerPayload.error.description) : '';
+          const isNoBillingCycleError =
+            status === 400 &&
+            providerCode === 'BAD_REQUEST_ERROR' &&
+            providerDescription.toLowerCase().includes('no billing cycle is going on');
+
+          if (isNoBillingCycleError) {
+            return res.status(409).json({
+              error: 'razorpay_cancel_not_available',
+              message: 'This subscription cannot be cancelled yet because the first billing cycle has not started. Please wait for payment confirmation, then try again.',
+            });
+          }
+          console.error('[billing_switch_to_free_immediate] razorpay cancel failed', error);
+          return res.status(503).json({ error: 'razorpay_cancel_failed' });
+        }
+      }
+
+      await db.runTransaction(async (tx: any) => {
+        const tenantSnap = await tx.get(tenantRef);
+        if (!tenantSnap.exists) {
+          throw new Error('tenant_missing');
+        }
+
+        tx.set(
+          billingRef,
+          {
+            planId: 'free',
+            planVariantId: null,
+            couponCode: null,
+            status: 'canceled',
+            renewalDate: null,
+            checkoutRequired: admin.firestore.FieldValue.delete(),
+            checkoutRequiredProvider: admin.firestore.FieldValue.delete(),
+            checkoutRequiredSinceIso: admin.firestore.FieldValue.delete(),
+            billingAttemptId: admin.firestore.FieldValue.delete(),
+            pendingPlanVariantId: admin.firestore.FieldValue.delete(),
+            pendingPlanId: admin.firestore.FieldValue.delete(),
+            pendingCouponCode: admin.firestore.FieldValue.delete(),
+            billingProvider: admin.firestore.FieldValue.delete(),
+            subscriptionId: admin.firestore.FieldValue.delete(),
+            cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+            scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+            scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+            limitsSnapshot: admin.firestore.FieldValue.delete(),
+            limitsSnapshotAt: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        tx.set(
+          tenantRef,
+          {
+            billingTier: 'free',
+            quotas: admin.firestore.FieldValue.delete(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      });
+
+      void logTenantAuditEventImpl({
+        tenantId,
+        action: 'billing_downgrade_to_free',
+        authContext: req.authContext,
+        metadata: {
+          fromPlanId: currentPlanId,
+          provider: billingProvider,
+          mode: 'immediate',
+          ...(subscriptionId ? { subscriptionId } : {}),
+        },
+        targetId: tenantId,
+        targetType: 'billing',
+      });
+
+      void sendTenantBillingEventNotification({
+        tenantId,
+        kind: 'downgrade_to_free_immediate',
+        title: 'Switched to Free plan',
+        body: 'This coaching center has been switched to the Free plan.',
+        priority: 'medium',
+        metadata: {
+          provider: billingProvider,
+          subscriptionId: subscriptionId || null,
+          fromPlanId: currentPlanId,
+          actorId,
+          actorEmail: actorEmail || null,
+          actorRole,
+          actorMembershipId,
+        },
+      }).catch(() => undefined);
+
+      return res.json({ ok: true, scheduled: false, planId: 'free' });
+    } catch (error: any) {
+      const msg = String(error?.message || error);
+      if (msg === 'tenant_missing') {
+        return res.status(404).json({ error: 'tenant_missing' });
+      }
+      console.error('[billing_switch_to_free_immediate] failed', error);
+      return res.status(500).json({ error: 'billing_switch_to_free_immediate_failed' });
+    }
+  });
+
+  // Cancel a previously scheduled downgrade-to-free (best-effort) and resume the provider subscription.
+  app.post('/billing/switch-to-free/cancel', requireAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = billingCancelSwitchToFreeSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    if (tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const billingRef = db.collection('tenantBilling').doc(tenantId);
+      const billingSnap = await billingRef.get();
+      const billingData = billingSnap.exists ? billingSnap.data() || {} : {};
+
+      const diagnosticsEnabled = process.env.BILLING_PROVIDER_DIAGNOSTICS === '1';
+
+      const scheduled = Boolean((billingData as any).cancelAtCycleEnd) && (billingData as any).scheduledDowngradePlanId === 'free';
+      if (!scheduled) {
+        return res.json({ ok: true, cancelled: false });
+      }
+
+      const billingProvider = typeof (billingData as any).billingProvider === 'string' ? (billingData as any).billingProvider : null;
+      const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
+
+      if (billingProvider === 'razorpay' && subscriptionId) {
+        // Always fetch provider snapshot so the caller can confirm renewal status.
+        const getProviderSnapshot = async () => {
+          const sub = await fetchRazorpaySubscription({ subscriptionId });
+          return {
+            provider: 'razorpay' as const,
+            subscriptionId,
+            status: sub.status ?? null,
+            cancelAtCycleEnd: sub.cancelAtCycleEnd === true,
+            chargeAt: typeof sub.chargeAt === 'number' ? sub.chargeAt : null,
+            currentEnd: typeof sub.currentEnd === 'number' ? sub.currentEnd : null,
+          };
+        };
+
+        const buildVerification = (provider: Awaited<ReturnType<typeof getProviderSnapshot>>) => ({
+          provider: provider.provider,
+          renewalsEnabled: provider.cancelAtCycleEnd === false,
+          status: provider.status,
+          nextChargeAt: provider.chargeAt,
+        });
+
+        if (!scheduled) {
+          try {
+            const provider = await getProviderSnapshot();
+            const verification = buildVerification(provider);
+            return res.json({ ok: true, cancelled: false, verification, ...(diagnosticsEnabled ? { provider } : {}) });
+          } catch {
+            return res.json({ ok: true, cancelled: false });
+          }
+        }
+
+        try {
+          await resumeRazorpaySubscriptionImpl({ subscriptionId });
+
+          // Verify renewals are actually re-enabled (cancel_at_cycle_end cleared).
+          // This is best-effort: if verification fails (e.g., credentials/network), still proceed
+          // with cancelling the scheduled downgrade on our side.
+          if (!isTestProcess) {
+            try {
+              const provider = await getProviderSnapshot();
+              const status = (provider.status || '').trim().toLowerCase();
+              const cancelAtCycleEnd = provider.cancelAtCycleEnd === true;
+              if (status !== 'active' || cancelAtCycleEnd) {
+                return res.status(409).json({
+                  error: 'razorpay_renewal_not_reenabled',
+                  verification: buildVerification(provider),
+                  ...(diagnosticsEnabled ? { provider } : {}),
+                });
+              }
+            } catch (error) {
+              console.warn('[billing_cancel_switch_to_free] razorpay verification failed', error);
+            }
+          }
+        } catch (error) {
+          console.error('[billing_cancel_switch_to_free] razorpay resume failed', error);
+          return res.status(503).json({ error: 'razorpay_resume_failed' });
+        }
+      }
+      if (!scheduled) {
+        return res.json({ ok: true, cancelled: false });
+      }
+
+      await billingRef.set(
+        {
+          cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+          scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+          scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      void logTenantAuditEventImpl({
+        tenantId,
+        action: 'billing_downgrade_to_free_cancelled',
+        authContext: req.authContext,
+        metadata: {
+          provider: billingProvider,
+          ...(subscriptionId ? { subscriptionId } : {}),
+        },
+        targetId: tenantId,
+        targetType: 'billing',
+      });
+
+      if (billingProvider === 'razorpay' && subscriptionId) {
+        try {
+          const sub = await fetchRazorpaySubscription({ subscriptionId });
+          const provider = {
+            provider: 'razorpay' as const,
+            subscriptionId,
+            status: sub.status ?? null,
+            cancelAtCycleEnd: sub.cancelAtCycleEnd === true,
+            chargeAt: typeof sub.chargeAt === 'number' ? sub.chargeAt : null,
+            currentEnd: typeof sub.currentEnd === 'number' ? sub.currentEnd : null,
+          };
+          return res.json({
+            ok: true,
+            cancelled: true,
+            verification: {
+              provider: 'razorpay',
+              renewalsEnabled: provider.cancelAtCycleEnd === false,
+              status: provider.status,
+              nextChargeAt: provider.chargeAt,
+            },
+            ...(diagnosticsEnabled ? { provider } : {}),
+          });
+        } catch {
+          // If provider fetch fails, still report cancelled on our side.
+        }
+      }
+
+      return res.json({ ok: true, cancelled: true });
+    } catch (error) {
+      console.error('[billing_cancel_switch_to_free] failed', error);
+      return res.status(500).json({ error: 'billing_cancel_switch_to_free_failed' });
+    }
+  });
+
+  app.post('/billing/play/verify', requireAdminTenantAccess, async (req, res) => {
+    if (!storeBillingFeatureEnabled()) {
+      return res.status(503).json({ error: 'store_billing_disabled' });
+    }
+
+    const parsed = playVerificationSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const db = getFirestoreImpl();
+
+    if (process.env.TEST_MODE === '1') {
+      const now = Date.now();
+      const renewalDate = new Date(now + 7 * 24 * 60 * 60_000).toISOString();
+      return res.json({
+        ok: true,
+        provider: 'google_play',
+        status: 'verified',
+        planId: 'pro',
+        planVariantId: typeof parsed.data.planVariantId === 'string' ? parsed.data.planVariantId.trim() : undefined,
+        renewalDate,
+        acknowledged: true,
+      });
+    }
+
+    const packageName = (process.env.GOOGLE_PLAY_PACKAGE_NAME || '').trim();
+    if (!packageName) {
+      return res.status(503).json({ error: 'google_play_unconfigured', message: 'Missing GOOGLE_PLAY_PACKAGE_NAME' });
+    }
+
+    const productId = parsed.data.productId.trim();
+    const purchaseToken = parsed.data.purchaseToken.trim();
+    const requestedPlanVariantId = typeof parsed.data.planVariantId === 'string' ? parsed.data.planVariantId.trim() : '';
+
+    try {
+      const purchase = await fetchGooglePlaySubscriptionPurchase({ packageName, productId, purchaseToken });
+      const expiryMs = typeof purchase.expiryTimeMillis === 'string' ? Number(purchase.expiryTimeMillis) : NaN;
+      const expiryIso = Number.isFinite(expiryMs) ? new Date(expiryMs).toISOString() : null;
+
+      // Basic validity checks.
+      const nowMs = Date.now();
+      if (Number.isFinite(expiryMs) && expiryMs <= nowMs) {
+        return res.status(409).json({ error: 'purchase_expired', expiryTime: expiryIso });
+      }
+
+      // paymentState (subscriptions):
+      // 0 = pending, 1 = received, 2 = free trial, 3 = pending deferred upgrade/downgrade.
+      const paymentState = typeof purchase.paymentState === 'number' ? purchase.paymentState : null;
+      if (paymentState === 0) {
+        const nowIso = new Date().toISOString();
+        const billingAttemptId = `play_${crypto
+          .createHash('sha256')
+          .update(`${productId}:${purchaseToken}`)
+          .digest('hex')
+          .slice(0, 24)}`;
+        try {
+          await db.collection('tenantBilling').doc(tenantAccess.tenantId).set(
+            {
+              checkoutRequired: true,
+              checkoutRequiredProvider: 'google_play',
+              checkoutRequiredSinceIso: nowIso,
+              billingAttemptId,
+              billingProvider: 'play',
+              subscriptionId: purchaseToken,
+              storeProductId: productId,
+              lastStoreVerifyAtIso: nowIso,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        } catch {
+          // Best-effort.
+        }
+        return res.status(409).json({ error: 'purchase_pending' });
+      }
+
+      // Determine planVariantId from request OR catalog mapping by playProductId.
+      let resolvedVariantId = requestedPlanVariantId;
+      let resolvedPlanId: PlanId = 'pro';
+      let resolvedPriceInr = 0;
+      if (!resolvedVariantId) {
+        const configured = await listPlanVariants(db, { includeInactive: false });
+        const match = configured.find((v) => typeof (v as any).playProductId === 'string' && (v as any).playProductId === productId);
+        if (match) {
+          resolvedVariantId = match.id;
+          resolvedPlanId = match.planId;
+          resolvedPriceInr = Number.isFinite(match.priceInr) ? Math.max(0, Math.trunc(match.priceInr)) : 0;
+        }
+      }
+      if (resolvedVariantId) {
+        const variant = await getPlanVariantById(db, resolvedVariantId);
+        if (variant) {
+          resolvedPlanId = variant.planId;
+          resolvedPriceInr = Number.isFinite(variant.priceInr) ? Math.max(0, Math.trunc(variant.priceInr)) : resolvedPriceInr;
+        }
+      }
+
+      if (!resolvedVariantId) {
+        return res.status(400).json({
+          error: 'plan_variant_required',
+          message: 'Missing planVariantId and no billingPlanVariants.playProductId mapping found for this productId.',
+        });
+      }
+
+      let limitsSnapshot: ReturnType<typeof toTenantBillingLimitsSnapshot> | null = null;
+      try {
+        const resolved = await resolvePlanLimitsFromCatalog(db, {
+          planId: resolvedPlanId,
+          planVariantId: resolvedVariantId || null,
+        });
+        limitsSnapshot = toTenantBillingLimitsSnapshot(resolved);
+      } catch {
+        limitsSnapshot = null;
+      }
+
+      // Acknowledge purchase if needed.
+      const acknowledgementState = typeof purchase.acknowledgementState === 'number' ? purchase.acknowledgementState : null;
+      if (acknowledgementState === 0) {
+        try {
+          await acknowledgeGooglePlaySubscription({ packageName, productId, purchaseToken });
+        } catch (error) {
+          // Best-effort: still proceed to activate, but record ops event for debugging.
+          void recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_ack_failed',
+            severity: 'warn',
+            message: 'Google Play acknowledge failed (best-effort)',
+            tenantId: tenantAccess.tenantId,
+            subscriptionId: purchaseToken,
+            httpStatus: typeof (error as any)?.status === 'number' ? (error as any).status : null,
+            requestPath: '/billing/play/verify',
+          }).catch(() => undefined);
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const billingAttemptId = `play_${crypto
+        .createHash('sha256')
+        .update(`${productId}:${purchaseToken}`)
+        .digest('hex')
+        .slice(0, 24)}`;
+      const billingRef = db.collection('tenantBilling').doc(tenantAccess.tenantId);
+      const tenantRef = db.collection('tenants').doc(tenantAccess.tenantId);
+
+      // Mirror Razorpay's "payment received / subscription activated" notification behavior.
+      // Idempotency: only notify once per subscriptionId (purchaseToken).
+      let shouldSendActivated = false;
+      try {
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(billingRef);
+          const data = snap.exists ? snap.data() ?? {} : {};
+          const lastNotifiedSub = typeof (data as any).activationNotifiedSubscriptionId === 'string'
+            ? (data as any).activationNotifiedSubscriptionId
+            : null;
+
+          if (purchaseToken && lastNotifiedSub !== purchaseToken) {
+            shouldSendActivated = true;
+          }
+
+          tx.set(
+            billingRef,
+            stripUndefinedDeep({
+              planId: resolvedPlanId,
+              planVariantId: resolvedVariantId,
+              status: 'active',
+              billingProvider: 'play',
+              subscriptionId: purchaseToken,
+              renewalDate: expiryIso,
+              checkoutRequired: false,
+              checkoutRequiredProvider: admin.firestore.FieldValue.delete(),
+              checkoutRequiredSinceIso: admin.firestore.FieldValue.delete(),
+              billingAttemptId: admin.firestore.FieldValue.delete(),
+              cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+              scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+              scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+              delinquentSince: admin.firestore.FieldValue.delete(),
+              delinquentSinceIso: admin.firestore.FieldValue.delete(),
+              ...(limitsSnapshot ? { limitsSnapshot, limitsSnapshotAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              lastStoreVerifyAtIso: nowIso,
+              storeProductId: productId,
+              storeOrderId: typeof purchase.orderId === 'string' ? purchase.orderId : parsed.data.orderId,
+              ...(shouldSendActivated
+                ? {
+                    activationNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    activationNotifiedAtIso: nowIso,
+                    activationNotifiedSubscriptionId: purchaseToken,
+                  }
+                : {}),
+            }),
+            { merge: true }
+          );
+        });
+      } catch {
+        // Still proceed; notification is best-effort.
+      }
+
+      await tenantRef.set(
+        {
+          billingTier: resolvedPlanId,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (shouldSendActivated) {
+        const expiryDisplay = formatIsoIstForDisplay(expiryIso || undefined);
+        const bodyLines: string[] = [];
+        bodyLines.push(`Your ${String(resolvedPlanId).toUpperCase()} subscription is activated.`);
+        if (resolvedPriceInr > 0) bodyLines.push(`Amount: ₹${resolvedPriceInr}.`);
+        if (expiryDisplay) bodyLines.push(`Next billing: ${expiryDisplay}.`);
+
+        void sendTenantBillingEventNotification({
+          tenantId: tenantAccess.tenantId,
+          tenantName: undefined,
+          kind: 'subscription_activated',
+          title: 'Subscription activated',
+          body: bodyLines.join('\n'),
+          priority: 'medium',
+          metadata: {
+            provider: 'play',
+            planId: resolvedPlanId,
+            planVariantId: resolvedVariantId,
+            productId,
+            subscriptionId: purchaseToken,
+            orderId: typeof purchase.orderId === 'string' ? purchase.orderId : parsed.data.orderId,
+            renewalDate: expiryIso,
+            paymentState,
+          },
+        }).catch(() => undefined);
+      }
+
+      // Persist an invoice entry (best-effort).
+      try {
+        const orderId = (typeof purchase.orderId === 'string' ? purchase.orderId : parsed.data.orderId || '').trim();
+        const issuedAt = nowIso;
+        const invoiceId = orderId ? `play_${orderId}` : `play_${purchaseToken.slice(0, 12)}_${issuedAt}`;
+        const status: BillingInvoiceRecord['status'] = paymentState === 2 ? 'open' : 'paid';
+        await db
+          .collection('billingInvoices')
+          .doc(tenantAccess.tenantId)
+          .collection('invoices')
+          .doc(invoiceId)
+          .set(
+            stripUndefinedDeep({
+              amountInr: resolvedPriceInr,
+              status,
+              provider: 'play',
+              issuedAt,
+              planId: resolvedPlanId,
+              planVariantId: resolvedVariantId,
+              isSynthetic: true,
+              sourceEvent: 'play_verify',
+              providerSubscriptionId: purchaseToken,
+              subscriptionId: purchaseToken,
+              billingAttemptId,
+              providerPaymentId: orderId || null,
+              rawEvent: 'play_verify',
+            }),
+            { merge: true }
+          );
+      } catch {
+        // ignore
+      }
+
+      // Tenant audit trail (best-effort)
+      void logTenantAuditEventImpl({
+        tenantId: tenantAccess.tenantId,
+        action: 'billing_play_verified',
+        authContext: req.authContext,
+        metadata: {
+          provider: 'play',
+          productId,
+          planId: resolvedPlanId,
+          planVariantId: resolvedVariantId,
+          expiryTime: expiryIso,
+          orderId: typeof purchase.orderId === 'string' ? purchase.orderId : parsed.data.orderId,
+          paymentState,
+        },
+        targetId: typeof purchase.orderId === 'string' ? purchase.orderId : purchaseToken,
+        targetType: 'billing',
+      }).catch(() => undefined);
+
+      return res.json({
+        ok: true,
+        provider: 'google_play',
+        status: 'verified',
+        planId: resolvedPlanId,
+        planVariantId: resolvedVariantId,
+        renewalDate: expiryIso,
+        acknowledged: acknowledgementState === 1 ? true : undefined,
+      });
+    } catch (error: any) {
+      const status = typeof error?.status === 'number' ? error.status : 500;
+      const message = typeof error?.message === 'string' ? error.message : 'play_verify_failed';
+      console.error('[billing_play_verify] failed', { tenantId: tenantAccess.tenantId, status, message });
+      void recordBillingOpsEvent(db, {
+        provider: 'play',
+        type: 'play_verify_failed',
+        severity: 'error',
+        message,
+        tenantId: tenantAccess.tenantId,
+        subscriptionId: purchaseToken,
+        httpStatus: status,
+        requestPath: '/billing/play/verify',
+      }).catch(() => undefined);
+      return res.status(status >= 400 && status < 600 ? status : 500).json({ error: 'play_verify_failed', message });
+    }
+  });
+
+  app.post('/billing/appstore/verify', requireAdminTenantAccess, async (req, res) => {
+    if (!storeBillingFeatureEnabled()) {
+      return res.status(503).json({ error: 'store_billing_disabled' });
+    }
+
+    const parsed = appStoreVerificationSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    console.info('[billing_appstore_verify] stub payload received', {
+      tenantId: tenantAccess.tenantId,
+      transactionId: parsed.data.transactionId,
+      bundleId: parsed.data.bundleId,
+    });
+    return res.json({ ok: true, provider: 'app_store', status: 'received' });
+  });
+
+  const playNotificationParser = express.raw({ type: 'application/json' });
+  app.post('/billing/play/notifications', playNotificationParser, async (req, res) => {
+    if (!storeBillingFeatureEnabled()) {
+      return res.status(503).json({ error: 'store_billing_disabled' });
+    }
+
+    const rawPayload = extractRawBody(req.body);
+
+    // Keep the tests lightweight (they don't configure Firebase/Play credentials).
+    if (process.env.TEST_MODE === '1') {
+      console.info('[billing_play_notification] test-mode payload received', safePreview(rawPayload));
+      return res.status(202).json({ ok: true, provider: 'google_play' });
+    }
+
+    const requiredAudience = (process.env.PLAY_RTDN_OIDC_AUDIENCE || '').trim();
+    if (requiredAudience) {
+      try {
+        const authHeader = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : '';
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+        if (!token) {
+          return res.status(401).json({ error: 'missing_oidc_token' });
+        }
+
+        const { OAuth2Client } = await import('google-auth-library');
+        const client = new OAuth2Client();
+        await client.verifyIdToken({ idToken: token, audience: requiredAudience });
+      } catch (error) {
+        console.warn('[billing_play_notification] oidc verification failed', (error as any)?.message || error);
+        return res.status(401).json({ error: 'invalid_oidc_token' });
+      }
+    }
+
+    // Always respond 2xx quickly so Pub/Sub doesn't retry aggressively.
+    res.status(202).json({ ok: true, provider: 'google_play' });
+
+    void (async () => {
+      try {
+        const parsedEnvelope = (() => {
+          try {
+            return JSON.parse(rawPayload || '{}') as any;
+          } catch {
+            return null;
+          }
+        })();
+
+        const b64 = typeof parsedEnvelope?.message?.data === 'string' ? parsedEnvelope.message.data : '';
+        const messageId = typeof parsedEnvelope?.message?.messageId === 'string' ? parsedEnvelope.message.messageId : null;
+        const publishTime = typeof parsedEnvelope?.message?.publishTime === 'string' ? parsedEnvelope.message.publishTime : null;
+
+        if (!b64) {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_missing_message_data',
+            severity: 'warn',
+            message: 'RTDN Pub/Sub push missing message.data',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            ip: typeof req.ip === 'string' ? req.ip : null,
+            userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+            payloadPreview: safePreview(rawPayload),
+            metadata: { messageId, publishTime },
+          });
+          return;
+        }
+
+        const decoded = (() => {
+          try {
+            return Buffer.from(b64, 'base64').toString('utf8');
+          } catch {
+            return '';
+          }
+        })();
+        if (!decoded) {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_decode_failed',
+            severity: 'warn',
+            message: 'RTDN Pub/Sub base64 decode failed',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            ip: typeof req.ip === 'string' ? req.ip : null,
+            userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+            payloadPreview: safePreview(rawPayload),
+            metadata: { messageId, publishTime },
+          });
+          return;
+        }
+
+        const developerNotification = (() => {
+          try {
+            return JSON.parse(decoded || '{}') as any;
+          } catch {
+            return null;
+          }
+        })();
+
+        const subscriptionNotification = developerNotification?.subscriptionNotification;
+        const notificationType = typeof subscriptionNotification?.notificationType === 'number' ? subscriptionNotification.notificationType : null;
+        const purchaseToken = typeof subscriptionNotification?.purchaseToken === 'string' ? subscriptionNotification.purchaseToken.trim() : '';
+        const productId = typeof subscriptionNotification?.subscriptionId === 'string' ? subscriptionNotification.subscriptionId.trim() : '';
+
+        const packageNameFromEvent = typeof developerNotification?.packageName === 'string' ? developerNotification.packageName.trim() : '';
+        const packageNameEnv = (process.env.GOOGLE_PLAY_PACKAGE_NAME || '').trim();
+        const packageName = packageNameEnv || packageNameFromEvent;
+
+        if (!packageName) {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_unconfigured',
+            severity: 'error',
+            message: 'Missing GOOGLE_PLAY_PACKAGE_NAME (required for RTDN processing)',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            payloadPreview: safePreview(decoded),
+            metadata: { messageId, publishTime },
+          });
+          return;
+        }
+
+        if (packageNameEnv && packageNameFromEvent && packageNameEnv !== packageNameFromEvent) {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_package_mismatch',
+            severity: 'warn',
+            message: 'RTDN packageName mismatch',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            payloadPreview: safePreview(decoded),
+            metadata: { messageId, publishTime, packageNameEnv, packageNameFromEvent },
+          });
+          return;
+        }
+
+        if (!purchaseToken || !productId || notificationType == null) {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_invalid_payload',
+            severity: 'warn',
+            message: 'RTDN payload missing subscriptionNotification fields',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            payloadPreview: safePreview(decoded),
+            metadata: { messageId, publishTime, notificationType, purchaseTokenPresent: Boolean(purchaseToken), productIdPresent: Boolean(productId) },
+          });
+          return;
+        }
+
+        const db = getFirestoreImpl();
+
+        // Resolve tenant by Play subscriptionId (we store purchaseToken as subscriptionId).
+        const billingSnap = await db.collection('tenantBilling').where('subscriptionId', '==', purchaseToken).limit(1).get();
+        if (billingSnap.empty) {
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_tenant_not_found',
+            severity: 'warn',
+            message: 'RTDN purchaseToken not mapped to any tenantBilling.subscriptionId',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            subscriptionId: purchaseToken,
+            payloadPreview: safePreview(decoded),
+            metadata: { messageId, publishTime, notificationType, productId },
+          });
+          return;
+        }
+
+        const doc = billingSnap.docs[0];
+        const tenantId = doc.id;
+        const billingData = doc.data() || {};
+
+        const planId: PlanId = normalizePlanId(typeof (billingData as any).planId === 'string' ? (billingData as any).planId : 'pro');
+        const planVariantId = typeof (billingData as any).planVariantId === 'string' ? (billingData as any).planVariantId : null;
+
+        let resolvedVariantId = planVariantId;
+        let resolvedPlanId: PlanId = planId === 'free' ? 'pro' : planId;
+        let resolvedPriceInr = 0;
+        if (resolvedVariantId) {
+          try {
+            const variant = await getPlanVariantById(db, resolvedVariantId);
+            if (variant) {
+              resolvedPlanId = variant.planId;
+              resolvedPriceInr = Number.isFinite(variant.priceInr) ? Math.max(0, Math.trunc(variant.priceInr)) : 0;
+            }
+          } catch {
+            // ignore
+          }
+        } else {
+          try {
+            const configured = await listPlanVariants(db, { includeInactive: false });
+            const match = configured.find((v) => typeof (v as any).playProductId === 'string' && (v as any).playProductId === productId);
+            if (match) {
+              resolvedVariantId = match.id;
+              resolvedPlanId = match.planId;
+              resolvedPriceInr = Number.isFinite(match.priceInr) ? Math.max(0, Math.trunc(match.priceInr)) : 0;
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        const purchase = await fetchGooglePlaySubscriptionPurchase({ packageName, productId, purchaseToken });
+        const expiryMs = typeof purchase.expiryTimeMillis === 'string' ? Number(purchase.expiryTimeMillis) : NaN;
+        const expiryIso = Number.isFinite(expiryMs) ? new Date(expiryMs).toISOString() : null;
+        const expiryDisplay = formatIsoIstForDisplay(expiryIso || undefined);
+        const nowIso = new Date().toISOString();
+        const nowMs = Date.now();
+
+        const paymentState = typeof purchase.paymentState === 'number' ? purchase.paymentState : null;
+        const orderId = typeof purchase.orderId === 'string' ? purchase.orderId.trim() : '';
+        const autoRenewing = typeof (purchase as any).autoRenewing === 'boolean' ? Boolean((purchase as any).autoRenewing) : null;
+
+        // Notification types:
+        // 1 RECOVERED, 2 RENEWED, 3 CANCELED, 4 PURCHASED, 5 ON_HOLD,
+        // 6 IN_GRACE_PERIOD, 7 RESTARTED, 12 REVOKED, 13 EXPIRED.
+        const isExpired = Number.isFinite(expiryMs) && expiryMs <= nowMs;
+
+        const billingRef = db.collection('tenantBilling').doc(tenantId);
+        const tenantRef = db.collection('tenants').doc(tenantId);
+
+        const lastRenewalOrderId = typeof (billingData as any).lastStoreRenewalNotifiedOrderId === 'string' ? (billingData as any).lastStoreRenewalNotifiedOrderId : '';
+        const lastRenewalExpiryIso = typeof (billingData as any).lastStoreRenewalNotifiedExpiryIso === 'string' ? (billingData as any).lastStoreRenewalNotifiedExpiryIso : '';
+        const lastCancelExpiryIso = typeof (billingData as any).lastStoreCancelNotifiedExpiryIso === 'string' ? (billingData as any).lastStoreCancelNotifiedExpiryIso : '';
+        const lastDelinquentKey = typeof (billingData as any).lastStoreDelinquentNotifiedKey === 'string' ? (billingData as any).lastStoreDelinquentNotifiedKey : '';
+        const lastExpiredExpiryIso = typeof (billingData as any).lastStoreExpiredNotifiedExpiryIso === 'string' ? (billingData as any).lastStoreExpiredNotifiedExpiryIso : '';
+
+        const isNewRenewal = Boolean(expiryIso) && (orderId ? orderId !== lastRenewalOrderId : expiryIso !== lastRenewalExpiryIso);
+
+        if (notificationType === 2 /* RENEWED */) {
+          if (isNewRenewal) {
+            try {
+              await billingRef.set(
+                stripUndefinedDeep({
+                  planId: resolvedPlanId,
+                  planVariantId: resolvedVariantId || null,
+                  status: 'active',
+                  billingProvider: 'play',
+                  subscriptionId: purchaseToken,
+                  renewalDate: expiryIso,
+                  storeProductId: productId,
+                  ...(orderId ? { storeOrderId: orderId } : {}),
+                  ...(autoRenewing === true
+                    ? {
+                        cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+                        scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+                        scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+                      }
+                    : {}),
+                  delinquentSince: admin.firestore.FieldValue.delete(),
+                  delinquentSinceIso: admin.firestore.FieldValue.delete(),
+                  lastStoreVerifyAtIso: nowIso,
+                  lastPaymentCapturedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  lastPaymentCapturedAtIso: nowIso,
+                  lastPaymentCapturedPaymentId: orderId || null,
+                  lastPaymentCapturedSubscriptionId: purchaseToken,
+                  lastStoreRenewalNotifiedOrderId: orderId || null,
+                  lastStoreRenewalNotifiedExpiryIso: expiryIso || null,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                }),
+                { merge: true }
+              );
+            } catch {
+              // ignore
+            }
+
+            try {
+              await tenantRef.set(
+                {
+                  billingTier: resolvedPlanId,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+              );
+            } catch {
+              // ignore
+            }
+
+            // Invoice (best-effort)
+            try {
+              const invoiceId = orderId ? `play_${orderId}` : expiryIso ? `play_${purchaseToken.slice(0, 12)}_${expiryIso}` : `play_${purchaseToken.slice(0, 12)}_${nowIso}`;
+              await db
+                .collection('billingInvoices')
+                .doc(tenantId)
+                .collection('invoices')
+                .doc(invoiceId)
+                .set(
+                  stripUndefinedDeep({
+                    amountInr: resolvedPriceInr,
+                    status: 'paid',
+                    provider: 'play',
+                    issuedAt: nowIso,
+                    planId: resolvedPlanId,
+                    planVariantId: resolvedVariantId || null,
+                    isSynthetic: true,
+                    sourceEvent: 'play_rtdn_renewed',
+                    providerSubscriptionId: purchaseToken,
+                    subscriptionId: purchaseToken,
+                    providerPaymentId: orderId || null,
+                    rawEvent: 'play_rtdn',
+                  }),
+                  { merge: true }
+                );
+            } catch {
+              // ignore
+            }
+
+            const bodyLines: string[] = [];
+            bodyLines.push(`Payment received for the ${String(resolvedPlanId).toUpperCase()} plan.`);
+            if (resolvedPriceInr > 0) bodyLines.push(`Amount: ₹${resolvedPriceInr}.`);
+            if (expiryDisplay) bodyLines.push(`Next billing: ${expiryDisplay}.`);
+
+            void sendTenantBillingEventNotification({
+              tenantId,
+              tenantName: undefined,
+              kind: 'subscription_charged',
+              title: 'Subscription payment received',
+              body: bodyLines.join('\n'),
+              priority: 'medium',
+              metadata: {
+                provider: 'play',
+                planId: resolvedPlanId,
+                planVariantId: resolvedVariantId || null,
+                productId,
+                subscriptionId: purchaseToken,
+                orderId: orderId || null,
+                renewalDate: expiryIso,
+                paymentState,
+                notificationType,
+              },
+            }).catch(() => undefined);
+          }
+          return;
+        }
+
+        if (notificationType === 3 /* CANCELED */) {
+          if (expiryIso && expiryIso === lastCancelExpiryIso) {
+            return;
+          }
+
+          try {
+            await billingRef.set(
+              stripUndefinedDeep({
+                planId: resolvedPlanId,
+                planVariantId: resolvedVariantId || null,
+                status: isExpired ? 'canceled' : 'active',
+                billingProvider: 'play',
+                subscriptionId: purchaseToken,
+                renewalDate: expiryIso,
+                storeProductId: productId,
+                ...(orderId ? { storeOrderId: orderId } : {}),
+                cancelAtCycleEnd: true,
+                scheduledDowngradePlanId: 'free',
+                ...(expiryIso ? { scheduledDowngradeAt: expiryIso } : {}),
+                lastStoreCancelNotifiedExpiryIso: expiryIso || nowIso,
+                lastStoreVerifyAtIso: nowIso,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              }),
+              { merge: true }
+            );
+          } catch {
+            // ignore
+          }
+
+          const bodyLines: string[] = [];
+          bodyLines.push('Your subscription was cancelled (auto-renew turned off).');
+          if (expiryDisplay) {
+            bodyLines.push(`Your plan remains active until ${expiryDisplay}, then switches to Free.`);
+          }
+
+          void sendTenantBillingEventNotification({
+            tenantId,
+            tenantName: undefined,
+            kind: 'subscription_cancelled',
+            title: 'Subscription cancelled',
+            body: bodyLines.join('\n'),
+            priority: 'medium',
+            metadata: {
+              provider: 'play',
+              planId: resolvedPlanId,
+              planVariantId: resolvedVariantId || null,
+              productId,
+              subscriptionId: purchaseToken,
+              orderId: orderId || null,
+              renewalDate: expiryIso,
+              notificationType,
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (notificationType === 5 /* ON_HOLD */ || notificationType === 6 /* IN_GRACE_PERIOD */) {
+          const delinquentKey = `${purchaseToken}:${notificationType}:${expiryIso || 'unknown'}`;
+          if (delinquentKey === lastDelinquentKey) {
+            return;
+          }
+
+          const kind = notificationType === 6 ? 'payment_failed' : 'subscription_failed';
+          const title = notificationType === 6 ? 'Subscription payment failed' : 'Subscription issue';
+          const body =
+            notificationType === 6
+              ? ['A subscription payment failed.', 'Please update your payment method to avoid interruption.', ...(expiryDisplay ? [`Grace until: ${expiryDisplay}.`] : [])].join('\n')
+              : ['There was an issue with your subscription.', 'Please update your payment method to avoid any interruption.'].join('\n');
+
+          try {
+            await billingRef.set(
+              stripUndefinedDeep({
+                planId: resolvedPlanId,
+                planVariantId: resolvedVariantId || null,
+                status: 'delinquent',
+                billingProvider: 'play',
+                subscriptionId: purchaseToken,
+                renewalDate: expiryIso,
+                storeProductId: productId,
+                ...(orderId ? { storeOrderId: orderId } : {}),
+                ...((billingData as any).delinquentSince ? {} : { delinquentSince: admin.firestore.FieldValue.serverTimestamp() }),
+                delinquentSinceIso: typeof (billingData as any).delinquentSinceIso === 'string' ? (billingData as any).delinquentSinceIso : nowIso,
+                lastStoreDelinquentNotifiedKey: delinquentKey,
+                lastStoreVerifyAtIso: nowIso,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              }),
+              { merge: true }
+            );
+          } catch {
+            // ignore
+          }
+
+          void sendTenantBillingEventNotification({
+            tenantId,
+            tenantName: undefined,
+            kind,
+            title,
+            body,
+            priority: 'high',
+            metadata: {
+              provider: 'play',
+              planId: resolvedPlanId,
+              productId,
+              subscriptionId: purchaseToken,
+              orderId: orderId || null,
+              renewalDate: expiryIso,
+              paymentState,
+              notificationType,
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        if (notificationType === 12 /* REVOKED */ || notificationType === 13 /* EXPIRED */ || isExpired) {
+          if (expiryIso && expiryIso === lastExpiredExpiryIso) {
+            return;
+          }
+
+          try {
+            await billingRef.set(
+              {
+                planId: 'free',
+                planVariantId: null,
+                couponCode: null,
+                status: 'canceled',
+                billingProvider: 'play',
+                subscriptionId: purchaseToken,
+                renewalDate: null,
+                cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+                scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+                scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+                limitsSnapshot: admin.firestore.FieldValue.delete(),
+                limitsSnapshotAt: admin.firestore.FieldValue.delete(),
+                delinquentSince: admin.firestore.FieldValue.delete(),
+                delinquentSinceIso: admin.firestore.FieldValue.delete(),
+                lastStoreExpiredNotifiedExpiryIso: expiryIso || nowIso,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          } catch {
+            // ignore
+          }
+
+          try {
+            await tenantRef.set(
+              {
+                billingTier: 'free',
+                quotas: admin.firestore.FieldValue.delete(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          } catch {
+            // ignore
+          }
+
+          void sendTenantBillingEventNotification({
+            tenantId,
+            tenantName: undefined,
+            kind: 'subscription_cancelled',
+            title: 'Subscription cancelled',
+            body: 'Your subscription has ended and the plan is now Free.',
+            priority: 'medium',
+            metadata: {
+              provider: 'play',
+              productId,
+              subscriptionId: purchaseToken,
+              orderId: orderId || null,
+              renewalDate: expiryIso,
+              paymentState,
+              notificationType,
+            },
+          }).catch(() => undefined);
+          return;
+        }
+
+        // Default: record and ignore unknown RTDN types.
+        await recordBillingOpsEvent(db, {
+          provider: 'play',
+          type: 'play_rtdn_unhandled_notification_type',
+          severity: 'info',
+          message: 'Unhandled RTDN subscription notificationType',
+          tenantId,
+          subscriptionId: purchaseToken,
+          httpStatus: 202,
+          requestPath: '/billing/play/notifications',
+          payloadPreview: safePreview(decoded),
+          metadata: { messageId, publishTime, notificationType, productId, paymentState, orderId: orderId || null },
+        });
+      } catch (error) {
+        try {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'play',
+            type: 'play_rtdn_handler_failed',
+            severity: 'error',
+            message: typeof (error as any)?.message === 'string' ? (error as any).message : 'RTDN handler failed',
+            httpStatus: 202,
+            requestPath: '/billing/play/notifications',
+            payloadPreview: safePreview(rawPayload),
+          });
+        } catch {
+          // ignore
+        }
+        console.error('[billing_play_notification] handler failed', error);
+      }
+    })();
+  });
+
+  const appStoreNotificationParser = express.raw({ type: 'application/json' });
+  app.post('/billing/appstore/notifications', appStoreNotificationParser, (req, res) => {
+    if (!storeBillingFeatureEnabled()) {
+      return res.status(503).json({ error: 'store_billing_disabled' });
+    }
+    const rawPayload = extractRawBody(req.body);
+    console.info('[billing_appstore_notification] stub payload received', rawPayload.slice(0, 500));
+    return res.status(202).json({ ok: true, provider: 'app_store' });
+  });
+
+  const stripeWebhookParser = express.raw({ type: 'application/json' });
+  app.post('/billing/stripe/webhook', stripeWebhookParser, (req, res) => {
+    return res.status(410).json({ error: 'stripe_disabled', message: 'Stripe billing is disabled; use Razorpay.' });
+  });
+
+  const razorpayWebhookParser = express.raw({ type: 'application/json' });
+  app.post('/billing/razorpay/webhook', razorpayWebhookParser, (req, res) => {
+    if (!billingWebhooksFeatureEnabled()) {
+      return res.status(503).json({ error: 'billing_webhooks_disabled' });
+    }
+    const rawPayload = extractRawBody(req.body);
+
+    const signature = typeof req.headers['x-razorpay-signature'] === 'string' ? req.headers['x-razorpay-signature'] : '';
+    const webhookSecret = (process.env.RAZORPAY_WEBHOOK_SECRET || '').trim();
+    const isTestMode = process.env.TEST_MODE === '1';
+
+    if (!isTestMode && webhookSecret) {
+      const ok = verifyRazorpayWebhookSignature({ rawBody: rawPayload, signatureHeader: signature, webhookSecret });
+      if (!ok) {
+        inc('billing_webhook_signature_failures_total', { provider: 'razorpay' });
+        console.warn('[billing_razorpay_webhook] invalid signature');
+        void (async () => {
+          try {
+            const parsed = (() => {
+              try {
+                return JSON.parse(rawPayload || '{}') as any;
+              } catch {
+                return null;
+              }
+            })();
+            const paymentEntity = parsed?.payload?.payment?.entity;
+            const subscriptionEntity = parsed?.payload?.subscription?.entity;
+            const event = typeof parsed?.event === 'string' ? parsed.event : null;
+            const subscriptionId = typeof subscriptionEntity?.id === 'string'
+              ? subscriptionEntity.id
+              : typeof paymentEntity?.subscription_id === 'string'
+                ? paymentEntity.subscription_id
+                : null;
+            const paymentId = typeof paymentEntity?.id === 'string' ? paymentEntity.id : null;
+            const tenantId =
+              typeof subscriptionEntity?.notes?.tenantId === 'string'
+                ? subscriptionEntity.notes.tenantId
+                : typeof paymentEntity?.notes?.tenantId === 'string'
+                  ? paymentEntity.notes.tenantId
+                  : null;
+
+            const db = getFirestoreImpl();
+            await recordBillingOpsEvent(db, {
+              provider: 'razorpay',
+              type: 'razorpay_webhook_invalid_signature',
+              severity: 'error',
+              message: 'Invalid Razorpay webhook signature',
+              httpStatus: 400,
+              requestPath: '/billing/razorpay/webhook',
+              ip: typeof req.ip === 'string' ? req.ip : null,
+              userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+              tenantId,
+              event,
+              subscriptionId,
+              paymentId,
+              payloadPreview: safePreview(rawPayload),
+              metadata: {
+                signaturePresent: Boolean(signature),
+                webhookSecretConfigured: Boolean(webhookSecret),
+              },
+            });
+          } catch {
+            // ignore
+          }
+        })();
+        return res.status(400).json({ error: 'invalid_signature' });
+      }
+    }
+
+    let parsed: RazorpayWebhookEvent;
+    try {
+      parsed = JSON.parse(rawPayload || '{}');
+    } catch (error) {
+      inc('billing_webhook_invalid_json_total', { provider: 'razorpay' });
+      console.warn('[billing_razorpay_webhook] invalid json', error);
+      void (async () => {
+        try {
+          const db = getFirestoreImpl();
+          await recordBillingOpsEvent(db, {
+            provider: 'razorpay',
+            type: 'razorpay_webhook_invalid_json',
+            severity: 'error',
+            message: 'Invalid Razorpay webhook JSON payload',
+            httpStatus: 400,
+            requestPath: '/billing/razorpay/webhook',
+            ip: typeof req.ip === 'string' ? req.ip : null,
+            userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+            payloadPreview: safePreview(rawPayload),
+          });
+        } catch {
+          // ignore
+        }
+      })();
+      return res.status(400).json({ error: 'invalid_json' });
+    }
+
+    void (async () => {
+      try {
+        const db = getFirestoreImpl();
+        await handleRazorpayWebhook({ db, rawBody: rawPayload, parsedBody: parsed });
+      } catch (error) {
+        inc('billing_webhook_handler_failures_total', { provider: 'razorpay' });
+        console.error('[billing_razorpay_webhook] handler failed', error);
+        void (async () => {
+          try {
+            const paymentEntity = (parsed as any)?.payload?.payment?.entity;
+            const subscriptionEntity = (parsed as any)?.payload?.subscription?.entity;
+            const event = typeof (parsed as any)?.event === 'string' ? (parsed as any).event : null;
+            const subscriptionId = typeof subscriptionEntity?.id === 'string'
+              ? subscriptionEntity.id
+              : typeof paymentEntity?.subscription_id === 'string'
+                ? paymentEntity.subscription_id
+                : null;
+            const paymentId = typeof paymentEntity?.id === 'string' ? paymentEntity.id : null;
+            const tenantId =
+              typeof subscriptionEntity?.notes?.tenantId === 'string'
+                ? subscriptionEntity.notes.tenantId
+                : typeof paymentEntity?.notes?.tenantId === 'string'
+                  ? paymentEntity.notes.tenantId
+                  : null;
+
+            const err = error as any;
+            const stack = typeof err?.stack === 'string' ? err.stack : null;
+            const message = typeof err?.message === 'string' ? err.message : 'Razorpay webhook handler failed';
+
+            const db = getFirestoreImpl();
+            await recordBillingOpsEvent(db, {
+              provider: 'razorpay',
+              type: 'razorpay_webhook_handler_failed',
+              severity: 'error',
+              message,
+              httpStatus: 202,
+              requestPath: '/billing/razorpay/webhook',
+              ip: typeof req.ip === 'string' ? req.ip : null,
+              userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+              tenantId,
+              event,
+              subscriptionId,
+              paymentId,
+              payloadPreview: safePreview(rawPayload),
+              metadata: {
+                stackPreview: safePreview(stack, 1200),
+              },
+            });
+          } catch {
+            // ignore
+          }
+        })();
+      }
+    })();
+
+    inc('billing_webhook_accepted_total', { provider: 'razorpay' });
+
+    return res.status(202).json({ ok: true, provider: 'razorpay' });
+  });
+
+  // ----- Twilio endpoints with validation + rate limiting -----
+  const rl = rateLimitMiddleware({ windowMs: 60_000, max: 30 }); // 30 requests/minute per IP per endpoint
+  app.post('/twilio/sms', rl, requireStaffTenantAccess, async (req,res)=>{
+    const parsed = tenantScopedSmsSchema.safeParse(req.body||{});
+    if(!parsed.success) return res.status(400).json({ error:'validation_failed', issues: parsed.error.issues });
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    const normalizedTenantId = tenantAccess.tenantId;
+    const actorUid = req.authContext?.uid;
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const historyId = typeof parsed.data.historyId === 'string' ? parsed.data.historyId.trim() : '';
+    const rawHistory = (parsed.data as any).history;
+    const historyWithActor = rawHistory && typeof rawHistory === 'object'
+      ? stripUndefinedDeep({ ...(rawHistory as any), userId: (rawHistory as any)?.userId || actorUid })
+      : actorUid
+        ? ({ userId: actorUid } as any)
+        : undefined;
+
+    try {
+      if (parsed.data.quotaBatchId) {
+        await consumeTenantReminderReservationToken(getFirestoreImpl(), normalizedTenantId, parsed.data.quotaBatchId, 'sms', {
+          historyId: parsed.data.historyId,
+          history: historyWithActor || undefined,
+        });
+      } else {
+        await assertTenantReminderQuotaAvailable(getFirestoreImpl(), normalizedTenantId, 'sms', 1, {
+          historyId: historyId || undefined,
+          history: historyWithActor || undefined,
+        });
+      }
+    } catch (error) {
+      if (error instanceof TenantReminderLimitError) {
+        return res.status(409).json({
+          error: 'reminder_limit_reached',
+          limit: error.limit,
+          used: error.used,
+          channel: error.channel,
+        });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[twilio_sms] reminder quota check failed', error);
+      const isTestMode = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+      if (!isTestMode) {
+        return res.status(503).json({ error: 'reminder_quota_check_failed' });
+      }
+    }
+
+    const { tenantId: _tenantId, quotaBatchId: _quotaBatchId, historyId: _historyId, history: _history, ...twilioPayload } = parsed.data;
+    void _tenantId;
+    void _quotaBatchId;
+    void _history;
+
+    if (historyId) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId, {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'sms',
+          status: 'pending',
+          message: twilioPayload.message,
+          metadata: { deliveryStatus: 'sending' },
+        });
+      } catch (e) {
+        console.warn('[twilio_sms] reminderHistory pre-send upsert failed', e);
+      }
+    }
+
+    let result: any;
+    try {
+      result = await sendSMSImpl(twilioPayload);
+    } catch (error: any) {
+      if (historyId) {
+        try {
+          await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId, {
+            ...(historyWithActor || {}),
+            tenantId: normalizedTenantId,
+            reminderType: 'sms',
+            status: 'failed',
+            message: twilioPayload.message,
+            metadata: { deliveryStatus: 'failed' },
+            errorMessage:
+              typeof error?.message === 'string' && error.message.trim() ? error.message : 'sms_send_exception',
+          });
+        } catch (e) {
+          console.warn('[twilio_sms] reminderHistory update failed (exception)', e);
+        }
+
+        try {
+          await finalizeReminderQuotaFromHistory(getFirestoreImpl(), {
+            historyId,
+            finalStatus: 'failed',
+            fallbackTenantId: normalizedTenantId,
+            fallbackChannel: 'sms',
+          });
+        } catch (e) {
+          console.warn('[twilio_sms] quota finalize failed (exception)', e);
+        }
+      }
+      return res.status(500).json({ success: false, error: 'send_exception' });
+    }
+    if (historyId) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId, {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'sms',
+          status: result.success ? 'success' : 'failed',
+          message: twilioPayload.message,
+          metadata: {
+            deliveryStatus: result.success ? 'sent' : 'failed',
+            twilioSid: result.success ? result.sid : undefined,
+          },
+          errorMessage: result.success ? undefined : (result as any)?.error || 'send_failed',
+        });
+      } catch (e) {
+        console.warn('[twilio_sms] reminderHistory update failed', e);
+      }
+
+      try {
+        await finalizeReminderQuotaFromHistory(getFirestoreImpl(), {
+          historyId,
+          finalStatus: result.success ? 'success' : 'failed',
+          fallbackTenantId: normalizedTenantId,
+          fallbackChannel: 'sms',
+        });
+      } catch (e) {
+        console.warn('[twilio_sms] quota finalize failed', e);
+      }
+    }
+    if(!result.success) return res.status(500).json(result);
+    void logTenantAuditEventImpl({
+      tenantId: normalizedTenantId,
+      action: 'reminder_queued',
+      authContext: req.authContext,
+      metadata: {
+        channel: 'twilio_sms',
+        destination: twilioPayload.to,
+        messageLength: twilioPayload.message.length,
+        sid: result.sid,
+      },
+    });
+    res.json(result);
+  });
+
+  app.post('/twilio/voice-call', rl, requireStaffTenantAccess, async (req,res)=>{
+    const parsed = tenantScopedVoiceSchema.safeParse(req.body||{});
+    if(!parsed.success) return res.status(400).json({ error:'validation_failed', issues: parsed.error.issues });
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    const normalizedTenantId = tenantAccess.tenantId;
+    const actorUid = req.authContext?.uid;
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const historyId = typeof parsed.data.historyId === 'string' ? parsed.data.historyId.trim() : '';
+    const rawHistory = (parsed.data as any).history;
+    const historyWithActor = rawHistory && typeof rawHistory === 'object'
+      ? stripUndefinedDeep({ ...(rawHistory as any), userId: (rawHistory as any)?.userId || actorUid })
+      : actorUid
+        ? ({ userId: actorUid } as any)
+        : undefined;
+
+    try {
+      if (parsed.data.quotaBatchId) {
+        await consumeTenantReminderReservationToken(getFirestoreImpl(), normalizedTenantId, parsed.data.quotaBatchId, 'voice', {
+          historyId: parsed.data.historyId,
+          history: historyWithActor || undefined,
+        });
+      } else {
+        await assertTenantReminderQuotaAvailable(getFirestoreImpl(), normalizedTenantId, 'voice', 1, {
+          historyId: historyId || undefined,
+          history: historyWithActor || undefined,
+        });
+      }
+    } catch (error) {
+      if (error instanceof TenantReminderLimitError) {
+        return res.status(409).json({
+          error: 'reminder_limit_reached',
+          limit: error.limit,
+          used: error.used,
+          channel: error.channel,
+        });
+      }
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.warn('[twilio_voice] reminder quota check failed', error);
+      const isTestMode = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+      if (!isTestMode) {
+        return res.status(503).json({ error: 'reminder_quota_check_failed' });
+      }
+    }
+
+    const { tenantId: _tenantId, quotaBatchId: _quotaBatchId, historyId: _historyId, history: _history, ...voicePayload } = parsed.data;
+    void _tenantId;
+    void _quotaBatchId;
+    void _history;
+
+    if (historyId) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId, {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'voice',
+          status: 'pending',
+          message: voicePayload.message,
+          metadata: { deliveryStatus: 'sending' },
+        });
+      } catch (e) {
+        console.warn('[twilio_voice] reminderHistory pre-send upsert failed', e);
+      }
+    }
+
+    let result: any;
+    try {
+      result = await sendVoiceCallImpl(voicePayload);
+    } catch (error: any) {
+      if (historyId) {
+        try {
+          await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId, {
+            ...(historyWithActor || {}),
+            tenantId: normalizedTenantId,
+            reminderType: 'voice',
+            status: 'failed',
+            message: voicePayload.message,
+            metadata: { deliveryStatus: 'failed' },
+            errorMessage:
+              typeof error?.message === 'string' && error.message.trim() ? error.message : 'voice_send_exception',
+          });
+        } catch (e) {
+          console.warn('[twilio_voice] reminderHistory update failed (exception)', e);
+        }
+
+        try {
+          await finalizeReminderQuotaFromHistory(getFirestoreImpl(), {
+            historyId,
+            finalStatus: 'failed',
+            fallbackTenantId: normalizedTenantId,
+            fallbackChannel: 'voice',
+          });
+        } catch (e) {
+          console.warn('[twilio_voice] quota finalize failed (exception)', e);
+        }
+      }
+      return res.status(500).json({ success: false, error: 'send_exception' });
+    }
+    if (historyId) {
+      try {
+        await upsertReminderHistoryWithDates(getFirestoreImpl(), historyId, {
+          ...(historyWithActor || {}),
+          tenantId: normalizedTenantId,
+          reminderType: 'voice',
+          status: result.success ? 'success' : 'failed',
+          message: voicePayload.message,
+          metadata: {
+            deliveryStatus: result.success ? 'sent' : 'failed',
+            twilioSid: result.success ? result.sid : undefined,
+          },
+          errorMessage: result.success ? undefined : (result as any)?.error || 'send_failed',
+        });
+      } catch (e) {
+        console.warn('[twilio_voice] reminderHistory update failed', e);
+      }
+
+      try {
+        await finalizeReminderQuotaFromHistory(getFirestoreImpl(), {
+          historyId,
+          finalStatus: result.success ? 'success' : 'failed',
+          fallbackTenantId: normalizedTenantId,
+          fallbackChannel: 'voice',
+        });
+      } catch (e) {
+        console.warn('[twilio_voice] quota finalize failed', e);
+      }
+    }
+    if(!result.success) return res.status(500).json(result);
+    void logTenantAuditEventImpl({
+      tenantId: normalizedTenantId,
+      action: 'reminder_queued',
+      authContext: req.authContext,
+      metadata: {
+        channel: 'twilio_voice',
+        destination: voicePayload.to,
+        language: voicePayload.language ?? 'english',
+        sid: result.sid,
+        fallback: result.fallback,
+      },
+    });
+    res.json(result);
+  });
+
+  const pushProxyRL = rateLimitMiddleware({ windowMs: 60_000, max: 120 });
+  app.post('/notifications/push', pushProxyRL, requireStaffTenantAccess, async (req,res)=>{
+    const parsed = tenantScopedPushPayloadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const payloadData = parsed.data as any;
+    const { tenantId: _tenantId, ...payload } = payloadData;
+    void _tenantId;
+
+    const payloadAny = payload as any;
+    const messageBatch: Array<{ to: string | string[] }> = Array.isArray(payloadAny.messages)
+      ? payloadAny.messages
+      : [payloadAny];
+    const targetCount = messageBatch.reduce((count: number, msg) => {
+      if (Array.isArray(msg?.to)) return count + msg.to.length;
+      return count + 1;
+    }, 0);
+    const auditMetadata = {
+      channel: 'expo_push',
+      messageCount: messageBatch.length,
+      targetCount,
+      dryRun: Boolean('dryRun' in payloadAny ? payloadAny.dryRun : false),
+    };
+
+    if (process.env.TEST_MODE === '1') {
+      void logTenantAuditEventImpl({
+        tenantId: normalizedTenantId,
+        action: 'reminder_queued',
+        authContext: req.authContext,
+        metadata: { ...auditMetadata, testMode: true },
+      });
+      return res.json({ data: { status: 'ok', id: 'test-mode', details: 'expo push skipped in test mode' } });
+    }
+
+    const requestPayload = 'messages' in payload ? { messages: payload.messages, dryRun: payload.dryRun } : payload;
+    const endpoint = process.env.EXPO_PUSH_ENDPOINT || 'https://exp.host/--/api/v2/push/send';
+    const timeoutMs = Number(process.env.EXPO_PUSH_PROXY_TIMEOUT_MS || 10000);
+    try {
+      const expoResult = await executeExpoPushProxyRequestImpl({
+        payload: requestPayload,
+        endpoint,
+        timeoutMs,
+        fetchImpl,
+      });
+      if (!expoResult.ok) {
+        console.warn('[push_proxy] expo push request failed', expoResult.status, expoResult.rawBody?.slice?.(0, 200));
+        return res.status(expoResult.status).json(expoResult.body);
+      }
+      void logTenantAuditEventImpl({
+        tenantId: normalizedTenantId,
+        action: 'reminder_queued',
+        authContext: req.authContext,
+        metadata: { ...auditMetadata, status: expoResult.status },
+      });
+      return res.status(expoResult.status).json(expoResult.body);
+    } catch (e: any) {
+      const message = e?.name === 'AbortError' ? 'expo_push_timeout' : e?.message || String(e);
+      console.warn('[push_proxy] error', message);
+      return res.status(502).json({ error: 'expo_push_failed', message });
+    }
+  });
+
+  app.get('/tenants/:tenantId/export', requireParamsStaffTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const exportStarted = new Date();
+    const exportStartedIso = exportStarted.toISOString();
+    const exportedBy = (await resolveAuthenticatedEmail(req.authContext)) ?? req.authContext?.uid ?? null;
+    const safeTenantId = tenantAccess.tenantId.replace(/[^A-Za-z0-9_-]/g, '_');
+    const safeTimestamp = exportStartedIso.replace(/[:]/g, '-').replace(/\./g, '-');
+    const filename = `tenant-${safeTenantId}-export-${safeTimestamp}.json.gz`;
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+
+    const gzip = createGzip({ level: 6 });
+    const abortController = new AbortController();
+    const handleAbort = () => {
+      if (!abortController.signal.aborted) {
+        abortController.abort();
+      }
+    };
+
+    req.on('aborted', handleAbort);
+    req.on('close', handleAbort);
+
+    gzip.on('error', (error) => {
+      console.error('[tenant_export] gzip stream error', error);
+      if (!res.headersSent) {
+        res.removeHeader('Content-Encoding');
+        res.removeHeader('Content-Disposition');
+        res.status(500).json({ error: 'tenant_export_failed' });
+      } else {
+        res.destroy(error);
+      }
+    });
+
+    gzip.pipe(res);
+
+    try {
+      const result = await streamTenantExportImpl({
+        tenantId: tenantAccess.tenantId,
+        writer: gzip,
+        exportedBy,
+        signal: abortController.signal,
+        startedAt: exportStartedIso,
+      });
+      gzip.end();
+      void logTenantAuditEventImpl({
+        tenantId: tenantAccess.tenantId,
+        action: 'tenant_data_exported',
+        authContext: req.authContext,
+        targetType: 'export',
+        metadata: {
+          exportedBy,
+          durationMs: Date.now() - exportStarted.getTime(),
+          totalDocuments: result.totalDocuments,
+          datasetCounts: result.datasetCounts,
+          format: 'json.gz',
+        },
+      });
+    } catch (error) {
+      gzip.destroy();
+      if (error instanceof TenantExportAbortedError || abortController.signal.aborted) {
+        console.warn('[tenant_export] request aborted', { tenantId: tenantAccess.tenantId });
+        return;
+      }
+      console.error('[tenant_export] failed', error);
+      if (!res.headersSent) {
+        res.removeHeader('Content-Encoding');
+        res.removeHeader('Content-Disposition');
+        return res.status(500).json({ error: 'tenant_export_failed' });
+      }
+    } finally {
+      req.off('aborted', handleAbort);
+      req.off('close', handleAbort);
+    }
+  });
+
+  app.get('/notifications/daily-quotes/status', optionalQueryStaffTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : '';
+
+    if (!tenantId) {
+      if (authContext.tokenType === 'master') {
+        return res.json(getDailyQuoteSchedulerStatus());
+      }
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    if (!req.tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    res.json(getDailyQuoteSchedulerStatus());
+  });
+
+  app.post('/notifications/daily-quotes/trigger', requireStaffTenantAccess, async (req, res) => {
+    const parsed = tenantScopedDailyQuoteTriggerSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const { timeOfDay, targetEmails, dryRun, reason, now } = parsed.data;
+      let overrideNow: Date | undefined;
+      if (now) {
+        const parsedNow = new Date(now);
+        if (Number.isNaN(parsedNow.getTime())) {
+          return res.status(400).json({ error: 'invalid_now' });
+        }
+        overrideNow = parsedNow;
+      }
+      const stats = await runDailyQuoteJobImpl({
+        tenantId: normalizedTenantId,
+        timeOfDay,
+        targetEmails,
+        dryRun,
+        reason,
+        now: overrideNow,
+      });
+
+      const targetEmailsCount = Array.isArray(targetEmails) ? targetEmails.length : 0;
+      const statsSummary = {
+        sent: stats.sent,
+        failed: stats.failed,
+        attemptedDeliveries: stats.attemptedDeliveries,
+        eligibleDevices: stats.eligibleDevices,
+        totalDevices: stats.totalDevices,
+        dryRun: stats.dryRun,
+      };
+      void logTenantAuditEventImpl({
+        tenantId: normalizedTenantId,
+        action: 'daily_quotes_triggered',
+        authContext: req.authContext,
+        targetType: 'job',
+        metadata: {
+          timeOfDay: timeOfDay ?? 'auto',
+          dryRun: Boolean(dryRun),
+          reason: reason ?? 'manual_trigger',
+          targetEmailsCount,
+          overrideNow: overrideNow?.toISOString(),
+          stats: statsSummary,
+        },
+      });
+
+      res.json({ ok: true, stats });
+    } catch (error: any) {
+      res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
+  type BirthdayTriggerDefaults = Partial<Pick<BirthdayJobOptions, 'dryRun' | 'forceSend' | 'skipWhatsApp' | 'suppressStateUpdates' | 'reason' | 'now'>>;
+
+  async function handleBirthdayTrigger(
+    req: express.Request,
+    res: express.Response,
+    defaults: BirthdayTriggerDefaults = {}
+  ) {
+    const parsed = tenantScopedBirthdayTriggerSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const tenantId = tenantAccess.tenantId;
+    const providedTenantId = typeof parsed.data.tenantId === 'string' ? parsed.data.tenantId.trim() : '';
+    if (providedTenantId && providedTenantId !== tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const {
+        email,
+        emails,
+        deviceId,
+        deviceIds,
+        dryRun,
+        forceSend,
+        skipWhatsApp,
+        suppressStateUpdates,
+        reason,
+        now,
+      } = parsed.data;
+
+      const emailSet = new Set<string>();
+      if (typeof email === 'string') emailSet.add(email);
+      if (Array.isArray(emails)) emails.forEach(entry => emailSet.add(entry));
+
+      const combinedDeviceIds = [
+        ...(typeof deviceId === 'string' ? [deviceId] : []),
+        ...(Array.isArray(deviceIds) ? deviceIds : []),
+      ]
+        .map(id => id.trim())
+        .filter(Boolean);
+      const deviceIdSet = new Set(combinedDeviceIds);
+
+      const options: BirthdayJobOptions = {
+        tenantId,
+        targetEmails: emailSet.size > 0 ? Array.from(emailSet) : undefined,
+        targetDeviceIds: deviceIdSet.size > 0 ? Array.from(deviceIdSet) : undefined,
+        dryRun: dryRun ?? defaults.dryRun,
+        forceSend: forceSend ?? defaults.forceSend,
+        skipWhatsApp: skipWhatsApp ?? defaults.skipWhatsApp,
+        suppressStateUpdates: suppressStateUpdates ?? defaults.suppressStateUpdates,
+        reason: reason ?? defaults.reason ?? 'manual_trigger',
+      };
+
+      if (now) {
+        const parsedNow = new Date(now);
+        if (Number.isNaN(parsedNow.getTime())) {
+          return res.status(400).json({ error: 'invalid_now' });
+        }
+        options.now = parsedNow;
+      } else if (defaults.now instanceof Date) {
+        options.now = defaults.now;
+      }
+
+      const stats = await runBirthdayNotificationJobImpl(options);
+      const targetDeviceIdsCount = deviceIdSet.size;
+      const targetEmailsCount = emailSet.size;
+      void logTenantAuditEventImpl({
+        tenantId,
+        action: 'birthday_job_triggered',
+        authContext: req.authContext,
+        targetType: 'job',
+        metadata: {
+          dryRun: Boolean(options.dryRun),
+          forceSend: Boolean(options.forceSend),
+          skipWhatsApp: Boolean(options.skipWhatsApp),
+          suppressStateUpdates: Boolean(options.suppressStateUpdates),
+          reason: options.reason,
+          targetEmailsCount,
+          targetDeviceIdsCount,
+          stats,
+        },
+      });
+      res.json({ ok: true, stats });
+    } catch (error: any) {
+      res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  }
+
+  app.post('/notifications/birthday/trigger', requireStaffTenantAccess, (req, res) => handleBirthdayTrigger(req, res));
+  app.post('/notifications/birthday/test', requireStaffTenantAccess, (req, res) =>
+    handleBirthdayTrigger(req, res, {
+      forceSend: true,
+      skipWhatsApp: true,
+      suppressStateUpdates: true,
+      reason: 'manual_birthday_test',
+    })
+  );
+
+  app.post('/devices/ping', requireMemberTenantAccess, async (req, res) => {
+    const parsed = devicePingSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    const tenantId = tenantAccess?.tenantId?.trim();
+    if (!tenantAccess || !tenantId) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    if (tenantId !== parsed.data.tenantId.trim()) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const normalizedEmail = normalizeEmail(parsed.data.userEmail);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+
+    const authEmail = normalizeEmail(req.authContext?.email || '');
+    if (authEmail && authEmail !== normalizedEmail) {
+      return res.status(403).json({ error: 'email_mismatch' });
+    }
+
+    const deviceId = parsed.data.deviceId.trim();
+    if (!deviceId) {
+      return res.status(400).json({ error: 'invalid_device_id' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const deviceRef = db.collection('user_devices').doc(normalizedEmail).collection('devices').doc(deviceId);
+      const userRef = db.collection('user_devices').doc(normalizedEmail);
+      const pingType = parsed.data.pingType;
+      const activity = resolveDevicePingActivity(pingType);
+      const baseUpdate: admin.firestore.UpdateData<admin.firestore.DocumentData> = {
+        deviceId,
+        ownerEmail: normalizedEmail,
+        tenantIds: admin.firestore.FieldValue.arrayUnion(tenantId),
+        activeTenantId: tenantId,
+        lastTenantId: tenantId,
+        lastTenantPingAt: admin.firestore.FieldValue.serverTimestamp(),
+        tenantEnforcedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        isOnline: parsed.data.isOnline ?? true,
+        lastActivityType: activity,
+        lastPingType: pingType,
+      };
+
+      if (parsed.data.requestId) {
+        baseUpdate.lastPingRequestId = parsed.data.requestId;
+      }
+      if (req.authContext?.uid) {
+        baseUpdate.ownerUid = req.authContext.uid;
+      }
+
+      await deviceRef.set(baseUpdate, { merge: true });
+
+      const parentUpdate: admin.firestore.UpdateData<admin.firestore.DocumentData> = {
+        email: normalizedEmail,
+        lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+        tenantIds: admin.firestore.FieldValue.arrayUnion(tenantId),
+      };
+      if (req.authContext?.uid) {
+        parentUpdate.userId = req.authContext.uid;
+      }
+      await userRef.set(parentUpdate, { merge: true });
+
+      res.json({ ok: true, tenantId, deviceId });
+    } catch (error) {
+      console.error('[devices/ping] failed to enforce tenant metadata', error);
+      res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  app.get('/chat/stream', async (req, res) => {
+    const master = process.env.INTERNAL_API_KEY;
+    if (!master) {
+      return res.status(501).json({ error: 'not_enabled' });
+    }
+
+    const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+    const tokenPayload = decodeInternalToken(token);
+    if (!token || !tokenPayload) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : '';
+    if (!tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+
+    const userEmail = typeof req.query.user === 'string' ? req.query.user : '';
+    const partnerEmail = typeof req.query.partner === 'string' ? req.query.partner : '';
+    const normalizedUser = normalizeEmail(userEmail);
+    const normalizedPartner = normalizeEmail(partnerEmail);
+    const conversationKey = getConversationKey(normalizedUser, normalizedPartner);
+
+    if (!normalizedUser || !normalizedPartner || !conversationKey) {
+      return res.status(400).json({ error: 'invalid_conversation' });
+    }
+
+    if (typeof tokenPayload.email === 'string' && normalizeEmail(tokenPayload.email) !== normalizedUser) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const userIsMember = await isTenantEmailActiveMemberImpl(tenantId, normalizedUser);
+    const partnerIsMember = await isTenantEmailActiveMemberImpl(tenantId, normalizedPartner);
+    if (!userIsMember || !partnerIsMember) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    try {
+      ensureFirebase();
+    } catch (error) {
+      console.error('[chat-stream] firebase init failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+
+    req.socket.setTimeout(0);
+    req.socket.setNoDelay(true);
+    req.socket.setKeepAlive(true);
+
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    (res as any).flushHeaders?.();
+
+    let closed = false;
+    const send = (payload: unknown) => {
+      if (closed || res.writableEnded) {
+        return;
+      }
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    send({ type: 'ready', payload: { tenantId, conversationKey } });
+
+    let cleanup: (() => void) | null = null;
+    const heartbeat = setInterval(() => {
+      send({ type: 'ping', timestamp: Date.now() });
+    }, 25000);
+
+    const closeStream = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      clearInterval(heartbeat);
+      cleanup?.();
+      if (!res.writableEnded) {
+        res.end();
+      }
+    };
+
+    try {
+      cleanup = await watchConversationRealtime(tenantId, conversationKey, {
+        onMessage: (message) => send({ type: 'message', payload: message }),
+        onStatus: (status) => send({ type: 'status', payload: status }),
+        onMessageUpdate: (message) => send({ type: 'message_update', payload: message }),
+        onMessageDelete: (message) => send({ type: 'message_delete', payload: message }),
+      });
+    } catch (error) {
+      console.error('[chat-stream] watch failed', error);
+      send({ type: 'status', payload: { error: 'internal_error' } });
+      closeStream();
+      return;
+    }
+
+    req.on('close', closeStream);
+    req.on('aborted', closeStream);
+  });
+
+  app.post('/chat/delta', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatDeltaSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    const normalizedActor = normalizeEmail(actorEmail);
+    const normalizedUser = normalizeEmail(parsed.data.userEmail);
+    if (!normalizedActor || normalizedActor !== normalizedUser) {
+      return res.status(403).json({ error: 'not_authorized', message: 'User email mismatch' });
+    }
+
+    try {
+      const { partnerEmail, limit, direction, cursor } = parsed.data;
+      const normalizedPartner = normalizeEmail(partnerEmail);
+      const conversationKey = getConversationKey(normalizedUser, normalizedPartner);
+      if (!normalizedUser || !normalizedPartner || !conversationKey) {
+        return res.status(200).json({
+          messages: [],
+          hasMore: false,
+          cursor: { oldestTimestamp: null, newestTimestamp: null, count: 0 },
+        });
+      }
+
+      const partnerIsMember = await isTenantEmailActiveMemberImpl(tenantAccess.tenantId, normalizedPartner);
+      if (!partnerIsMember) {
+        return res.status(403).json({ error: 'partner_not_in_tenant' });
+      }
+
+      ensureFirebase();
+
+      const db = admin.database();
+      const conversationRef = db
+        .ref('tenantChat')
+        .child(tenantAccess.tenantId)
+        .child('conversationMessages')
+        .child(conversationKey);
+
+      const queryLimit = Math.min(Math.max(limit, 1), 200);
+      const cursorTimestamp = cursor?.timestamp || null;
+      const cursorMessageId = cursor?.messageId || null;
+
+      let queryRef: admin.database.Query = conversationRef.orderByChild('timestamp');
+
+      if (direction === 'older') {
+        if (cursorTimestamp) {
+          queryRef = queryRef.endAt(cursorTimestamp).limitToLast(queryLimit + 1);
+        } else {
+          queryRef = queryRef.limitToLast(queryLimit);
+        }
+      } else if (direction === 'newer' && cursorTimestamp) {
+        queryRef = queryRef.startAt(cursorTimestamp).limitToFirst(queryLimit + 1);
+      } else {
+        queryRef = queryRef.limitToLast(queryLimit);
+      }
+
+      const snapshot = await queryRef.get();
+      if (!snapshot.exists()) {
+        return res.status(200).json({
+          messages: [],
+          hasMore: false,
+          cursor: { oldestTimestamp: null, newestTimestamp: null, count: 0 },
+        });
+      }
+
+    const rows: { id: string; value: Record<string, any> }[] = [];
+    let scannedRowCount = 0;
+
+      snapshot.forEach((childSnap) => {
+        if (!childSnap.key) return false;
+        const value = childSnap.val() as Record<string, any> | null;
+        if (value) {
+          scannedRowCount += 1;
+          rows.push({ id: childSnap.key, value });
+        }
+        return false;
+      });
+
+      rows.sort((a, b) => {
+        const aTs = Date.parse((a.value.timestamp as string) || '') || 0;
+        const bTs = Date.parse((b.value.timestamp as string) || '') || 0;
+        return aTs - bTs;
+      });
+
+      const isCursorMatch = (msgId: string | undefined, timestamp: string | undefined) => {
+        if (!cursorTimestamp) {
+          return false;
+        }
+        if (!timestamp) {
+          return false;
+        }
+        if (timestamp !== cursorTimestamp) {
+          return false;
+        }
+        if (!cursorMessageId) {
+          return true;
+        }
+        return msgId === cursorMessageId;
+      };
+
+      const rawCount = scannedRowCount;
+
+      const normalizedMessages = rows
+        .map(({ id, value }) => {
+          if ((direction === 'older' || direction === 'newer') && isCursorMatch(id, value.timestamp)) {
+            return null;
+          }
+          return {
+            ...value,
+            id,
+            sender: normalizeEmail(value.sender),
+            recipientId: normalizeEmail(value.recipientId) || undefined,
+            conversationKey,
+          } as Record<string, any>;
+        })
+        .filter((entry): entry is Record<string, any> => Boolean(entry));
+
+      const moreAvailable = cursorTimestamp ? rawCount > queryLimit : rawCount === queryLimit;
+      const trimmedMessages = moreAvailable
+        ? normalizedMessages.slice(normalizedMessages.length - queryLimit)
+        : normalizedMessages;
+
+      const responseMessages: Record<string, any>[] = trimmedMessages.map((message) => ({
+        ...message,
+        sender: normalizeEmail(message.sender),
+        recipientId: message.recipientId ? normalizeEmail(message.recipientId) : undefined,
+        tenantId: typeof message.tenantId === 'string' ? message.tenantId : undefined,
+      }));
+
+      const oldest = responseMessages[0]?.timestamp ?? null;
+      const newest = responseMessages[responseMessages.length - 1]?.timestamp ?? null;
+
+      return res.status(200).json({
+        messages: responseMessages,
+        hasMore: moreAvailable,
+        cursor: {
+          oldestTimestamp: oldest,
+          newestTimestamp: newest,
+          count: responseMessages.length,
+        },
+      });
+    } catch (error) {
+      console.error('[chat-delta] failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // ----- CSP violation reports (backend aggregation) -----
+  const cspRL = rateLimitMiddleware({ windowMs: 60_000, max: 120 }); // generous: 120 reports/min per IP
+  app.post('/csp-report', cspRL, express.json({ type: ['application/json','application/reports+json','application/csp-report'] as any }), async (req,res)=>{
+    const receivedAt = Date.now();
+    try {
+      const reportBody:any = req.body || {};
+      const payload = reportBody['csp-report'] || reportBody?.cspReport || reportBody?.body || reportBody;
+      const entries = Array.isArray(payload)? payload : [payload];
+      ensureFirebase();
+      const db = admin.firestore();
+      const batch = db.batch();
+      let count = 0;
+      for (const entry of entries.slice(0,25)) {
+        const eff = typeof entry === 'object'? {
+          violatedDirective: entry['violated-directive'] || entry['violatedDirective'],
+          effectiveDirective: entry['effective-directive'] || entry['effectiveDirective'],
+          blockedURI: entry['blocked-uri'] || entry['blockedURI'],
+          sourceFile: entry['source-file'] || entry['sourceFile'],
+          disposition: entry['disposition'],
+          referrer: entry['referrer'],
+          originalPolicy: (entry['original-policy'] || entry['originalPolicy'])?.slice?.(0,400),
+          scriptSample: entry['script-sample'] || entry['scriptSample']?.slice?.(0,200),
+        } : { raw: String(entry).slice(0,500) };
+        console.warn('[csp_violation]', JSON.stringify(eff));
+        inc(metricNames.cspViolation, { directive: eff.effectiveDirective || eff.violatedDirective || 'unknown' });
+        try {
+          // Persist (collection: security_csp_violations)
+          const docRef = db.collection('security_csp_violations').doc();
+          batch.set(docRef, { ...eff, receivedAt });
+        } catch {}
+        count++;
+      }
+      if (count > 0) {
+  try { await batch.commit(); } catch(e:any){ console.warn('[csp_violation] firestore_batch_error', e?.message); inc(metricNames.cspViolationPersistFailure); }
+      }
+    } catch(e:any){ console.warn('[csp_violation] parse_error', e?.message||e); }
+    res.status(204).end();
+  });
+
+  // ----- CSP violation pruning job -----
+  const CSP_RETENTION_DAYS = Number(process.env.CSP_VIOLATION_RETENTION_DAYS || 7);
+  const CSP_PRUNE_INTERVAL_MS = Number(process.env.CSP_VIOLATION_PRUNE_INTERVAL_MS || 3600000); // 1h
+  async function pruneCspViolations(){
+    if (CSP_RETENTION_DAYS <= 0) return;
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const cutoff = Date.now() - CSP_RETENTION_DAYS*24*60*60*1000;
+      const snap = await db.collection('security_csp_violations')
+        .where('receivedAt','<', cutoff)
+        .limit(500)
+        .get();
+      if (snap.empty) return;
+      let batch = db.batch();
+      let count = 0;
+      snap.docs.forEach(d=>{ batch.delete(d.ref); count++; });
+      await batch.commit();
+      console.log(`[csp_prune] removed ${count} violations older than ${CSP_RETENTION_DAYS}d`);
+  inc(metricNames.cspViolationPruned, { days: String(CSP_RETENTION_DAYS) });
+      // If we hit limit, schedule a faster follow-up
+      if (count === 500) setTimeout(()=>{ pruneCspViolations().catch(()=>{}); }, 5000).unref?.();
+    } catch(e:any){ console.warn('[csp_prune] error', e?.message||e); }
+  }
+  if (!isTestProcess && CSP_PRUNE_INTERVAL_MS > 0) {
+    setInterval(()=>{ pruneCspViolations().catch(()=>{}); }, CSP_PRUNE_INTERVAL_MS).unref?.();
+    setTimeout(()=>{ pruneCspViolations().catch(()=>{}); }, 20000).unref?.();
+  }
+
+  // Expose for tests
+  (app as any)._pruneCspViolations = pruneCspViolations;
+
+  app.get('/whatsapp/queue/status', optionalQueryStaffTenantAccess, async (req,res)=>{
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error:'unauthorized' });
+    }
+    const single = typeof req.query.jobId === 'string' ? req.query.jobId.trim() : undefined;
+    const multiRaw = req.query.jobIds;
+    const messageId = typeof req.query.messageId === 'string' ? req.query.messageId.trim() : undefined;
+
+    const tenantFilterRaw = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : undefined;
+    const tenantFilter = tenantFilterRaw || undefined;
+    if (!tenantFilter && authContext.tokenType !== 'master') {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+
+    const parseJobIds = (raw: unknown): string[] => {
+      if (typeof raw === 'string') {
+        return raw
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      if (Array.isArray(raw)) {
+        return raw
+          .flatMap((v) => (typeof v === 'string' ? v.split(',') : []))
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      return [];
+    };
+
+    if(messageId){
+      const jobId=findJobByMessageId(messageId);
+      if(!jobId) return res.status(404).json({error:'not_found'});
+      const st=await Promise.resolve(getJobStatus(jobId, tenantFilter));
+      if(!st) return res.status(404).json({error:'not_found'});
+      return res.json({ jobs:[{ id: jobId, ...st }]});
+    }
+    if(single){
+      const st=await Promise.resolve(getJobStatus(single, tenantFilter));
+      if(!st) return res.status(404).json({error:'not_found'});
+      return res.json({ jobs:[{id:single,...st}]});
+    }
+
+    const multi = parseJobIds(multiRaw);
+    if (multi.length > 0) {
+      const jobs = await Promise.resolve(listJobStatus(multi, tenantFilter));
+      return res.json({ jobs });
+    }
+    return res.status(400).json({ error:'missing_jobId' });
+  });
+
+  app.get('/metrics', async (_req, res) => {
+    const snap = await getInMemoryQueueSnapshot();
+    const base = `wa_queue_depth ${snap.queued}\nwa_queue_in_flight ${snap.processing}`;
+    const metrics = metricsText(base);
+    const lines = [metrics.trim()];
+
+    const depthThresh = Number(process.env.ALERT_QUEUE_DEPTH || '');
+    if (!isNaN(depthThresh)) lines.push(`wa_alert_queue_depth_exceeded ${snap.queued > depthThresh ? 1 : 0}`);
+
+    const failThresh = Number(process.env.ALERT_FAILURE_RATE || '');
+    if (!isNaN(failThresh)) {
+      const rate = getFailureRate();
+      lines.push(`wa_failure_rate ${rate.toFixed(4)}`);
+      lines.push(`wa_alert_failure_rate_exceeded ${rate > failThresh ? 1 : 0}`);
+    }
+
+    // Billing alert-style gauges computed from in-memory rolling windows.
+    // Intended as a lightweight alternative when no external alerting exists.
+    const window15m = 15 * 60 * 1000;
+    const window24h = 24 * 60 * 60 * 1000;
+
+    const sig15 = getWindowCount('billing_webhook_signature_failures_total', window15m, { provider: 'razorpay' });
+    const json15 = getWindowCount('billing_webhook_invalid_json_total', window15m, { provider: 'razorpay' });
+    const handler15 = getWindowCount('billing_webhook_handler_failures_total', window15m, { provider: 'razorpay' });
+    const invoice15 = getWindowCount('billing_invoice_write_failures_total', window15m, { provider: 'razorpay' });
+    const state15 = getWindowCount('billing_state_write_failures_total', window15m, { provider: 'razorpay' });
+    const unknown24 = getWindowCount('billing_webhook_unknown_events_total', window24h, { provider: 'razorpay' });
+
+    lines.push(`wa_billing_webhook_signature_failures_15m ${sig15}`);
+    lines.push(`wa_billing_webhook_invalid_json_15m ${json15}`);
+    lines.push(`wa_billing_webhook_handler_failures_15m ${handler15}`);
+    lines.push(`wa_billing_invoice_write_failures_15m ${invoice15}`);
+    lines.push(`wa_billing_state_write_failures_15m ${state15}`);
+    lines.push(`wa_billing_unknown_events_24h ${unknown24}`);
+
+    // Backfill freshness: how long since the scheduler last ran.
+    // Note: this tracks only the in-process scheduler, not manual CLI runs.
+    const backfillStatus = getBillingBackfillSchedulerStatus();
+    const lastBackfillIso = backfillStatus.lastRunAt;
+    let backfillAgeSeconds: number | null = null;
+    if (lastBackfillIso) {
+      const t = Date.parse(lastBackfillIso);
+      if (!Number.isNaN(t)) {
+        backfillAgeSeconds = Math.max(0, Math.floor((Date.now() - t) / 1000));
+      }
+    }
+    lines.push(`wa_billing_backfill_last_run_age_seconds ${backfillAgeSeconds ?? -1}`);
+
+    const sigThresh = Number(process.env.ALERT_BILLING_SIGNATURE_FAILURES_15M || '');
+    if (!isNaN(sigThresh)) {
+      lines.push(`wa_alert_billing_webhook_signature_failures_15m_exceeded ${sig15 > sigThresh ? 1 : 0}`);
+    }
+    const jsonThresh = Number(process.env.ALERT_BILLING_INVALID_JSON_15M || '');
+    if (!isNaN(jsonThresh)) {
+      lines.push(`wa_alert_billing_webhook_invalid_json_15m_exceeded ${json15 > jsonThresh ? 1 : 0}`);
+    }
+    const handlerThresh = Number(process.env.ALERT_BILLING_HANDLER_FAILURES_15M || '');
+    if (!isNaN(handlerThresh)) {
+      lines.push(`wa_alert_billing_webhook_handler_failures_15m_exceeded ${handler15 > handlerThresh ? 1 : 0}`);
+    }
+    const invoiceThresh = Number(process.env.ALERT_BILLING_INVOICE_WRITE_FAILURES_15M || '');
+    if (!isNaN(invoiceThresh)) {
+      lines.push(`wa_alert_billing_invoice_write_failures_15m_exceeded ${invoice15 > invoiceThresh ? 1 : 0}`);
+    }
+    const stateThresh = Number(process.env.ALERT_BILLING_STATE_WRITE_FAILURES_15M || '');
+    if (!isNaN(stateThresh)) {
+      lines.push(`wa_alert_billing_state_write_failures_15m_exceeded ${state15 > stateThresh ? 1 : 0}`);
+    }
+    const unknownThresh = Number(process.env.ALERT_BILLING_UNKNOWN_EVENTS_24H || '');
+    if (!isNaN(unknownThresh)) {
+      lines.push(`wa_alert_billing_unknown_events_24h_exceeded ${unknown24 > unknownThresh ? 1 : 0}`);
+    }
+
+    const backfillStaleHours = Number(process.env.ALERT_BILLING_BACKFILL_STALE_HOURS || '');
+    if (!isNaN(backfillStaleHours)) {
+      const staleSeconds = Math.max(0, Math.floor(backfillStaleHours * 3600));
+      const exceeded = backfillAgeSeconds !== null ? backfillAgeSeconds > staleSeconds : true;
+      lines.push(`wa_alert_billing_backfill_stale_exceeded ${exceeded ? 1 : 0}`);
+    }
+
+    res.type('text/plain').send(lines.join('\n') + '\n');
+  });
+  app.get('/ready', (_req,res)=> res.sendStatus(200));
+  app.get('/health', (_req,res)=> res.json({status:'ok', uptime: process.uptime(), ts: Date.now()}));
+
+  app.get('/billing/admin/backfill/status', requireOperatorAuth, (_req, res) => {
+    return res.json({ ok: true, scheduler: getBillingBackfillSchedulerStatus() });
+  });
+
+  app.get('/billing/admin/play-reconcile/status', requireOperatorAuth, async (_req, res) => {
+    const scheduler = getPlayBillingReconcileSchedulerStatus();
+    const lockDocPath = (process.env.PLAY_BILLING_RECONCILE_LOCK_DOC || '').trim() || 'billingLocks/play_billing_reconcile';
+
+    const parseDocPath = (value: string): { collection: string; docId: string } | null => {
+      const parts = value
+        .split('/')
+        .map((p) => p.trim())
+        .filter(Boolean);
+      if (parts.length !== 2) return null;
+      return { collection: parts[0], docId: parts[1] };
+    };
+
+    const toJson = (value: any): any => {
+      if (value == null) return value;
+      if (typeof value !== 'object') return value;
+      if (typeof value.toDate === 'function') {
+        try {
+          return value.toDate().toISOString();
+        } catch {
+          return String(value);
+        }
+      }
+      if (Array.isArray(value)) return value.map(toJson);
+      const out: Record<string, any> = {};
+      for (const [k, v] of Object.entries(value)) out[k] = toJson(v);
+      return out;
+    };
+
+    let lockDoc: Record<string, unknown> | null = null;
+    const parsed = parseDocPath(lockDocPath);
+    if (parsed) {
+      try {
+        const db = getFirestoreImpl();
+        const snap = await db.collection(parsed.collection).doc(parsed.docId).get();
+        lockDoc = snap.exists ? (toJson(snap.data() || {}) as Record<string, unknown>) : null;
+      } catch (error: any) {
+        lockDoc = { error: typeof error?.message === 'string' ? error.message : 'lock_doc_read_failed' } as any;
+      }
+    } else {
+      lockDoc = { error: 'invalid_lock_doc_path', lockDocPath } as any;
+    }
+
+    return res.json({ ok: true, scheduler, lockDocPath, lockDoc });
+  });
+
+  app.get('/billing/admin/metrics-summary', requireOperatorAuth, (_req, res) => {
+    try {
+      const window15m = 15 * 60 * 1000;
+      const window24h = 24 * 60 * 60 * 1000;
+
+      const provider = 'razorpay';
+      const gauges = {
+        billing_webhook_signature_failures_15m: getWindowCount('billing_webhook_signature_failures_total', window15m, { provider }),
+        billing_webhook_invalid_json_15m: getWindowCount('billing_webhook_invalid_json_total', window15m, { provider }),
+        billing_webhook_handler_failures_15m: getWindowCount('billing_webhook_handler_failures_total', window15m, { provider }),
+        billing_invoice_write_failures_15m: getWindowCount('billing_invoice_write_failures_total', window15m, { provider }),
+        billing_state_write_failures_15m: getWindowCount('billing_state_write_failures_total', window15m, { provider }),
+        billing_unknown_events_24h: getWindowCount('billing_webhook_unknown_events_total', window24h, { provider }),
+      };
+
+      const backfillStatus = getBillingBackfillSchedulerStatus();
+      const lastBackfillIso = backfillStatus.lastRunAt;
+      let backfillLastRunAgeSeconds: number | null = null;
+      if (lastBackfillIso) {
+        const t = Date.parse(lastBackfillIso);
+        if (!Number.isNaN(t)) {
+          backfillLastRunAgeSeconds = Math.max(0, Math.floor((Date.now() - t) / 1000));
+        }
+      }
+
+      const thresholds = {
+        signatureFailures15m: Number(process.env.ALERT_BILLING_SIGNATURE_FAILURES_15M || ''),
+        invalidJson15m: Number(process.env.ALERT_BILLING_INVALID_JSON_15M || ''),
+        handlerFailures15m: Number(process.env.ALERT_BILLING_HANDLER_FAILURES_15M || ''),
+        invoiceWriteFailures15m: Number(process.env.ALERT_BILLING_INVOICE_WRITE_FAILURES_15M || ''),
+        stateWriteFailures15m: Number(process.env.ALERT_BILLING_STATE_WRITE_FAILURES_15M || ''),
+        unknownEvents24h: Number(process.env.ALERT_BILLING_UNKNOWN_EVENTS_24H || ''),
+        backfillStaleHours: Number(process.env.ALERT_BILLING_BACKFILL_STALE_HOURS || ''),
+      };
+
+      const enabled = {
+        signatureFailures15m: !isNaN(thresholds.signatureFailures15m),
+        invalidJson15m: !isNaN(thresholds.invalidJson15m),
+        handlerFailures15m: !isNaN(thresholds.handlerFailures15m),
+        invoiceWriteFailures15m: !isNaN(thresholds.invoiceWriteFailures15m),
+        stateWriteFailures15m: !isNaN(thresholds.stateWriteFailures15m),
+        unknownEvents24h: !isNaN(thresholds.unknownEvents24h),
+        backfillStaleHours: !isNaN(thresholds.backfillStaleHours),
+      };
+
+      const alerts = {
+        signatureFailures15mExceeded: enabled.signatureFailures15m
+          ? gauges.billing_webhook_signature_failures_15m > thresholds.signatureFailures15m
+          : false,
+        invalidJson15mExceeded: enabled.invalidJson15m ? gauges.billing_webhook_invalid_json_15m > thresholds.invalidJson15m : false,
+        handlerFailures15mExceeded: enabled.handlerFailures15m
+          ? gauges.billing_webhook_handler_failures_15m > thresholds.handlerFailures15m
+          : false,
+        invoiceWriteFailures15mExceeded: enabled.invoiceWriteFailures15m
+          ? gauges.billing_invoice_write_failures_15m > thresholds.invoiceWriteFailures15m
+          : false,
+        stateWriteFailures15mExceeded: enabled.stateWriteFailures15m
+          ? gauges.billing_state_write_failures_15m > thresholds.stateWriteFailures15m
+          : false,
+        unknownEvents24hExceeded: enabled.unknownEvents24h ? gauges.billing_unknown_events_24h > thresholds.unknownEvents24h : false,
+        backfillStaleExceeded: enabled.backfillStaleHours
+          ? backfillLastRunAgeSeconds !== null
+            ? backfillLastRunAgeSeconds > Math.max(0, Math.floor(thresholds.backfillStaleHours * 3600))
+            : true
+          : false,
+      };
+
+      const activeAlerts = Object.entries(alerts)
+        .filter(([, v]) => v)
+        .map(([k]) => k);
+
+      return res.json({
+        ok: true,
+        provider,
+        gauges,
+        backfill: {
+          schedulerEnabled: backfillStatus.enabled,
+          schedulerStarted: backfillStatus.schedulerStarted,
+          lastRunAt: backfillStatus.lastRunAt,
+          lastRunAgeSeconds: backfillLastRunAgeSeconds,
+        },
+        thresholds: {
+          signatureFailures15m: enabled.signatureFailures15m ? thresholds.signatureFailures15m : null,
+          invalidJson15m: enabled.invalidJson15m ? thresholds.invalidJson15m : null,
+          handlerFailures15m: enabled.handlerFailures15m ? thresholds.handlerFailures15m : null,
+          invoiceWriteFailures15m: enabled.invoiceWriteFailures15m ? thresholds.invoiceWriteFailures15m : null,
+          stateWriteFailures15m: enabled.stateWriteFailures15m ? thresholds.stateWriteFailures15m : null,
+          unknownEvents24h: enabled.unknownEvents24h ? thresholds.unknownEvents24h : null,
+          backfillStaleHours: enabled.backfillStaleHours ? thresholds.backfillStaleHours : null,
+        },
+        alerts,
+        activeAlerts,
+        generatedAtIso: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error('[billing_metrics_summary] failed', error);
+      return res.status(500).json({ error: 'billing_metrics_summary_failed' });
+    }
+  });
+
+  // Firebase init helpers handled via ensureFirebase() imported from firebaseAdmin.ts
+
+  /* c8 ignore start - presence sweeper operational path excluded from coverage (timers, Firestore side-effects) */
+  // ---------------- Presence Sweeper (restored original) ----------------
+  const TENANT_JOIN_REQUEST_COLLECTION = 'tenantJoinRequests';
+  const JOIN_REQUEST_AUTO_EXPIRE_ACTOR = 'system:auto-expire';
+  const JOIN_REQUEST_EXPIRY_SWEEP_INTERVAL_MS = Number(
+    process.env.JOIN_REQUEST_EXPIRY_SWEEP_INTERVAL_MS || 60 * 60 * 1000,
+  );
+  const JOIN_REQUEST_EXPIRY_SWEEP_BATCH_SIZE = Math.min(
+    Math.max(Number(process.env.JOIN_REQUEST_EXPIRY_SWEEP_BATCH_SIZE || 200), 1),
+    500,
+  );
+
+  const TENANT_INVITE_COLLECTION = 'tenantInvites';
+  const INVITE_AUTO_EXPIRE_ACTOR = 'system:auto-expire';
+  const INVITE_EXPIRY_SWEEP_INTERVAL_MS = Number(
+    process.env.INVITE_EXPIRY_SWEEP_INTERVAL_MS || 60 * 60 * 1000,
+  );
+  const INVITE_EXPIRY_SWEEP_BATCH_SIZE = Math.min(
+    Math.max(Number(process.env.INVITE_EXPIRY_SWEEP_BATCH_SIZE || 200), 1),
+    500,
+  );
+
+  const PRESENCE_SWEEP_INTERVAL_MS = Number(process.env.PRESENCE_SWEEP_INTERVAL_MS || 300000);
+  const PRESENCE_STALE_MINUTES = Number(process.env.PRESENCE_STALE_MINUTES || 5);
+  const PRESENCE_STALE_WINDOW_MS = PRESENCE_STALE_MINUTES * 60_000;
+  const PRESENCE_COLLECTION = process.env.PRESENCE_COLLECTION || 'tenantPresence';
+  type PresenceQueryMode = 'online_only' | 'full_scan';
+  const PRESENCE_SWEEP_QUERY_MODE: PresenceQueryMode =
+    (process.env.PRESENCE_SWEEP_QUERY_MODE || 'online_only').toLowerCase() === 'full_scan'
+      ? 'full_scan'
+      : 'online_only';
+
+  async function expireJoinRequestsOnce() {
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const nowIso = new Date().toISOString();
+      let expired = 0;
+      while (true) {
+        const snapshot = await db
+          .collection(TENANT_JOIN_REQUEST_COLLECTION)
+          .where('status', '==', 'pending')
+          .where('expiresAt', '<=', nowIso)
+          .limit(JOIN_REQUEST_EXPIRY_SWEEP_BATCH_SIZE)
+          .get();
+        if (snapshot.empty) {
+          break;
+        }
+        const batch = db.batch();
+        snapshot.docs.forEach((docSnap) => {
+          const expiresAtRaw = docSnap.get('expiresAt');
+          let expiresAtIso: string | null = null;
+          if (expiresAtRaw && typeof (expiresAtRaw as any).toDate === 'function') {
+            expiresAtIso = (expiresAtRaw as admin.firestore.Timestamp).toDate().toISOString();
+          } else if (typeof expiresAtRaw === 'string') {
+            expiresAtIso = expiresAtRaw;
+          }
+          const reviewedAt = expiresAtIso && !Number.isNaN(Date.parse(expiresAtIso)) ? expiresAtIso : nowIso;
+          batch.update(docSnap.ref, {
+            status: 'expired',
+            reviewedAt,
+            reviewedBy: JOIN_REQUEST_AUTO_EXPIRE_ACTOR,
+            lastUpdatedAt: nowIso,
+          });
+        });
+        await batch.commit();
+        expired += snapshot.size;
+        if (snapshot.size < JOIN_REQUEST_EXPIRY_SWEEP_BATCH_SIZE) {
+          break;
+        }
+      }
+      if (expired) {
+        console.log(`[join_request_expiry] expired ${expired} stale join requests (cutoff ${nowIso})`);
+      }
+      return { expired };
+    } catch (error: any) {
+      console.warn('[join_request_expiry] sweep error', error?.message || error);
+      throw error;
+    }
+  }
+
+  async function expireInvitesOnce() {
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const nowIso = new Date().toISOString();
+      const nowTs = admin.firestore.Timestamp.now();
+      let expired = 0;
+
+      const expireBatch = async (snapshot: admin.firestore.QuerySnapshot<admin.firestore.DocumentData>) => {
+        if (snapshot.empty) return 0;
+        const batch = db.batch();
+        snapshot.docs.forEach((docSnap) => {
+          const expiresAtRaw = docSnap.get('expiresAt');
+          let expiresAtIso: string | null = null;
+          if (expiresAtRaw && typeof (expiresAtRaw as any).toDate === 'function') {
+            expiresAtIso = (expiresAtRaw as admin.firestore.Timestamp).toDate().toISOString();
+          } else if (typeof expiresAtRaw === 'string') {
+            expiresAtIso = expiresAtRaw;
+          }
+
+          const expiredAt = expiresAtIso && !Number.isNaN(Date.parse(expiresAtIso)) ? expiresAtIso : nowIso;
+          batch.update(docSnap.ref, {
+            status: 'expired',
+            expiredAt,
+            expiredBy: INVITE_AUTO_EXPIRE_ACTOR,
+            updatedAt: nowIso,
+          });
+        });
+        await batch.commit();
+        return snapshot.size;
+      };
+
+      // Sweep invites where expiresAt is stored as an ISO string.
+      while (true) {
+        const snapshot = await db
+          .collection(TENANT_INVITE_COLLECTION)
+          .where('status', '==', 'pending')
+          .where('expiresAt', '<=', nowIso)
+          .limit(INVITE_EXPIRY_SWEEP_BATCH_SIZE)
+          .get();
+        const processed = await expireBatch(snapshot);
+        expired += processed;
+        if (processed === 0 || processed < INVITE_EXPIRY_SWEEP_BATCH_SIZE) {
+          break;
+        }
+      }
+
+      // Backward/defensive: sweep invites where expiresAt might be a Firestore Timestamp.
+      while (true) {
+        let snapshot: admin.firestore.QuerySnapshot<admin.firestore.DocumentData>;
+        try {
+          snapshot = await db
+            .collection(TENANT_INVITE_COLLECTION)
+            .where('status', '==', 'pending')
+            .where('expiresAt', '<=', nowTs)
+            .limit(INVITE_EXPIRY_SWEEP_BATCH_SIZE)
+            .get();
+        } catch {
+          break;
+        }
+
+        const processed = await expireBatch(snapshot);
+        expired += processed;
+        if (processed === 0 || processed < INVITE_EXPIRY_SWEEP_BATCH_SIZE) {
+          break;
+        }
+      }
+
+      if (expired) {
+        console.log(`[invite_expiry] expired ${expired} pending invites (cutoff ${nowIso})`);
+      }
+      return { expired };
+    } catch (error: any) {
+      console.warn('[invite_expiry] sweep error', error?.message || error);
+      throw error;
+    }
+  }
+
+  if (!isTestProcess && JOIN_REQUEST_EXPIRY_SWEEP_INTERVAL_MS > 0) {
+    const scheduleJoinExpirySweep = () =>
+      expireJoinRequestsOnce().catch((error) =>
+        console.warn('[join_request_expiry] periodic error', error instanceof Error ? error.message : error),
+      );
+    setInterval(scheduleJoinExpirySweep, JOIN_REQUEST_EXPIRY_SWEEP_INTERVAL_MS).unref?.();
+    setTimeout(scheduleJoinExpirySweep, 10000).unref?.();
+  }
+
+  if (!isTestProcess && INVITE_EXPIRY_SWEEP_INTERVAL_MS > 0) {
+    const scheduleInviteExpirySweep = () =>
+      expireInvitesOnce().catch((error) =>
+        console.warn('[invite_expiry] periodic error', error instanceof Error ? error.message : error),
+      );
+    setInterval(scheduleInviteExpirySweep, INVITE_EXPIRY_SWEEP_INTERVAL_MS).unref?.();
+    setTimeout(scheduleInviteExpirySweep, 12000).unref?.();
+  }
+
+  app.post('/internal/join-requests/expire', async (_req, res) => {
+    try {
+      const result = await expireJoinRequestsOnce();
+      res.json({ ok: true, ...result });
+    } catch (error: any) {
+      res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
+  app.post('/internal/invites/expire', async (_req, res) => {
+    try {
+      const result = await expireInvitesOnce();
+      res.json({ ok: true, ...result });
+    } catch (error: any) {
+      res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
+  // Expose for tests
+  (app as any)._expireInvitesOnce = expireInvitesOnce;
+
+  function parseAnyTimestamp(val: any): Date | null {
+    try {
+      if (!val) return null;
+      if (val && typeof val === 'object' && (val as any)._methodName === 'serverTimestamp') return new Date();
+      if (val && typeof val === 'object' && typeof (val as any).seconds === 'number') return new Date((val as any).seconds * 1000 + Math.floor(((val as any).nanoseconds || 0) / 1e6));
+      if (val && typeof (val as any).toDate === 'function') return (val as any).toDate();
+      if (val instanceof Date) return val;
+      if (typeof val === 'number' || typeof val === 'string') return new Date(val);
+      return null;
+    } catch { return null; }
+  }
+
+  async function fetchPresenceSnapshot(
+    col: admin.firestore.CollectionReference<admin.firestore.DocumentData>,
+    preferredMode: PresenceQueryMode
+  ): Promise<{ snap: admin.firestore.QuerySnapshot<admin.firestore.DocumentData>; modeUsed: PresenceQueryMode }> {
+    if (preferredMode === 'online_only') {
+      try {
+        const snap = await col.where('isOnline', '==', true).get();
+        return { snap, modeUsed: 'online_only' };
+      } catch (error) {
+        console.warn('[presence_sweeper] online_only query failed; falling back to full_scan', error instanceof Error ? error.message : error);
+      }
+    }
+    const snap = await col.get();
+    return { snap, modeUsed: 'full_scan' };
+  }
+
+  async function sweepPresenceOnce(){
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const col = db.collection(PRESENCE_COLLECTION);
+      const { snap, modeUsed } = await fetchPresenceSnapshot(col, PRESENCE_SWEEP_QUERY_MODE);
+      const now = Date.now();
+      let updates = 0;
+      let scanned = 0;
+      for (const doc of snap.docs){
+        const data = doc.data() as any;
+        const lastSeen = data.lastSeen;
+        const isOnline = data.isOnline === true;
+        const parsed = parseAnyTimestamp(lastSeen);
+        scanned++;
+        if (!parsed) {
+          if (isOnline) { await doc.ref.update({ isOnline: false }); updates++; }
+          continue;
+        }
+        const isStale = now - parsed.getTime() > PRESENCE_STALE_WINDOW_MS;
+        if (isOnline && isStale) {
+          await doc.ref.update({ isOnline: false });
+          updates++;
+        }
+      }
+      console.log(`[presence_sweeper] mode=${modeUsed} scanned ${scanned} docs, updated ${updates} stale presence flags`);
+      return { scanned, updates };
+    } catch(e:any) {
+      console.warn('[presence_sweeper] sweep error', e?.message||e);
+      throw e;
+    }
+  }
+
+  if (!isTestProcess && PRESENCE_SWEEP_INTERVAL_MS > 0) {
+    setInterval(() => { sweepPresenceOnce().catch((e)=>console.warn('[presence_sweeper] periodic error', e?.message||e)); }, PRESENCE_SWEEP_INTERVAL_MS).unref?.();
+    setTimeout(() => { sweepPresenceOnce().catch((e)=>console.warn('[presence_sweeper] startup error', e?.message||e)); }, 5000).unref?.();
+  }
+
+  app.post('/internal/presence/sweep', async (_req, res) => {
+    try {
+      const { scanned, updates } = await sweepPresenceOnce();
+      res.json({ ok: true, scanned, updates, thresholdMinutes: PRESENCE_STALE_MINUTES });
+    } catch (e:any) {
+      res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  const schedulersEnabled = !isTestProcess;
+  if (schedulersEnabled) {
+    startBirthdayNotificationScheduler();
+    startDailyQuoteScheduler();
+    startBillingBackfillScheduler();
+    startPlayBillingReconcileScheduler();
+  }
+
+  // Expose for tests and diagnostics
+  (app as any)._runBirthdayNotificationJob = runBirthdayNotificationJobImpl;
+  (app as any)._runDailyQuoteJob = runDailyQuoteJobImpl;
+  // Graceful shutdown helper for external usage
+  (app as any).shutdown = async () => { try { await shutdownQueue(); } catch {} };
+  /* c8 ignore stop */
+  return app;
+}
+
+// If run directly, start server
+if (require.main === module) {
+  const app = createApp();
+  const PORT = process.env.PORT || 8080;
+  const server = app.listen(PORT, ()=> console.log('Backend runtime listening on', PORT));
+  ['SIGINT','SIGTERM'].forEach(sig=>process.on(sig, ()=>{ server.close(()=>process.exit(0)); setTimeout(()=>process.exit(1), 10000); }));
+}
