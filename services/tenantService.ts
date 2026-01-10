@@ -1446,22 +1446,47 @@ class TenantService {
     const invites = Array.isArray(params.invites) ? params.invites : [];
     const nowIso = new Date().toISOString();
 
+    const parseIsoTs = (value: unknown): number => {
+      if (typeof value !== 'string') return Number.NEGATIVE_INFINITY;
+      const parsed = Date.parse(value);
+      return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+    };
+
+    const bestInviteByTenant = new Map<string, { invite: TenantInvite; sortKey: number }>();
+    for (const invite of invites) {
+      const tenantId = typeof invite?.tenantId === 'string' ? invite.tenantId.trim() : '';
+      if (!tenantId) continue;
+
+      const raw = invite as any;
+      const sortKey = Math.max(
+        parseIsoTs(raw.updatedAt),
+        parseIsoTs(raw.revokedAt),
+        parseIsoTs(raw.rejectedAt),
+        parseIsoTs(raw.acceptedAt),
+        parseIsoTs(raw.issuedAt),
+      );
+
+      const existing = bestInviteByTenant.get(tenantId);
+      if (!existing || sortKey >= existing.sortKey) {
+        bestInviteByTenant.set(tenantId, { invite, sortKey });
+      }
+    }
+
     // Only the invitee can map an invite -> membership doc id because it requires the user's uid.
     // This mirrors how join-code claim updates tenantMemberships/{tenantId}_{uid}.
-    for (const invite of invites) {
-      if (!invite?.tenantId) {
-        continue;
-      }
-      if (invite.status === 'accepted') {
-        continue;
-      }
+    for (const { invite } of bestInviteByTenant.values()) {
+      if (!invite?.tenantId) continue;
+
+      if (invite.status === 'accepted') continue;
 
       const nextStatus: TenantMembershipStatus | null =
         invite.status === 'pending'
           ? 'pending_invite'
           : invite.status === 'rejected'
             ? 'rejected'
-            : null;
+            : invite.status === 'revoked' || invite.status === 'expired'
+              ? 'revoked'
+              : null;
 
       if (!nextStatus) {
         continue;
@@ -1473,6 +1498,17 @@ class TenantService {
       const existing = snap.exists() ? (snap.data() as Partial<TenantMembership>) : null;
 
       const existingStatus = (existing?.status as TenantMembershipStatus | undefined) ?? undefined;
+
+      // Never let a stale invite overwrite an active membership.
+      if (existingStatus === 'active') {
+        continue;
+      }
+
+      // Avoid creating noise: if the user never saw a pending invite, don't create a revoked/rejected membership.
+      if (!snap.exists() && nextStatus !== 'pending_invite') {
+        continue;
+      }
+
       const existingRole = (existing?.role as TenantMembershipRole | undefined) ?? undefined;
       const existingCreatedAt = typeof existing?.createdAt === 'string' ? existing.createdAt : nowIso;
       const existingToken = typeof existing?.inviteToken === 'string' ? existing.inviteToken : undefined;
@@ -1480,7 +1516,9 @@ class TenantService {
       const inviteAt =
         nextStatus === 'pending_invite'
           ? invite.issuedAt
-          : invite.rejectedAt || invite.issuedAt || nowIso;
+          : nextStatus === 'rejected'
+            ? invite.rejectedAt || invite.issuedAt || nowIso
+            : ((invite as any).revokedAt as string | undefined) || (invite as any).updatedAt || invite.issuedAt || nowIso;
 
       const shouldUpdateStatus = existingStatus !== nextStatus;
       const shouldUpdateToken = nextStatus === 'pending_invite' && existingToken !== invite.token;
@@ -1489,11 +1527,11 @@ class TenantService {
         typeof invite.expiresAt === 'string' &&
         (typeof existingExpiresAt !== 'string' || existingExpiresAt !== invite.expiresAt);
       const shouldClearInviteFields =
-        nextStatus === 'rejected' &&
+        (nextStatus === 'rejected' || nextStatus === 'revoked') &&
         (typeof existingToken === 'string' || typeof existingExpiresAt === 'string' || typeof existing?.invitedBy === 'string');
 
-      // Don't override an active membership role; otherwise keep it aligned with the invite.
-      const shouldUpdateRole = existingStatus !== 'active' && existingRole !== invite.role;
+      // Keep role aligned with the invite for non-active memberships.
+      const shouldUpdateRole = existingRole !== invite.role;
 
       if (
         !snap.exists() ||
@@ -1505,10 +1543,22 @@ class TenantService {
       ) {
         const statusEvent = this.createStatusEvent(nextStatus, {
           at: typeof inviteAt === 'string' ? inviteAt : nowIso,
-          actorId: nextStatus === 'pending_invite' ? invite.issuedBy : userId,
-          actorEmail: nextStatus === 'pending_invite' ? undefined : email,
-          actorName: nextStatus !== 'pending_invite' ? params.displayName : undefined,
-          reason: nextStatus === 'pending_invite' ? 'invite_received' : 'invite_rejected_by_user',
+          actorId:
+            nextStatus === 'pending_invite'
+              ? invite.issuedBy
+              : nextStatus === 'rejected'
+                ? userId
+                : String(((invite as any).revokedBy as string | undefined) || invite.issuedBy || 'system'),
+          actorEmail: nextStatus === 'rejected' ? email : undefined,
+          actorName: nextStatus === 'rejected' ? params.displayName : undefined,
+          reason:
+            nextStatus === 'pending_invite'
+              ? 'invite_received'
+              : nextStatus === 'rejected'
+                ? 'invite_rejected_by_user'
+                : invite.status === 'expired'
+                  ? 'invite_expired'
+                  : 'invite_revoked',
         });
 
         if (!snap.exists()) {
@@ -1541,7 +1591,7 @@ class TenantService {
             updatePayload.inviteToken = invite.token;
             updatePayload.inviteExpiresAt = invite.expiresAt;
             updatePayload.invitedBy = invite.issuedBy;
-          } else if (nextStatus === 'rejected') {
+          } else if (nextStatus === 'rejected' || nextStatus === 'revoked') {
             updatePayload.inviteToken = deleteField();
             updatePayload.inviteExpiresAt = deleteField();
             updatePayload.invitedBy = deleteField();

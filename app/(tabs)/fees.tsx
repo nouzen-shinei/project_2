@@ -29,7 +29,8 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as XLSX from 'xlsx';
 import { ref, getDownloadURL, deleteObject } from 'firebase/storage';
-import { uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { reconcileTenantStorageUsageViaBackend, uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { maybeShowStorageLimitReachedAlert } from '../../services/storageLimitAlert';
 import { getFirestore as getFirestoreClient, doc as docClient, setDoc as setDocClient, deleteDoc as deleteDocClient, collection as collectionClient } from 'firebase/firestore';
 import { storage } from '../../config/firebase';
 import { useRouter } from 'expo-router';
@@ -3432,6 +3433,30 @@ export default function Fees() {
       if (blob.size > MAX_FILE_SIZE) {
         throw new Error(`File "${fileName}" exceeds the 20 MB limit. Please choose a smaller file.`);
       }
+
+      // Preflight storage quota for single receipt uploads as well.
+      try {
+        const quota = await reconcileTenantStorageUsageViaBackend({ tenantId });
+        if (Number.isFinite(quota?.bytes) && Number.isFinite(quota?.limitBytes)) {
+          const wouldUse = (quota.bytes || 0) + blob.size;
+          if (wouldUse > quota.limitBytes) {
+            throw new Error(
+              JSON.stringify({
+                error: 'storage_limit_reached',
+                usedBytes: quota.bytes,
+                limitBytes: quota.limitBytes,
+                incrementBytes: blob.size,
+              }),
+            );
+          }
+        }
+      } catch (quotaError) {
+        // If this was the structured storage_limit_reached error, rethrow.
+        if (maybeShowStorageLimitReachedAlert(quotaError, 'fees.receiptSinglePreflight')) {
+          throw quotaError;
+        }
+        logger.warn('Failed to preflight storage quota; proceeding with upload attempt.', quotaError);
+      }
       
       const result = await uploadBlobViaBackend({
         tenantId,
@@ -3440,6 +3465,7 @@ export default function Fees() {
         contentType: blob.type || 'application/octet-stream',
         filename: fileName,
         feeId,
+        suppressStorageLimitAlert: true,
         onProgress: (p) => {
           try {
             onProgress?.(p, blob.size);
@@ -3660,6 +3686,9 @@ export default function Fees() {
       setShowReceiptUpload(false);
     } catch (error) {
       logger.error('Error uploading receipt:', error);
+      if (maybeShowStorageLimitReachedAlert(error, 'fees.uploadReceipt')) {
+        return;
+      }
       Alert.alert('Error', 'Failed to upload receipt. Please try again.');
     } finally {
       setUploadingReceipt(false);
@@ -3747,11 +3776,54 @@ export default function Fees() {
         try {
           const uploadedReceipts = [];
 
-          const sizes = filteredNewFiles.map((file: any) => {
-            const sz = Number(file?.size);
-            return Number.isFinite(sz) && sz > 0 ? sz : 1;
-          });
+          // Preflight storage quota: if insufficient, fail the entire batch before uploading anything.
+          const resolvedSizes = await Promise.all(
+            filteredNewFiles.map(async (file: any) => {
+              const direct = Number(file?.size);
+              if (Number.isFinite(direct) && direct > 0) return direct;
+              try {
+                const info = await FileSystem.getInfoAsync(file?.uri);
+                const infoSize = Number((info as any)?.size);
+                if ((info as any)?.exists && Number.isFinite(infoSize) && infoSize > 0) return infoSize;
+              } catch {
+                // ignore
+              }
+              try {
+                const resp = await fetch(file?.uri);
+                const blob = await resp.blob();
+                const blobSize = Number(blob?.size);
+                if (Number.isFinite(blobSize) && blobSize > 0) return blobSize;
+              } catch {
+                // ignore
+              }
+              return 1;
+            }),
+          );
+          const sizes = resolvedSizes.map((sz) => (Number.isFinite(sz) && sz > 0 ? sz : 1));
           const totalBytes = sizes.reduce((sum: number, sz: number) => sum + sz, 0) || filteredNewFiles.length || 1;
+
+          try {
+            if (tenantId) {
+              const quota = await reconcileTenantStorageUsageViaBackend({ tenantId });
+              if (Number.isFinite(quota?.bytes) && Number.isFinite(quota?.limitBytes)) {
+                const wouldUse = (quota.bytes || 0) + totalBytes;
+                if (wouldUse > quota.limitBytes) {
+                  maybeShowStorageLimitReachedAlert(
+                    {
+                      error: 'storage_limit_reached',
+                      usedBytes: quota.bytes,
+                      limitBytes: quota.limitBytes,
+                      incrementBytes: totalBytes,
+                    },
+                    'fees.receiptsBatchPreflight',
+                  );
+                  return;
+                }
+              }
+            }
+          } catch (quotaError) {
+            logger.warn('Failed to preflight storage quota; proceeding with upload attempt.', quotaError);
+          }
           let completedBytes = 0;
           
           for (let i = 0; i < filteredNewFiles.length; i++) {
@@ -3800,6 +3872,9 @@ export default function Fees() {
 
         } catch (error) {
           logger.error('Error uploading receipts:', error);
+          if (maybeShowStorageLimitReachedAlert(error, 'fees.uploadReceipts')) {
+            return;
+          }
           Alert.alert('Error', 'Failed to upload receipts');
         } finally {
           setUploadingReceipt(false);
@@ -3932,11 +4007,54 @@ export default function Fees() {
     try {
       const uploadedReceipts = [];
 
-      const sizes = selectedFiles.map((file: any) => {
-        const sz = Number(file?.size);
-        return Number.isFinite(sz) && sz > 0 ? sz : 1;
-      });
+      // Preflight storage quota: if insufficient, fail the entire batch before uploading anything.
+      const resolvedSizes = await Promise.all(
+        selectedFiles.map(async (file: any) => {
+          const direct = Number(file?.size);
+          if (Number.isFinite(direct) && direct > 0) return direct;
+          try {
+            const info = await FileSystem.getInfoAsync(file?.uri);
+            const infoSize = Number((info as any)?.size);
+            if ((info as any)?.exists && Number.isFinite(infoSize) && infoSize > 0) return infoSize;
+          } catch {
+            // ignore
+          }
+          try {
+            const resp = await fetch(file?.uri);
+            const blob = await resp.blob();
+            const blobSize = Number(blob?.size);
+            if (Number.isFinite(blobSize) && blobSize > 0) return blobSize;
+          } catch {
+            // ignore
+          }
+          return 1;
+        }),
+      );
+      const sizes = resolvedSizes.map((sz) => (Number.isFinite(sz) && sz > 0 ? sz : 1));
       const totalBytes = sizes.reduce((sum: number, sz: number) => sum + sz, 0) || selectedFiles.length || 1;
+
+      try {
+        if (tenantId) {
+          const quota = await reconcileTenantStorageUsageViaBackend({ tenantId });
+          if (Number.isFinite(quota?.bytes) && Number.isFinite(quota?.limitBytes)) {
+            const wouldUse = (quota.bytes || 0) + totalBytes;
+            if (wouldUse > quota.limitBytes) {
+              maybeShowStorageLimitReachedAlert(
+                {
+                  error: 'storage_limit_reached',
+                  usedBytes: quota.bytes,
+                  limitBytes: quota.limitBytes,
+                  incrementBytes: totalBytes,
+                },
+                'fees.receiptsBatchPreflight',
+              );
+              return;
+            }
+          }
+        }
+      } catch (quotaError) {
+        logger.warn('Failed to preflight storage quota; proceeding with upload attempt.', quotaError);
+      }
       let completedBytes = 0;
       
       for (let i = 0; i < selectedFiles.length; i++) {
@@ -3989,6 +4107,9 @@ export default function Fees() {
       setShowReceiptUpload(false); // Close the upload modal after successful upload
     } catch (error) {
       logger.error('Error uploading receipts:', error);
+      if (maybeShowStorageLimitReachedAlert(error, 'fees.uploadReceipts')) {
+        return;
+      }
       Alert.alert('Error', 'Failed to upload receipts');
     } finally {
       setUploadingReceipt(false);

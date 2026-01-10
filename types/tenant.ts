@@ -168,9 +168,13 @@ export interface TenantInvite {
   role: TenantMembershipRole;
   status: TenantInviteStatus;
   token: string;
+  inviteLink?: string;
   issuedBy: string;
   issuedAt: string;
   expiresAt: string;
+  updatedAt?: string;
+  revokedAt?: string;
+  revokedBy?: string;
   acceptedAt?: string;
   acceptedBy?: string;
   rejectedAt?: string;

@@ -8,6 +8,13 @@ export type StorageLimitReachedInfo = {
   incrementBytes?: number;
 };
 
+export type StorageLimitAlertOptions = {
+  /** Override the incremental bytes shown in the message (e.g., actual blob size). */
+  incrementBytes?: number;
+  /** Additional message lines to append for contextual guidance. */
+  extraMessageLines?: string[];
+};
+
 let lastShownKey = '';
 let lastShownAt = 0;
 
@@ -73,11 +80,17 @@ export function tryExtractStorageLimitReachedInfo(input: unknown): StorageLimitR
   return info;
 }
 
-export function maybeShowStorageLimitReachedAlert(input: unknown, context?: string): boolean {
+export function maybeShowStorageLimitReachedAlert(
+  input: unknown,
+  context?: string,
+  options?: StorageLimitAlertOptions,
+): boolean {
   const info = tryExtractStorageLimitReachedInfo(input);
   if (!info) return false;
 
-  const key = `${info.usedBytes}|${info.limitBytes}|${info.incrementBytes ?? ''}`;
+  // Include extra lines in dedup key so different contextual alerts show (e.g., notice upload vs receipt upload).
+  const extraKey = Array.isArray(options?.extraMessageLines) ? options!.extraMessageLines.join('|') : '';
+  const key = `${info.usedBytes}|${info.limitBytes}|${info.incrementBytes ?? ''}|${extraKey}`;
   const now = Date.now();
   if (key === lastShownKey && now - lastShownAt < 5000) {
     return true;
@@ -88,12 +101,18 @@ export function maybeShowStorageLimitReachedAlert(input: unknown, context?: stri
 
   const used = bytesToMB(info.usedBytes);
   const limit = bytesToMB(info.limitBytes);
-  const inc = typeof info.incrementBytes === 'number' ? bytesToMB(info.incrementBytes) : null;
+  const resolvedIncrementBytes =
+    typeof options?.incrementBytes === 'number' && Number.isFinite(options.incrementBytes)
+      ? options.incrementBytes
+      : info.incrementBytes;
+  const inc = typeof resolvedIncrementBytes === 'number' ? bytesToMB(resolvedIncrementBytes) : null;
 
   const messageLines = [
     `Your storage is full (${used} MB used of ${limit} MB).`,
     inc ? `This upload needs about ${inc} MB.` : null,
     'Please delete some existing uploads (receipts/images/files) and try again.',
+    'You can also upgrade your plan for more storage.',
+    ...(Array.isArray(options?.extraMessageLines) ? options!.extraMessageLines.filter(Boolean) : []),
   ].filter(Boolean) as string[];
 
   const message = messageLines.join('\n');

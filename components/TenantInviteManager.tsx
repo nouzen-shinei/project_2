@@ -21,6 +21,7 @@ import { useTenant } from '@/hooks/useTenantContext';
 import { useAuth } from '@/hooks/useAuthUnified';
 import { useTenantUsageSummary } from '@/hooks/useTenantUsageSummary';
 import { tenantService } from '@/services/tenantService';
+import { tenantBackendClient } from '@/services/tenantBackendClient';
 import type { TenantInvite, TenantMembershipRole } from '@/types';
 import { formatDateToString } from '@/lib/utils';
 import { logger } from '@/lib/logger';
@@ -62,26 +63,6 @@ const statusChipColor = (
     default:
       return { backgroundColor: `${theme.primary}1A`, color: theme.primary };
   }
-};
-
-const DEFAULT_WEB_APP_BASE_URL = 'https://tuitionmanager.app';
-
-const normalizeBaseUrl = (value?: string | null): string | null => {
-  const trimmed = (value || '').trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/\/+$/, '');
-};
-
-const resolveWebAppBaseUrl = (): string => {
-  const fromEnv = normalizeBaseUrl(process.env.EXPO_PUBLIC_WEB_APP_URL);
-  if (fromEnv) return fromEnv;
-
-  if (Platform.OS === 'web' && typeof window !== 'undefined') {
-    const origin = normalizeBaseUrl(window.location?.origin);
-    if (origin) return origin;
-  }
-
-  return DEFAULT_WEB_APP_BASE_URL;
 };
 
 const parseIsoDate = (value?: string | null): Date | null => {
@@ -273,16 +254,13 @@ const TenantInviteManager = forwardRef<TenantInviteManagerHandle, TenantInviteMa
     [openModal],
   );
 
-  const composeInviteLink = useCallback((token: string) => {
-    const safeToken = encodeURIComponent((token || '').trim());
-    const base = resolveWebAppBaseUrl();
-    return `${base}/invite/${safeToken}`;
-  }, []);
-
   const handleCopyLink = useCallback(
     async (invite: TenantInvite) => {
       try {
-        const link = composeInviteLink(invite.token);
+        const fromDoc = typeof (invite as any)?.inviteLink === 'string' ? String((invite as any).inviteLink).trim() : '';
+        const link = fromDoc
+          ? fromDoc
+          : (await tenantBackendClient.getInviteLink({ tenantId: invite.tenantId, inviteId: invite.id })).inviteLink;
         await Clipboard.setStringAsync(link);
         if (copyResetRef.current) {
           clearTimeout(copyResetRef.current);
@@ -310,7 +288,7 @@ const TenantInviteManager = forwardRef<TenantInviteManagerHandle, TenantInviteMa
         });
       }
     },
-    [composeInviteLink],
+    [],
   );
 
   const handleCreateInvite = async () => {

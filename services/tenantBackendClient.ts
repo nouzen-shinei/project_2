@@ -329,6 +329,16 @@ class TenantBackendClient {
     return this.request(path, {});
   }
 
+  getInviteLink(payload: { tenantId: string; inviteId: string }): Promise<{ ok: boolean; inviteId: string; inviteLink: string }> {
+    const tenantId = payload.tenantId?.trim();
+    const inviteId = payload.inviteId?.trim();
+    if (!tenantId || !inviteId) {
+      throw new TenantBackendError('tenant_required', 'Tenant and invite ids are required');
+    }
+    const path = `/tenants/${encodeURIComponent(tenantId)}/invites/${encodeURIComponent(inviteId)}/link`;
+    return this.request(path, {});
+  }
+
   acceptInvite(payload: { token: string }): Promise<{ ok: boolean }> {
     const token = payload.token?.trim();
     if (!token) {

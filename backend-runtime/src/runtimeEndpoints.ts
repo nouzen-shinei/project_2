@@ -6,6 +6,7 @@ type RuntimeEndpoints = {
   notificationsApiBaseUrl?: string;
   wabaApiBaseUrl?: string;
   chatApiBaseUrl?: string;
+  webAppBaseUrl?: string;
 };
 
 const COLLECTION = 'appSettings';
@@ -38,6 +39,7 @@ function normalizeEndpoints(raw: unknown): RuntimeEndpoints | null {
     notificationsApiBaseUrl: normalizeBaseUrl(obj.notificationsApiBaseUrl),
     wabaApiBaseUrl: normalizeBaseUrl(obj.wabaApiBaseUrl),
     chatApiBaseUrl: normalizeBaseUrl(obj.chatApiBaseUrl),
+    webAppBaseUrl: normalizeBaseUrl(obj.webAppBaseUrl),
   };
 
   const hasAny = Object.values(endpoints).some(Boolean);
@@ -87,4 +89,9 @@ export async function getPreferredBackendBaseUrl(): Promise<string | null> {
 export async function getEmailBackendBaseUrl(): Promise<string | null> {
   const endpoints = await getRuntimeEndpoints();
   return endpoints?.emailApiBaseUrl || null;
+}
+
+export async function getWebAppBaseUrl(): Promise<string | null> {
+  const endpoints = await getRuntimeEndpoints();
+  return endpoints?.webAppBaseUrl || null;
 }

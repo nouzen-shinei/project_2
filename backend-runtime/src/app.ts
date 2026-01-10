@@ -11,7 +11,7 @@ import { findJobByMessageId } from './storage';
 import { z } from 'zod';
 import { cspMiddleware } from './csp';
 import { ensureFirebase } from './firebaseAdmin';
-import { getEmailBackendBaseUrl } from './runtimeEndpoints';
+import { getEmailBackendBaseUrl, getWebAppBaseUrl } from './runtimeEndpoints';
 import { getMaintenanceMode } from './maintenanceMode';
 import { finalizeReminderQuotaFromHistory } from './lib/reminderQuota';
 import { startBirthdayNotificationScheduler, runBirthdayNotificationJob, BirthdayJobOptions } from './birthdayNotificationJob';
@@ -610,6 +610,44 @@ const notificationPreferenceKeys = [
 type NotificationPreferenceKey = (typeof notificationPreferenceKeys)[number];
 
 const DEFAULT_INVITE_EXPIRY_DAYS = 7;
+
+const DEFAULT_WEB_APP_BASE_URL = 'https://tuitionmanager.app';
+
+function normalizeWebBaseUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  return trimmed ? trimmed : null;
+}
+
+async function resolveWebAppBaseUrlServer(): Promise<string> {
+  const fromFirestore = normalizeWebBaseUrl(await getWebAppBaseUrl());
+  if (fromFirestore) return fromFirestore;
+
+  // Backward-compatible env fallback. NOTE: EXPO_PUBLIC_* is only public on the client;
+  // on the server it's just an env var.
+  const fromEnv =
+    normalizeWebBaseUrl(process.env.WEB_APP_BASE_URL) ||
+    normalizeWebBaseUrl(process.env.PUBLIC_WEB_APP_ORIGIN) ||
+    normalizeWebBaseUrl(process.env.EXPO_PUBLIC_WEB_APP_URL);
+  return fromEnv || DEFAULT_WEB_APP_BASE_URL;
+}
+
+async function buildTenantInviteLinkServer(token: string): Promise<string> {
+  const base = await resolveWebAppBaseUrlServer();
+  const safeToken = encodeURIComponent((token || '').trim());
+  return `${base}/invite/${safeToken}`;
+}
+
+async function buildSmartSharedFileLinkServer(token: string): Promise<{ shareUrl: string; webUrl: string }> {
+  const base = await resolveWebAppBaseUrlServer();
+  const safeToken = encodeURIComponent((token || '').trim());
+  const webUrl = `${base}/shared/${safeToken}`;
+  const q = new URLSearchParams();
+  q.set('u', webUrl);
+  q.set('dl', `shared/${(token || '').trim()}`);
+  const shareUrl = `${base}/l?${q.toString()}`;
+  return { shareUrl, webUrl };
+}
 
 const tenantNotificationPreferencesSchema = z
   .object({
@@ -5318,6 +5356,8 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(500).json({ error: 'token_failed' });
     }
 
+    const { shareUrl, webUrl } = await buildSmartSharedFileLinkServer(token);
+
     try {
       const db = getFirestoreImpl();
       const docRef = db.collection('sharedFiles').doc(token);
@@ -5325,6 +5365,8 @@ export function createApp(options: CreateAppOptions = {}){
         stripUndefinedDeep({
           token,
           tenantId: parsed.data.tenantId,
+          shareUrl,
+          webUrl,
           createdAt: nowIso,
           createdByUid: authContext.uid,
           createdByEmail: authContext.email || undefined,
@@ -5341,7 +5383,7 @@ export function createApp(options: CreateAppOptions = {}){
         }),
       );
 
-      return res.json({ token });
+      return res.json({ token, shareUrl });
     } catch (error) {
       console.error('[shared_files] create failed', error);
       return res.status(500).json({ error: 'internal_error' });
@@ -5377,7 +5419,19 @@ export function createApp(options: CreateAppOptions = {}){
         fileUrl: parsed.data.fileUrl,
       });
       if (existing?.token) {
-        return res.json({ token: existing.token, existing: true });
+        const data = existing.data || {};
+        const existingShareUrl = typeof (data as any)?.shareUrl === 'string' ? String((data as any).shareUrl).trim() : '';
+        if (existingShareUrl) {
+          return res.json({ token: existing.token, shareUrl: existingShareUrl, existing: true });
+        }
+        const { shareUrl, webUrl } = await buildSmartSharedFileLinkServer(existing.token);
+        // Best-effort backfill
+        try {
+          await db.collection('sharedFiles').doc(existing.token).set({ shareUrl, webUrl, updatedAt: new Date().toISOString() }, { merge: true });
+        } catch {
+          // ignore
+        }
+        return res.json({ token: existing.token, shareUrl, existing: true });
       }
     } catch (error) {
       // Fail open to creation; do not block sharing if index is missing.
@@ -5390,6 +5444,8 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(500).json({ error: 'token_failed' });
     }
 
+    const { shareUrl, webUrl } = await buildSmartSharedFileLinkServer(token);
+
     try {
       const db = getFirestoreImpl();
       const docRef = db.collection('sharedFiles').doc(token);
@@ -5397,6 +5453,8 @@ export function createApp(options: CreateAppOptions = {}){
         stripUndefinedDeep({
           token,
           tenantId: parsed.data.tenantId,
+          shareUrl,
+          webUrl,
           createdAt: nowIso,
           createdByUid: authContext.uid,
           createdByEmail: authContext.email || undefined,
@@ -5413,9 +5471,63 @@ export function createApp(options: CreateAppOptions = {}){
         }),
       );
 
-      return res.json({ token, existing: false });
+      return res.json({ token, shareUrl, existing: false });
     } catch (error) {
       console.error('[shared_files] resolve-or-create failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // Return the canonical shareUrl for a token (auth + tenant required).
+  // Useful when the client already has a token (e.g. from chat upload metadata) and wants
+  // a server-generated web share link.
+  app.get('/shared-files/link/:token', optionalQueryMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess?.tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+
+    const token = normalizeShareToken(req.params.token);
+    if (!token) {
+      return res.status(400).json({ error: 'invalid_token' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('sharedFiles').doc(token);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      const data = snap.data() as any;
+      if (!isActiveSharedFileDoc(data)) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      if (data?.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const existingShareUrl = typeof data?.shareUrl === 'string' ? String(data.shareUrl).trim() : '';
+      if (existingShareUrl) {
+        return res.json({ token, shareUrl: existingShareUrl });
+      }
+
+      const { shareUrl, webUrl } = await buildSmartSharedFileLinkServer(token);
+      // Best-effort store so list endpoints can return it.
+      try {
+        await ref.set({ shareUrl, webUrl, updatedAt: new Date().toISOString() }, { merge: true });
+      } catch {
+        // ignore
+      }
+
+      return res.json({ token, shareUrl });
+    } catch (error) {
+      console.error('[shared_files] link failed', error);
       return res.status(500).json({ error: 'internal_error' });
     }
   });
@@ -5970,6 +6082,7 @@ export function createApp(options: CreateAppOptions = {}){
       notificationsApiBaseUrl: z.string().trim().min(1).optional(),
       wabaApiBaseUrl: z.string().trim().min(1).optional(),
       chatApiBaseUrl: z.string().trim().min(1).optional(),
+      webAppBaseUrl: z.string().trim().min(1).optional(),
     })
     .strict();
 
@@ -6004,12 +6117,14 @@ export function createApp(options: CreateAppOptions = {}){
     const notificationsApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.notificationsApiBaseUrl);
     const wabaApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.wabaApiBaseUrl);
     const chatApiBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.chatApiBaseUrl);
+    const webAppBaseUrl = normalizeRuntimeEndpointUrl(parsed.data.webAppBaseUrl);
 
     if (apiBaseUrl) patch.apiBaseUrl = apiBaseUrl;
     if (emailApiBaseUrl) patch.emailApiBaseUrl = emailApiBaseUrl;
     if (notificationsApiBaseUrl) patch.notificationsApiBaseUrl = notificationsApiBaseUrl;
     if (wabaApiBaseUrl) patch.wabaApiBaseUrl = wabaApiBaseUrl;
     if (chatApiBaseUrl) patch.chatApiBaseUrl = chatApiBaseUrl;
+    if (webAppBaseUrl) patch.webAppBaseUrl = webAppBaseUrl;
 
     if (!Object.keys(patch).length) {
       return res.status(400).json({ error: 'empty_update' });
@@ -7179,12 +7294,15 @@ export function createApp(options: CreateAppOptions = {}){
       const nowIso = new Date().toISOString();
       const expiresInDays = parsed.data.expiresInDays ?? DEFAULT_INVITE_EXPIRY_DAYS;
       const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+      const token = crypto.randomBytes(16).toString('hex');
+      const inviteLink = await buildTenantInviteLinkServer(token);
       const inviteData = {
         tenantId: tenantAccess.tenantId,
         email: inviteeEmail,
         role: desiredRole,
         status: 'pending',
-        token: crypto.randomBytes(16).toString('hex'),
+        token,
+        inviteLink,
         issuedBy: req.authContext?.uid || 'system',
         issuedAt: nowIso,
         expiresAt,
@@ -7238,6 +7356,57 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  // Return a server-generated invite link (auth + admin tenant required).
+  // Useful for older invites that may not yet have inviteLink stored.
+  app.post('/tenants/:tenantId/invites/:inviteId/link', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    const inviteId = typeof req.params?.inviteId === 'string' ? req.params.inviteId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    if (!inviteId) {
+      return res.status(400).json({ error: 'invite_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const inviteRef = db.collection('tenantInvites').doc(inviteId);
+      const snap = await inviteRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+      const invite = snap.data() as any;
+      if (invite?.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+
+      const token = typeof invite?.token === 'string' ? String(invite.token).trim() : '';
+      if (!token) {
+        return res.status(409).json({ error: 'invite_token_missing' });
+      }
+
+      const inviteLink = await buildTenantInviteLinkServer(token);
+      // Best-effort store so Firestore listeners can use it.
+      try {
+        await inviteRef.set({ inviteLink, updatedAt: new Date().toISOString() }, { merge: true });
+      } catch {
+        // ignore
+      }
+      return res.json({ ok: true, inviteId, inviteLink });
+    } catch (error) {
+      console.error('[tenant_invite_link] failed', error);
+      return res.status(500).json({ error: 'invite_link_failed' });
+    }
+  });
+
   app.post('/tenants/:tenantId/invites/:inviteId/resend', requireParamsAdminTenantAccess, async (req, res) => {
     const tenantAccess = req.tenantAccess;
     if (!tenantAccess) {
@@ -7277,7 +7446,9 @@ export function createApp(options: CreateAppOptions = {}){
       }
 
       const nowIso = new Date().toISOString();
-      await inviteRef.update({ lastSentAt: nowIso, lastSentBy: req.authContext?.uid || 'system' });
+      const token = typeof invite.token === 'string' ? String(invite.token).trim() : '';
+      const inviteLink = token ? await buildTenantInviteLinkServer(token) : undefined;
+      await inviteRef.update(stripUndefinedDeep({ lastSentAt: nowIso, lastSentBy: req.authContext?.uid || 'system', inviteLink }));
       await db.collection('tenantAuditLogs').add(
         stripUndefinedDeep({
           tenantId: tenantAccess.tenantId,
@@ -7296,6 +7467,7 @@ export function createApp(options: CreateAppOptions = {}){
         invite: {
           id: inviteId,
           ...invite,
+          ...(inviteLink ? { inviteLink } : {}),
           lastSentAt: nowIso,
           lastSentBy: req.authContext?.uid || 'system',
         },

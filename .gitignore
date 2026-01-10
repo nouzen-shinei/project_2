@@ -10,7 +10,6 @@ dist/
 web-build/
 expo-env.d.ts
 .expo-shared/
-public/
 
 # native
 *.orig.*
@@ -82,6 +81,7 @@ vercel/
 # docs (do not commit)
 docs/*.md
 docs/roadmaps/
+docs/devlog/
 
 # android build directories and config
 android/app/build/
@@ -120,4 +120,4 @@ android/app/google-services.json
 app/google-services.json
 
 README-old*.md
-docs/devlog/
+

@@ -129,6 +129,7 @@ export async function uploadBlobViaBackend(args: {
   feeId?: string;
   email?: string;
   onProgress?: (progress: number) => void;
+  suppressStorageLimitAlert?: boolean;
 }): Promise<BackendStorageUploadResponse> {
   const tenantId = (args.tenantId || '').trim();
   if (!tenantId) {
@@ -194,7 +195,9 @@ export async function uploadBlobViaBackend(args: {
     if (result.status !== 200) {
       maybeShowMaintenanceAlertFromRaw(result.status, result.responseText);
       if (result.status === 409) {
-        maybeShowStorageLimitReachedAlert(result.responseText, 'uploadBlobViaBackend');
+        if (!args.suppressStorageLimitAlert) {
+          maybeShowStorageLimitReachedAlert(result.responseText, 'uploadBlobViaBackend');
+        }
       }
       throw new Error(result.responseText || `upload_failed_${result.status}`);
     }
@@ -238,7 +241,9 @@ export async function uploadBlobViaBackend(args: {
     const text = await response.text().catch(() => '');
     maybeShowMaintenanceAlertFromRaw(response.status, text);
     if (response.status === 409) {
-      maybeShowStorageLimitReachedAlert(text, 'uploadBlobViaBackend');
+      if (!args.suppressStorageLimitAlert) {
+        maybeShowStorageLimitReachedAlert(text, 'uploadBlobViaBackend');
+      }
     }
     throw new Error(text || `upload_failed_${response.status}`);
   }

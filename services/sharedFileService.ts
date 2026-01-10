@@ -75,26 +75,6 @@ export const normalizeSharedFileName = (input: { fileUrl: string; fileName?: str
   return provided || 'file';
 };
 
-const DEFAULT_WEB_APP_BASE_URL = 'https://tuitionmanager.app';
-
-const normalizeBaseUrl = (value?: string | null): string | null => {
-  const trimmed = (value || '').trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/\/+$/, '');
-};
-
-export const resolveWebAppBaseUrl = (): string => {
-  const fromEnv = normalizeBaseUrl(process.env.EXPO_PUBLIC_WEB_APP_URL);
-  if (fromEnv) return fromEnv;
-
-  if (Platform.OS === 'web' && typeof window !== 'undefined') {
-    const origin = normalizeBaseUrl(window.location?.origin);
-    if (origin) return origin;
-  }
-
-  return DEFAULT_WEB_APP_BASE_URL;
-};
-
 const normalizeHttpUrl = (value?: string | null): string | null => {
   const trimmed = (value || '').trim();
   if (!trimmed) return null;
@@ -122,21 +102,6 @@ const resolveAuthedApiBaseUrl = (): string | null => {
   const fromSnap = normalizeHttpUrl(snap.apiBaseUrl || snap.notificationsApiBaseUrl || snap.wabaApiBaseUrl || snap.chatApiBaseUrl);
   if (fromSnap) return fromSnap;
   return resolvePublicApiBaseUrl();
-};
-
-const buildSmartLink = (fallbackUrl: string, deepLinkPath: string): string => {
-  const base = resolveWebAppBaseUrl();
-  const u = encodeURIComponent(fallbackUrl);
-  const dl = encodeURIComponent(deepLinkPath.replace(/^\/+/, ''));
-  return `${base}/l?u=${u}&dl=${dl}`;
-};
-
-const buildSmartShareLinkFromToken = (token: string): string => {
-  const baseWeb = resolveWebAppBaseUrl();
-  const safeToken = encodeURIComponent((token || '').trim());
-  const webUrl = `${baseWeb}/shared/${safeToken}`;
-  const deepLinkPath = `shared/${safeToken}`;
-  return buildSmartLink(webUrl, deepLinkPath);
 };
 
 const hashString = (value: string): string => {
@@ -178,8 +143,6 @@ const looksLikeFirebaseStorageUrl = (url: string): boolean => {
 };
 
 export const sharedFileService = {
-  buildSmartShareLinkFromToken,
-
   async getCachedSmartShareLink(input: { tenantId: string; fileUrl: string }): Promise<string | null> {
     const tenantId = (input.tenantId || '').trim();
     const fileUrl = (input.fileUrl || '').trim();
@@ -227,7 +190,35 @@ export const sharedFileService = {
   },
 
   async recordUploadShareToken(input: { tenantId: string; fileUrl: string; shareToken: string }): Promise<string> {
-    const shareUrl = buildSmartShareLinkFromToken(input.shareToken);
+    const base = resolveAuthedApiBaseUrl();
+    if (!base) {
+      throw new Error('Backend URL not configured for sharing');
+    }
+
+    const token = await internalTokenManager.getToken(base);
+    if (!token) {
+      throw new Error('Not authenticated');
+    }
+
+    const safeToken = encodeURIComponent((input.shareToken || '').trim());
+    const qs = new URLSearchParams({ tenantId: input.tenantId });
+    const res = await fetch(`${base}/shared-files/link/${safeToken}?${qs.toString()}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(text || `Share link resolve failed (${res.status})`);
+    }
+
+    const data = (await res.json()) as { shareUrl?: string };
+    const shareUrl = typeof data?.shareUrl === 'string' ? data.shareUrl.trim() : '';
+    if (!shareUrl) {
+      throw new Error('Share link resolve failed (missing shareUrl)');
+    }
+
     await sharedFileService.cacheSmartShareLink({ tenantId: input.tenantId, fileUrl: input.fileUrl, shareUrl, token: input.shareToken });
     return shareUrl;
   },
@@ -239,7 +230,7 @@ export const sharedFileService = {
     fileType?: string;
     fileSize?: number;
     thumbnailUrl?: string;
-  }): Promise<string> {
+  }): Promise<{ token: string; shareUrl: string }> {
     const base = resolveAuthedApiBaseUrl();
     if (!base) {
       throw new Error('Backend URL not configured for sharing');
@@ -271,12 +262,18 @@ export const sharedFileService = {
       throw new Error(text || `Share create failed (${res.status})`);
     }
 
-    const data = (await res.json()) as { token?: string };
+    const data = (await res.json()) as { token?: string; shareUrl?: string };
     const shareToken = typeof data?.token === 'string' ? data.token.trim() : '';
     if (!shareToken) {
       throw new Error('Share create failed (missing token)');
     }
-    return shareToken;
+
+    const shareUrl = typeof data?.shareUrl === 'string' ? data.shareUrl.trim() : '';
+    if (!shareUrl) {
+      throw new Error('Share create failed (missing shareUrl)');
+    }
+
+    return { token: shareToken, shareUrl };
   },
 
   async ensureSmartShareLink(input: {
@@ -327,7 +324,7 @@ export const sharedFileService = {
 
       const effectiveFileName = normalizeSharedFileName({ fileUrl: rawUrl, fileName: input.fileName });
 
-      const token = await sharedFileService.createShareToken({
+      const created = await sharedFileService.createShareToken({
         tenantId: normalizedTenantId,
         fileUrl: rawUrl,
         fileName: effectiveFileName,
@@ -336,9 +333,8 @@ export const sharedFileService = {
         thumbnailUrl: input.thumbnailUrl,
       });
 
-      const shareUrl = buildSmartShareLinkFromToken(token);
-      await sharedFileService.cacheSmartShareLink({ tenantId: normalizedTenantId, fileUrl: rawUrl, shareUrl, token });
-      return shareUrl;
+      await sharedFileService.cacheSmartShareLink({ tenantId: normalizedTenantId, fileUrl: rawUrl, shareUrl: created.shareUrl, token: created.token });
+      return created.shareUrl;
     })().catch((err) => {
       // Drop failed entries so a retry can happen.
       shareLinkCache.delete(cacheKey);

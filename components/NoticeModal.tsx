@@ -40,6 +40,7 @@ import { Notice, NoticeFormData } from '../types/notice';
 import Toast from 'react-native-toast-message';
 import { tenantService } from '../services/tenantService';
 import { uploadBlobViaBackend } from '../services/backendStorageUploadService';
+import { maybeShowStorageLimitReachedAlert } from '../services/storageLimitAlert';
 import type { TenantMembershipRole } from '../types/tenant';
 import {
   DEFAULT_NOTICE_REACTIONS,
@@ -1287,6 +1288,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
       
       // Upload image if one is selected
       if (selectedImageUri) {
+        let imageBlob: Blob | null = null;
         try {
           const tenantId = await tenantService.getCachedSelectedTenant();
           if (!tenantId) {
@@ -1298,19 +1300,29 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
 
           // Upload via backend (storage quota enforced)
           const response = await fetch(selectedImageUri);
-          const blob = await response.blob();
+          imageBlob = await response.blob();
 
           const result = await uploadBlobViaBackend({
             tenantId,
             purpose: 'noticeImage',
-            blob,
-            contentType: blob.type || 'image/jpeg',
+            blob: imageBlob,
+            contentType: imageBlob.type || 'image/jpeg',
             filename,
+            suppressStorageLimitAlert: true,
           });
 
           finalFormData.imageUrl = result.url;
         } catch (uploadError) {
           logger.error('Upload error:', uploadError);
+          // If storage is full, show a single storage-limit modal with accurate attachment size.
+          if (
+            maybeShowStorageLimitReachedAlert(uploadError, 'notice.imageUpload', {
+              incrementBytes: typeof imageBlob?.size === 'number' ? imageBlob.size : undefined,
+              extraMessageLines: ['Tip: You can post this notice without attachments.'],
+            })
+          ) {
+            return;
+          }
           Toast.show({
             type: 'error',
             text1: 'Image upload failed',
@@ -1322,6 +1334,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
       }
 
       if (selectedAudio) {
+        let audioBlob: Blob | null = null;
         try {
           const tenantId = await tenantService.getCachedSelectedTenant();
           if (!tenantId) {
@@ -1329,16 +1342,17 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
           }
 
           const response = await fetch(selectedAudio.uri);
-          const blob = await response.blob();
+          audioBlob = await response.blob();
           const extension = selectedAudio.name?.split('.')?.pop()?.replace(/[^a-zA-Z0-9]/g, '') || 'mp3';
           const filename = `notice_audio_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${extension}`;
 
           const result = await uploadBlobViaBackend({
             tenantId,
             purpose: 'noticeAudio',
-            blob,
-            contentType: selectedAudio.mimeType || blob.type || 'audio/mpeg',
+            blob: audioBlob,
+            contentType: selectedAudio.mimeType || audioBlob.type || 'audio/mpeg',
             filename,
+            suppressStorageLimitAlert: true,
           });
 
           finalFormData.audioUrl = result.url;
@@ -1348,6 +1362,15 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
           finalFormData.audioStoragePath = result.path;
         } catch (uploadError) {
           logger.error('Audio upload error:', uploadError);
+          // If storage is full, show a single storage-limit modal with accurate attachment size.
+          if (
+            maybeShowStorageLimitReachedAlert(uploadError, 'notice.audioUpload', {
+              incrementBytes: typeof audioBlob?.size === 'number' ? audioBlob.size : undefined,
+              extraMessageLines: ['Tip: You can post this notice without attachments.'],
+            })
+          ) {
+            return;
+          }
           Toast.show({
             type: 'error',
             text1: 'Audio upload failed',

@@ -51,6 +51,51 @@ export function registerServiceWorker() {
   if (typeof window === 'undefined') return;
   if (!('serviceWorker' in navigator)) return;
 
+  // In development, a registered service worker commonly causes stale bundles to
+  // be served on normal refresh (hard refresh bypasses the SW cache). Avoid
+  // registering in dev, and proactively unregister any existing SW + caches.
+  const isDev =
+    // Expo sets __DEV__ globally.
+    (typeof (globalThis as any).__DEV__ !== 'undefined' && Boolean((globalThis as any).__DEV__)) ||
+    // Fallback for environments without __DEV__.
+    (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production');
+
+  if (isDev) {
+    try {
+      void navigator.serviceWorker.getRegistrations().then((registrations) => {
+        for (const registration of registrations) {
+          try {
+            void registration.unregister();
+          } catch {
+            // ignore
+          }
+        }
+      });
+    } catch {
+      // ignore
+    }
+
+    try {
+      if ('caches' in window) {
+        void (window as any).caches.keys().then((keys: string[]) => {
+          void Promise.all(
+            keys.map((key) => {
+              try {
+                return (window as any).caches.delete(key);
+              } catch {
+                return Promise.resolve(false);
+              }
+            })
+          );
+        });
+      }
+    } catch {
+      // ignore
+    }
+
+    return;
+  }
+
   const doRegister = () => {
     navigator.serviceWorker
       .register('/service-worker.js')

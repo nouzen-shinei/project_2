@@ -1,6 +1,6 @@
 /* c8 ignore start */
 import fetch from 'node-fetch';
-import { getEmailBackendBaseUrl } from './runtimeEndpoints';
+import { getEmailBackendBaseUrl, getWebAppBaseUrl } from './runtimeEndpoints';
 
 type JoinRequestEmailContext = {
   tenantId: string;
@@ -125,16 +125,18 @@ async function getEmailBackendConfig(): Promise<{ url: string; headers: Record<s
   };
 }
 
-function resolveAdminPortalBase(): string | null {
+async function resolveAdminPortalBase(): Promise<string | null> {
+  const remote = normalizeBaseUrl(await getWebAppBaseUrl());
   return (
     normalizeBaseUrl(process.env.ADMIN_PORTAL_BASE_URL) ||
     normalizeBaseUrl(process.env.EXPO_PUBLIC_ADMIN_BASE_URL) ||
+    remote ||
     normalizeBaseUrl(process.env.EXPO_PUBLIC_WEB_APP_URL)
   );
 }
 
-function buildAdminJoinRequestUrl(event: JoinRequestEmailContext): string | undefined {
-  const base = resolveAdminPortalBase();
+async function buildAdminJoinRequestUrl(event: JoinRequestEmailContext): Promise<string | undefined> {
+  const base = await resolveAdminPortalBase();
   if (!base) {
     return undefined;
   }
@@ -144,17 +146,19 @@ function buildAdminJoinRequestUrl(event: JoinRequestEmailContext): string | unde
   return `${base}${pathSegment}?${params.toString()}`;
 }
 
-function resolveAppBaseUrl(): string | null {
+async function resolveAppBaseUrl(): Promise<string | null> {
+  const remote = normalizeBaseUrl(await getWebAppBaseUrl());
   return (
     normalizeBaseUrl(process.env.TENANT_INVITE_BASE_URL) ||
+    remote ||
     normalizeBaseUrl(process.env.EXPO_PUBLIC_APP_URL) ||
     normalizeBaseUrl(process.env.EXPO_PUBLIC_WEB_APP_URL) ||
     normalizeBaseUrl(process.env.EXPO_PUBLIC_APP_BASE_URL)
   );
 }
 
-function buildTenantInviteLink(token: string): string | undefined {
-  const base = resolveAppBaseUrl();
+async function buildTenantInviteLink(token: string): Promise<string | undefined> {
+  const base = await resolveAppBaseUrl();
   if (!base) {
     return undefined;
   }
@@ -192,7 +196,7 @@ export async function sendTenantJoinRequestEmails(
   }
 
   const subject = event.tenantName ? `New join request • ${event.tenantName}` : 'New join request';
-  const reviewUrl = buildAdminJoinRequestUrl(event);
+  const reviewUrl = await buildAdminJoinRequestUrl(event);
 
   let sent = 0;
   let failed = 0;
@@ -273,7 +277,7 @@ export async function sendTenantInviteEmail(
         from_name: context.tenantName || 'Coaching Center',
         invite_role: context.role,
         invite_message: context.message || '',
-        invite_link: buildTenantInviteLink(context.inviteToken),
+        invite_link: await buildTenantInviteLink(context.inviteToken),
         expires_at: context.expiresAt,
         expires_at_human: formatInviteExpiration(context.expiresAt),
       }),

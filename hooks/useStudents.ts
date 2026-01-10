@@ -48,7 +48,7 @@ function useStudents() {
     return unsubscribe;
   }, [activeTenant?.id, tenantLoading]);
 
-  const addStudent = async (studentData: CreateStudentData) => {
+  const addStudent = async (studentData: CreateStudentData): Promise<string> => {
     try {
       if (!activeTenant?.id) {
         throw new Error('Select a coaching center before adding students');
@@ -61,7 +61,7 @@ function useStudents() {
       }
       // Pass current user info for attribution
       const createdBy = user?.displayName || user?.email?.split('@')[0] || 'Unknown User';
-      await studentService.addStudent(activeTenant.id, studentData, createdBy);
+      return await studentService.addStudent(activeTenant.id, studentData, createdBy);
     } catch (err) {
       logger.error('Failed to add student:', err);
       throw err;

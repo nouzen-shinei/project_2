@@ -14,7 +14,7 @@ import {
   FlatList,
   Platform,
 } from 'react-native';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter, useNavigation } from 'expo-router';
 import { 
   User, 
   Phone, 
@@ -40,6 +40,7 @@ import { Student } from '../../types';
 import { studentService } from '../../services/studentService';
 import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
 import { uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { tryExtractStorageLimitReachedInfo } from '../../services/storageLimitAlert';
 import { formatDateToString } from '../../lib/utils';
 import { chatService } from '../../services/chatService';
 import { useTenant } from '../../hooks/useTenantContext';
@@ -47,6 +48,7 @@ import { useTenant } from '../../hooks/useTenantContext';
 export default function StudentProfile() {
   const { id, edit } = useLocalSearchParams<{ id: string; edit?: string }>();
   const router = useRouter();
+  const navigation = useNavigation();
   const { theme } = useTheme();
   const { fees, loading: feesLoading } = useFees();
   const { activeTenant } = useTenant();
@@ -86,6 +88,23 @@ export default function StudentProfile() {
       setIsEditing(true);
     }
   }, [edit]);
+
+  // Handle back navigation - fallback to students page if no history
+  const handleGoBack = () => {
+    try {
+      // Check if we can go back in the navigation stack
+      const canGoBack = navigation?.canGoBack?.();
+      if (canGoBack) {
+        router.back();
+      } else {
+        // If no history (e.g., after page refresh), navigate to students page
+        router.replace('/(tabs)/students');
+      }
+    } catch {
+      // Fallback to students page if anything goes wrong
+      router.replace('/(tabs)/students');
+    }
+  };
 
   // Helper function to get ordinal suffix for numbers
   const getOrdinalSuffix = (day: number): string => {
@@ -165,7 +184,10 @@ export default function StudentProfile() {
     setSelectedImage(null);
   };
 
-  const uploadProfileImage = async (imageUri: string, existingImageUrl?: string): Promise<string | null> => {
+  const uploadProfileImage = async (
+    imageUri: string,
+    existingImageUrl?: string,
+  ): Promise<{ url: string | null; skippedBecauseStorageLimit: boolean; failed: boolean }> => {
     try {
       setIsUploadingImage(true);
       // Delete old profile image if it exists
@@ -202,13 +224,14 @@ export default function StudentProfile() {
         blob,
         contentType: blob.type || 'image/jpeg',
         filename: fileName,
+        suppressStorageLimitAlert: true,
       });
 
-      return result.url;
+      return { url: result.url, skippedBecauseStorageLimit: false, failed: false };
     } catch (error) {
-      logger.error('Error uploading profile image:', error);
-      Alert.alert('Upload Error', 'Failed to upload profile image. Please try again.');
-      return null;
+      const isStorageLimit = !!tryExtractStorageLimitReachedInfo(error);
+      logger.error('Error uploading profile image:', { error, isStorageLimit });
+      return { url: null, skippedBecauseStorageLimit: isStorageLimit, failed: !isStorageLimit };
     } finally {
       setIsUploadingImage(false);
     }
@@ -299,14 +322,16 @@ export default function StudentProfile() {
       setSaving(true);
       
       let updatedData = { ...editedStudent };
+      let imageSkippedBecauseStorageLimit = false;
+      let imageUploadFailed = false;
       
       // Upload new profile image if selected
       if (selectedImage) {
         const existingImageUrl = editedStudent.profileImageUrl;
-        const uploadedUrl = await uploadProfileImage(selectedImage, existingImageUrl);
-        if (uploadedUrl) {
-          updatedData.profileImageUrl = uploadedUrl;
-        }
+        const uploadResult = await uploadProfileImage(selectedImage, existingImageUrl);
+        if (uploadResult.url) updatedData.profileImageUrl = uploadResult.url;
+        if (uploadResult.skippedBecauseStorageLimit) imageSkippedBecauseStorageLimit = true;
+        if (uploadResult.failed) imageUploadFailed = true;
       }
       
       // Check if fee due date has changed
@@ -371,15 +396,23 @@ export default function StudentProfile() {
       setIsEditing(false);
       setSelectedImage(null);
       
-      // Show success message with fee update info if applicable
+      // Show a single success modal; include image upload outcome when applicable.
+      const messageParts: string[] = [];
       if (feeDueDateChanged && editedStudent.feeDueDate) {
-        Alert.alert(
-          'Success', 
-          'Student details updated successfully! Due dates for existing pending fees have been updated. No new fees were created.'
+        messageParts.push(
+          'Student details updated successfully! Due dates for existing pending fees have been updated. No new fees were created.',
         );
       } else {
-        Alert.alert('Success', 'Student details updated successfully');
+        messageParts.push('Student details updated successfully');
       }
+
+      if (imageSkippedBecauseStorageLimit) {
+        messageParts.push('Profile image upload was skipped because your storage limit was reached.');
+      } else if (imageUploadFailed) {
+        messageParts.push('Profile image upload failed, but the rest of the changes were saved.');
+      }
+
+      Alert.alert('Success', messageParts.join('\n\n'));
       
     } catch (error) {
       logger.error('Error saving student:', error);
@@ -442,7 +475,7 @@ export default function StudentProfile() {
         <Text style={[styles.errorText, { color: theme.error }]}>Student not found</Text>
         <TouchableOpacity 
           style={[styles.backButton, { backgroundColor: theme.primary }]} 
-          onPress={() => router.back()}
+          onPress={handleGoBack}
         >
           <Text style={styles.backButtonText}>Go Back</Text>
         </TouchableOpacity>
@@ -462,7 +495,7 @@ export default function StudentProfile() {
       <View style={[styles.header, { backgroundColor: theme.surface }]}>
         <TouchableOpacity 
           style={styles.headerButton} 
-          onPress={isEditing ? handleCancelEdit : () => router.back()}
+          onPress={isEditing ? handleCancelEdit : handleGoBack}
         >
           {isEditing ? (
             <X size={24} color={theme.textSecondary} />

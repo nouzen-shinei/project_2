@@ -93,7 +93,7 @@ android {
         applicationId 'com.sneha.tution'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 20251100
+        versionCode 20251101
         versionName "1.1.3"
     }
     signingConfigs {

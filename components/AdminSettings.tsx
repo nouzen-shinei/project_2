@@ -792,12 +792,21 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
       const existingLogoUrl = originalValues?.logoUrl || null;
       let finalLogoUrl = logoPreviewUrl || null;
       const hasPendingLogoUpload = Boolean(pendingLogoAsset);
+      let logoSkippedBecauseStorageLimit = false;
+      let logoUploadFailed = false;
 
       if (activeTenant?.id && hasPendingLogoUpload && pendingLogoAsset) {
-        const uploadedLogoUrl = await uploadTenantLogo(activeTenant.id, pendingLogoAsset);
-        finalLogoUrl = uploadedLogoUrl;
-        setLogoPreviewUrl(uploadedLogoUrl);
-        setPendingLogoAsset(null);
+        const uploadResult = await uploadTenantLogo(activeTenant.id, pendingLogoAsset);
+        if (uploadResult.url) {
+          finalLogoUrl = uploadResult.url;
+          setLogoPreviewUrl(uploadResult.url);
+          setPendingLogoAsset(null);
+        } else {
+          // Upload did not happen; keep existing tenant logo.
+          finalLogoUrl = existingLogoUrl;
+          if (uploadResult.skippedBecauseStorageLimit) logoSkippedBecauseStorageLimit = true;
+          if (uploadResult.failed) logoUploadFailed = true;
+        }
       }
 
       const logoChanged = (existingLogoUrl || null) !== (finalLogoUrl || null);
@@ -834,10 +843,16 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
 
       setCoachingName(trimmedCoachingName);
       // Keep modal open; show success toast and update originals so Save disables again
+      const successText2 = logoSkippedBecauseStorageLimit
+        ? 'Saved settings, but logo upload was skipped (storage limit reached).'
+        : logoUploadFailed
+          ? 'Saved settings, but the logo could not be uploaded.'
+          : 'Your changes have been applied.';
+
       Toast.show({
         type: 'success',
         text1: 'Settings saved',
-        text2: 'Your changes have been applied.',
+        text2: successText2,
         position: 'top',
         topOffset: 60,
         visibilityTime: 3000,

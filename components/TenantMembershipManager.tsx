@@ -104,6 +104,8 @@ const STATUS_REASON_LABELS: Record<string, string> = {
   invite_received: 'Invite received',
   invite_accepted: 'Invite accepted',
   invite_rejected_by_user: 'Invite rejected',
+  invite_revoked: 'Invite revoked',
+  invite_expired: 'Invite expired',
   membership_revoked: 'Access revoked',
   self_leave: 'Left by user',
 };
@@ -736,13 +738,25 @@ const TenantMembershipManager = () => {
       });
       if (createLogoAsset) {
         try {
-          const uploadedLogoUrl = await uploadTenantLogo(tenant.id, createLogoAsset);
-          await tenantService.updateTenant({
-            id: tenant.id,
-            logoUrl: uploadedLogoUrl,
-            branding: { ...(tenant.branding || {}), logoUrl: uploadedLogoUrl },
-            updatedBy: user.uid,
-          });
+          const uploadResult = await uploadTenantLogo(tenant.id, createLogoAsset);
+          if (uploadResult.url) {
+            await tenantService.updateTenant({
+              id: tenant.id,
+              logoUrl: uploadResult.url,
+              branding: { ...(tenant.branding || {}), logoUrl: uploadResult.url },
+              updatedBy: user.uid,
+            });
+          } else if (uploadResult.skippedBecauseStorageLimit) {
+            Alert.alert(
+              'Logo upload skipped',
+              'The center was created, but the logo upload was skipped because your storage limit was reached. Clear space and try again from Admin Settings.',
+            );
+          } else {
+            Alert.alert(
+              'Logo upload failed',
+              'The center was created but the logo could not be uploaded. Try again from Admin Settings.',
+            );
+          }
         } catch (logoError) {
           logger.warn('TenantMembershipManager: tenant logo upload failed', logoError);
           Alert.alert(
@@ -786,10 +800,32 @@ const TenantMembershipManager = () => {
     const isPendingRequest = membership.status === 'pending_request';
     const isRejected = membership.status === 'rejected';
     const isRevoked = membership.status === 'revoked';
+
+    const revokedReason = (() => {
+      if (!isRevoked) return null;
+      const history = Array.isArray(membership.statusHistory) ? membership.statusHistory : [];
+      for (let i = history.length - 1; i >= 0; i -= 1) {
+        const event = history[i];
+        if (event?.status === 'revoked' && typeof event.reason === 'string' && event.reason) {
+          return event.reason;
+        }
+      }
+      return null;
+    })();
+
     const statusDate = parseIsoDate(membership.updatedAt || membership.createdAt);
     const pendingTimelineLabel = statusDate ? `Requested ${formatDateToString(statusDate)}` : 'Request submitted';
     const rejectionTimelineLabel = statusDate ? `Reviewed ${formatDateToString(statusDate)}` : 'Request reviewed';
-    const revokedTimelineLabel = statusDate ? `Removed ${formatDateToString(statusDate)}` : 'Access removed';
+    const revokedTimelineLabel = (() => {
+      const base = statusDate ? `Removed ${formatDateToString(statusDate)}` : 'Access removed';
+      if (revokedReason === 'invite_revoked') {
+        return statusDate ? `Invite revoked ${formatDateToString(statusDate)}` : 'Invite revoked';
+      }
+      if (revokedReason === 'invite_expired') {
+        return statusDate ? `Invite expired ${formatDateToString(statusDate)}` : 'Invite expired';
+      }
+      return base;
+    })();
     const logoUrl = tenant?.branding?.logoUrl || tenant?.logoUrl || null;
     const leaveCtaLabel = isPendingRequest ? 'Withdraw request' : 'Leave this center';
     const showLeaveButton = canLeave && !isRejected && !isRevoked && membership.status !== 'pending_invite';
@@ -799,9 +835,18 @@ const TenantMembershipManager = () => {
     const showDecisionBlock = isRejected || isRevoked;
     const decisionTone = isRejected ? theme.error : theme.textSecondary;
     const decisionLabel = isRejected ? rejectionTimelineLabel : revokedTimelineLabel;
-    const decisionMessage = isRejected
-      ? `Admins from ${tenant?.name || 'this center'} rejected your request. You can reach out to them or try a new join code.`
-      : `Access to ${tenant?.name || 'this center'} was revoked. Use a fresh join code or contact an admin to regain access.`;
+    const decisionMessage = (() => {
+      if (isRejected) {
+        return `Admins from ${tenant?.name || 'this center'} rejected your request. You can reach out to them or try a new join code.`;
+      }
+      if (revokedReason === 'invite_revoked') {
+        return `This invite was revoked by an admin from ${tenant?.name || 'this center'}. Ask them to send a new invite or use a join code to request access again.`;
+      }
+      if (revokedReason === 'invite_expired') {
+        return `This invite has expired for ${tenant?.name || 'this center'}. Ask an admin to resend a new invite link or use a join code to request access again.`;
+      }
+      return `Access to ${tenant?.name || 'this center'} was revoked. Use a fresh join code or contact an admin to regain access.`;
+    })();
     const decisionButtonLabel = isRejected ? 'Try another join code' : 'Request access again';
     const timelineItems = buildMembershipTimeline(membership);
     const showTimeline = timelineItems.length > 0;

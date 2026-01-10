@@ -151,6 +151,7 @@ export type RuntimeEndpointsDoc = {
   notificationsApiBaseUrl?: string;
   wabaApiBaseUrl?: string;
   chatApiBaseUrl?: string;
+  webAppBaseUrl?: string;
   createdAt?: string;
   updatedAt?: string;
 };

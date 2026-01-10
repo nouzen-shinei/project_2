@@ -38,6 +38,7 @@ import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { tryExtractStorageLimitReachedInfo } from '../../services/storageLimitAlert';
 import UsageAlertInlineBanner from '@/components/UsageAlertInlineBanner';
 import { useActiveUsageAlerts } from '@/hooks/useActiveUsageAlerts';
 import { tryPresentModalAlert } from '@/services/modalAlertService';
@@ -170,7 +171,10 @@ export default function Students() {
 
   const performanceOptions = ['Excellent', 'Very Good', 'Good', 'Average', 'Needs Improvement'];
 
-  const uploadProfileImage = async (imageUri: string, existingImageUrl?: string): Promise<string | null> => {
+  const uploadProfileImage = async (
+    imageUri: string,
+    existingImageUrl?: string,
+  ): Promise<{ url: string | null; skippedBecauseStorageLimit: boolean; failed: boolean }> => {
     try {
       setIsUploadingImage(true);
       
@@ -209,13 +213,14 @@ export default function Students() {
         blob,
         contentType: blob.type || 'image/jpeg',
         filename,
+        suppressStorageLimitAlert: true,
       });
 
-      return result.url;
+      return { url: result.url, skippedBecauseStorageLimit: false, failed: false };
     } catch (error) {
-      logger.error('Error uploading profile image:', error);
-      Alert.alert('Upload Error', 'Failed to upload profile image. Please try again.');
-      return null;
+      const isStorageLimit = !!tryExtractStorageLimitReachedInfo(error);
+      logger.error('Error uploading profile image:', { error, isStorageLimit });
+      return { url: null, skippedBecauseStorageLimit: isStorageLimit, failed: !isStorageLimit };
     } finally {
       setIsUploadingImage(false);
     }
@@ -329,34 +334,45 @@ export default function Students() {
 
       setIsAddingStudent(true);
 
-      let profileImageUrl = '';
-      
-      // Upload profile image if selected
-      if (profileImage) {
-        profileImageUrl = await uploadProfileImage(profileImage) || '';
-      }
-
-      // Create student data with profile image URL
+      // Create student first (so student quota is checked before any upload).
       const studentData = {
         ...newStudent,
         tenantId,
-        profileImageUrl,
+        profileImageUrl: '',
       };
 
-      await addStudent(studentData);
+      const createdStudentId = await addStudent(studentData);
+
+      // Upload + attach profile image after student is created.
+      let imageSkippedBecauseStorageLimit = false;
+      let imageUploadFailed = false;
+
+      if (profileImage) {
+        const uploadResult = await uploadProfileImage(profileImage);
+        if (uploadResult.url) {
+          try {
+            await updateStudent(createdStudentId, { profileImageUrl: uploadResult.url });
+          } catch (e) {
+            logger.warn('Failed to attach profile image after creating student:', e);
+            imageUploadFailed = true;
+          }
+        }
+
+        if (uploadResult.skippedBecauseStorageLimit) imageSkippedBecauseStorageLimit = true;
+        if (uploadResult.failed) imageUploadFailed = true;
+      }
       setShowAddModal(false);
       resetForm();
       
-      // Show success toast
-      Toast.show({
-        type: 'success',
-        text1: '✅ Student Added',
-        text2: `${newStudent.name} has been added successfully!`,
-        position: 'top',
-        visibilityTime: 3000,
-      });
-      
-      Alert.alert('Success', 'Student added successfully!');
+      const messageParts: string[] = [`${newStudent.name} has been added successfully!`];
+      if (imageSkippedBecauseStorageLimit) {
+        messageParts.push('Profile image upload was skipped because your storage limit was reached.');
+      } else if (imageUploadFailed) {
+        messageParts.push('Profile image upload failed, but the student was added.');
+      }
+
+      // Single modal: avoid competing alerts (especially storage-limit).
+      Alert.alert('Success', messageParts.join('\n\n'));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err || '');
       const isStudentLimit = /student[_\s-]?limit[_\s-]?reached/i.test(message) || /student limit reached/i.test(message);

@@ -2,6 +2,7 @@ import { logger } from '@/lib/logger';
 import { storage } from '@/config/firebase';
 import { deleteObject, ref } from 'firebase/storage';
 import { uploadBlobViaBackend } from './backendStorageUploadService';
+import { tryExtractStorageLimitReachedInfo } from './storageLimitAlert';
 
 export interface TenantLogoAsset {
   uri: string;
@@ -10,6 +11,12 @@ export interface TenantLogoAsset {
 }
 
 export const TENANT_LOGO_MAX_BYTES = 4 * 1024 * 1024; // 4 MB limit keeps uploads lightweight
+
+export type TenantLogoUploadResult = {
+  url: string | null;
+  skippedBecauseStorageLimit: boolean;
+  failed: boolean;
+};
 
 const MIME_EXTENSION_MAP: Record<string, string> = {
   'image/png': 'png',
@@ -32,7 +39,7 @@ function inferExtension(asset: TenantLogoAsset): string {
   return 'jpg';
 }
 
-export async function uploadTenantLogo(tenantId: string, asset: TenantLogoAsset): Promise<string> {
+export async function uploadTenantLogo(tenantId: string, asset: TenantLogoAsset): Promise<TenantLogoUploadResult> {
   const normalizedTenantId = tenantId?.trim();
   if (!normalizedTenantId) {
     throw new Error('Missing tenant id for logo upload');
@@ -57,11 +64,16 @@ export async function uploadTenantLogo(tenantId: string, asset: TenantLogoAsset)
       blob,
       contentType: asset.mimeType || blob.type,
       filename,
+      suppressStorageLimitAlert: true,
     });
-    return result.url;
+    return { url: result.url, skippedBecauseStorageLimit: false, failed: false };
   } catch (error) {
-    logger.error('tenantBrandingService: logo upload failed', error);
-    throw new Error('Unable to upload logo. Please try again.');
+    const isStorageLimit = !!tryExtractStorageLimitReachedInfo(error);
+    logger.error('tenantBrandingService: logo upload failed', { error, isStorageLimit });
+    if (isStorageLimit) {
+      return { url: null, skippedBecauseStorageLimit: true, failed: false };
+    }
+    return { url: null, skippedBecauseStorageLimit: false, failed: true };
   }
 }
 

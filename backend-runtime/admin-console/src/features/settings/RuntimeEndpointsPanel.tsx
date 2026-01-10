@@ -12,6 +12,7 @@ type FormState = {
   notificationsApiBaseUrl: string;
   wabaApiBaseUrl: string;
   chatApiBaseUrl: string;
+  webAppBaseUrl: string;
 };
 
 function toFormState(doc: RuntimeEndpointsDoc | null): FormState {
@@ -21,6 +22,7 @@ function toFormState(doc: RuntimeEndpointsDoc | null): FormState {
     notificationsApiBaseUrl: doc?.notificationsApiBaseUrl ?? '',
     wabaApiBaseUrl: doc?.wabaApiBaseUrl ?? '',
     chatApiBaseUrl: doc?.chatApiBaseUrl ?? '',
+    webAppBaseUrl: doc?.webAppBaseUrl ?? '',
   };
 }
 
@@ -68,12 +70,14 @@ export function RuntimeEndpointsPanel() {
       const notificationsApiBaseUrl = normalizeUrl(form.notificationsApiBaseUrl);
       const wabaApiBaseUrl = normalizeUrl(form.wabaApiBaseUrl);
       const chatApiBaseUrl = normalizeUrl(form.chatApiBaseUrl);
+      const webAppBaseUrl = normalizeUrl(form.webAppBaseUrl);
 
       if (apiBaseUrl) patch.apiBaseUrl = apiBaseUrl;
       if (emailApiBaseUrl) patch.emailApiBaseUrl = emailApiBaseUrl;
       if (notificationsApiBaseUrl) patch.notificationsApiBaseUrl = notificationsApiBaseUrl;
       if (wabaApiBaseUrl) patch.wabaApiBaseUrl = wabaApiBaseUrl;
       if (chatApiBaseUrl) patch.chatApiBaseUrl = chatApiBaseUrl;
+      if (webAppBaseUrl) patch.webAppBaseUrl = webAppBaseUrl;
 
       const response = await updateRuntimeEndpoints(patch);
       const updated = response.data ?? null;
@@ -140,6 +144,14 @@ export function RuntimeEndpointsPanel() {
             value={form.chatApiBaseUrl}
             onChange={(e) => setForm((prev) => ({ ...prev, chatApiBaseUrl: e.target.value }))}
             placeholder="https://chat.example.com"
+          />
+        </label>
+        <label>
+          Web App Base URL
+          <input
+            value={form.webAppBaseUrl}
+            onChange={(e) => setForm((prev) => ({ ...prev, webAppBaseUrl: e.target.value }))}
+            placeholder="https://tuitionmanager.app"
           />
         </label>
       </div>

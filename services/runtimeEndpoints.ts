@@ -11,6 +11,7 @@ export type RuntimeEndpoints = {
   notificationsApiBaseUrl?: string;
   wabaApiBaseUrl?: string;
   chatApiBaseUrl?: string;
+  webAppBaseUrl?: string;
   updatedAt?: string;
 };
 
@@ -36,6 +37,7 @@ function mergeNormalized(raw: any): RuntimeEndpoints {
     notificationsApiBaseUrl: normalizeHttpUrl(raw?.notificationsApiBaseUrl),
     wabaApiBaseUrl: normalizeHttpUrl(raw?.wabaApiBaseUrl),
     chatApiBaseUrl: normalizeHttpUrl(raw?.chatApiBaseUrl),
+    webAppBaseUrl: normalizeHttpUrl(raw?.webAppBaseUrl),
     updatedAt: typeof raw?.updatedAt === 'string' ? raw.updatedAt : undefined,
   };
 }
