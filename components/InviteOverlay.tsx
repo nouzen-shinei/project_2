@@ -70,6 +70,9 @@ const computeState = (invite: TenantInvite | null): InviteViewState => {
   if (invite.status === 'accepted') {
     return 'accepted';
   }
+  if (invite.status === 'rejected') {
+    return 'error';
+  }
   if (invite.status === 'revoked') {
     return 'error';
   }
@@ -81,6 +84,9 @@ const computeState = (invite: TenantInvite | null): InviteViewState => {
 };
 
 const statusCopyFor = (state: InviteViewState, invite?: TenantInvite | null): string => {
+  if (invite?.status === 'rejected') {
+    return 'This invite was declined. Ask an admin for a fresh link if you still need access.';
+  }
   switch (state) {
     case 'ready':
       return 'Review the access details below, then accept to step inside the workspace.';

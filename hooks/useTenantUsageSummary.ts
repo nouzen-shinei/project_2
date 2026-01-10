@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import { logger } from '@/lib/logger';
 import { usageAnalyticsService } from '@/services/usageAnalyticsService';
+import { runtimeEndpoints } from '@/services/runtimeEndpoints';
 import type { UsageSummaryResponse } from '@/types/usage';
 import { useTenant } from '@/hooks/useTenantContext';
 
@@ -49,6 +50,15 @@ export const useTenantUsageSummary = (
     setLoading(true);
     setError(null);
     try {
+      // First-login edge case: the app may have started before auth was ready,
+      // so runtime endpoints might not be readable until after authorization.
+      const baseUrl = await runtimeEndpoints.ensurePreferredBackendBaseUrl();
+      if (!baseUrl) {
+        // Don't surface a scary error on the very first render; we'll retry on focus/refresh.
+        setLoading(false);
+        return;
+      }
+
       const summary = await usageAnalyticsService.getCurrentUsageSnapshot(tenantId, { month });
       setUsageSummary(summary);
       const refreshedAt = summary.lastRefreshedAt ? new Date(summary.lastRefreshedAt) : new Date();
@@ -56,7 +66,11 @@ export const useTenantUsageSummary = (
       lastFetchAtRef.current = Date.now();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to load usage snapshot.';
-      logger.warn('useTenantUsageSummary: failed to load usage snapshot', err);
+      if (typeof message === 'string' && message.includes('Backend URL not configured')) {
+        // Avoid noisy warnings during transient startup/auth races.
+      } else {
+        logger.warn('useTenantUsageSummary: failed to load usage snapshot', err);
+      }
       setError(message);
     } finally {
       inFlightRef.current = false;

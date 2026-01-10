@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -101,7 +101,9 @@ const STATUS_REASON_LABELS: Record<string, string> = {
   join_code_claim: 'Requested via join code',
   join_request_approved: 'Approved by admin',
   join_request_rejected: 'Rejected by admin',
+  invite_received: 'Invite received',
   invite_accepted: 'Invite accepted',
+  invite_rejected_by_user: 'Invite rejected',
   membership_revoked: 'Access revoked',
   self_leave: 'Left by user',
 };
@@ -190,6 +192,11 @@ const TenantMembershipManager = () => {
     refreshTenants,
   } = useTenant();
 
+  const [incomingInviteError, setIncomingInviteError] = useState<string | null>(null);
+  const [incomingInviteLoading, setIncomingInviteLoading] = useState(false);
+  const [acceptingInviteMembershipId, setAcceptingInviteMembershipId] = useState<string | null>(null);
+  const [rejectingInviteMembershipId, setRejectingInviteMembershipId] = useState<string | null>(null);
+
   const getStatusColor = useCallback(
     (status: string) => {
       if (status === 'active') {
@@ -213,6 +220,43 @@ const TenantMembershipManager = () => {
     }, {});
   }, [tenants]);
 
+  useEffect(() => {
+    const email = user?.email?.trim().toLowerCase();
+    if (!email) {
+      setIncomingInviteError(null);
+      setIncomingInviteLoading(false);
+      return;
+    }
+
+    setIncomingInviteLoading(true);
+    const unsubscribe = tenantService.listenToIncomingInvites(
+      email,
+      (invites) => {
+        setIncomingInviteError(null);
+        setIncomingInviteLoading(false);
+
+        // Merge invite status into tenantMemberships/{tenantId}_{uid} so the UI shows a single
+        // entry per coaching center, just like join-code claim updates the existing membership doc.
+        if (user?.uid) {
+          void tenantService
+            .syncIncomingInvitesToMembershipsForUser({
+              userId: user.uid,
+              email,
+              displayName: user.displayName || undefined,
+              invites,
+            })
+            .catch((error) => logger.warn('TenantMembershipManager: invite->membership sync failed', error));
+        }
+      },
+      (error) => {
+        logger.warn('TenantMembershipManager: incoming invite listen failed', error);
+        setIncomingInviteError('Unable to load invitations.');
+        setIncomingInviteLoading(false);
+      },
+    );
+    return unsubscribe;
+  }, [user?.displayName, user?.email, user?.uid]);
+
   const membershipRows = useMemo<MembershipRow[]>(() => {
     return memberships.map((membership) => ({
       membership,
@@ -226,24 +270,27 @@ const TenantMembershipManager = () => {
   const filteredMembershipRows = useMemo(() => {
     const queryValue = searchQuery.trim().toLowerCase();
     return membershipRows.filter(({ membership, tenant }) => {
-      if (statusFilter === 'active' && membership.status !== 'active') {
+      const status = membership.status;
+
+      if (statusFilter === 'active' && status !== 'active') {
         return false;
       }
       if (statusFilter === 'pending') {
-        const isPending = membership.status === 'pending_invite' || membership.status === 'pending_request';
+        const isPending = status === 'pending_invite' || status === 'pending_request';
         if (!isPending) {
           return false;
         }
       }
-      if (statusFilter === 'rejected' && membership.status !== 'rejected') {
+      if (statusFilter === 'rejected' && status !== 'rejected') {
         return false;
       }
-      if (statusFilter === 'revoked' && membership.status !== 'revoked') {
+      if (statusFilter === 'revoked' && status !== 'revoked') {
         return false;
       }
       if (!queryValue) {
         return true;
       }
+
       const haystack = [
         tenant?.name,
         tenant?.slug,
@@ -340,6 +387,67 @@ const TenantMembershipManager = () => {
     [selectTenant, switchingTenantId],
   );
 
+
+  const handleAcceptPendingInviteMembership = useCallback(
+    async (membership: TenantMembership) => {
+      if (!user?.uid || !user.email) {
+        Alert.alert('Sign in required', 'Sign in again to accept this invite.');
+        return;
+      }
+      const token = typeof membership.inviteToken === 'string' ? membership.inviteToken.trim() : '';
+      if (!token) {
+        Alert.alert('Invite missing', 'This invite link is missing. Ask an admin for a fresh invite.');
+        return;
+      }
+      if (acceptingInviteMembershipId === membership.id) {
+        return;
+      }
+      setAcceptingInviteMembershipId(membership.id);
+      try {
+        await tenantService.acceptInvite(token);
+        await refreshTenants();
+        await selectTenant(membership.tenantId);
+        Alert.alert('Invite accepted', 'You now have access to this coaching center.');
+      } catch (error) {
+        logger.warn('TenantMembershipManager: accept invite failed', error);
+        Alert.alert('Unable to accept invite', error instanceof Error ? error.message : 'Please try again.');
+      } finally {
+        setAcceptingInviteMembershipId(null);
+      }
+    },
+    [acceptingInviteMembershipId, refreshTenants, selectTenant, user?.email, user?.uid],
+  );
+
+  const handleRejectPendingInviteMembership = useCallback(
+    async (membership: TenantMembership) => {
+      if (!user?.uid) {
+        Alert.alert('Sign in required', 'Sign in again to reject this invite.');
+        return;
+      }
+      const token = typeof membership.inviteToken === 'string' ? membership.inviteToken.trim() : '';
+      if (!token) {
+        Alert.alert('Invite missing', 'This invite link is missing. Ask an admin for a fresh invite.');
+        return;
+      }
+      if (rejectingInviteMembershipId === membership.id) {
+        return;
+      }
+      setRejectingInviteMembershipId(membership.id);
+      try {
+        await tenantService.rejectInviteByToken(token, user.uid);
+        // Membership doc will be updated by the invite->membership sync listener.
+        await refreshTenants();
+        Alert.alert('Invite rejected', 'This invite was moved to Rejected.');
+      } catch (error) {
+        logger.warn('TenantMembershipManager: reject invite failed', error);
+        Alert.alert('Unable to reject invite', error instanceof Error ? error.message : 'Please try again.');
+      } finally {
+        setRejectingInviteMembershipId(null);
+      }
+    },
+    [refreshTenants, rejectingInviteMembershipId, user?.uid],
+  );
+
   const leaveTenant = useCallback(
     async (tenantId: string, tenantName?: string) => {
       if (!user?.uid) {
@@ -430,7 +538,9 @@ const TenantMembershipManager = () => {
   const canSubmitCode = normalizedCode.length >= 5;
   const membershipStatus = joinPreview?.membership?.status;
   const alreadyMember = membershipStatus === 'active';
-  const alreadyPending = membershipStatus === 'pending_request';
+  const alreadyInvitePending = membershipStatus === 'pending_invite' || joinPreview?.pendingInvite === true;
+  const alreadyPendingRequest = membershipStatus === 'pending_request';
+  const alreadyPending = alreadyInvitePending || alreadyPendingRequest;
 
   const resetJoinModalState = () => {
     setJoinCode('');
@@ -569,6 +679,23 @@ const TenantMembershipManager = () => {
       await refreshTenants();
     } catch (claimError) {
       if (claimError instanceof TenantBackendError) {
+        if (claimError.code === 'invite_pending') {
+          Alert.alert(
+            'Invite already waiting',
+            'You already have a pending invite for this coaching center. Accept it from the Pending tab instead of using a join code.',
+            [
+              {
+                text: 'View pending',
+                onPress: () => {
+                  setJoinModalVisible(false);
+                  setStatusFilter('pending');
+                },
+              },
+              { text: 'OK' },
+            ],
+          );
+          return;
+        }
         setJoinError(claimError.message);
       } else {
         setJoinError('Unable to join that coaching center right now.');
@@ -665,7 +792,10 @@ const TenantMembershipManager = () => {
     const revokedTimelineLabel = statusDate ? `Removed ${formatDateToString(statusDate)}` : 'Access removed';
     const logoUrl = tenant?.branding?.logoUrl || tenant?.logoUrl || null;
     const leaveCtaLabel = isPendingRequest ? 'Withdraw request' : 'Leave this center';
-    const showLeaveButton = canLeave && !isRejected && !isRevoked;
+    const showLeaveButton = canLeave && !isRejected && !isRevoked && membership.status !== 'pending_invite';
+    const showInviteDecisionButtons = membership.status === 'pending_invite' && !!membership.inviteToken;
+    const isInviteDecisionBusy =
+      acceptingInviteMembershipId === membership.id || rejectingInviteMembershipId === membership.id;
     const showDecisionBlock = isRejected || isRevoked;
     const decisionTone = isRejected ? theme.error : theme.textSecondary;
     const decisionLabel = isRejected ? rejectionTimelineLabel : revokedTimelineLabel;
@@ -826,6 +956,45 @@ const TenantMembershipManager = () => {
             </TouchableOpacity>
           </View>
         )}
+
+        {showInviteDecisionButtons && (
+          <View style={styles.cardActions}>
+            <View style={styles.inviteDecisionRow}>
+              <TouchableOpacity
+                style={[
+                  styles.inviteAcceptButton,
+                  {
+                    backgroundColor: theme.primary,
+                    borderColor: theme.primary,
+                    opacity: isInviteDecisionBusy ? 0.7 : 1,
+                  },
+                ]}
+                onPress={() => handleAcceptPendingInviteMembership(membership)}
+                disabled={isInviteDecisionBusy}
+              >
+                {acceptingInviteMembershipId === membership.id ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.inviteAcceptButtonText}>Accept</Text>
+                )}
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.leaveButton,
+                  { borderColor: theme.border, opacity: isInviteDecisionBusy ? 0.7 : 1, flex: 1 },
+                ]}
+                onPress={() => handleRejectPendingInviteMembership(membership)}
+                disabled={isInviteDecisionBusy}
+              >
+                {rejectingInviteMembershipId === membership.id ? (
+                  <ActivityIndicator size="small" color={theme.error} />
+                ) : (
+                  <Text style={[styles.leaveButtonText, { color: theme.error }]}>Reject</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
       </View>
     );
   };
@@ -850,6 +1019,13 @@ const TenantMembershipManager = () => {
         <View style={[styles.alertRow, { backgroundColor: `${theme.error}10` }]}> 
           <AlertCircle size={16} color={theme.error} />
           <Text style={[styles.alertText, { color: theme.error }]}>{error}</Text>
+        </View>
+      )}
+
+      {incomingInviteError && (
+        <View style={[styles.alertRow, { backgroundColor: `${theme.error}10` }]}> 
+          <AlertCircle size={16} color={theme.error} />
+          <Text style={[styles.alertText, { color: theme.error }]}>{incomingInviteError}</Text>
         </View>
       )}
 
@@ -937,6 +1113,11 @@ const TenantMembershipManager = () => {
           <ActivityIndicator size="small" color={theme.primary} />
           <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading centers…</Text>
         </View>
+      ) : incomingInviteLoading ? (
+        <View style={styles.loadingState}>
+          <ActivityIndicator size="small" color={theme.primary} />
+          <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading invitations…</Text>
+        </View>
       ) : membershipRows.length ? (
         filteredMembershipRows.length ? (
           <View style={styles.membershipListShell}>
@@ -946,7 +1127,7 @@ const TenantMembershipManager = () => {
               showsVerticalScrollIndicator={false}
               nestedScrollEnabled
             >
-              {filteredMembershipRows.map(renderMembershipCard)}
+              {filteredMembershipRows.map((row) => renderMembershipCard(row))}
             </ScrollView>
           </View>
         ) : (
@@ -1222,7 +1403,9 @@ const TenantMembershipManager = () => {
                 )}
                 {alreadyPending && (
                   <Text style={[styles.previewInfo, { color: theme.textSecondary }]}> 
-                    Your request is waiting for an admin to approve it. We&apos;ll keep you posted.
+                    {alreadyInvitePending
+                      ? 'An invite is already waiting for this account. Close this modal and accept it from the Pending tab.'
+                      : "Your request is waiting for an admin to approve it. We'll keep you posted."}
                   </Text>
                 )}
                 {!alreadyMember && !alreadyPending && !joinSuccess && (
@@ -1567,6 +1750,24 @@ const styles = StyleSheet.create({
   leaveButtonText: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  inviteDecisionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  inviteAcceptButton: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    alignItems: 'center',
+    flex: 1,
+  },
+  inviteAcceptButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#fff',
   },
   emptyState: {
     alignItems: 'flex-start',

@@ -25,6 +25,10 @@ export interface Notice {
   targetAudience: string[]; // Changed to array to support multiple selections
   viewCount: number;
   userViews: { [userId: string]: { count: number; lastViewed: string } };
+
+  // Reactions are stored as { [reactionType]: [userId, ...] }
+  // Counts are derived from the array lengths.
+  reactions?: Record<string, string[]>;
 }
 
 export interface NoticeFormData {

@@ -46,6 +46,7 @@ import type { TenantInvite, TenantMembership, TenantMembershipRole } from '@/typ
 import { STORAGE_KEYS, PROTECTED_CACHE_KEYS } from '@/lib/storageKeys';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { ROLE_BADGE_MAP, type RoleBadgeConfig } from '@/lib/roleBadges';
+import { canShowInstallPrompt, isAppInstalled, showInstallPrompt } from '../../lib/pwa';
 
 const formatBytes = (bytes: number): string => {
   if (!bytes) return '0 KB';
@@ -231,6 +232,69 @@ export default function Settings() {
     salutation: '' | 'Mr.' | 'Ms.';
     subjects: string[];
   };
+
+  const [pwaInstalled, setPwaInstalled] = useState(false);
+  const [pwaInstallAvailable, setPwaInstallAvailable] = useState(false);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+
+    try {
+      setPwaInstalled(isAppInstalled());
+    } catch {
+      // ignore
+    }
+
+    const update = () => {
+      try {
+        setPwaInstallAvailable(canShowInstallPrompt());
+      } catch {
+        // ignore
+      }
+    };
+
+    update();
+
+    const onAvailable = () => update();
+    const onInstalled = () => {
+      try {
+        setPwaInstalled(true);
+      } catch {
+        // ignore
+      }
+      update();
+    };
+
+    window.addEventListener('tm:pwa-install-available', onAvailable);
+    window.addEventListener('tm:pwa-installed', onInstalled);
+    return () => {
+      window.removeEventListener('tm:pwa-install-available', onAvailable);
+      window.removeEventListener('tm:pwa-installed', onInstalled);
+    };
+  }, []);
+
+  const handleInstallWebApp = useCallback(async () => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+
+    try {
+      const accepted = await showInstallPrompt();
+      if (accepted) {
+        setPwaInstalled(true);
+        return;
+      }
+    } catch {
+      // fall through
+    }
+
+    Alert.alert(
+      'Install Tuition Manager',
+      "If you don't see an install popup, use your browser menu:\n\n- Chrome/Edge (desktop): menu → Install app\n- Android Chrome: menu → Add to Home screen\n- iPhone/iPad Safari: Share → Add to Home Screen"
+    );
+  }, []);
   const [editingProfile, setEditingProfile] = useState(false);
   const [profileData, setProfileData] = useState<ProfileFormData>({
     displayName: user?.displayName || '',
@@ -1527,6 +1591,17 @@ export default function Settings() {
                 subtitle: adminSettingsSubtitle,
                 onPress: tenantUnavailable ? undefined : () => setShowAdminModal(true),
                 disabled: tenantUnavailable,
+              },
+            ]
+          : []),
+
+        ...(Platform.OS === 'web' && !pwaInstalled
+          ? [
+              {
+                icon: Download,
+                title: 'Install app',
+                subtitle: pwaInstallAvailable ? 'Install Tuition Manager on this device' : 'Install from your browser menu (⋮)',
+                onPress: handleInstallWebApp,
               },
             ]
           : []),

@@ -6,6 +6,7 @@ import {
   addDoc,
   arrayUnion,
   collection,
+  deleteField,
   deleteDoc,
   doc,
   getDoc,
@@ -1341,6 +1342,218 @@ class TenantService {
         onError?.(error as Error);
       },
     );
+  }
+
+  listenToIncomingInvites(
+    email: string,
+    onSuccess: (invites: TenantInvite[]) => void,
+    onError?: (error: Error) => void,
+    limitCount: number = 25,
+  ): () => void {
+    const normalizedEmail = (email || '').trim().toLowerCase();
+    if (!normalizedEmail) {
+      onSuccess([]);
+      return () => undefined;
+    }
+
+    // NOTE: Avoid `orderBy('issuedAt')` here.
+    // Firestore requires a composite index for where(email==X) + orderBy(issuedAt),
+    // which breaks local/dev projects unless an index is created.
+    // Instead, fetch all invites for that email (typically small) and sort client-side.
+    const q = query(this.inviteRef, where('email', '==', normalizedEmail));
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        const invites = snapshot.docs
+          .map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          }))
+          .sort((a, b) => {
+            const issuedA = typeof (a as any).issuedAt === 'string' ? Date.parse((a as any).issuedAt) : NaN;
+            const issuedB = typeof (b as any).issuedAt === 'string' ? Date.parse((b as any).issuedAt) : NaN;
+            if (Number.isNaN(issuedA) && Number.isNaN(issuedB)) return 0;
+            if (Number.isNaN(issuedA)) return 1;
+            if (Number.isNaN(issuedB)) return -1;
+            return issuedB - issuedA;
+          }) as TenantInvite[];
+
+        onSuccess(invites.slice(0, Math.max(0, limitCount)));
+      },
+      (error) => {
+        logger.error('tenantService.listenToIncomingInvites failed', error);
+        onError?.(error as Error);
+      },
+    );
+  }
+
+  async rejectInvite(inviteId: string, actorId: string): Promise<void> {
+    const normalizedInviteId = (inviteId || '').trim();
+    if (!normalizedInviteId) {
+      throw new Error('Invite id missing');
+    }
+    const inviteSnap = await getDoc(doc(this.inviteRef, normalizedInviteId));
+    if (!inviteSnap.exists()) {
+      throw new Error('Invite not found');
+    }
+    const invite = inviteSnap.data() as TenantInvite;
+
+    const token = typeof (invite as any).token === 'string' ? String((invite as any).token).trim() : '';
+    if (!token) {
+      throw new Error('Invite token missing');
+    }
+
+    try {
+      await tenantBackendClient.rejectInvite({ token });
+    } catch (error) {
+      logger.error('tenantService.rejectInvite failed', { inviteId, actorId, error });
+      if (error instanceof TenantBackendError) {
+        throw error;
+      }
+      throw new Error('Failed to reject invite');
+    }
+  }
+
+  async rejectInviteByToken(token: string, actorId: string): Promise<void> {
+    const normalizedToken = (token || '').trim();
+    if (!normalizedToken) {
+      throw new Error('Invite token missing');
+    }
+
+    try {
+      await tenantBackendClient.rejectInvite({ token: normalizedToken });
+    } catch (error) {
+      logger.error('tenantService.rejectInviteByToken failed', { actorId, error });
+      if (error instanceof TenantBackendError) {
+        throw error;
+      }
+      throw new Error('Failed to reject invite');
+    }
+  }
+
+  async syncIncomingInvitesToMembershipsForUser(params: {
+    userId: string;
+    email: string;
+    displayName?: string;
+    invites: TenantInvite[];
+  }): Promise<void> {
+    const userId = (params.userId || '').trim();
+    const email = (params.email || '').trim().toLowerCase();
+    if (!userId || !email) {
+      return;
+    }
+
+    const invites = Array.isArray(params.invites) ? params.invites : [];
+    const nowIso = new Date().toISOString();
+
+    // Only the invitee can map an invite -> membership doc id because it requires the user's uid.
+    // This mirrors how join-code claim updates tenantMemberships/{tenantId}_{uid}.
+    for (const invite of invites) {
+      if (!invite?.tenantId) {
+        continue;
+      }
+      if (invite.status === 'accepted') {
+        continue;
+      }
+
+      const nextStatus: TenantMembershipStatus | null =
+        invite.status === 'pending'
+          ? 'pending_invite'
+          : invite.status === 'rejected'
+            ? 'rejected'
+            : null;
+
+      if (!nextStatus) {
+        continue;
+      }
+
+      const membershipId = membershipDocId(invite.tenantId, userId);
+      const membershipRef = doc(this.membershipRef, membershipId);
+      const snap = await getDoc(membershipRef);
+      const existing = snap.exists() ? (snap.data() as Partial<TenantMembership>) : null;
+
+      const existingStatus = (existing?.status as TenantMembershipStatus | undefined) ?? undefined;
+      const existingRole = (existing?.role as TenantMembershipRole | undefined) ?? undefined;
+      const existingCreatedAt = typeof existing?.createdAt === 'string' ? existing.createdAt : nowIso;
+      const existingToken = typeof existing?.inviteToken === 'string' ? existing.inviteToken : undefined;
+      const existingExpiresAt = existing?.inviteExpiresAt;
+      const inviteAt =
+        nextStatus === 'pending_invite'
+          ? invite.issuedAt
+          : invite.rejectedAt || invite.issuedAt || nowIso;
+
+      const shouldUpdateStatus = existingStatus !== nextStatus;
+      const shouldUpdateToken = nextStatus === 'pending_invite' && existingToken !== invite.token;
+      const shouldUpdateExpiry =
+        nextStatus === 'pending_invite' &&
+        typeof invite.expiresAt === 'string' &&
+        (typeof existingExpiresAt !== 'string' || existingExpiresAt !== invite.expiresAt);
+      const shouldClearInviteFields =
+        nextStatus === 'rejected' &&
+        (typeof existingToken === 'string' || typeof existingExpiresAt === 'string' || typeof existing?.invitedBy === 'string');
+
+      // Don't override an active membership role; otherwise keep it aligned with the invite.
+      const shouldUpdateRole = existingStatus !== 'active' && existingRole !== invite.role;
+
+      if (
+        !snap.exists() ||
+        shouldUpdateStatus ||
+        shouldUpdateToken ||
+        shouldUpdateExpiry ||
+        shouldUpdateRole ||
+        shouldClearInviteFields
+      ) {
+        const statusEvent = this.createStatusEvent(nextStatus, {
+          at: typeof inviteAt === 'string' ? inviteAt : nowIso,
+          actorId: nextStatus === 'pending_invite' ? invite.issuedBy : userId,
+          actorEmail: nextStatus === 'pending_invite' ? undefined : email,
+          actorName: nextStatus !== 'pending_invite' ? params.displayName : undefined,
+          reason: nextStatus === 'pending_invite' ? 'invite_received' : 'invite_rejected_by_user',
+        });
+
+        if (!snap.exists()) {
+          const payload: Omit<TenantMembership, 'id'> = {
+            tenantId: invite.tenantId,
+            userId,
+            email,
+            displayName: (params.displayName || email.split('@')[0] || email).slice(0, 120),
+            role: invite.role,
+            status: nextStatus,
+            createdAt: existingCreatedAt,
+            updatedAt: nowIso,
+            statusHistory: [statusEvent],
+          };
+
+          if (nextStatus === 'pending_invite') {
+            payload.inviteToken = invite.token;
+            payload.inviteExpiresAt = invite.expiresAt;
+            payload.invitedBy = invite.issuedBy;
+          }
+          await setDoc(membershipRef, payload);
+        } else {
+          const updatePayload: Record<string, unknown> = {
+            updatedAt: nowIso,
+          };
+          if (shouldUpdateStatus) updatePayload.status = nextStatus;
+          if (shouldUpdateRole) updatePayload.role = invite.role;
+
+          if (nextStatus === 'pending_invite') {
+            updatePayload.inviteToken = invite.token;
+            updatePayload.inviteExpiresAt = invite.expiresAt;
+            updatePayload.invitedBy = invite.issuedBy;
+          } else if (nextStatus === 'rejected') {
+            updatePayload.inviteToken = deleteField();
+            updatePayload.inviteExpiresAt = deleteField();
+            updatePayload.invitedBy = deleteField();
+          }
+
+          // Keep status history consistent with join-code claim behavior.
+          updatePayload.statusHistory = arrayUnion(statusEvent);
+
+          await setDoc(membershipRef, updatePayload, { merge: true });
+        }
+      }
+    }
   }
 
   listenToCodes(

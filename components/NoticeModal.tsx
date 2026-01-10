@@ -41,6 +41,17 @@ import Toast from 'react-native-toast-message';
 import { tenantService } from '../services/tenantService';
 import { uploadBlobViaBackend } from '../services/backendStorageUploadService';
 import type { TenantMembershipRole } from '../types/tenant';
+import {
+  DEFAULT_NOTICE_REACTIONS,
+  NOTICE_REACTION_CATEGORIES,
+  NOTICE_REACTION_EMOJIS,
+} from '../lib/noticeReactionEmojiCatalog';
+import {
+  loadNoticeReactionEmojiStore,
+  recordNoticeReactionEmoji,
+  extractFirstEmoji,
+  type NoticeReactionEmojiStore,
+} from '../lib/noticeReactionEmojiStore';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
@@ -136,6 +147,228 @@ const getUsageNoticeContentOverride = (notice: any): string | null => {
 };
 
 const MAX_AUDIO_FILE_SIZE = 15 * 1024 * 1024; // 15 MB limit for announcements
+
+type EmojiPickerCategory = 'Recent' | 'Custom' | 'All' | (typeof NOTICE_REACTION_CATEGORIES)[number];
+
+const getReactionCounts = (notice: Notice | null | undefined): { type: string; count: number }[] => {
+  const reactions = (notice as any)?.reactions;
+  if (!reactions || typeof reactions !== 'object' || Array.isArray(reactions)) {
+    return [];
+  }
+
+  return Object.entries(reactions as Record<string, unknown>)
+    .map(([type, users]) => ({
+      type,
+      count: Array.isArray(users) ? users.filter((v) => typeof v === 'string').length : 0,
+    }))
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+};
+
+const getReactionUserIds = (notice: Notice | null | undefined, reactionType?: string | null): string[] => {
+  const reactions = (notice as any)?.reactions;
+  if (!reactions || typeof reactions !== 'object' || Array.isArray(reactions)) {
+    return [];
+  }
+  if (reactionType) {
+    const users = (reactions as any)[reactionType];
+    return Array.isArray(users) ? users.filter((v) => typeof v === 'string') : [];
+  }
+  const all = Object.values(reactions as Record<string, unknown>)
+    .flatMap((users) => (Array.isArray(users) ? users : []))
+    .filter((v) => typeof v === 'string') as string[];
+  return Array.from(new Set(all));
+};
+
+const initialsFromName = (name?: string | null): string => {
+  const safe = (name || '').trim();
+  if (!safe) return '?';
+  const parts = safe.split(/\s+/).filter(Boolean);
+  const first = parts[0]?.[0] || '?';
+  const last = parts.length > 1 ? parts[parts.length - 1]?.[0] : '';
+  return (first + last).toUpperCase();
+};
+
+type ReactionMember = {
+  userId: string;
+  displayName?: string;
+  email?: string;
+  role?: TenantMembershipRole;
+};
+
+const EmojiPickerModal: React.FC<{
+  visible: boolean;
+  onClose: () => void;
+  onPick: (emoji: string, meta?: { isCustom?: boolean }) => void;
+  theme: any;
+}> = ({ visible, onClose, onPick, theme }) => {
+  const [query, setQuery] = useState('');
+  const [custom, setCustom] = useState('');
+  const [category, setCategory] = useState<EmojiPickerCategory>('All');
+  const [store, setStore] = useState<NoticeReactionEmojiStore>({
+    recent: [],
+    custom: [],
+    updatedAt: new Date().toISOString(),
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (!visible) return;
+      const next = await loadNoticeReactionEmojiStore();
+      if (cancelled) return;
+      setStore(next);
+      setCategory('All');
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [visible]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const fromCatalog = NOTICE_REACTION_EMOJIS;
+
+    if (q) {
+      const customSet = new Set([...(store.custom || []), ...(store.recent || [])]);
+      const customItems = Array.from(customSet).map((emoji) => ({
+        emoji,
+        keywords: [emoji, 'custom'],
+        category: 'Other' as const,
+      }));
+      const combined = [...customItems, ...fromCatalog];
+      return combined.filter((e) => e.keywords.some((k) => k.includes(q)) || e.emoji.includes(q));
+    }
+
+    if (category === 'Recent') {
+      return (store.recent || []).map((emoji) => ({
+        emoji,
+        keywords: [emoji, 'recent'],
+        category: 'Other' as const,
+      }));
+    }
+    if (category === 'Custom') {
+      return (store.custom || []).map((emoji) => ({
+        emoji,
+        keywords: [emoji, 'custom'],
+        category: 'Other' as const,
+      }));
+    }
+    if (category === 'All') {
+      const customItems = (store.custom || []).map((emoji) => ({
+        emoji,
+        keywords: [emoji, 'custom'],
+        category: 'Other' as const,
+      }));
+      const catalogEmojis = fromCatalog.filter((item) => !customItems.some((c) => c.emoji === item.emoji));
+      return [...customItems, ...catalogEmojis];
+    }
+
+    return fromCatalog.filter((e) => e.category === category);
+  }, [query, store.custom, store.recent, category]);
+
+  const pickCustom = () => {
+    const raw = custom.trim();
+    if (!raw) return;
+    const emoji = extractFirstEmoji(raw);
+    onPick(emoji, { isCustom: true });
+    setCustom('');
+    onClose();
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.detailModalOverlay}>
+        <View style={[styles.pickerModalContainer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+          <View style={[styles.pickerHeader, { borderBottomColor: theme.border }]}>
+            <Text style={[styles.pickerTitle, { color: theme.text }]}>Pick an emoji</Text>
+            <TouchableOpacity onPress={onClose} style={styles.closeButton}>
+              <X size={22} color={theme.textSecondary} />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.pickerInputs}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.categoryRow}
+            >
+              {(['Recent', 'Custom', 'All', ...NOTICE_REACTION_CATEGORIES] as EmojiPickerCategory[]).map((c) => {
+                const selected = category === c;
+                return (
+                  <TouchableOpacity
+                    key={c}
+                    style={[
+                      styles.categoryChip,
+                      {
+                        borderColor: selected ? theme.primary : theme.border,
+                        backgroundColor: selected ? `${theme.primary}18` : theme.background,
+                      },
+                    ]}
+                    onPress={() => setCategory(c)}
+                  >
+                    <Text style={[styles.categoryChipText, { color: selected ? theme.primary : theme.textSecondary }]}>
+                      {c}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+
+            <TextInput
+              style={[styles.pickerInput, { backgroundColor: theme.background, borderColor: theme.border, color: theme.text }]}
+              value={query}
+              onChangeText={setQuery}
+              placeholder="Search (e.g. love, party, thanks)"
+              placeholderTextColor={theme.textSecondary}
+            />
+            <View style={styles.customRow}>
+              <TextInput
+                style={[styles.pickerInput, { flex: 1, backgroundColor: theme.background, borderColor: theme.border, color: theme.text }]}
+                value={custom}
+                onChangeText={setCustom}
+                placeholder="Or paste any emoji"
+                placeholderTextColor={theme.textSecondary}
+              />
+              <TouchableOpacity
+                style={[styles.customPickButton, { backgroundColor: theme.primary, opacity: custom.trim() ? 1 : 0.6 }]}
+                onPress={pickCustom}
+                disabled={!custom.trim()}
+              >
+                <Text style={styles.customPickButtonText}>Use</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.pickerGrid} showsVerticalScrollIndicator={false}>
+            {filtered.map((item: { emoji: string; keywords: string[] }) => (
+              <TouchableOpacity
+                key={`${item.emoji}-${item.keywords[0]}`}
+                style={[styles.pickerEmojiButton, { borderColor: theme.border, backgroundColor: theme.background }]}
+                onPress={() => {
+                  const isCustomPick = Boolean(store.custom?.includes(item.emoji)) && !NOTICE_REACTION_EMOJIS.some((c) => c.emoji === item.emoji);
+                  onPick(item.emoji, { isCustom: isCustomPick });
+                  onClose();
+                }}
+              >
+                <Text style={styles.pickerEmojiText}>{item.emoji}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+};
+
+const hasUserReacted = (notice: Notice | null | undefined, reactionType: string, userId: string | null | undefined): boolean => {
+  if (!userId) return false;
+  const reactions = (notice as any)?.reactions as Record<string, unknown> | undefined;
+  const users = reactions && typeof reactions === 'object' && !Array.isArray(reactions) ? reactions[reactionType] : null;
+  if (!Array.isArray(users)) return false;
+  return users.includes(userId);
+};
 
 const formatFileSize = (size?: number) => {
   if (!size || size <= 0) return 'Unknown size';
@@ -242,9 +475,14 @@ export const NoticeDetailModal: React.FC<NoticeDetailModalProps> = ({
   const { theme } = useTheme();
   const { user } = useAuth();
   const { activeTenant } = useTenant();
-  const { markNoticeAsViewed } = useNotices();
+  const { markNoticeAsViewed, toggleNoticeReaction } = useNotices();
+  const { isOnline } = useNetworkStatus();
   const [creatorRole, setCreatorRole] = useState<TenantMembershipRole | 'system' | null>(null);
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
+  const [reactionBusy, setReactionBusy] = useState<string | null>(null);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [showReactedBy, setShowReactedBy] = useState(false);
+  const [reactedByMembers, setReactedByMembers] = useState<Record<string, ReactionMember>>({});
   
   const screenWidth = Dimensions.get('window').width;
   const screenHeight = Dimensions.get('window').height;
@@ -386,6 +624,78 @@ export const NoticeDetailModal: React.FC<NoticeDetailModalProps> = ({
     }
   };
 
+  const reactionCounts = useMemo(() => getReactionCounts(notice), [notice]);
+  const reactionTypesToShow = useMemo(
+    () => Array.from(new Set([ ...DEFAULT_NOTICE_REACTIONS, ...reactionCounts.map((r) => r.type) ])).slice(0, 10),
+    [reactionCounts]
+  );
+  const reactedUserIds = useMemo(() => getReactionUserIds(notice), [notice]);
+  const reactedCount = reactedUserIds.length;
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadMembers = async () => {
+      const tenantId = notice?.tenantId || activeTenant?.id;
+      if (!visible || !tenantId || reactedUserIds.length === 0) {
+        if (!cancelled) setReactedByMembers({});
+        return;
+      }
+      try {
+        const memberships = await tenantService.getActiveMembershipsForTenant(tenantId);
+        if (cancelled) return;
+        const map: Record<string, ReactionMember> = {};
+        memberships.forEach((m) => {
+          if (!m.userId) return;
+          map[m.userId] = {
+            userId: m.userId,
+            displayName: m.displayName,
+            email: m.email,
+            role: m.role as TenantMembershipRole,
+          };
+        });
+        setReactedByMembers(map);
+      } catch (error) {
+        logger.warn('[NoticeDetailModal] Failed to load reacted-by members', error);
+        if (!cancelled) setReactedByMembers({});
+      }
+    };
+
+    loadMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, notice?.tenantId, activeTenant?.id, reactedUserIds.join('|')]);
+
+  const handleToggleReaction = async (reactionType: string) => {
+    if (!notice?.id || !user?.uid) return;
+    if (reactionBusy) return;
+
+    if (!isOnline) {
+      Toast.show({
+        type: 'error',
+        text1: 'Offline',
+        text2: 'Reconnect to react to notices.',
+        position: 'top',
+      });
+      return;
+    }
+
+    try {
+      setReactionBusy(reactionType);
+      await toggleNoticeReaction({ noticeId: notice.id, reactionType });
+    } catch (error: any) {
+      logger.warn('[NoticeDetailModal] Failed to toggle reaction', error);
+      Toast.show({
+        type: 'error',
+        text1: 'Reaction failed',
+        text2: error?.message || 'Please try again',
+        position: 'top',
+      });
+    } finally {
+      setReactionBusy(null);
+    }
+  };
+
   if (!notice) {
     return null;
   }
@@ -495,6 +805,83 @@ export const NoticeDetailModal: React.FC<NoticeDetailModalProps> = ({
               </TouchableOpacity>
             )}
 
+            {/* Reactions */}
+            <View style={[styles.reactionsCard, { borderColor: theme.border, backgroundColor: theme.background }]}> 
+              <Text style={[styles.reactionsTitle, { color: theme.textSecondary }]}>Reactions</Text>
+              <View style={styles.reactionsRow}>
+                {reactionTypesToShow.map((reactionType) => {
+                  const count = reactionCounts.find((r) => r.type === reactionType)?.count || 0;
+                  const selected = hasUserReacted(notice, reactionType, user?.uid);
+                  const disabled = Boolean(reactionBusy) || !user?.uid;
+                  return (
+                    <TouchableOpacity
+                      key={reactionType}
+                      style={[
+                        styles.reactionChip,
+                        {
+                          borderColor: selected ? theme.primary : theme.border,
+                          backgroundColor: selected ? `${theme.primary}18` : theme.surface,
+                          opacity: disabled ? 0.6 : 1,
+                        },
+                      ]}
+                      onPress={() => handleToggleReaction(reactionType)}
+                      disabled={disabled}
+                    >
+                      <Text style={[styles.reactionChipText, { color: theme.text }]}>{reactionType}</Text>
+                      {count > 0 ? (
+                        <Text style={[styles.reactionChipCount, { color: selected ? theme.primary : theme.textSecondary }]}>
+                          {count}
+                        </Text>
+                      ) : null}
+                    </TouchableOpacity>
+                  );
+                })}
+
+                <TouchableOpacity
+                  style={[
+                    styles.reactionChip,
+                    {
+                      borderColor: theme.border,
+                      backgroundColor: theme.surface,
+                      opacity: (!user?.uid || Boolean(reactionBusy)) ? 0.6 : 1,
+                    },
+                  ]}
+                  onPress={() => setShowEmojiPicker(true)}
+                  disabled={!user?.uid || Boolean(reactionBusy)}
+                >
+                  <Text style={[styles.reactionChipText, { color: theme.text }]}>＋</Text>
+                  <Text style={[styles.reactionChipCount, { color: theme.textSecondary }]}>More</Text>
+                </TouchableOpacity>
+              </View>
+
+              {reactedCount > 0 ? (
+                <TouchableOpacity
+                  style={styles.reactedByRow}
+                  onPress={() => setShowReactedBy(true)}
+                >
+                  <View style={styles.reactedByAvatars}>
+                    {reactedUserIds.slice(0, 6).map((uid) => {
+                      const member = reactedByMembers[uid];
+                      const label = initialsFromName(member?.displayName || member?.email || '');
+                      return (
+                        <View
+                          key={uid}
+                          style={[styles.reactedAvatar, { backgroundColor: theme.surface, borderColor: theme.border }]}
+                        >
+                          <Text style={[styles.reactedAvatarText, { color: theme.textSecondary }]}>{label}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                  <Text style={[styles.reactedByText, { color: theme.textSecondary }]}>
+                    {reactedCount} reacted • Tap to view
+                  </Text>
+                </TouchableOpacity>
+              ) : (
+                <Text style={[styles.reactedByText, { color: theme.textSecondary }]}>Be the first to react</Text>
+              )}
+            </View>
+
             {/* Meta Information */}
             <View style={[styles.metaContainer, { backgroundColor: theme.background, borderColor: theme.border }]}>
               <View style={styles.metaRow}>
@@ -555,6 +942,64 @@ export const NoticeDetailModal: React.FC<NoticeDetailModalProps> = ({
           </View>
         </View>
       </View>
+
+      <EmojiPickerModal
+        visible={showEmojiPicker}
+        onClose={() => setShowEmojiPicker(false)}
+        onPick={(emoji, meta) => {
+          void recordNoticeReactionEmoji(emoji, { isCustom: Boolean(meta?.isCustom) });
+          handleToggleReaction(emoji);
+        }}
+        theme={theme}
+      />
+
+      <Modal
+        visible={showReactedBy}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowReactedBy(false)}
+      >
+        <View style={styles.detailModalOverlay}>
+          <View style={[styles.pickerModalContainer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+            <View style={[styles.pickerHeader, { borderBottomColor: theme.border }]}>
+              <Text style={[styles.pickerTitle, { color: theme.text }]}>Who reacted</Text>
+              <TouchableOpacity onPress={() => setShowReactedBy(false)} style={styles.closeButton}>
+                <X size={22} color={theme.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView contentContainerStyle={{ padding: 14 }}>
+              {getReactionCounts(notice).map((entry) => {
+                const users = getReactionUserIds(notice, entry.type);
+                return (
+                  <View key={entry.type} style={{ marginBottom: 14 }}>
+                    <Text style={[styles.reactedSectionTitle, { color: theme.text }]}>
+                      {entry.type}  {entry.count}
+                    </Text>
+                    {users.map((uid) => {
+                      const member = reactedByMembers[uid];
+                      const name = member?.displayName || member?.email || 'Unknown member';
+                      const role = member?.role ? ` (${member.role})` : '';
+                      return (
+                        <View key={`${entry.type}-${uid}`} style={styles.reactedMemberRow}>
+                          <View style={[styles.reactedAvatar, { backgroundColor: theme.background, borderColor: theme.border }]}>
+                            <Text style={[styles.reactedAvatarText, { color: theme.textSecondary }]}> 
+                              {initialsFromName(name)}
+                            </Text>
+                          </View>
+                          <Text style={[styles.reactedMemberText, { color: theme.text }]} numberOfLines={1}>
+                            {name}{role}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </Modal>
   );
 };
@@ -1055,6 +1500,35 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
     }
     setSelectedNotice(notice);
     setShowDetailModal(true);
+  };
+
+  // Keep selected notice synced with the latest snapshot (reactions, views, edits, etc.)
+  useEffect(() => {
+    if (!showDetailModal || !selectedNotice?.id) return;
+    const updated = notices.find((n) => n.id === selectedNotice.id);
+    if (updated) {
+      setSelectedNotice(updated);
+    }
+  }, [notices, showDetailModal, selectedNotice?.id]);
+
+  const renderReactionSummary = (notice: Notice) => {
+    const counts = getReactionCounts(notice);
+    if (counts.length === 0) return null;
+
+    const top = counts.slice(0, 3);
+    return (
+      <View style={styles.reactionSummaryRow}>
+        {top.map((entry) => (
+          <View
+            key={entry.type}
+            style={[styles.reactionSummaryChip, { borderColor: theme.border, backgroundColor: theme.surface }]}
+          >
+            <Text style={[styles.reactionSummaryText, { color: theme.text }]}>{entry.type}</Text>
+            <Text style={[styles.reactionSummaryCount, { color: theme.textSecondary }]}>{entry.count}</Text>
+          </View>
+        ))}
+      </View>
+    );
   };
 
   const getPriorityColor = (priority: string) => {
@@ -1583,6 +2057,8 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                           {getUsageNoticeContentOverride(notice) || notice.content}
                         </Text>
 
+                        {renderReactionSummary(notice)}
+
                         <View style={styles.noticeMeta}>
                           <Text style={[styles.noticeAuthor, { color: theme.textSecondary }]}>
                             By {notice.createdByName}
@@ -2101,6 +2577,199 @@ const styles = StyleSheet.create({
   metaText: {
     fontSize: 14,
     fontFamily: 'Inter-Regular',
+  },
+
+  // Reactions (detail)
+  reactionsCard: {
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 10,
+  },
+  reactionsTitle: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+    marginBottom: 10,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  reactionsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  reactionChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    gap: 6,
+  },
+  reactionChipText: {
+    fontSize: 16,
+    fontFamily: 'Inter-SemiBold',
+  },
+  reactionChipCount: {
+    fontSize: 13,
+    fontFamily: 'Inter-SemiBold',
+  },
+
+  // Reactions (list summary)
+  reactionSummaryRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 10,
+  },
+  reactionSummaryChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    gap: 4,
+  },
+  reactionSummaryText: {
+    fontSize: 13,
+    fontFamily: 'Inter-SemiBold',
+  },
+  reactionSummaryCount: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+  },
+
+  reactedByRow: {
+    marginTop: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  reactedByAvatars: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flex: 1,
+    flexWrap: 'wrap',
+  },
+  reactedAvatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  reactedAvatarText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  reactedByText: {
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+  },
+
+  // Picker + reacted-by modal
+  pickerModalContainer: {
+    width: '90%',
+    maxWidth: 520,
+    maxHeight: '60%',
+    borderRadius: 16,
+    borderWidth: 1,
+    overflow: 'hidden',
+  },
+  pickerHeader: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  pickerTitle: {
+    fontSize: 16,
+    fontFamily: 'Inter-SemiBold',
+  },
+  pickerInputs: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 10,
+    gap: 10,
+  },
+  categoryRow: {
+    paddingBottom: 2,
+    paddingRight: 6,
+    gap: 8,
+    alignItems: 'center',
+  },
+  categoryChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  categoryChipText: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+  },
+  pickerInput: {
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    fontFamily: 'Inter-Regular',
+  },
+  customRow: {
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'center',
+  },
+  customPickButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  customPickButtonText: {
+    fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+    color: '#ffffff',
+  },
+  pickerGrid: {
+    padding: 14,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  pickerEmojiButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pickerEmojiText: {
+    fontSize: 22,
+  },
+  reactedSectionTitle: {
+    fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+    marginBottom: 8,
+  },
+  reactedMemberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  reactedMemberText: {
+    fontSize: 14,
+    fontFamily: 'Inter-Regular',
+    flex: 1,
   },
   detailActions: {
     flexDirection: 'row',

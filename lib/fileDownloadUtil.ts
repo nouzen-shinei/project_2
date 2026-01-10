@@ -4,10 +4,58 @@ import { logger } from '@/lib/logger';
 
 import { Platform } from 'react-native';
 
+const deriveFileNameFromUrl = (url: string): string | null => {
+  const raw = (url || '').trim();
+  if (!raw) return null;
+
+  try {
+    const u = new URL(raw);
+
+    // Firebase download URL form: /v0/b/<bucket>/o/<encodedObjectPath>
+    const idx = u.pathname.indexOf('/o/');
+    if (idx >= 0) {
+      const encoded = u.pathname.slice(idx + 3);
+      const objectPath = decodeURIComponent(encoded);
+      const parts = objectPath.split('/').filter(Boolean);
+      const last = parts[parts.length - 1];
+      return last ? last.trim() : null;
+    }
+
+    // GCS form: https://storage.googleapis.com/<bucket>/<path>
+    const pathParts = u.pathname.split('/').filter(Boolean);
+    const last = pathParts[pathParts.length - 1];
+    return last ? decodeURIComponent(last).trim() : null;
+  } catch {
+    const noQuery = raw.split('?')[0];
+    const parts = noQuery.split('/').filter(Boolean);
+    const last = parts[parts.length - 1];
+    return last ? decodeURIComponent(last).trim() : null;
+  }
+};
+
+const looksLikeGarbageFileName = (value?: string | null): boolean => {
+  const v = (value || '').trim();
+  if (!v) return true;
+  if (/^https?:\/\//i.test(v)) return true;
+  if (v.includes('?') || v.includes('&') || v.includes('token=')) return true;
+  if (/%2f/i.test(v)) return true;
+  return false;
+};
+
+const normalizeDownloadFileName = (input: { fileUrl: string; fileName?: string }): string => {
+  const provided = (input.fileName || '').trim();
+  if (!looksLikeGarbageFileName(provided)) return provided;
+
+  const derived = deriveFileNameFromUrl(input.fileUrl);
+  if (derived) return derived;
+
+  return provided || '';
+};
+
 export const FileDownloadUtil = {
   // Helper function to extract clean filename from URL or provided name
   extractCleanFileName(fileUrl: string, providedFileName?: string): string {
-    let cleanName = providedFileName || '';
+    let cleanName = normalizeDownloadFileName({ fileUrl, fileName: providedFileName });
     
     // If no provided filename or it contains URL artifacts, extract from URL
     if (!cleanName || cleanName.includes('%2F') || cleanName.includes('alt=media') || cleanName.includes('token=')) {
@@ -31,15 +79,11 @@ export const FileDownloadUtil = {
           }
         }
         
-        // If still no good filename found, try to extract from the o/ path parameter
-        if (!cleanName || cleanName.includes('%2F')) {
-          const oParam = pathParts.find(part => part.startsWith('o%2F') || part.includes('%2F'));
-          if (oParam) {
-            const decoded = decodeURIComponent(oParam);
-            const filenamePart = decoded.split('/').pop();
-            if (filenamePart && filenamePart.includes('.')) {
-              cleanName = filenamePart;
-            }
+        // If still no good filename found, use the shared normalizer heuristics.
+        if (!cleanName || looksLikeGarbageFileName(cleanName)) {
+          const derived = deriveFileNameFromUrl(fileUrl);
+          if (derived) {
+            cleanName = derived;
           }
         }
       } catch (error) {

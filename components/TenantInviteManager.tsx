@@ -32,6 +32,7 @@ const INVITE_PAGE_SIZE = 5;
 const statusLabel: Record<TenantInvite['status'], string> = {
   pending: 'Pending',
   accepted: 'Accepted',
+  rejected: 'Rejected',
   expired: 'Expired',
   revoked: 'Revoked',
 };
@@ -40,6 +41,7 @@ const inviteFilterOptions: { id: 'all' | TenantInvite['status']; label: string }
   { id: 'all', label: 'All' },
   { id: 'pending', label: 'Pending' },
   { id: 'accepted', label: 'Accepted' },
+  { id: 'rejected', label: 'Rejected' },
   { id: 'expired', label: 'Expired' },
   { id: 'revoked', label: 'Revoked' },
 ];
@@ -51,6 +53,8 @@ const statusChipColor = (
   switch (status) {
     case 'accepted':
       return { backgroundColor: `${theme.success}1A`, color: theme.success };
+    case 'rejected':
+      return { backgroundColor: `${theme.error}1A`, color: theme.error };
     case 'expired':
       return { backgroundColor: `${theme.warning}1A`, color: theme.warning };
     case 'revoked':

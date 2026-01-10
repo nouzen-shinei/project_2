@@ -119,5 +119,5 @@ backend-runtime/coverage/
 android/app/google-services.json
 app/google-services.json
 
-README-old.md
+README-old*.md
 docs/devlog/

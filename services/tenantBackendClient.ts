@@ -51,6 +51,7 @@ export interface TenantJoinCodePreviewResponse {
   tenant: TenantJoinCodeTenant;
   code: TenantJoinCodeMetadata;
   membership: TenantJoinMembershipPreview | null;
+  pendingInvite?: boolean;
 }
 
 export interface TenantJoinCodeClaimResponse {
@@ -144,12 +145,20 @@ class TenantBackendClient {
         return 'This invite has expired. Ask the coaching center for a fresh link.';
       case 'invite_already_used':
         return 'This invite link was already used.';
+      case 'invite_rejected':
+        return 'You already rejected this invite. Ask the coaching center for a fresh link if you changed your mind.';
       case 'invite_not_pending':
         return 'Only pending invites can be resent or revoked.';
       case 'invite_email_mismatch':
         return 'Sign in with the email that originally received this invite.';
       case 'invite_accept_failed':
         return 'Unable to accept this invite right now. Please try again in a moment.';
+      case 'invite_pending':
+        return 'You already have a pending invite for this coaching center. Please accept the invite instead of using a join code.';
+      case 'already_member':
+        return 'This account is already a member of that coaching center.';
+      case 'join_request_pending':
+        return 'You already have a pending join request for that coaching center.';
       case 'request_not_found':
         return 'That join request no longer exists.';
       case 'request_already_reviewed':
@@ -326,6 +335,14 @@ class TenantBackendClient {
       throw new TenantBackendError('invite_token_required', 'Invite link missing or invalid.');
     }
     return this.request('/tenants/invites/accept', { token });
+  }
+
+  rejectInvite(payload: { token: string }): Promise<{ ok: boolean }> {
+    const token = payload.token?.trim();
+    if (!token) {
+      throw new TenantBackendError('invite_token_required', 'Invite link missing or invalid.');
+    }
+    return this.request('/tenants/invites/reject', { token });
   }
 
   updateMembershipRole(payload: {

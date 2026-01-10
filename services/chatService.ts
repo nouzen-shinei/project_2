@@ -1,5 +1,6 @@
 import { logger } from '@/lib/logger';
 import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chatUploadUtils';
+import { sharedFileService } from '@/services/sharedFileService';
 import { database, storage, auth } from '@/config/firebase';
 import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system';
@@ -1906,7 +1907,16 @@ class ChatService {
                   }
                   try {
                     const parsed = JSON.parse(xhr.responseText || '{}');
-                    resolve({ url: String(parsed.url), size: Number(parsed.bytes || blob.size || 0) });
+                    const url = String(parsed.url);
+                    const size = Number(parsed.bytes || blob.size || 0);
+                    const shareToken = typeof parsed.shareToken === 'string' ? parsed.shareToken.trim() : '';
+                    if (shareToken && tenantId) {
+                      void sharedFileService.recordUploadShareToken({ tenantId, fileUrl: url, shareToken });
+                    } else if (url && tenantId) {
+                      // Best-effort: ensure a cached share link exists for later.
+                      void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: sanitizedFileName, fileType, fileSize: size, tenantId });
+                    }
+                    resolve({ url, size });
                   } catch (e) {
                     reject(e);
                   }
@@ -1926,7 +1936,15 @@ class ChatService {
 
               try {
                 const parsed = JSON.parse(xhr.responseText || '{}');
-                resolve({ url: String(parsed.url), size: Number(parsed.bytes || blob.size || 0) });
+                const url = String(parsed.url);
+                const size = Number(parsed.bytes || blob.size || 0);
+                const shareToken = typeof parsed.shareToken === 'string' ? parsed.shareToken.trim() : '';
+                if (shareToken && tenantId) {
+                  void sharedFileService.recordUploadShareToken({ tenantId, fileUrl: url, shareToken });
+                } else if (url && tenantId) {
+                  void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: sanitizedFileName, fileType, fileSize: size, tenantId });
+                }
+                resolve({ url, size });
               } catch (e) {
                 reject(e);
               }
@@ -2033,9 +2051,17 @@ class ChatService {
       const parsed = JSON.parse((typeof result.body === 'string' ? result.body : '') || '{}');
       const finalUrl = String(parsed.url || '');
       const finalSize = Number(parsed.bytes || sizeFromSource || 0) || 0;
+      const shareToken = typeof parsed.shareToken === 'string' ? parsed.shareToken.trim() : '';
       if (!finalUrl) {
         throw new Error('upload_failed_missing_url');
       }
+
+      if (shareToken && tenantId) {
+        void sharedFileService.recordUploadShareToken({ tenantId, fileUrl: finalUrl, shareToken });
+      } else if (tenantId) {
+        void sharedFileService.ensureSmartShareLink({ fileUrl: finalUrl, fileName: sanitizedFileName, fileType, fileSize: finalSize, tenantId });
+      }
+
       return { url: finalUrl, size: finalSize };
       
     } catch (error) {

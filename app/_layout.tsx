@@ -53,6 +53,7 @@ import { setLastInAppRoute } from '../lib/lastInAppRoute';
 import { tryPresentModalAlert } from '../services/modalAlertService';
 import { wasStorageLimitReachedAlertShownRecently } from '../services/storageLimitAlert';
 import { runtimeEndpoints } from '../services/runtimeEndpoints';
+import { ensurePwaHeadTags, initPWAInstallPrompt, registerServiceWorker } from '../lib/pwa';
 
 SplashScreen.preventAutoHideAsync();
 // Install console/error & event filters (web-only)
@@ -78,6 +79,13 @@ if (typeof document !== 'undefined') {
         'https://api.razorpay.com'
       ]
     });
+  } catch {}
+
+  // Initialize PWA capabilities (web-only)
+  try {
+    ensurePwaHeadTags();
+    registerServiceWorker();
+    initPWAInstallPrompt();
   } catch {}
 }
 
@@ -145,6 +153,26 @@ export default function RootLayout() {
   
   const { user, loading, isInitialized, isOffline, roleChangeNotice } = useAuth();
   const { isOnline, isOffline: networkOffline, isInitialLoad } = useNetworkStatus();
+
+  const [tenantBootstrapped, setTenantBootstrapped] = useState(false);
+  const [splashHidden, setSplashHidden] = useState(false);
+
+  // Safety net: never keep the native splash up forever.
+  useEffect(() => {
+    if (splashHidden) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      SplashScreen.hideAsync().catch(() => {
+        // ignore
+      });
+      setSplashHidden(true);
+      logger.warn('[RootLayout] Forced SplashScreen.hideAsync() after timeout');
+    }, 10_000);
+
+    return () => clearTimeout(timeout);
+  }, [splashHidden]);
   
   // Initialize notifications system
   useNotifications();
@@ -153,10 +181,21 @@ export default function RootLayout() {
   const segmentsRef = useRef(segments);
   const [hasRedirected, setHasRedirected] = useState(false);
 
+  const isPublicRoute = Array.isArray(segments) && (segments[0] === 'l' || segments[0] === 'shared');
+
   // Load runtime backend endpoints (Firestore + cache) early.
   useEffect(() => {
     runtimeEndpoints.init().catch((e) => logger.warn('[RootLayout] runtimeEndpoints init failed', e));
   }, []);
+
+  // On first login, Firestore permissions can change; re-fetch endpoints once authorized.
+  useEffect(() => {
+    if (!user?.isAuthorized) {
+      return;
+    }
+
+    runtimeEndpoints.refresh().catch((e) => logger.warn('[RootLayout] runtimeEndpoints refresh failed', e));
+  }, [user?.isAuthorized]);
 
   useEffect(() => {
     segmentsRef.current = segments;
@@ -185,10 +224,25 @@ export default function RootLayout() {
   });
 
   useEffect(() => {
-    if (fontsLoaded || fontError) {
-      SplashScreen.hideAsync();
+    // Keep the native splash visible until:
+    // - fonts are ready (so layout doesn't shift)
+    // - auth has initialized
+    // - and for authorized users, tenant memberships have bootstrapped
+    if (splashHidden) {
+      return;
     }
-  }, [fontsLoaded, fontError]);
+
+    const fontsReady = Boolean(fontsLoaded || fontError);
+    const authReady = Boolean(isInitialized && !loading);
+    const tenantReady = user?.isAuthorized ? tenantBootstrapped : true;
+
+    if (fontsReady && authReady && tenantReady) {
+      SplashScreen.hideAsync().catch(() => {
+        // ignore
+      });
+      setSplashHidden(true);
+    }
+  }, [fontsLoaded, fontError, isInitialized, loading, user?.isAuthorized, tenantBootstrapped, splashHidden]);
 
   // Global handler for billing delinquency enforcement (HTTP 402 billing_past_due)
   useEffect(() => {
@@ -384,6 +438,27 @@ export default function RootLayout() {
   }
 
   // Show login screen only if user is null and not offline
+  if (!user && !isOffline && isPublicRoute) {
+    return (
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <MaintenanceGate>
+          <ThemeProvider>
+            <ModalAlertProvider>
+              <Stack screenOptions={{ headerShown: false }}>
+                <Stack.Screen name="l" options={{ headerShown: false }} />
+                <Stack.Screen name="shared/index" options={{ headerShown: false }} />
+                <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
+                <Stack.Screen name="+not-found" options={{ headerShown: false }} />
+              </Stack>
+              <StatusBar style="auto" />
+              <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+            </ModalAlertProvider>
+          </ThemeProvider>
+        </MaintenanceGate>
+      </GestureHandlerRootView>
+    );
+  }
+
   if (!user && !isOffline) {
     const LoginScreen = require('./auth/login').default;
     return (
@@ -414,6 +489,7 @@ export default function RootLayout() {
                   isOffline={isOffline}
                   roleChangeNotice={roleChangeNotice}
                   router={router}
+                  onTenantBootstrapped={() => setTenantBootstrapped(true)}
                 />
                 <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
               </ModalAlertProvider>
@@ -430,9 +506,10 @@ interface TenantAwareShellProps {
   isOffline: boolean;
   roleChangeNotice: { oldRole: 'user' | 'admin'; newRole: 'user' | 'admin'; at: number } | null | undefined;
   router: ReturnType<typeof useRouter>;
+  onTenantBootstrapped?: () => void;
 }
 
-const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router }: TenantAwareShellProps) => {
+const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router, onTenantBootstrapped }: TenantAwareShellProps) => {
   const { theme } = useTheme();
   const segments = useSegments();
   const isDashboardRoute =
@@ -482,6 +559,19 @@ const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router }: 
   });
 
   const initialMembershipBootstrap = loading && memberships.length === 0;
+
+  const reportedTenantBootstrap = useRef(false);
+  useEffect(() => {
+    if (reportedTenantBootstrap.current) {
+      return;
+    }
+    // Once the initial tenant membership bootstrap has resolved, let the root
+    // layout hide the native splash screen.
+    if (!initialMembershipBootstrap) {
+      reportedTenantBootstrap.current = true;
+      onTenantBootstrapped?.();
+    }
+  }, [initialMembershipBootstrap, onTenantBootstrapped]);
 
   if (initialMembershipBootstrap) {
     return (

@@ -8,6 +8,7 @@ import {
   query, 
   orderBy, 
   onSnapshot, 
+  runTransaction,
   serverTimestamp,
   increment,
   Timestamp,
@@ -169,6 +170,69 @@ export const useNotices = () => {
     });
   };
 
+  const toggleNoticeReaction = async (params: { noticeId: string; reactionType: string }): Promise<void> => {
+    if (!user) throw new Error('User not authenticated');
+    if (!activeTenant?.id) throw new Error('Select a coaching center before reacting to notices');
+
+    const noticeId = params.noticeId;
+    const reactionType = (params.reactionType || '').trim();
+    if (!reactionType) throw new Error('Reaction type is required');
+    if (reactionType.length > 32) throw new Error('Reaction type is too long');
+
+    const noticeRef = doc(db, 'notices', noticeId);
+    const userId = user.uid;
+
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(noticeRef);
+      if (!snap.exists()) {
+        throw new Error('Notice not found');
+      }
+
+      const data = snap.data() as any;
+      const currentReactionsRaw = data?.reactions;
+      const currentReactions: Record<string, string[]> =
+        currentReactionsRaw && typeof currentReactionsRaw === 'object' && !Array.isArray(currentReactionsRaw)
+          ? (currentReactionsRaw as Record<string, string[]>)
+          : {};
+
+      // One reaction per user: remove userId from any existing reaction first.
+      let removedFrom: string | null = null;
+      const nextReactions: Record<string, string[]> = {};
+
+      for (const [type, rawUsers] of Object.entries(currentReactions)) {
+        const users = Array.isArray(rawUsers) ? rawUsers.filter((v) => typeof v === 'string') : [];
+        const hadUser = users.includes(userId);
+        const filtered = hadUser ? users.filter((id) => id !== userId) : users;
+
+        if (hadUser) {
+          removedFrom = type;
+        }
+
+        const unique = Array.from(new Set(filtered));
+        if (unique.length > 0) {
+          nextReactions[type] = unique;
+        }
+      }
+
+      // If user tapped the same reaction they already had, toggling off ends here.
+      if (removedFrom === reactionType) {
+        tx.update(noticeRef, {
+          reactions: nextReactions,
+          updatedAt: serverTimestamp(),
+        });
+        return;
+      }
+
+      const existing = Array.isArray(nextReactions[reactionType]) ? nextReactions[reactionType] : [];
+      nextReactions[reactionType] = Array.from(new Set([...existing, userId]));
+
+      tx.update(noticeRef, {
+        reactions: nextReactions,
+        updatedAt: serverTimestamp(),
+      });
+    });
+  };
+
   const getUnviewedNotices = (): Notice[] => {
     if (!user) return [];
 
@@ -215,6 +279,7 @@ export const useNotices = () => {
     updateNotice,
     deleteNotice,
     markNoticeAsViewed,
+    toggleNoticeReaction,
     getUnviewedNotices,
     getPendingNotices,
     getNoticesByPriority,

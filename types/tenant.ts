@@ -4,7 +4,7 @@ export type TenantStatus = 'active' | 'suspended' | 'archived';
 export type TenantBillingTier = 'free' | 'pro' | 'enterprise';
 export type TenantMembershipRole = 'owner' | 'admin' | 'staff' | 'member';
 export type TenantMembershipStatus = 'active' | 'pending_invite' | 'pending_request' | 'revoked' | 'rejected';
-export type TenantInviteStatus = 'pending' | 'accepted' | 'expired' | 'revoked';
+export type TenantInviteStatus = 'pending' | 'accepted' | 'rejected' | 'expired' | 'revoked';
 export type TenantJoinRequestStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 export type TenantChecklistItemId = 'profile-basics' | 'branding' | 'team' | 'join-codes' | 'notifications';
 
@@ -173,6 +173,8 @@ export interface TenantInvite {
   expiresAt: string;
   acceptedAt?: string;
   acceptedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
   lastSentAt?: string;
   lastSentBy?: string;
   invitationMessage?: string;

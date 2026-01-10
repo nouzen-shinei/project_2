@@ -44,6 +44,7 @@ class RuntimeEndpointsService {
   private cached: RuntimeEndpoints | null = null;
   private started = false;
   private unsub?: () => void;
+  private refreshInFlight: Promise<void> | null = null;
 
   async init(): Promise<void> {
     if (this.started) return;
@@ -52,6 +53,48 @@ class RuntimeEndpointsService {
     await this.loadFromStorage();
     await this.refreshFromFirestoreOnce();
     this.startListener();
+  }
+
+  /**
+   * Re-attempt loading endpoints from Firestore.
+   *
+   * Important for the first-login flow: the initial `init()` may run before auth
+   * is established (and Firestore rules may deny reads), so we refresh once the
+   * user is authorized.
+   */
+  async refresh(): Promise<void> {
+    if (this.refreshInFlight) {
+      return this.refreshInFlight;
+    }
+
+    this.refreshInFlight = (async () => {
+      // Ensure the cache + listener are initialized.
+      if (!this.started) {
+        await this.init();
+        return;
+      }
+
+      // If we already have something usable, avoid unnecessary reads.
+      if (this.getPreferredBackendBaseUrl()) {
+        return;
+      }
+
+      await this.refreshFromFirestoreOnce();
+
+      // If the listener failed to start earlier (e.g. auth), retry.
+      if (!this.unsub) {
+        this.startListener();
+      }
+    })().finally(() => {
+      this.refreshInFlight = null;
+    });
+
+    return this.refreshInFlight;
+  }
+
+  async ensurePreferredBackendBaseUrl(): Promise<string | undefined> {
+    await this.refresh();
+    return this.getPreferredBackendBaseUrl();
   }
 
   stop(): void {

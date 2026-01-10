@@ -69,6 +69,7 @@ import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { useRouter } from 'expo-router';
 import { tenantService } from '@/services/tenantService';
 import TenantRoleBadge from '@/components/TenantRoleBadge';
+import { normalizeSharedFileName } from '@/services/sharedFileService';
 
 export default function Chat() {
   const { theme, isDarkMode } = useTheme();
@@ -6343,8 +6344,9 @@ export default function Chat() {
               style={styles.imageViewerActionButton}
               onPress={() => {
                 const sourceUri = lastViewedRemoteImage || selectedImageUri;
-                const fileName = sourceUri.split('/').pop() || 'image.jpg';
-                handleDownloadFile(sourceUri, fileName, selectedImageUri);
+                const derived = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
+                const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
+                handleDownloadFile(sourceUri, downloadName, selectedImageUri);
               }}
             >
               <Download size={20} color="#ffffff" />
@@ -6362,9 +6364,18 @@ export default function Chat() {
         <ShareModal
           visible={showImageShareModal}
           onClose={() => setShowImageShareModal(false)}
-          fileUrl={selectedImageUri}
-          fileName={selectedImageUri.split('/').pop() || 'image.jpg'}
-          onDownload={() => handleDownloadFile(lastViewedRemoteImage || selectedImageUri, selectedImageUri.split('/').pop() || 'image.jpg', selectedImageUri)}
+          fileUrl={lastViewedRemoteImage || selectedImageUri}
+          fileName={(() => {
+            const src = lastViewedRemoteImage || selectedImageUri;
+            const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
+            return derived && derived !== 'file' ? derived : 'image.jpg';
+          })()}
+          onDownload={() => {
+            const src = lastViewedRemoteImage || selectedImageUri;
+            const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
+            const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
+            handleDownloadFile(src, downloadName, selectedImageUri);
+          }}
         />
       </View>
     </Modal>

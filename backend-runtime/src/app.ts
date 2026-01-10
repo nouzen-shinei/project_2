@@ -513,6 +513,14 @@ const tenantInviteAcceptSchema = z.object({
     .max(200),
 });
 
+const tenantInviteRejectSchema = z.object({
+  token: z
+    .string()
+    .trim()
+    .min(8)
+    .max(200),
+});
+
 const joinRequestApprovalSchema = z.object({
   role: tenantMembershipRoleSchema.default('staff'),
   reviewerName: z.string().trim().max(120).optional(),
@@ -4902,6 +4910,11 @@ export function createApp(options: CreateAppOptions = {}){
     requireTenantMembershipAccessImpl,
     getFirestoreImpl
   );
+  const optionalQueryMemberTenantAccess = tenantAccessMiddleware(
+    { resolveTenantId: queryTenantIdResolver(), minRole: 'member', requireTenantId: false },
+    requireTenantMembershipAccessImpl,
+    getFirestoreImpl
+  );
   const optionalBodyMemberTenantAccess = tenantAccessMiddleware(
     { minRole: 'member', requireTenantId: false },
     requireTenantMembershipAccessImpl,
@@ -4966,6 +4979,9 @@ export function createApp(options: CreateAppOptions = {}){
     /^\/tenants\/join-code\/resolve$/,
     /^\/tenants\/join-code\/claim$/,
     /^\/tenants\/invites\/accept$/,
+    /^\/shared-files\/public\//,
+    /^\/shared-files$/,
+    /^\/shared-files\/mine$/,
   ];
 
   function shouldBypassDefaultTenantGuard(req: express.Request): boolean {
@@ -5117,7 +5133,7 @@ export function createApp(options: CreateAppOptions = {}){
   // Auth middleware
   app.use((req,res,next)=>{
     const master=process.env.INTERNAL_API_KEY; if(!master) return next();
-    const p=req.path; if(p==='/health'||p==='/ready'||p.startsWith('/webhooks/whatsapp')||p==='/auth/bridge') return next();
+    const p=req.path; if(p==='/health'||p==='/ready'||p.startsWith('/webhooks/whatsapp')||p==='/auth/bridge'||p.startsWith('/shared-files/public/')) return next();
     if(p==='/billing/stripe/webhook'||p==='/billing/razorpay/webhook'||p==='/billing/play/notifications'||p==='/billing/appstore/notifications') return next();
     if(p==='/billing/checkout/session-public') return next();
     if(p==='/chat/stream'){
@@ -5172,6 +5188,7 @@ export function createApp(options: CreateAppOptions = {}){
         p === '/metrics' ||
         p === '/csp-report' ||
         p === '/auth/bridge' ||
+        p.startsWith('/shared-files/public/') ||
         p.startsWith('/admin/') ||
         p === '/admin' ||
         p.startsWith('/internal/') ||
@@ -5210,6 +5227,276 @@ export function createApp(options: CreateAppOptions = {}){
       return next();
     }
     return defaultTenantGuard(req, res, next);
+  });
+
+  const sharedFileCreateSchema = z.object({
+    tenantId: z.string().min(1).max(120),
+    fileUrl: z.string().min(1).max(4000),
+    fileName: z.string().min(1).max(400),
+    fileType: z.string().max(240).optional(),
+    fileSize: z.number().int().nonnegative().optional(),
+    thumbnailUrl: z.string().max(4000).optional(),
+    expiresAt: z.string().datetime().optional(),
+  });
+
+  const sharedFileListSchema = z.object({
+    tenantId: z.string().min(1).max(120),
+    limit: z.coerce.number().int().min(1).max(200).optional(),
+  });
+
+  const normalizeShareToken = (value: string | undefined): string => {
+    const raw = (value || '').trim();
+    return raw.replace(/[^a-zA-Z0-9_-]/g, '');
+  };
+
+  const mintShareToken = (): string => {
+    try {
+      // 12 bytes -> 16 chars base64url-ish. Good enough for non-guessable links.
+      const token = (crypto as any)?.randomBytes?.(12)?.toString?.('base64url');
+      if (typeof token === 'string' && token.trim()) {
+        return token;
+      }
+    } catch {
+      // ignore
+    }
+    // Fallback for older runtimes
+    return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+  };
+
+  const isActiveSharedFileDoc = (data: any): boolean => {
+    if (!data || typeof data !== 'object') return false;
+    if (data.revokedAt) return false;
+    if (typeof data.expiresAt === 'string') {
+      const exp = Date.parse(data.expiresAt);
+      if (!Number.isNaN(exp) && Date.now() > exp) return false;
+    }
+    return true;
+  };
+
+  const findLatestActiveShareForFile = async (db: FirebaseFirestore.Firestore, input: { tenantId: string; uid: string; fileUrl: string }) => {
+    const snap = await db
+      .collection('sharedFiles')
+      .where('tenantId', '==', input.tenantId)
+      .where('createdByUid', '==', input.uid)
+      .where('file.url', '==', input.fileUrl)
+      .orderBy('createdAt', 'desc')
+      .limit(5)
+      .get();
+
+    for (const doc of snap.docs) {
+      const data = doc.data() as any;
+      if (isActiveSharedFileDoc(data)) {
+        return { token: normalizeShareToken(String(data?.token || doc.id)), data };
+      }
+    }
+    return null;
+  };
+
+  // Create a share token for a file (auth + tenant required).
+  app.post('/shared-files', optionalBodyMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = sharedFileCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess?.tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    if (tenantAccess.tenantId !== parsed.data.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const nowIso = new Date().toISOString();
+    const token = normalizeShareToken(mintShareToken());
+    if (!token) {
+      return res.status(500).json({ error: 'token_failed' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const docRef = db.collection('sharedFiles').doc(token);
+      await docRef.set(
+        stripUndefinedDeep({
+          token,
+          tenantId: parsed.data.tenantId,
+          createdAt: nowIso,
+          createdByUid: authContext.uid,
+          createdByEmail: authContext.email || undefined,
+          expiresAt: parsed.data.expiresAt || undefined,
+          revokedAt: undefined,
+          revokedByUid: undefined,
+          file: {
+            url: parsed.data.fileUrl,
+            fileName: parsed.data.fileName,
+            fileType: parsed.data.fileType || undefined,
+            fileSize: parsed.data.fileSize ?? undefined,
+            thumbnailUrl: parsed.data.thumbnailUrl || undefined,
+          },
+        }),
+      );
+
+      return res.json({ token });
+    } catch (error) {
+      console.error('[shared_files] create failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // Resolve-or-create a share token for a file (auth + tenant required).
+  // Used to avoid creating duplicate tokens for the same user+tenant+file.
+  app.post('/shared-files/resolve-or-create', optionalBodyMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = sharedFileCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess?.tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    if (tenantAccess.tenantId !== parsed.data.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const existing = await findLatestActiveShareForFile(db, {
+        tenantId: parsed.data.tenantId,
+        uid: authContext.uid,
+        fileUrl: parsed.data.fileUrl,
+      });
+      if (existing?.token) {
+        return res.json({ token: existing.token, existing: true });
+      }
+    } catch (error) {
+      // Fail open to creation; do not block sharing if index is missing.
+      console.warn('[shared_files] resolve failed; falling back to create', error);
+    }
+
+    const nowIso = new Date().toISOString();
+    const token = normalizeShareToken(mintShareToken());
+    if (!token) {
+      return res.status(500).json({ error: 'token_failed' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const docRef = db.collection('sharedFiles').doc(token);
+      await docRef.set(
+        stripUndefinedDeep({
+          token,
+          tenantId: parsed.data.tenantId,
+          createdAt: nowIso,
+          createdByUid: authContext.uid,
+          createdByEmail: authContext.email || undefined,
+          expiresAt: parsed.data.expiresAt || undefined,
+          revokedAt: undefined,
+          revokedByUid: undefined,
+          file: {
+            url: parsed.data.fileUrl,
+            fileName: parsed.data.fileName,
+            fileType: parsed.data.fileType || undefined,
+            fileSize: parsed.data.fileSize ?? undefined,
+            thumbnailUrl: parsed.data.thumbnailUrl || undefined,
+          },
+        }),
+      );
+
+      return res.json({ token, existing: false });
+    } catch (error) {
+      console.error('[shared_files] resolve-or-create failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // List current user's share links (auth + tenant required).
+  app.get('/shared-files/mine', optionalQueryMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = sharedFileListSchema.safeParse(req.query || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess?.tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+    if (tenantAccess.tenantId !== parsed.data.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const limit = parsed.data.limit ?? 50;
+    try {
+      const db = getFirestoreImpl();
+      const snap = await db
+        .collection('sharedFiles')
+        .where('tenantId', '==', parsed.data.tenantId)
+        .where('createdByUid', '==', authContext.uid)
+        .orderBy('createdAt', 'desc')
+        .limit(limit)
+        .get();
+
+      const items = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+      return res.json({ items });
+    } catch (error) {
+      console.error('[shared_files] list failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  });
+
+  // Resolve a share token publicly (no auth). Used by web recipients and deep links.
+  app.get('/shared-files/public/:token', async (req, res) => {
+    const token = normalizeShareToken(req.params.token);
+    if (!token) {
+      return res.status(400).json({ error: 'invalid_token' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const docRef = db.collection('sharedFiles').doc(token);
+      const snap = await docRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+
+      const data = snap.data() as any;
+      if (data?.revokedAt) {
+        return res.status(404).json({ error: 'revoked' });
+      }
+      if (typeof data?.expiresAt === 'string') {
+        const exp = Date.parse(data.expiresAt);
+        if (!Number.isNaN(exp) && Date.now() > exp) {
+          return res.status(404).json({ error: 'expired' });
+        }
+      }
+
+      // Best-effort access timestamp
+      try {
+        await docRef.update({ lastAccessedAt: new Date().toISOString() });
+      } catch {
+        // ignore
+      }
+
+      return res.json({ token, ...data });
+    } catch (error) {
+      console.error('[shared_files] resolve failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
   });
 
   function requireOperatorAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -6518,6 +6805,9 @@ export function createApp(options: CreateAppOptions = {}){
       if (inviteStatus === 'revoked') {
         return res.status(409).json({ error: 'invite_revoked' });
       }
+      if (inviteStatus === 'rejected') {
+        return res.status(409).json({ error: 'invite_rejected' });
+      }
       if (inviteStatus === 'accepted') {
         return res.status(409).json({ error: 'invite_already_used' });
       }
@@ -6537,6 +6827,13 @@ export function createApp(options: CreateAppOptions = {}){
       const membershipSnap = await membershipRef.get();
       const existingMembership = membershipSnap.exists ? membershipSnap.data() || {} : null;
       const alreadyActive = existingMembership?.status === 'active';
+
+      if (alreadyActive) {
+        return res.status(409).json({
+          error: 'already_member',
+          message: 'You are already a member of this coaching center.',
+        });
+      }
 
       const nowIso = new Date().toISOString();
       const role = typeof inviteData.role === 'string' ? (inviteData.role as TenantMembershipRole) : 'member';
@@ -6570,12 +6867,57 @@ export function createApp(options: CreateAppOptions = {}){
         });
       }
 
-      await membershipRef.set(membershipPayload, { merge: true });
-      await inviteDoc.ref.update({
-        status: 'accepted',
-        acceptedAt: nowIso,
-        acceptedBy: authContext.uid,
-        updatedAt: nowIso,
+      await db.runTransaction(async (tx) => {
+        const freshInviteSnap = await tx.get(inviteDoc.ref);
+        if (!freshInviteSnap.exists) {
+          throw new TenantAccessError(404, { error: 'invite_not_found' });
+        }
+        const freshInvite = freshInviteSnap.data() || {};
+        const freshStatus = typeof freshInvite.status === 'string' ? freshInvite.status : 'pending';
+        if (freshStatus !== 'pending') {
+          const mappedError =
+            freshStatus === 'revoked'
+              ? 'invite_revoked'
+              : freshStatus === 'rejected'
+                ? 'invite_rejected'
+                : freshStatus === 'accepted'
+                  ? 'invite_already_used'
+                  : 'invite_not_found';
+          throw new TenantAccessError(409, { error: mappedError });
+        }
+
+        const freshMembershipSnap = await tx.get(membershipRef);
+        const freshMembership = freshMembershipSnap.exists ? freshMembershipSnap.data() || {} : null;
+        if (freshMembership?.status === 'active') {
+          throw new TenantAccessError(409, {
+            error: 'already_member',
+            message: 'You are already a member of this coaching center.',
+          });
+        }
+
+        tx.set(membershipRef, membershipPayload, { merge: true });
+        tx.update(inviteDoc.ref, {
+          status: 'accepted',
+          acceptedAt: nowIso,
+          acceptedBy: authContext.uid,
+          updatedAt: nowIso,
+        });
+
+        const joinRequestsQuery = db
+          .collection('tenantJoinRequests')
+          .where('tenantId', '==', tenantId)
+          .where('userId', '==', authContext.uid)
+          .where('status', '==', 'pending')
+          .limit(50);
+        const joinRequestsSnap = await tx.get(joinRequestsQuery);
+        joinRequestsSnap.docs.forEach((docSnap) => {
+          tx.update(docSnap.ref, {
+            status: 'approved',
+            reviewedAt: nowIso,
+            reviewedBy: authContext.uid,
+            assignedRole: role,
+          });
+        });
       });
 
       await db.collection('tenantAuditLogs').add(
@@ -6607,8 +6949,154 @@ export function createApp(options: CreateAppOptions = {}){
         },
       });
     } catch (error) {
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
       console.error('[tenant_invite_accept] failed', error);
       return res.status(500).json({ error: 'invite_accept_failed' });
+    }
+  });
+
+  app.post('/tenants/invites/reject', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || !authContext.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = tenantInviteRejectSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const token = parsed.data.token.trim().toLowerCase();
+    try {
+      const db = getFirestoreImpl();
+      const inviteQuerySnap = await db
+        .collection('tenantInvites')
+        .where('token', '==', token)
+        .limit(1)
+        .get();
+      if (inviteQuerySnap.empty) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+
+      const inviteDoc = inviteQuerySnap.docs[0];
+      const inviteData = inviteDoc.data() || {};
+      const tenantId = typeof inviteData.tenantId === 'string' ? inviteData.tenantId.trim() : '';
+      if (!tenantId) {
+        return res.status(404).json({ error: 'invite_not_found' });
+      }
+
+      const userEmail = await resolveAuthenticatedEmail(authContext);
+      if (!userEmail) {
+        return res.status(400).json({ error: 'email_required' });
+      }
+
+      const inviteEmailRaw = typeof inviteData.email === 'string' ? inviteData.email : '';
+      const inviteEmail = normalizeEmail(inviteEmailRaw);
+      if (inviteEmail && inviteEmail !== userEmail) {
+        return res.status(403).json({ error: 'invite_email_mismatch', expectedEmail: inviteEmail });
+      }
+
+      const inviteStatus = typeof inviteData.status === 'string' ? inviteData.status : 'pending';
+      if (inviteStatus === 'revoked') {
+        return res.status(409).json({ error: 'invite_revoked' });
+      }
+      if (inviteStatus === 'rejected') {
+        return res.status(409).json({ error: 'invite_rejected' });
+      }
+      if (inviteStatus === 'accepted') {
+        return res.status(409).json({ error: 'invite_already_used' });
+      }
+
+      const now = Date.now();
+      const expiresAtIso = typeof inviteData.expiresAt === 'string' ? inviteData.expiresAt : null;
+      const expiresAtTs = expiresAtIso ? Date.parse(expiresAtIso) : NaN;
+      if (inviteStatus === 'expired' || (!Number.isNaN(expiresAtTs) && expiresAtTs < now)) {
+        if (inviteStatus !== 'expired') {
+          await inviteDoc.ref.update({ status: 'expired', updatedAt: new Date(now).toISOString() });
+        }
+        return res.status(410).json({ error: 'invite_expired' });
+      }
+
+      const membershipId = membershipDocId(tenantId, authContext.uid);
+      const membershipRef = db.collection('tenantMemberships').doc(membershipId);
+      const nowIso = new Date().toISOString();
+
+      await db.runTransaction(async (tx) => {
+        const freshInviteSnap = await tx.get(inviteDoc.ref);
+        if (!freshInviteSnap.exists) {
+          throw new TenantAccessError(404, { error: 'invite_not_found' });
+        }
+        const freshInvite = freshInviteSnap.data() || {};
+        const freshStatus = typeof freshInvite.status === 'string' ? freshInvite.status : 'pending';
+        if (freshStatus !== 'pending') {
+          const mappedError =
+            freshStatus === 'revoked'
+              ? 'invite_revoked'
+              : freshStatus === 'rejected'
+                ? 'invite_rejected'
+                : freshStatus === 'accepted'
+                  ? 'invite_already_used'
+                  : 'invite_not_found';
+          throw new TenantAccessError(409, { error: mappedError });
+        }
+
+        tx.update(inviteDoc.ref, {
+          status: 'rejected',
+          rejectedAt: nowIso,
+          rejectedBy: authContext.uid,
+          updatedAt: nowIso,
+        });
+
+        const membershipSnap = await tx.get(membershipRef);
+        if (membershipSnap.exists) {
+          const membership = membershipSnap.data() || {};
+          const tokenMatches = typeof membership.inviteToken === 'string' ? membership.inviteToken.trim() === token : false;
+          const isPendingInvite = membership.status === 'pending_invite';
+          if (isPendingInvite || tokenMatches) {
+            tx.set(
+              membershipRef,
+              {
+                status: 'rejected',
+                updatedAt: nowIso,
+                inviteToken: admin.firestore.FieldValue.delete(),
+                inviteExpiresAt: admin.firestore.FieldValue.delete(),
+                invitedBy: admin.firestore.FieldValue.delete(),
+                statusHistory: admin.firestore.FieldValue.arrayUnion({
+                  status: 'rejected',
+                  at: nowIso,
+                  actorId: authContext.uid,
+                  actorEmail: userEmail,
+                  reason: 'invite_rejected_by_user',
+                }),
+              },
+              { merge: true },
+            );
+          }
+        }
+      });
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId: authContext.uid,
+          actorEmail: userEmail,
+          action: 'membership_invited',
+          targetId: inviteDoc.id,
+          targetType: 'invite',
+          metadata: { outcome: 'rejected', inviteEmail: inviteEmail || undefined },
+          createdAt: nowIso,
+        })
+      );
+
+      return res.json({ ok: true, tenantId, inviteId: inviteDoc.id });
+    } catch (error) {
+      if (error instanceof TenantAccessError) {
+        return res.status(error.status).json(error.body);
+      }
+      console.error('[tenant_invite_reject] failed', error);
+      return res.status(500).json({ error: 'invite_reject_failed' });
     }
   });
 
@@ -7019,6 +7507,22 @@ export function createApp(options: CreateAppOptions = {}){
           reviewedBy: actorId,
           assignedRole: desiredRole,
         });
+
+        const invitesQuery = db
+          .collection('tenantInvites')
+          .where('tenantId', '==', tenantAccess.tenantId)
+          .where('email', '==', normalizedEmail)
+          .where('status', '==', 'pending')
+          .limit(50);
+        const invitesSnap = await tx.get(invitesQuery);
+        invitesSnap.docs.forEach((docSnap) => {
+          tx.update(docSnap.ref, {
+            status: 'accepted',
+            acceptedAt: nowIso,
+            acceptedBy: actorId,
+            updatedAt: nowIso,
+          });
+        });
       });
 
       await db.collection('tenantAuditLogs').add(
@@ -7414,10 +7918,51 @@ export function createApp(options: CreateAppOptions = {}){
       if (metadata.actorName) {
         statusEvent.actorName = metadata.actorName;
       }
-      await membershipRef.update({
-        status: desiredStatus,
-        updatedAt: nowIso,
-        statusHistory: admin.firestore.FieldValue.arrayUnion(statusEvent),
+      await db.runTransaction(async (tx) => {
+        tx.update(membershipRef, {
+          status: desiredStatus,
+          updatedAt: nowIso,
+          statusHistory: admin.firestore.FieldValue.arrayUnion(statusEvent),
+        });
+
+        if (desiredStatus !== 'active') {
+          return;
+        }
+
+        const targetEmail = typeof membership.email === 'string' ? String(membership.email).trim().toLowerCase() : '';
+        const joinRequestsQuery = db
+          .collection('tenantJoinRequests')
+          .where('tenantId', '==', tenantAccess.tenantId)
+          .where('userId', '==', targetUserId)
+          .where('status', '==', 'pending')
+          .limit(50);
+        const joinRequestsSnap = await tx.get(joinRequestsQuery);
+        joinRequestsSnap.docs.forEach((docSnap) => {
+          tx.update(docSnap.ref, {
+            status: 'approved',
+            reviewedAt: nowIso,
+            reviewedBy: actorId,
+            assignedRole: targetRole,
+          });
+        });
+
+        if (targetEmail) {
+          const invitesQuery = db
+            .collection('tenantInvites')
+            .where('tenantId', '==', tenantAccess.tenantId)
+            .where('email', '==', targetEmail)
+            .where('status', '==', 'pending')
+            .limit(50);
+          const invitesSnap = await tx.get(invitesQuery);
+          invitesSnap.docs.forEach((docSnap) => {
+            tx.update(docSnap.ref, {
+              status: 'accepted',
+              acceptedAt: nowIso,
+              acceptedBy: actorId,
+              updatedAt: nowIso,
+            });
+          });
+        }
       });
 
       const auditMetadata: Record<string, unknown> = {
@@ -7789,6 +8334,7 @@ export function createApp(options: CreateAppOptions = {}){
     try {
       ensureFirebase();
       const db = admin.firestore();
+      const userEmail = await resolveAuthenticatedEmail(authContext);
       const validation = await validateJoinCode(db, normalizedCode);
       if (!validation.ok) {
         const { status, body } = mapJoinCodeError(validation);
@@ -7809,6 +8355,23 @@ export function createApp(options: CreateAppOptions = {}){
           createdAt: toIsoTimestamp(membershipData.createdAt) ?? null,
           updatedAt: toIsoTimestamp(membershipData.updatedAt) ?? null,
         };
+      }
+
+      let pendingInvite = false;
+      const normalizedEmail = userEmail ? userEmail.toLowerCase() : '';
+      if (normalizedEmail) {
+        try {
+          const inviteSnap = await db
+            .collection('tenantInvites')
+            .where('tenantId', '==', tenantSnap.id)
+            .where('email', '==', normalizedEmail)
+            .where('status', '==', 'pending')
+            .limit(1)
+            .get();
+          pendingInvite = !inviteSnap.empty;
+        } catch {
+          // best-effort
+        }
       }
 
       return res.json({
@@ -7835,6 +8398,7 @@ export function createApp(options: CreateAppOptions = {}){
           usageCap: typeof codeData.usageCap === 'number' ? codeData.usageCap : null,
         },
         membership,
+        pendingInvite,
       });
     } catch (error) {
       console.error('[tenant-join-code] lookup failed', error);
@@ -7884,10 +8448,30 @@ export function createApp(options: CreateAppOptions = {}){
           message: 'You are already a member of this coaching center.',
         });
       }
+      if (existingMembership && existingMembership.status === 'pending_invite') {
+        return res.status(409).json({
+          error: 'invite_pending',
+          message: 'You already have an invite to this coaching center. Please accept the invite instead of using a join code.',
+        });
+      }
       if (existingMembership && existingMembership.status === 'pending_request') {
         return res.status(409).json({
           error: 'join_request_pending',
           message: 'Your request to join this coaching center is still pending review.',
+        });
+      }
+
+      const pendingInviteSnap = await db
+        .collection('tenantInvites')
+        .where('tenantId', '==', tenantSnap.id)
+        .where('email', '==', userEmail.toLowerCase())
+        .where('status', '==', 'pending')
+        .limit(1)
+        .get();
+      if (!pendingInviteSnap.empty) {
+        return res.status(409).json({
+          error: 'invite_pending',
+          message: 'You already have an invite to this coaching center. Please accept the invite instead of using a join code.',
         });
       }
 
@@ -9491,7 +10075,65 @@ export function createApp(options: CreateAppOptions = {}){
       });
 
       const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(objectPath)}?alt=media&token=${downloadToken}`;
-      return res.json({ url, path: objectPath, bytes, contentType });
+
+      // Best-effort: create a share token at upload time for shareable uploads.
+      // This makes ShareModal instant later and avoids exposing raw Storage URLs.
+      let shareToken: string | undefined;
+      try {
+        // Avoid creating share tokens for non-share UX uploads (keeps shared list clean).
+        const shouldPrecreateShareToken =
+          purpose === 'chat' ||
+          purpose === 'receipt' ||
+          purpose === 'noticeImage' ||
+          purpose === 'noticeAudio' ||
+          purpose === 'studentProfile';
+
+        if (shouldPrecreateShareToken) {
+          const authContext = req.authContext;
+          if (authContext?.uid) {
+            const nowIso = new Date().toISOString();
+            const token = normalizeShareToken(mintShareToken());
+            const hasProvidedName = Boolean((parsed.data.filename || '').trim()) && filename !== 'file';
+            const shareFileName =
+              (hasProvidedName ? filename : '') ||
+              (purpose === 'receipt'
+                ? `receipt.${safeExt}`
+                : purpose === 'noticeAudio'
+                  ? `notice_audio.${safeExt}`
+                  : purpose === 'noticeImage'
+                    ? `notice.${safeExt}`
+                    : purpose === 'studentProfile'
+                      ? `student_profile.${safeExt}`
+                      : `file.${safeExt}`);
+
+            if (token) {
+              await db
+                .collection('sharedFiles')
+                .doc(token)
+                .set(
+                  stripUndefinedDeep({
+                    token,
+                    tenantId: normalizedTenantId,
+                    createdAt: nowIso,
+                    createdByUid: authContext.uid,
+                    createdByEmail: authContext.email || undefined,
+                    file: {
+                      url,
+                      fileName: shareFileName,
+                      fileType: contentType || undefined,
+                      fileSize: bytes,
+                    },
+                  }),
+                );
+              shareToken = token;
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('[storage_upload] unable to precreate share token', error);
+      }
+
+      return res.json({ url, path: objectPath, bytes, contentType, ...(shareToken ? { shareToken } : {}) });
     } catch (error) {
       await releaseTenantStorageBytes(db, normalizedTenantId, bytes).catch(() => undefined);
       invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
