@@ -26,6 +26,15 @@ type TenantCandidate = {
   billingAttemptId?: string;
 };
 
+type AttemptToCancel = {
+  provider: string;
+  subscriptionId: string;
+  billingAttemptId?: string;
+  sinceIso: string;
+  attemptKey: string;
+  invoiceDocs: Array<admin.firestore.QueryDocumentSnapshot>;
+};
+
 type Stats = {
   jobLabel: string;
   runId: string;
@@ -414,7 +423,15 @@ async function failOpenInvoicesForTenant(options: {
     }
 
     if (targetSubscriptionId) {
-      return invoiceSubscriptionId === targetSubscriptionId || invoiceProviderSubscriptionId === targetSubscriptionId;
+      const hasStamp = Boolean(invoiceSubscriptionId || invoiceProviderSubscriptionId || invoiceAttemptId);
+      if (hasStamp) {
+        return invoiceSubscriptionId === targetSubscriptionId || invoiceProviderSubscriptionId === targetSubscriptionId;
+      }
+
+      // Some invoice writers historically didn't stamp providerSubscriptionId/subscriptionId.
+      // In that case, we cannot reliably scope by subscriptionId, so fail the open invoice
+      // (leaving it open is worse/incorrect once the tenant is downgraded).
+      return true;
     }
 
     if (Number.isFinite(targetSinceMs) && Number.isFinite(issuedAtMs)) {
@@ -452,6 +469,42 @@ async function failOpenInvoicesForTenant(options: {
   }
   await batch.commit();
   return matchedDocs.length;
+}
+
+async function failInvoicesByDocs(options: {
+  db: Firestore;
+  docs: Array<admin.firestore.QueryDocumentSnapshot>;
+  nowIso: string;
+  reasonCode: string;
+  reasonDescription: string;
+  attemptKey?: string;
+  billingAttemptId?: string;
+  dryRun: boolean;
+}): Promise<number> {
+  const { db, docs, nowIso, reasonCode, reasonDescription, attemptKey, billingAttemptId, dryRun } = options;
+  if (!docs.length) return 0;
+  if (dryRun) return docs.length;
+
+  const batch = db.batch();
+  for (const doc of docs) {
+    batch.set(
+      doc.ref,
+      stripUndefinedDeep({
+        status: 'failed',
+        failedAt: nowIso,
+        errorCode: reasonCode,
+        errorDescription: reasonDescription,
+        sourceEvent: 'auto_cancel_no_payment_24h',
+        rawEvent: 'auto_cancel',
+        autoCancelAttemptKey: attemptKey || null,
+        ...(billingAttemptId ? { billingAttemptId } : {}),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }),
+      { merge: true }
+    );
+  }
+  await batch.commit();
+  return docs.length;
 }
 
 async function createFailedInvoiceIfMissing(options: {
@@ -809,311 +862,436 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
     return stats;
   }
 
-  let candidates: TenantCandidate[] = [];
-  try {
-    if (targets.length > 0) {
-      const uniqueTargets = Array.from(new Set(targets));
-      const out: TenantCandidate[] = [];
-      for (const tenantId of uniqueTargets) {
-        const sinceIso = await findCutoffSinceIsoForTenant(db, tenantId, cutoffMs, cutoffIso);
-        if (!sinceIso) {
-          log(options.verbose, 'skipping targeted tenant (not older than cutoff)', { tenantId, cutoffIso });
-          continue;
-        }
-        out.push({ tenantId, reason: 'checkout_required', sinceIso });
-      }
-      candidates = out;
-    } else {
-      let fromInvoices: TenantCandidate[] = [];
-      let invoiceScanSaturated = false;
-      let invoiceScanLimit = 0;
-      try {
-        const invoiceScan = await listInvoiceCandidates(db, cutoffIso, maxTenants);
-        fromInvoices = invoiceScan.candidates;
-        invoiceScanSaturated = invoiceScan.scanSaturated;
-        invoiceScanLimit = invoiceScan.scanLimit;
-      } catch (error) {
-        // Invoice collectionGroup queries can require a composite index. If it's missing,
-        // don't fail the whole job; fall back to tenantBilling.checkoutRequired scanning.
-        log(options.verbose, 'invoice candidate scan failed; falling back to checkoutRequired scan', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      const fromCheckoutRequired = await listCheckoutRequiredCandidates(db, cutoffMs, maxTenants);
-
-      if (invoiceScanSaturated) {
-        log(true, 'invoice scan saturated (consider increasing BILLING_STALE_PENDING_MAX_TENANTS or adding pagination)', {
-          scanLimit: invoiceScanLimit,
-          maxTenants,
-        });
-      }
-      if (fromCheckoutRequired.length >= maxTenants) {
-        log(true, 'checkoutRequired scan saturated (consider increasing BILLING_STALE_PENDING_MAX_TENANTS)', { maxTenants });
-      }
-
-      const merged = new Map<string, TenantCandidate>();
-      for (const c of [...fromInvoices, ...fromCheckoutRequired]) {
-        const existing = merged.get(c.tenantId);
-        if (!existing || c.sinceIso < existing.sinceIso) {
-          merged.set(c.tenantId, c);
-        }
-      }
-      candidates = Array.from(merged.values()).slice(0, maxTenants);
-    }
-  } catch (error) {
-    stats.errors.push({ tenantId: '<scan>', message: error instanceof Error ? error.message : String(error) });
-    stats.finishedAtIso = new Date().toISOString();
-    return stats;
-  }
-
-  stats.candidatesFound = candidates.length;
-  log(options.verbose, 'candidates scanned', { candidates: candidates.length, cutoffIso });
-
   let fatalError: { tenantId: string; message: string } | null = null;
 
-  for (const candidate of candidates) {
-    const tenantId = candidate.tenantId;
-    stats.tenantsProcessed += 1;
+  try {
+    let candidates: TenantCandidate[] = [];
+    try {
+      if (targets.length > 0) {
+        const uniqueTargets = Array.from(new Set(targets));
+        const out: TenantCandidate[] = [];
+        for (const tenantId of uniqueTargets) {
+          const sinceIso = await findCutoffSinceIsoForTenant(db, tenantId, cutoffMs, cutoffIso);
+          if (!sinceIso) {
+            log(options.verbose, 'skipping targeted tenant (not older than cutoff)', { tenantId, cutoffIso });
+            continue;
+          }
+          out.push({ tenantId, reason: 'checkout_required', sinceIso });
+        }
+        candidates = out;
+      } else {
+        let fromInvoices: TenantCandidate[] = [];
+        let invoiceScanSaturated = false;
+        let invoiceScanLimit = 0;
+        try {
+          const invoiceScan = await listInvoiceCandidates(db, cutoffIso, maxTenants);
+          fromInvoices = invoiceScan.candidates;
+          invoiceScanSaturated = invoiceScan.scanSaturated;
+          invoiceScanLimit = invoiceScan.scanLimit;
+        } catch (error) {
+          // Invoice collectionGroup queries can require a composite index. If it's missing,
+          // don't fail the whole job; fall back to tenantBilling.checkoutRequired scanning.
+          log(options.verbose, 'invoice candidate scan failed; falling back to checkoutRequired scan', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        const fromCheckoutRequired = await listCheckoutRequiredCandidates(db, cutoffMs, maxTenants);
 
-    const lease = options.dryRun
-      ? { token: 'dry_run', release: async () => undefined }
-      : await acquireTenantLease({ db, tenantId, leaseMs, jobLabel: options.jobLabel, runId });
-    if (!lease) {
-      log(options.verbose, 'skipping tenant (locked by another execution)', { tenantId });
-      stats.tenantsSkippedLocked += 1;
-      continue;
+        if (invoiceScanSaturated) {
+          log(true, 'invoice scan saturated (consider increasing BILLING_STALE_PENDING_MAX_TENANTS or adding pagination)', {
+            scanLimit: invoiceScanLimit,
+            maxTenants,
+          });
+        }
+        if (fromCheckoutRequired.length >= maxTenants) {
+          log(true, 'checkoutRequired scan saturated (consider increasing BILLING_STALE_PENDING_MAX_TENANTS)', { maxTenants });
+        }
+
+        const merged = new Map<string, TenantCandidate>();
+        for (const c of [...fromInvoices, ...fromCheckoutRequired]) {
+          const existing = merged.get(c.tenantId);
+          if (!existing || c.sinceIso < existing.sinceIso) {
+            merged.set(c.tenantId, c);
+          }
+        }
+        candidates = Array.from(merged.values()).slice(0, maxTenants);
+      }
+    } catch (error) {
+      stats.errors.push({ tenantId: '<scan>', message: error instanceof Error ? error.message : String(error) });
+      stats.finishedAtIso = new Date().toISOString();
+      return stats;
     }
 
-    try {
-      log(options.verbose, 'processing tenant', { tenantId, reason: candidate.reason, sinceIso: candidate.sinceIso });
-      const billingRef = db.collection('tenantBilling').doc(tenantId);
-      const billingSnap = await billingRef.get();
-      const billing = billingSnap.exists ? (billingSnap.data() || {}) : {};
+    stats.candidatesFound = candidates.length;
+    log(options.verbose, 'candidates scanned', { candidates: candidates.length, cutoffIso });
 
-      const planId = typeof (billing as any).planId === 'string' ? String((billing as any).planId).toLowerCase() : 'free';
-      const pendingPlanId = typeof (billing as any).pendingPlanId === 'string' ? String((billing as any).pendingPlanId).toLowerCase() : '';
-      const planIdForHistory = pendingPlanId || planId;
+    for (const candidate of candidates) {
+      const tenantId = candidate.tenantId;
+      stats.tenantsProcessed += 1;
 
-      const provider = typeof (billing as any).billingProvider === 'string' ? String((billing as any).billingProvider).toLowerCase() : '';
-      const subscriptionId = typeof (billing as any).subscriptionId === 'string' ? String((billing as any).subscriptionId).trim() : '';
-      const billingAttemptId = typeof (billing as any).billingAttemptId === 'string' ? String((billing as any).billingAttemptId).trim() : '';
-      const attemptProvider = (candidate.provider || provider || '').trim().toLowerCase();
-      const attemptSubscriptionId = (candidate.subscriptionId || subscriptionId || '').trim();
-      const attemptBillingAttemptId = (candidate.billingAttemptId || billingAttemptId || '').trim();
-      const attemptKey = computeAttemptKey({
-        attemptId: attemptBillingAttemptId || undefined,
-        provider: attemptProvider,
-        subscriptionId: attemptSubscriptionId,
-        sinceIso: candidate.sinceIso,
-      });
-
-      const isCurrentAttempt = (() => {
-        if (attemptBillingAttemptId && billingAttemptId) {
-          return attemptBillingAttemptId === billingAttemptId;
-        }
-        if (attemptSubscriptionId && subscriptionId) {
-          return attemptSubscriptionId === subscriptionId;
-        }
-        return false;
-      })();
-
-      log(options.verbose, 'attempt context', {
-        tenantId,
-        provider: attemptProvider || null,
-        subscriptionId: attemptSubscriptionId || null,
-        billingAttemptId: attemptBillingAttemptId || null,
-        attemptKey,
-        isCurrentAttempt,
-      });
-
-      await runLease.release().catch(() => undefined);
-
-      // Only auto-cancel if there has been no payment for this specific pending attempt.
-      // (Tenants may have historical paid invoices from previous billing cycles.)
-      const paid = await hasPaidInvoiceForAttempt({
-        db,
-        tenantId,
-        sinceIso: candidate.sinceIso,
-        attemptId: attemptBillingAttemptId || undefined,
-        provider: attemptProvider || undefined,
-        subscriptionId: attemptSubscriptionId || undefined,
-      });
-      if (paid) {
-        log(options.verbose, 'skipping tenant (already has paid invoice for attempt)', { tenantId });
-        stats.tenantsSkipped += 1;
+      const lease = options.dryRun
+        ? { token: 'dry_run', release: async () => undefined }
+        : await acquireTenantLease({ db, tenantId, leaseMs, jobLabel: options.jobLabel, runId });
+      if (!lease) {
+        log(options.verbose, 'skipping tenant (locked by another execution)', { tenantId });
+        stats.tenantsSkippedLocked += 1;
         continue;
       }
 
-      const nowIso = new Date().toISOString();
-      const reasonCode = 'no_payment_within_24h';
-      const reasonDescription = `No payment was made within ${options.thresholdHours} hours of starting the subscription. Subscription cancelled and plan switched to Free.`;
+      try {
+        log(options.verbose, 'processing tenant', { tenantId, reason: candidate.reason, sinceIso: candidate.sinceIso });
+        const billingRef = db.collection('tenantBilling').doc(tenantId);
+        const billingSnap = await billingRef.get();
+        const billing = billingSnap.exists ? (billingSnap.data() || {}) : {};
 
-      // Cancel provider subscription (best-effort).
-      if (attemptProvider === 'razorpay' && attemptSubscriptionId) {
-        // Requirement (aligned with Play): if a provider subscription must be cancelled and the job cannot
-        // call the provider cancel API, the job should fail (rather than silently skipping).
-        if (!options.dryRun) {
-          // Suppress the Razorpay webhook's generic cancellation notice/email for a short window.
-          // The job sends the correct reasoned notification.
-          try {
-            await billingRef.set(
-              {
-                suppressProviderCancelNotificationUntilIso: addHoursIso(nowIso, 2),
-                lastSystemCancelContext: {
-                  source: 'billing_stale_pending_job',
-                  reasonCode,
-                  reasonDescription,
-                  atIso: nowIso,
-                  provider: attemptProvider || null,
-                  subscriptionId: attemptSubscriptionId || null,
-                  sinceIso: candidate.sinceIso,
-                },
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              },
-              { merge: true }
-            );
-          } catch {
-            // best-effort
-          }
+        const planId = typeof (billing as any).planId === 'string' ? String((billing as any).planId).toLowerCase() : 'free';
+        const pendingPlanId = typeof (billing as any).pendingPlanId === 'string' ? String((billing as any).pendingPlanId).toLowerCase() : '';
+        const planIdForHistory = pendingPlanId || planId;
 
-          stats.providerCancelsAttempted += 1;
-          try {
-            log(options.verbose, 'cancelling razorpay subscription', { tenantId, subscriptionId: attemptSubscriptionId });
-            await cancelRazorpaySubscription({ subscriptionId: attemptSubscriptionId, cancelAtCycleEnd: false });
-          } catch (error) {
-            stats.providerCancelsFailed += 1;
-            const message = error instanceof Error ? error.message : String(error);
-            log(options.verbose, 'razorpay cancel failed (fatal)', {
-              tenantId,
-              error: message,
-            });
-            // Normalize to a razorpay_* error code so the outer handler treats it as fatal.
-            if (message.startsWith('razorpay_')) {
-              throw new Error(message);
-            }
-            throw new Error(`razorpay_cancel_failed: ${message}`);
-          }
-        }
-      }
-
-      if ((attemptProvider === 'play' || attemptProvider === 'google_play') && attemptSubscriptionId) {
-        const productId = typeof (billing as any).storeProductId === 'string' ? String((billing as any).storeProductId).trim() : '';
-        const packageName = (process.env.GOOGLE_PLAY_PACKAGE_NAME || '').trim();
-
-        // Requirement: if a Play subscription must be cancelled and the job cannot call the Play cancel API,
-        // the job should fail (rather than silently skipping).
-        if (!options.dryRun) {
-          if (!packageName) {
-            throw new Error('google_play_package_name_missing');
-          }
-          if (!productId) {
-            throw new Error('google_play_product_id_missing');
-          }
-
-          stats.providerCancelsAttempted += 1;
-          log(options.verbose, 'cancelling google play subscription', { tenantId, productId, packageName });
-          await cancelGooglePlaySubscription({ packageName, productId, purchaseToken: attemptSubscriptionId });
-        }
-      }
-
-      // Mark any open invoices failed.
-      const failedInvoices = await failOpenInvoicesForTenant({
-        db,
-        tenantId,
-        nowIso,
-        reasonCode,
-        reasonDescription,
-        attemptKey,
-        billingAttemptId: attemptBillingAttemptId || undefined,
-        provider: attemptProvider || undefined,
-        subscriptionId: attemptSubscriptionId || undefined,
-        sinceIso: candidate.sinceIso,
-        dryRun: options.dryRun,
-      });
-      stats.invoicesFailed += failedInvoices;
-
-      // If there were no open invoices (common for Play pending), create a synthetic failed invoice so history shows a reason.
-      if (failedInvoices === 0) {
-        const created = await createFailedInvoiceIfMissing({
-          db,
-          tenantId,
-          nowIso,
+        const provider = typeof (billing as any).billingProvider === 'string' ? String((billing as any).billingProvider).toLowerCase() : '';
+        const subscriptionId = typeof (billing as any).subscriptionId === 'string' ? String((billing as any).subscriptionId).trim() : '';
+        const billingAttemptId = typeof (billing as any).billingAttemptId === 'string' ? String((billing as any).billingAttemptId).trim() : '';
+        const attemptProvider = (candidate.provider || provider || '').trim().toLowerCase();
+        const attemptSubscriptionId = (candidate.subscriptionId || subscriptionId || '').trim();
+        const attemptBillingAttemptId = (candidate.billingAttemptId || billingAttemptId || '').trim();
+        const attemptKey = computeAttemptKey({
+          attemptId: attemptBillingAttemptId || undefined,
+          provider: attemptProvider,
+          subscriptionId: attemptSubscriptionId,
           sinceIso: candidate.sinceIso,
-          provider: attemptProvider || undefined,
-          providerSubscriptionId: attemptSubscriptionId || undefined,
-          subscriptionId: attemptSubscriptionId || undefined,
-          planId: planIdForHistory,
-          planVariantId: typeof (billing as any).planVariantId === 'string' ? String((billing as any).planVariantId) : null,
+        });
+
+        const isCurrentAttempt = (() => {
+          if (attemptBillingAttemptId && billingAttemptId) {
+            return attemptBillingAttemptId === billingAttemptId;
+          }
+          if (attemptSubscriptionId && subscriptionId) {
+            return attemptSubscriptionId === subscriptionId;
+          }
+          return false;
+        })();
+
+        log(options.verbose, 'attempt context', {
+          tenantId,
+          provider: attemptProvider || null,
+          subscriptionId: attemptSubscriptionId || null,
+          billingAttemptId: attemptBillingAttemptId || null,
           attemptKey,
-          billingAttemptId: attemptBillingAttemptId || undefined,
-          reasonCode,
-          reasonDescription,
-          dryRun: options.dryRun,
+          isCurrentAttempt,
         });
-        if (created) {
-          stats.invoicesCreated += 1;
+
+        const nowIso = new Date().toISOString();
+        const reasonCode = 'no_payment_within_24h';
+        const reasonDescription = `No payment was made within ${options.thresholdHours} hours of starting the subscription. Subscription cancelled and plan switched to Free.`;
+
+        // Determine all stale attempts to cancel for this tenant.
+        // - Always include the candidate attempt context.
+        // - Also include any OTHER open invoices that are stale (issuedAt <= cutoff) so old pending attempts don't linger.
+        const attemptsByKey = new Map<string, AttemptToCancel>();
+
+        const addAttempt = (input: {
+          provider: string;
+          subscriptionId: string;
+          billingAttemptId?: string;
+          sinceIso: string;
+          doc?: admin.firestore.QueryDocumentSnapshot;
+        }): void => {
+          const p = (input.provider || '').trim().toLowerCase();
+          const s = (input.subscriptionId || '').trim();
+          if (!p || !s) return;
+          const sinceIso = parseIso(input.sinceIso) || input.sinceIso;
+          const key = computeAttemptKey({
+            attemptId: (input.billingAttemptId || '').trim() || undefined,
+            provider: p,
+            subscriptionId: s,
+            sinceIso,
+          });
+
+          const existing = attemptsByKey.get(key);
+          if (existing) {
+            if (input.doc) existing.invoiceDocs.push(input.doc);
+            if (!existing.billingAttemptId && input.billingAttemptId) existing.billingAttemptId = input.billingAttemptId;
+            return;
+          }
+          attemptsByKey.set(key, {
+            provider: p,
+            subscriptionId: s,
+            billingAttemptId: input.billingAttemptId,
+            sinceIso,
+            attemptKey: key,
+            invoiceDocs: input.doc ? [input.doc] : [],
+          });
+        };
+
+        // Candidate attempt (if available)
+        if (attemptProvider && attemptSubscriptionId) {
+          addAttempt({
+            provider: attemptProvider,
+            subscriptionId: attemptSubscriptionId,
+            billingAttemptId: attemptBillingAttemptId || undefined,
+            sinceIso: candidate.sinceIso,
+          });
         }
-      }
 
-      // Only downgrade if this attempt still appears to be the tenant's current attempt.
-      // Older attempts can be cancelled without impacting a newer authenticated autopay.
-      if (isCurrentAttempt) {
-        await downgradeTenantToFree({
-          db,
-          tenantId,
-          nowIso,
-          reasonCode,
-          reasonDescription,
-          provider: attemptProvider || undefined,
-          subscriptionId: attemptSubscriptionId || undefined,
-          expectedProvider: attemptProvider || undefined,
-          expectedSubscriptionId: attemptSubscriptionId || undefined,
-          expectedBillingAttemptId: attemptBillingAttemptId || undefined,
-          dryRun: options.dryRun,
-        });
-      } else {
-        log(options.verbose, 'skipping downgrade (attempt no longer current)', {
-          tenantId,
-          attemptProvider: attemptProvider || null,
-          attemptSubscriptionId: attemptSubscriptionId || null,
-          attemptBillingAttemptId: attemptBillingAttemptId || null,
-        });
-      }
-
-      if (!options.dryRun) {
+        // Other stale open invoices
         try {
-          const res = await sendTenantBillingEventNotification({
-            tenantId,
-            kind: 'subscription_cancelled',
-            title: 'Subscription cancelled',
-            body: `No payment was made within ${options.thresholdHours} hours. Your plan has been switched to Free.`,
-            priority: 'high',
-            dedupeKey: `stale_pending_cancel:${attemptKey}`,
-            metadata: {
-              source: 'billing_stale_pending_job',
-              provider: attemptProvider || null,
-              providerSubscriptionId: attemptSubscriptionId || null,
-              sinceIso: candidate.sinceIso,
-              reasonCode,
-              attemptKey,
-            },
-          });
-          log(options.verbose, 'sent billing notification', {
-            tenantId,
-            ok: res.ok,
-            pushSent: res.pushSent,
-            emailRecipients: res.emailRecipients,
-          });
-        } catch (notifyError) {
-          // Notifications are best-effort; the critical outcome is cancellation + downgrade.
-          log(options.verbose, 'billing notification failed (continuing)', {
-            tenantId,
-            error: notifyError instanceof Error ? notifyError.message : String(notifyError),
-          });
-        }
-      }
+          const openSnap = await db
+            .collection('billingInvoices')
+            .doc(tenantId)
+            .collection('invoices')
+            .where('status', '==', 'open')
+            .limit(250)
+            .get();
 
-      stats.tenantsCancelled += 1;
+          for (const doc of openSnap.docs) {
+            const data = doc.data() as any;
+            const issuedAtIso = parseIso(data?.issuedAt);
+            if (!issuedAtIso) continue;
+            if (!isoOlderThan(issuedAtIso, cutoffMs)) continue;
+
+            const invoiceProvider = typeof data?.provider === 'string' ? String(data.provider).trim().toLowerCase() : '';
+            const invoiceAttemptId = typeof data?.billingAttemptId === 'string' ? String(data.billingAttemptId).trim() : '';
+            const invoiceSubscriptionId = typeof data?.subscriptionId === 'string' ? String(data.subscriptionId).trim() : '';
+            const invoiceProviderSubscriptionId =
+              typeof data?.providerSubscriptionId === 'string' ? String(data.providerSubscriptionId).trim() : '';
+            const effectiveSubscription = invoiceProviderSubscriptionId || invoiceSubscriptionId;
+            if (!invoiceProvider || !effectiveSubscription) continue;
+
+            // Respect candidate provider if known (avoid cross-provider false positives)
+            if (attemptProvider && invoiceProvider && invoiceProvider !== attemptProvider) {
+              continue;
+            }
+
+            addAttempt({
+              provider: invoiceProvider,
+              subscriptionId: effectiveSubscription,
+              billingAttemptId: invoiceAttemptId || undefined,
+              sinceIso: issuedAtIso,
+              doc,
+            });
+          }
+        } catch {
+          // ignore; we'll still process the candidate attempt
+        }
+
+        const attempts = Array.from(attemptsByKey.values()).sort((a, b) => a.sinceIso.localeCompare(b.sinceIso));
+        if (attempts.length === 0) {
+          log(options.verbose, 'skipping tenant (no stale attempts found)', { tenantId });
+          stats.tenantsSkipped += 1;
+          continue;
+        }
+
+        let cancelledCurrentAttempt = false;
+
+        for (const attempt of attempts) {
+          const isAttemptCurrent = (() => {
+            if (attempt.billingAttemptId && billingAttemptId) {
+              return attempt.billingAttemptId === billingAttemptId;
+            }
+            if (attempt.subscriptionId && subscriptionId) {
+              return attempt.subscriptionId === subscriptionId;
+            }
+            return false;
+          })();
+
+          // Only auto-cancel if there has been no payment for this specific attempt.
+          // (Tenants may have historical paid invoices from previous billing cycles.)
+          const paid = await hasPaidInvoiceForAttempt({
+            db,
+            tenantId,
+            sinceIso: attempt.sinceIso,
+            attemptId: attempt.billingAttemptId || undefined,
+            provider: attempt.provider || undefined,
+            subscriptionId: attempt.subscriptionId || undefined,
+          });
+          if (paid) {
+            log(options.verbose, 'skipping attempt (already has paid invoice)', {
+              tenantId,
+              attemptKey: attempt.attemptKey,
+              provider: attempt.provider,
+              subscriptionId: attempt.subscriptionId,
+            });
+            continue;
+          }
+
+          // Cancel provider subscription (required; fatal if cannot cancel).
+          if (!options.dryRun) {
+            if (attempt.provider === 'razorpay' && attempt.subscriptionId) {
+              if (isAttemptCurrent) {
+                // Suppress the Razorpay webhook's generic cancellation notice/email for a short window.
+                // The job sends the correct reasoned notification.
+                try {
+                  await billingRef.set(
+                    {
+                      suppressProviderCancelNotificationUntilIso: addHoursIso(nowIso, 2),
+                      lastSystemCancelContext: {
+                        source: 'billing_stale_pending_job',
+                        reasonCode,
+                        reasonDescription,
+                        atIso: nowIso,
+                        provider: attempt.provider || null,
+                        subscriptionId: attempt.subscriptionId || null,
+                        sinceIso: attempt.sinceIso,
+                      },
+                      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    },
+                    { merge: true }
+                  );
+                } catch {
+                  // best-effort
+                }
+              }
+
+              stats.providerCancelsAttempted += 1;
+              try {
+                log(options.verbose, 'cancelling razorpay subscription', { tenantId, subscriptionId: attempt.subscriptionId });
+                await cancelRazorpaySubscription({ subscriptionId: attempt.subscriptionId, cancelAtCycleEnd: false });
+              } catch (error) {
+                stats.providerCancelsFailed += 1;
+                const message = error instanceof Error ? error.message : String(error);
+                log(options.verbose, 'razorpay cancel failed (fatal)', {
+                  tenantId,
+                  error: message,
+                });
+                if (message.startsWith('razorpay_')) {
+                  throw new Error(message);
+                }
+                throw new Error(`razorpay_cancel_failed: ${message}`);
+              }
+            }
+
+            if ((attempt.provider === 'play' || attempt.provider === 'google_play') && attempt.subscriptionId) {
+              const productId = typeof (billing as any).storeProductId === 'string' ? String((billing as any).storeProductId).trim() : '';
+              const packageName = (process.env.GOOGLE_PLAY_PACKAGE_NAME || '').trim();
+              if (!packageName) {
+                throw new Error('google_play_package_name_missing');
+              }
+              if (!productId) {
+                throw new Error('google_play_product_id_missing');
+              }
+
+              stats.providerCancelsAttempted += 1;
+              log(options.verbose, 'cancelling google play subscription', { tenantId, productId, packageName });
+              await cancelGooglePlaySubscription({ packageName, productId, purchaseToken: attempt.subscriptionId });
+            }
+          }
+
+          // Mark open invoices failed for this attempt.
+          let failedInvoices = 0;
+          if (attempt.invoiceDocs.length) {
+            failedInvoices = await failInvoicesByDocs({
+              db,
+              docs: attempt.invoiceDocs,
+              nowIso,
+              reasonCode,
+              reasonDescription,
+              attemptKey: attempt.attemptKey,
+              billingAttemptId: attempt.billingAttemptId,
+              dryRun: options.dryRun,
+            });
+          } else {
+            failedInvoices = await failOpenInvoicesForTenant({
+              db,
+              tenantId,
+              nowIso,
+              reasonCode,
+              reasonDescription,
+              attemptKey: attempt.attemptKey,
+              billingAttemptId: attempt.billingAttemptId,
+              provider: attempt.provider,
+              subscriptionId: attempt.subscriptionId,
+              sinceIso: attempt.sinceIso,
+              dryRun: options.dryRun,
+            });
+          }
+          stats.invoicesFailed += failedInvoices;
+
+          // If there were no open invoices, create a synthetic failed invoice so history shows a reason.
+          if (failedInvoices === 0) {
+            const created = await createFailedInvoiceIfMissing({
+              db,
+              tenantId,
+              nowIso,
+              sinceIso: attempt.sinceIso,
+              provider: attempt.provider,
+              providerSubscriptionId: attempt.subscriptionId,
+              subscriptionId: attempt.subscriptionId,
+              planId: planIdForHistory,
+              planVariantId: typeof (billing as any).planVariantId === 'string' ? String((billing as any).planVariantId) : null,
+              attemptKey: attempt.attemptKey,
+              billingAttemptId: attempt.billingAttemptId,
+              reasonCode,
+              reasonDescription,
+              dryRun: options.dryRun,
+            });
+            if (created) {
+              stats.invoicesCreated += 1;
+            }
+          }
+
+          if (isAttemptCurrent) {
+            cancelledCurrentAttempt = true;
+          } else {
+            log(options.verbose, 'cancelled non-current attempt (no downgrade/notify)', {
+              tenantId,
+              attemptKey: attempt.attemptKey,
+              provider: attempt.provider,
+              subscriptionId: attempt.subscriptionId,
+            });
+          }
+        }
+
+        // Downgrade + notify only if the cancelled attempt is still the tenant's current attempt.
+        if (cancelledCurrentAttempt) {
+          await downgradeTenantToFree({
+            db,
+            tenantId,
+            nowIso,
+            reasonCode,
+            reasonDescription,
+            provider: attemptProvider || undefined,
+            subscriptionId: attemptSubscriptionId || undefined,
+            expectedProvider: attemptProvider || undefined,
+            expectedSubscriptionId: attemptSubscriptionId || undefined,
+            expectedBillingAttemptId: attemptBillingAttemptId || undefined,
+            dryRun: options.dryRun,
+          });
+
+          if (!options.dryRun) {
+            try {
+              const res = await sendTenantBillingEventNotification({
+                tenantId,
+                kind: 'subscription_cancelled',
+                title: 'Subscription cancelled',
+                body: `No payment was made within ${options.thresholdHours} hours. Your plan has been switched to Free.`,
+                priority: 'high',
+                dedupeKey: `stale_pending_cancel:${attemptKey}`,
+                metadata: {
+                  source: 'billing_stale_pending_job',
+                  provider: attemptProvider || null,
+                  providerSubscriptionId: attemptSubscriptionId || null,
+                  sinceIso: candidate.sinceIso,
+                  reasonCode,
+                  attemptKey,
+                },
+              });
+              log(options.verbose, 'sent billing notification', {
+                tenantId,
+                ok: res.ok,
+                pushSent: res.pushSent,
+                emailRecipients: res.emailRecipients,
+                emailSummary: res.emailSummary || null,
+              });
+            } catch (notifyError) {
+              log(options.verbose, 'billing notification failed (continuing)', {
+                tenantId,
+                error: notifyError instanceof Error ? notifyError.message : String(notifyError),
+              });
+            }
+          }
+        }
+
+        stats.tenantsCancelled += 1;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       stats.errors.push({ tenantId, message });
@@ -1131,15 +1309,18 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
     } finally {
       await lease.release().catch(() => undefined);
     }
-  }
+    }
 
-  if (fatalError) {
-    log(options.verbose, 'fatal error encountered; aborting job', fatalError);
-    stats.fatalError = fatalError;
-  }
+    if (fatalError) {
+      log(options.verbose, 'fatal error encountered; aborting job', fatalError);
+      stats.fatalError = fatalError;
+    }
 
-  stats.finishedAtIso = new Date().toISOString();
-  return stats;
+    stats.finishedAtIso = new Date().toISOString();
+    return stats;
+  } finally {
+    await runLease.release().catch(() => undefined);
+  }
 }
 
 // Test-only hooks (not part of the public API).

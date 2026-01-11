@@ -868,111 +868,6 @@ export default function PlanAndBillingScreen() {
     setSwitchToFreeModalVisible(true);
   }, [activeTenant?.id, canManageBilling, handleManageGooglePlaySubscription, isAndroidGooglePlayBilling, isCheckoutBusy, downgradeToFreeScheduled, endOfCycleDisplay, refreshBilling, refreshLatestBillingChange, refreshUsageSummary, scheduledDowngradeDisplay]);
 
-  const handleCancelSwitchToFree = useCallback(() => {
-    const openInfoModal = (title: string, message: string) => {
-      setSwitchToFreeModalTitle(title);
-      setSwitchToFreeModalMessage(message);
-      setSwitchToFreeModalShowCancel(false);
-      setSwitchToFreeModalConfirmText('OK');
-      setSwitchToFreeModalConfirmStyle('primary');
-      setSwitchToFreeModalStatusMessage(null);
-      setSwitchToFreeModalStatusType('neutral');
-      setSwitchToFreeModalConfirmLoading(false);
-      setSwitchToFreeModalOnConfirm(undefined);
-      setSwitchToFreeModalVisible(true);
-    };
-
-    if (!canManageBilling) {
-      openInfoModal('Not allowed', 'Only Owner/Admin can manage billing for this coaching center.');
-      return;
-    }
-    if (!activeTenant?.id) {
-      openInfoModal('Missing tenant', 'Please select a coaching center first.');
-      return;
-    }
-    if (isCheckoutBusy) {
-      return;
-    }
-
-    if (requiresWebsiteForSubscriptionManagement) {
-      openInfoModal(
-        'Manage on website',
-        'This subscription was purchased on the website using Razorpay. Please manage subscription changes from the website.'
-      );
-      return;
-    }
-
-    if (requiresAppForSubscriptionManagement) {
-      openInfoModal(
-        'Manage in mobile app',
-        'This subscription is managed by Google Play. Please use the mobile app / Google Play to manage renewals and plan changes.'
-      );
-      return;
-    }
-
-    if (!downgradeToFreeScheduled) {
-      openInfoModal('Nothing to cancel', 'No downgrade to Free is currently scheduled.');
-      return;
-    }
-
-    if (isAndroidGooglePlayBilling) {
-      setSwitchToFreeModalTitle('Re-enable renewals in Google Play');
-      setSwitchToFreeModalMessage(
-        'This subscription is managed by Google Play.\n\nTo cancel the downgrade and re-enable future renewals, open Google Play and turn auto-renew back on (or tap Resubscribe). Then return to the app and refresh billing.'
-      );
-      setSwitchToFreeModalShowCancel(true);
-      setSwitchToFreeModalConfirmText('Open Google Play');
-      setSwitchToFreeModalConfirmStyle('primary');
-      setSwitchToFreeModalStatusMessage(null);
-      setSwitchToFreeModalStatusType('neutral');
-      setSwitchToFreeModalConfirmLoading(false);
-      const onConfirm = () => {
-        setSwitchToFreeModalVisible(false);
-        handleManageGooglePlaySubscription();
-      };
-      setSwitchToFreeModalOnConfirm(() => onConfirm);
-      setSwitchToFreeModalVisible(true);
-      return;
-    }
-
-    setSwitchToFreeModalTitle('Cancel scheduled downgrade?');
-    setSwitchToFreeModalMessage('This will keep your current plan active and allow renewals.');
-    setSwitchToFreeModalShowCancel(true);
-    setSwitchToFreeModalConfirmText('Keep current plan');
-    setSwitchToFreeModalConfirmStyle('primary');
-    setSwitchToFreeModalStatusMessage(null);
-    setSwitchToFreeModalStatusType('neutral');
-    setSwitchToFreeModalConfirmLoading(false);
-    const onConfirm = () => {
-      void (async () => {
-        try {
-          setSwitchToFreeModalConfirmLoading(true);
-          setSwitchToFreeModalStatusMessage(null);
-          setSwitchToFreeModalStatusType('neutral');
-          setCheckoutVariantBusy('free');
-          await billingService.cancelSwitchToFree({ tenantId: activeTenant.id });
-          await Promise.all([refreshBilling(), refreshUsageSummary(), refreshLatestBillingChange()]);
-          setSwitchToFreeModalVisible(false);
-        } catch (error: any) {
-          const rawMessage = typeof error?.message === 'string' ? error.message : '';
-          const parsed = parseJsonMessage(rawMessage);
-          const code = typeof parsed?.error === 'string' ? parsed.error : '';
-          setSwitchToFreeModalStatusType('error');
-          if (code === 'razorpay_resume_failed') {
-            setSwitchToFreeModalStatusMessage('We could not resume your subscription right now. Please try again later.');
-            return;
-          }
-          setSwitchToFreeModalStatusMessage(toFriendlyBillingErrorMessage(rawMessage) || 'Unable to cancel downgrade');
-        } finally {
-          setCheckoutVariantBusy(null);
-          setSwitchToFreeModalConfirmLoading(false);
-        }
-      })();
-    };
-    setSwitchToFreeModalOnConfirm(() => onConfirm);
-    setSwitchToFreeModalVisible(true);
-  }, [activeTenant?.id, canManageBilling, downgradeToFreeScheduled, handleManageGooglePlaySubscription, isAndroidGooglePlayBilling, isCheckoutBusy, refreshBilling, refreshLatestBillingChange, refreshUsageSummary]);
-
   const openExternalBillingUrl = useCallback(
     async (url: string) => {
       const cleaned = (url || '').trim();
@@ -1284,21 +1179,21 @@ export default function PlanAndBillingScreen() {
                     </TouchableOpacity>
                   </View>
 
-                </>
-              ) : null}
+                  {canManageBilling && !isAndroidGooglePlayBilling && (isDelinquent || (isPendingPaid && canUpdatePaymentMethod)) ? (
+                    <View style={styles.billingLinkRow}>
+                      <TouchableOpacity
+                        onPress={handleUpdatePaymentMethod}
+                        accessibilityRole="button"
+                        accessibilityLabel="Update payment method"
+                        disabled={catalogLoading || isCheckoutBusy}
+                        style={[styles.billingLinkButton, styles.billingLinkButtonRow]}
+                      >
+                        <Text style={[styles.billingLinkText, { color: theme.primary }]}>Update payment method</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
 
-              {canManageBilling && downgradeToFreeScheduled ? (
-                <TouchableOpacity
-                  onPress={handleCancelSwitchToFree}
-                  accessibilityRole="button"
-                  accessibilityLabel={isAndroidGooglePlayBilling ? 'Cancel downgrade in Google Play' : 'Cancel scheduled downgrade'}
-                  disabled={catalogLoading || isCheckoutBusy}
-                  style={styles.billingLinkButton}
-                >
-                  <Text style={[styles.billingLinkText, { color: theme.primary }]}>
-                    {isAndroidGooglePlayBilling ? 'Cancel downgrade in Google Play' : 'Cancel downgrade'}
-                  </Text>
-                </TouchableOpacity>
+                </>
               ) : null}
 
               {currentPlanDisplay.id === 'enterprise' ? (
@@ -1323,7 +1218,7 @@ export default function PlanAndBillingScreen() {
                         >
                           <Text style={[styles.billingActionButtonText, { color: theme.surface }]}>Open Google Play</Text>
                         </TouchableOpacity>
-                      ) : (
+                      ) : shouldShowCancelSubscriptionActions ? null : (
                         <TouchableOpacity
                           style={[styles.billingActionButton, { backgroundColor: theme.primary }]}
                           accessibilityRole="button"
@@ -1335,6 +1230,7 @@ export default function PlanAndBillingScreen() {
                         </TouchableOpacity>
                       )
                     ) : isPendingPaid ? (
+                      shouldShowCancelSubscriptionActions && !isAndroidGooglePlayBilling && canUpdatePaymentMethod ? null :
                       <TouchableOpacity
                         style={[styles.billingActionButton, { backgroundColor: theme.primary }]}
                         accessibilityRole="button"
@@ -1374,7 +1270,7 @@ export default function PlanAndBillingScreen() {
                       </TouchableOpacity>
                       ) : null}
 
-                    {isDelinquent || isRazorpayCheckoutRequired ? (
+                    {(isDelinquent || isRazorpayCheckoutRequired) && !shouldShowCancelSubscriptionActions ? (
                       <TouchableOpacity
                         style={[styles.billingSecondaryButton, { borderColor: theme.border }]}
                         accessibilityRole="button"

@@ -81,26 +81,6 @@ export interface BillingSwitchToFreeResponse {
   scheduledDowngradeAt?: string;
 }
 
-export interface BillingCancelSwitchToFreeResponse {
-  ok: true;
-  cancelled: boolean;
-  verification?: {
-    provider: 'razorpay';
-    renewalsEnabled: boolean;
-    status: string | null;
-    nextChargeAt: number | null;
-  };
-  // Only present when BILLING_PROVIDER_DIAGNOSTICS=1 in backend-runtime.
-  provider?: {
-    provider: 'razorpay';
-    subscriptionId: string;
-    status: string | null;
-    cancelAtCycleEnd: boolean;
-    chargeAt: number | null;
-    currentEnd: number | null;
-  };
-}
-
 export interface BillingHistoryInvoice {
   id: string;
   invoiceNumber?: string;
@@ -341,17 +321,6 @@ class BillingService {
     const tenantId = options.tenantId.trim();
     if (!tenantId) throw new Error('tenant_required');
     const result = await this.request<BillingSwitchToFreeResponse>('POST', '/billing/switch-to-free/immediate', {
-      body: { tenantId },
-    });
-
-    latestBillingChangeCache.delete(tenantId);
-    return result;
-  }
-
-  async cancelSwitchToFree(options: { tenantId: string }): Promise<BillingCancelSwitchToFreeResponse> {
-    const tenantId = options.tenantId.trim();
-    if (!tenantId) throw new Error('tenant_required');
-    const result = await this.request<BillingCancelSwitchToFreeResponse>('POST', '/billing/switch-to-free/cancel', {
       body: { tenantId },
     });
 

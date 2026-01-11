@@ -66,20 +66,6 @@ export function describeBillingChange(entry: BillingHistoryChange, options: Desc
     return { title: `Switched to Free${modeSuffix}`, subtitle: `${fromLabel} → FREE` };
   }
 
-  if (action === 'billing_downgrade_to_free_cancelled') {
-    if (context === 'plan') {
-      return { title: 'Downgrade cancelled' };
-    }
-
-    const provider = typeof (meta as any)?.provider === 'string' ? String((meta as any).provider) : '';
-    const subscriptionId = typeof (meta as any)?.subscriptionId === 'string' ? String((meta as any).subscriptionId) : '';
-    const parts = [provider ? `Provider: ${provider}` : null, subscriptionId ? `Subscription: ${subscriptionId}` : null].filter(Boolean);
-    return {
-      title: 'Downgrade cancelled',
-      subtitle: parts.length ? parts.join(' • ') : 'Your paid plan will continue',
-    };
-  }
-
   if (action === 'billing_checkout_started') {
     const planId = typeof (meta as any)?.planId === 'string' ? String((meta as any).planId) : '';
     const provider = typeof (meta as any)?.provider === 'string' ? String((meta as any).provider) : '';

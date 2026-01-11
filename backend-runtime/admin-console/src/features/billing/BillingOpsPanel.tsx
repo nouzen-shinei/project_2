@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { SectionCard } from '../../components/SectionCard';
 import {
   fetchBillingMetricsSummary,
@@ -21,6 +21,14 @@ type ManualBackfillForm = {
 };
 
 const DEFAULT_LIMIT = 50;
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return '[unserializable]';
+  }
+}
 
 function formatIso(value: unknown): string {
   const raw = typeof value === 'string' ? value.trim() : '';
@@ -56,9 +64,13 @@ export function BillingOpsPanel() {
   const [opsCursor, setOpsCursor] = useState<string | null>(null);
   const [opsLoading, setOpsLoading] = useState(false);
 
+  const [expandedOpsIds, setExpandedOpsIds] = useState<Set<string>>(() => new Set());
+
   const [runs, setRuns] = useState<BillingBackfillRunRecord[]>([]);
   const [runsCursor, setRunsCursor] = useState<string | null>(null);
   const [runsLoading, setRunsLoading] = useState(false);
+
+  const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(() => new Set());
 
   const [schedulerStatus, setSchedulerStatus] = useState<BillingBackfillSchedulerStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(false);
@@ -74,6 +86,27 @@ export function BillingOpsPanel() {
   });
   const [manualRunning, setManualRunning] = useState(false);
   const [manualResult, setManualResult] = useState<any>(null);
+
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const handleCopy = useCallback(async (key: string, value: string) => {
+    try {
+      await navigator.clipboard?.writeText(value);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1200);
+    } catch {
+      setCopiedKey(null);
+    }
+  }, []);
+
+  const toggleExpanded = useCallback((setter: (fn: (prev: Set<string>) => Set<string>) => void, id: string) => {
+    setter((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   const [billingMetrics, setBillingMetrics] = useState<BillingMetricsSummary | null>(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
@@ -375,26 +408,99 @@ export function BillingOpsPanel() {
                   <th>Tenant</th>
                   <th>Event</th>
                   <th>Message</th>
+                  <th style={{ width: '8rem' }}>Details</th>
                 </tr>
               </thead>
               <tbody>
                 {opsEvents.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="muted">
+                    <td colSpan={7} className="muted">
                       {opsLoading ? 'Loading…' : 'No ops events found.'}
                     </td>
                   </tr>
                 ) : (
-                  opsEvents.map((entry) => (
-                    <tr key={entry.id}>
-                      <td>{formatIso(entry.createdAtIso)}</td>
-                      <td>{entry.severity || '—'}</td>
-                      <td>{entry.type || '—'}</td>
-                      <td>{entry.tenantId || '—'}</td>
-                      <td>{entry.event || '—'}</td>
-                      <td>{entry.message || '—'}</td>
-                    </tr>
-                  ))
+                  opsEvents.map((entry) => {
+                    const expanded = expandedOpsIds.has(entry.id);
+                    const meta = entry.metadata ?? null;
+                    const metaJson = meta ? safeJsonStringify(meta) : null;
+                    const payload = typeof entry.payloadPreview === 'string' ? entry.payloadPreview : '';
+
+                    return (
+                      <Fragment key={entry.id}>
+                        <tr>
+                          <td>{formatIso(entry.createdAtIso)}</td>
+                          <td>{entry.severity || '—'}</td>
+                          <td>{entry.type || '—'}</td>
+                          <td>{entry.tenantId || '—'}</td>
+                          <td>{entry.event || '—'}</td>
+                          <td>{entry.message || '—'}</td>
+                          <td>
+                            <button
+                              type="button"
+                              className="text-button small-link"
+                              onClick={() => toggleExpanded(setExpandedOpsIds, entry.id)}
+                            >
+                              {expanded ? 'Hide' : 'View'}
+                            </button>
+                          </td>
+                        </tr>
+                        {expanded && (
+                          <tr>
+                            <td colSpan={7} style={{ paddingTop: 0 }}>
+                              <div style={{ padding: '0.75rem 0.25rem' }}>
+                                <div className="muted" style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                                  <span>HTTP: {entry.httpStatus ?? '—'}</span>
+                                  <span>Path: {entry.requestPath ?? '—'}</span>
+                                  <span>Subscription: {entry.subscriptionId ?? '—'}</span>
+                                  <span>Payment: {entry.paymentId ?? '—'}</span>
+                                </div>
+
+                                <div style={{ marginTop: '0.75rem' }}>
+                                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <h4 style={{ margin: 0 }}>Metadata</h4>
+                                    {metaJson && (
+                                      <button
+                                        type="button"
+                                        className="text-button small-link"
+                                        onClick={() => handleCopy(`ops:${entry.id}:meta`, metaJson)}
+                                      >
+                                        {copiedKey === `ops:${entry.id}:meta` ? 'Copied' : 'Copy JSON'}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {metaJson ? (
+                                    <pre className="code-block" style={{ marginTop: '0.5rem' }}>{metaJson}</pre>
+                                  ) : (
+                                    <p className="muted" style={{ marginTop: '0.35rem' }}>—</p>
+                                  )}
+                                </div>
+
+                                <div style={{ marginTop: '0.75rem' }}>
+                                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <h4 style={{ margin: 0 }}>Payload preview</h4>
+                                    {payload && (
+                                      <button
+                                        type="button"
+                                        className="text-button small-link"
+                                        onClick={() => handleCopy(`ops:${entry.id}:payload`, payload)}
+                                      >
+                                        {copiedKey === `ops:${entry.id}:payload` ? 'Copied' : 'Copy'}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {payload ? (
+                                    <pre className="code-block" style={{ marginTop: '0.5rem' }}>{payload}</pre>
+                                  ) : (
+                                    <p className="muted" style={{ marginTop: '0.35rem' }}>—</p>
+                                  )}
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -422,31 +528,97 @@ export function BillingOpsPanel() {
                   <th>Invoices</th>
                   <th>Reconcile</th>
                   <th>Errors</th>
+                  <th style={{ width: '8rem' }}>Details</th>
                 </tr>
               </thead>
               <tbody>
                 {runs.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="muted">
+                    <td colSpan={8} className="muted">
                       {runsLoading ? 'Loading…' : 'No backfill runs found.'}
                     </td>
                   </tr>
                 ) : (
-                  runs.map((entry) => (
-                    <tr key={entry.id}>
-                      <td>{formatIso(entry.startedAtIso)}</td>
-                      <td>{entry.status || '—'}</td>
-                      <td>{entry.dryRun ? 'Yes' : 'No'}</td>
-                      <td>{entry.stats?.tenantsProcessed ?? '—'}</td>
-                      <td>{entry.stats?.invoicesUpserted ?? '—'}</td>
-                      <td>
-                        {entry.stats?.reconciliation
-                          ? `${entry.stats.reconciliation.providerCapturedPayments ?? 0} captured / ${entry.stats.reconciliation.firestorePaidInvoices ?? 0} paid · missing ${entry.stats.reconciliation.missingPaidInvoices ?? 0} · extra ${entry.stats.reconciliation.extraPaidInvoices ?? 0}`
-                          : '—'}
-                      </td>
-                      <td>{entry.stats?.errors ?? '—'}</td>
-                    </tr>
-                  ))
+                  runs.map((entry) => {
+                    const expanded = expandedRunIds.has(entry.id);
+                    const statsJson = entry.stats ? safeJsonStringify(entry.stats) : null;
+                    const entryJson = safeJsonStringify(entry);
+
+                    return (
+                      <Fragment key={entry.id}>
+                        <tr>
+                          <td>{formatIso(entry.startedAtIso)}</td>
+                          <td>{entry.status || '—'}</td>
+                          <td>{entry.dryRun ? 'Yes' : 'No'}</td>
+                          <td>{entry.stats?.tenantsProcessed ?? '—'}</td>
+                          <td>{entry.stats?.invoicesUpserted ?? '—'}</td>
+                          <td>
+                            {entry.stats?.reconciliation
+                              ? `${entry.stats.reconciliation.providerCapturedPayments ?? 0} captured / ${entry.stats.reconciliation.firestorePaidInvoices ?? 0} paid · missing ${entry.stats.reconciliation.missingPaidInvoices ?? 0} · extra ${entry.stats.reconciliation.extraPaidInvoices ?? 0}`
+                              : '—'}
+                          </td>
+                          <td>{entry.stats?.errors ?? '—'}</td>
+                          <td>
+                            <button
+                              type="button"
+                              className="text-button small-link"
+                              onClick={() => toggleExpanded(setExpandedRunIds, entry.id)}
+                            >
+                              {expanded ? 'Hide' : 'View'}
+                            </button>
+                          </td>
+                        </tr>
+                        {expanded && (
+                          <tr>
+                            <td colSpan={8} style={{ paddingTop: 0 }}>
+                              <div style={{ padding: '0.75rem 0.25rem' }}>
+                                <div className="muted" style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                                  <span>Finished: {formatIso(entry.finishedAtIso)}</span>
+                                  <span>Job: {entry.jobLabel || '—'}</span>
+                                  <span>Runner: {entry.runnerId || '—'}</span>
+                                  <span>Run ID: {entry.runId || '—'}</span>
+                                </div>
+
+                                <div style={{ marginTop: '0.75rem' }}>
+                                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <h4 style={{ margin: 0 }}>Stats</h4>
+                                    {statsJson && (
+                                      <button
+                                        type="button"
+                                        className="text-button small-link"
+                                        onClick={() => handleCopy(`run:${entry.id}:stats`, statsJson)}
+                                      >
+                                        {copiedKey === `run:${entry.id}:stats` ? 'Copied' : 'Copy JSON'}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {statsJson ? (
+                                    <pre className="code-block" style={{ marginTop: '0.5rem' }}>{statsJson}</pre>
+                                  ) : (
+                                    <p className="muted" style={{ marginTop: '0.35rem' }}>—</p>
+                                  )}
+                                </div>
+
+                                <div style={{ marginTop: '0.75rem' }}>
+                                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <h4 style={{ margin: 0 }}>Raw record</h4>
+                                    <button
+                                      type="button"
+                                      className="text-button small-link"
+                                      onClick={() => handleCopy(`run:${entry.id}:raw`, entryJson)}
+                                    >
+                                      {copiedKey === `run:${entry.id}:raw` ? 'Copied' : 'Copy JSON'}
+                                    </button>
+                                  </div>
+                                  <pre className="code-block" style={{ marginTop: '0.5rem' }}>{entryJson}</pre>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })
                 )}
               </tbody>
             </table>

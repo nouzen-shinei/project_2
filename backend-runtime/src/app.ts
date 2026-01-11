@@ -2826,10 +2826,6 @@ const billingSwitchToFreeImmediateSchema = z.object({
   tenantId: z.string().trim().min(6).max(120),
 });
 
-const billingCancelSwitchToFreeSchema = z.object({
-  tenantId: z.string().trim().min(6).max(120),
-});
-
 const playVerificationSchema = z.object({
   tenantId: z.string().trim().min(6).max(120),
   purchaseToken: z.string().trim().min(10),
@@ -4778,8 +4774,7 @@ type TenantAuditEventAction =
   | 'billing_manage_link_requested'
   | 'billing_play_verified'
   | 'billing_downgrade_to_free'
-  | 'billing_downgrade_to_free_scheduled'
-  | 'billing_downgrade_to_free_cancelled';
+  | 'billing_downgrade_to_free_scheduled';
 
 type LogTenantAuditEventFn = (options: {
   tenantId: string;
@@ -5030,7 +5025,22 @@ export function createApp(options: CreateAppOptions = {}){
     return defaultTenantGuardBypassPatterns.some((pattern) => pattern.test(path));
   }
 
-  app.use(express.json());
+  // IMPORTANT: Do not run the global JSON body parser on webhook endpoints that
+  // require access to the exact raw payload (e.g. Razorpay signature checks).
+  // Those routes mount their own `express.raw({ type: 'application/json' })` parsers.
+  const jsonParser = express.json();
+  app.use((req, res, next) => {
+    const p = req.path || '';
+    if (
+      p === '/billing/stripe/webhook' ||
+      p === '/billing/razorpay/webhook' ||
+      p === '/billing/play/notifications' ||
+      p === '/billing/appstore/notifications'
+    ) {
+      return next();
+    }
+    return jsonParser(req, res, next);
+  });
   // Attach CSP headers early
   app.use(cspMiddleware({
     enableReportOnlyHeader: true,
@@ -5099,7 +5109,16 @@ export function createApp(options: CreateAppOptions = {}){
       const userRecord = await admin.auth().getUser(authContext.uid);
       return normalizeEmail(userRecord.email || undefined) || null;
     } catch (error) {
-      console.warn('[auth] failed to resolve user email', error);
+      // This can happen if a user was deleted while an old/stale token is still being used.
+      // Treat as a normal "no email available" condition to avoid noisy logs.
+      const err = error as any;
+      const code = typeof err?.errorInfo?.code === 'string' ? err.errorInfo.code : '';
+      if (code === 'auth/user-not-found' || code === 'auth/invalid-uid' || code === 'auth/argument-error') {
+        console.info('[auth] user email unavailable', { code, uid: authContext.uid });
+        return null;
+      }
+
+      console.warn('[auth] failed to resolve user email', { uid: authContext.uid, error });
       return null;
     }
   }
@@ -12621,157 +12640,6 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
-  // Cancel a previously scheduled downgrade-to-free (best-effort) and resume the provider subscription.
-  app.post('/billing/switch-to-free/cancel', requireAdminTenantAccess, async (req, res) => {
-    const tenantAccess = req.tenantAccess;
-    if (!tenantAccess) {
-      return res.status(500).json({ error: 'tenant_guard_missing' });
-    }
-
-    const parsed = billingCancelSwitchToFreeSchema.safeParse(req.body || {});
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
-    }
-
-    const tenantId = parsed.data.tenantId.trim();
-    if (tenantId !== tenantAccess.tenantId) {
-      return res.status(403).json({ error: 'tenant_mismatch' });
-    }
-
-    try {
-      const db = getFirestoreImpl();
-      const billingRef = db.collection('tenantBilling').doc(tenantId);
-      const billingSnap = await billingRef.get();
-      const billingData = billingSnap.exists ? billingSnap.data() || {} : {};
-
-      const diagnosticsEnabled = process.env.BILLING_PROVIDER_DIAGNOSTICS === '1';
-
-      const scheduled = Boolean((billingData as any).cancelAtCycleEnd) && (billingData as any).scheduledDowngradePlanId === 'free';
-      if (!scheduled) {
-        return res.json({ ok: true, cancelled: false });
-      }
-
-      const billingProvider = typeof (billingData as any).billingProvider === 'string' ? (billingData as any).billingProvider : null;
-      const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
-
-      if (billingProvider === 'razorpay' && subscriptionId) {
-        // Always fetch provider snapshot so the caller can confirm renewal status.
-        const getProviderSnapshot = async () => {
-          const sub = await fetchRazorpaySubscription({ subscriptionId });
-          return {
-            provider: 'razorpay' as const,
-            subscriptionId,
-            status: sub.status ?? null,
-            cancelAtCycleEnd: sub.cancelAtCycleEnd === true,
-            chargeAt: typeof sub.chargeAt === 'number' ? sub.chargeAt : null,
-            currentEnd: typeof sub.currentEnd === 'number' ? sub.currentEnd : null,
-          };
-        };
-
-        const buildVerification = (provider: Awaited<ReturnType<typeof getProviderSnapshot>>) => ({
-          provider: provider.provider,
-          renewalsEnabled: provider.cancelAtCycleEnd === false,
-          status: provider.status,
-          nextChargeAt: provider.chargeAt,
-        });
-
-        if (!scheduled) {
-          try {
-            const provider = await getProviderSnapshot();
-            const verification = buildVerification(provider);
-            return res.json({ ok: true, cancelled: false, verification, ...(diagnosticsEnabled ? { provider } : {}) });
-          } catch {
-            return res.json({ ok: true, cancelled: false });
-          }
-        }
-
-        try {
-          await resumeRazorpaySubscriptionImpl({ subscriptionId });
-
-          // Verify renewals are actually re-enabled (cancel_at_cycle_end cleared).
-          // This is best-effort: if verification fails (e.g., credentials/network), still proceed
-          // with cancelling the scheduled downgrade on our side.
-          if (!isTestProcess) {
-            try {
-              const provider = await getProviderSnapshot();
-              const status = (provider.status || '').trim().toLowerCase();
-              const cancelAtCycleEnd = provider.cancelAtCycleEnd === true;
-              if (status !== 'active' || cancelAtCycleEnd) {
-                return res.status(409).json({
-                  error: 'razorpay_renewal_not_reenabled',
-                  verification: buildVerification(provider),
-                  ...(diagnosticsEnabled ? { provider } : {}),
-                });
-              }
-            } catch (error) {
-              console.warn('[billing_cancel_switch_to_free] razorpay verification failed', error);
-            }
-          }
-        } catch (error) {
-          console.error('[billing_cancel_switch_to_free] razorpay resume failed', error);
-          return res.status(503).json({ error: 'razorpay_resume_failed' });
-        }
-      }
-      if (!scheduled) {
-        return res.json({ ok: true, cancelled: false });
-      }
-
-      await billingRef.set(
-        {
-          cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
-          scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
-          scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      void logTenantAuditEventImpl({
-        tenantId,
-        action: 'billing_downgrade_to_free_cancelled',
-        authContext: req.authContext,
-        metadata: {
-          provider: billingProvider,
-          ...(subscriptionId ? { subscriptionId } : {}),
-        },
-        targetId: tenantId,
-        targetType: 'billing',
-      });
-
-      if (billingProvider === 'razorpay' && subscriptionId) {
-        try {
-          const sub = await fetchRazorpaySubscription({ subscriptionId });
-          const provider = {
-            provider: 'razorpay' as const,
-            subscriptionId,
-            status: sub.status ?? null,
-            cancelAtCycleEnd: sub.cancelAtCycleEnd === true,
-            chargeAt: typeof sub.chargeAt === 'number' ? sub.chargeAt : null,
-            currentEnd: typeof sub.currentEnd === 'number' ? sub.currentEnd : null,
-          };
-          return res.json({
-            ok: true,
-            cancelled: true,
-            verification: {
-              provider: 'razorpay',
-              renewalsEnabled: provider.cancelAtCycleEnd === false,
-              status: provider.status,
-              nextChargeAt: provider.chargeAt,
-            },
-            ...(diagnosticsEnabled ? { provider } : {}),
-          });
-        } catch {
-          // If provider fetch fails, still report cancelled on our side.
-        }
-      }
-
-      return res.json({ ok: true, cancelled: true });
-    } catch (error) {
-      console.error('[billing_cancel_switch_to_free] failed', error);
-      return res.status(500).json({ error: 'billing_cancel_switch_to_free_failed' });
-    }
-  });
-
   app.post('/billing/play/verify', requireAdminTenantAccess, async (req, res) => {
     if (!storeBillingFeatureEnabled()) {
       return res.status(503).json({ error: 'store_billing_disabled' });
@@ -13685,17 +13553,31 @@ export function createApp(options: CreateAppOptions = {}){
     if (!billingWebhooksFeatureEnabled()) {
       return res.status(503).json({ error: 'billing_webhooks_disabled' });
     }
-    const rawPayload = extractRawBody(req.body);
+    const rawBodyBuffer = req.body instanceof Buffer ? req.body : Buffer.from(extractRawBody(req.body), 'utf8');
+    const rawPayload = rawBodyBuffer.toString('utf8');
+
+    const razorpayEventId = typeof req.headers['x-razorpay-event-id'] === 'string' ? req.headers['x-razorpay-event-id'] : null;
+    const requestId = typeof req.headers['request-id'] === 'string' ? req.headers['request-id'] : null;
 
     const signature = typeof req.headers['x-razorpay-signature'] === 'string' ? req.headers['x-razorpay-signature'] : '';
     const webhookSecret = (process.env.RAZORPAY_WEBHOOK_SECRET || '').trim();
     const isTestMode = process.env.TEST_MODE === '1';
 
     if (!isTestMode && webhookSecret) {
-      const ok = verifyRazorpayWebhookSignature({ rawBody: rawPayload, signatureHeader: signature, webhookSecret });
+      const ok = verifyRazorpayWebhookSignature({ rawBody: rawBodyBuffer, signatureHeader: signature, webhookSecret });
       if (!ok) {
         inc('billing_webhook_signature_failures_total', { provider: 'razorpay' });
-        console.warn('[billing_razorpay_webhook] invalid signature');
+        const payloadLen = rawBodyBuffer.length;
+        const payloadSha256 = crypto.createHash('sha256').update(rawBodyBuffer).digest('hex');
+        console.warn('[billing_razorpay_webhook] invalid signature', {
+          razorpayEventId,
+          requestId,
+          signaturePresent: Boolean(signature),
+          signatureLen: (signature || '').length,
+          payloadLen,
+          payloadSha256Prefix: payloadSha256.slice(0, 12),
+          contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : null,
+        });
         void (async () => {
           try {
             const parsed = (() => {
@@ -13737,8 +13619,14 @@ export function createApp(options: CreateAppOptions = {}){
               paymentId,
               payloadPreview: safePreview(rawPayload),
               metadata: {
+                razorpayEventId,
+                requestId,
                 signaturePresent: Boolean(signature),
+                signatureLen: (signature || '').length,
                 webhookSecretConfigured: Boolean(webhookSecret),
+                payloadLen: rawBodyBuffer.length,
+                payloadSha256: crypto.createHash('sha256').update(rawBodyBuffer).digest('hex'),
+                contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : null,
               },
             });
           } catch {
@@ -13754,7 +13642,7 @@ export function createApp(options: CreateAppOptions = {}){
       parsed = JSON.parse(rawPayload || '{}');
     } catch (error) {
       inc('billing_webhook_invalid_json_total', { provider: 'razorpay' });
-      console.warn('[billing_razorpay_webhook] invalid json', error);
+      console.warn('[billing_razorpay_webhook] invalid json', { razorpayEventId, requestId, error });
       void (async () => {
         try {
           const db = getFirestoreImpl();
@@ -13768,6 +13656,12 @@ export function createApp(options: CreateAppOptions = {}){
             ip: typeof req.ip === 'string' ? req.ip : null,
             userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
             payloadPreview: safePreview(rawPayload),
+            metadata: {
+              razorpayEventId,
+              requestId,
+              contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : null,
+              payloadLen: rawBodyBuffer.length,
+            },
           });
         } catch {
           // ignore
@@ -13821,6 +13715,8 @@ export function createApp(options: CreateAppOptions = {}){
               paymentId,
               payloadPreview: safePreview(rawPayload),
               metadata: {
+                razorpayEventId,
+                requestId,
                 stackPreview: safePreview(stack, 1200),
               },
             });
@@ -14996,35 +14892,44 @@ export function createApp(options: CreateAppOptions = {}){
     }
     lines.push(`wa_billing_backfill_last_run_age_seconds ${backfillAgeSeconds ?? -1}`);
 
-    const sigThresh = Number(process.env.ALERT_BILLING_SIGNATURE_FAILURES_15M || '');
-    if (!isNaN(sigThresh)) {
+    const sigThreshRaw = (process.env.ALERT_BILLING_SIGNATURE_FAILURES_15M ?? '').trim();
+    const sigThresh = sigThreshRaw === '' ? Number.NaN : Number(sigThreshRaw);
+    if (Number.isFinite(sigThresh)) {
       lines.push(`wa_alert_billing_webhook_signature_failures_15m_exceeded ${sig15 > sigThresh ? 1 : 0}`);
     }
-    const jsonThresh = Number(process.env.ALERT_BILLING_INVALID_JSON_15M || '');
-    if (!isNaN(jsonThresh)) {
+    const jsonThreshRaw = (process.env.ALERT_BILLING_INVALID_JSON_15M ?? '').trim();
+    const jsonThresh = jsonThreshRaw === '' ? Number.NaN : Number(jsonThreshRaw);
+    if (Number.isFinite(jsonThresh)) {
       lines.push(`wa_alert_billing_webhook_invalid_json_15m_exceeded ${json15 > jsonThresh ? 1 : 0}`);
     }
-    const handlerThresh = Number(process.env.ALERT_BILLING_HANDLER_FAILURES_15M || '');
-    if (!isNaN(handlerThresh)) {
+    const handlerThreshRaw = (process.env.ALERT_BILLING_HANDLER_FAILURES_15M ?? '').trim();
+    const handlerThresh = handlerThreshRaw === '' ? Number.NaN : Number(handlerThreshRaw);
+    if (Number.isFinite(handlerThresh)) {
       lines.push(`wa_alert_billing_webhook_handler_failures_15m_exceeded ${handler15 > handlerThresh ? 1 : 0}`);
     }
-    const invoiceThresh = Number(process.env.ALERT_BILLING_INVOICE_WRITE_FAILURES_15M || '');
-    if (!isNaN(invoiceThresh)) {
+    const invoiceThreshRaw = (process.env.ALERT_BILLING_INVOICE_WRITE_FAILURES_15M ?? '').trim();
+    const invoiceThresh = invoiceThreshRaw === '' ? Number.NaN : Number(invoiceThreshRaw);
+    if (Number.isFinite(invoiceThresh)) {
       lines.push(`wa_alert_billing_invoice_write_failures_15m_exceeded ${invoice15 > invoiceThresh ? 1 : 0}`);
     }
-    const stateThresh = Number(process.env.ALERT_BILLING_STATE_WRITE_FAILURES_15M || '');
-    if (!isNaN(stateThresh)) {
+    const stateThreshRaw = (process.env.ALERT_BILLING_STATE_WRITE_FAILURES_15M ?? '').trim();
+    const stateThresh = stateThreshRaw === '' ? Number.NaN : Number(stateThreshRaw);
+    if (Number.isFinite(stateThresh)) {
       lines.push(`wa_alert_billing_state_write_failures_15m_exceeded ${state15 > stateThresh ? 1 : 0}`);
     }
-    const unknownThresh = Number(process.env.ALERT_BILLING_UNKNOWN_EVENTS_24H || '');
-    if (!isNaN(unknownThresh)) {
+    const unknownThreshRaw = (process.env.ALERT_BILLING_UNKNOWN_EVENTS_24H ?? '').trim();
+    const unknownThresh = unknownThreshRaw === '' ? Number.NaN : Number(unknownThreshRaw);
+    if (Number.isFinite(unknownThresh)) {
       lines.push(`wa_alert_billing_unknown_events_24h_exceeded ${unknown24 > unknownThresh ? 1 : 0}`);
     }
 
-    const backfillStaleHours = Number(process.env.ALERT_BILLING_BACKFILL_STALE_HOURS || '');
-    if (!isNaN(backfillStaleHours)) {
+    const backfillStaleHoursRaw = (process.env.ALERT_BILLING_BACKFILL_STALE_HOURS ?? '').trim();
+    const backfillStaleHours = backfillStaleHoursRaw === '' ? Number.NaN : Number(backfillStaleHoursRaw);
+    if (Number.isFinite(backfillStaleHours) && backfillStaleHours > 0) {
       const staleSeconds = Math.max(0, Math.floor(backfillStaleHours * 3600));
-      const exceeded = backfillAgeSeconds !== null ? backfillAgeSeconds > staleSeconds : true;
+      // If the scheduler hasn't run yet, don't raise a "stale exceeded" alert.
+      // This avoids false positives right after deployment/startup.
+      const exceeded = backfillAgeSeconds !== null ? backfillAgeSeconds > staleSeconds : false;
       lines.push(`wa_alert_billing_backfill_stale_exceeded ${exceeded ? 1 : 0}`);
     }
 
@@ -15085,6 +14990,13 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.get('/billing/admin/metrics-summary', requireOperatorAuth, (_req, res) => {
     try {
+      const readNumberEnv = (name: string): number => {
+        const raw = (process.env[name] ?? '').trim();
+        if (!raw) return Number.NaN;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : Number.NaN;
+      };
+
       const window15m = 15 * 60 * 1000;
       const window24h = 24 * 60 * 60 * 1000;
 
@@ -15109,23 +15021,23 @@ export function createApp(options: CreateAppOptions = {}){
       }
 
       const thresholds = {
-        signatureFailures15m: Number(process.env.ALERT_BILLING_SIGNATURE_FAILURES_15M || ''),
-        invalidJson15m: Number(process.env.ALERT_BILLING_INVALID_JSON_15M || ''),
-        handlerFailures15m: Number(process.env.ALERT_BILLING_HANDLER_FAILURES_15M || ''),
-        invoiceWriteFailures15m: Number(process.env.ALERT_BILLING_INVOICE_WRITE_FAILURES_15M || ''),
-        stateWriteFailures15m: Number(process.env.ALERT_BILLING_STATE_WRITE_FAILURES_15M || ''),
-        unknownEvents24h: Number(process.env.ALERT_BILLING_UNKNOWN_EVENTS_24H || ''),
-        backfillStaleHours: Number(process.env.ALERT_BILLING_BACKFILL_STALE_HOURS || ''),
+        signatureFailures15m: readNumberEnv('ALERT_BILLING_SIGNATURE_FAILURES_15M'),
+        invalidJson15m: readNumberEnv('ALERT_BILLING_INVALID_JSON_15M'),
+        handlerFailures15m: readNumberEnv('ALERT_BILLING_HANDLER_FAILURES_15M'),
+        invoiceWriteFailures15m: readNumberEnv('ALERT_BILLING_INVOICE_WRITE_FAILURES_15M'),
+        stateWriteFailures15m: readNumberEnv('ALERT_BILLING_STATE_WRITE_FAILURES_15M'),
+        unknownEvents24h: readNumberEnv('ALERT_BILLING_UNKNOWN_EVENTS_24H'),
+        backfillStaleHours: readNumberEnv('ALERT_BILLING_BACKFILL_STALE_HOURS'),
       };
 
       const enabled = {
-        signatureFailures15m: !isNaN(thresholds.signatureFailures15m),
-        invalidJson15m: !isNaN(thresholds.invalidJson15m),
-        handlerFailures15m: !isNaN(thresholds.handlerFailures15m),
-        invoiceWriteFailures15m: !isNaN(thresholds.invoiceWriteFailures15m),
-        stateWriteFailures15m: !isNaN(thresholds.stateWriteFailures15m),
-        unknownEvents24h: !isNaN(thresholds.unknownEvents24h),
-        backfillStaleHours: !isNaN(thresholds.backfillStaleHours),
+        signatureFailures15m: Number.isFinite(thresholds.signatureFailures15m),
+        invalidJson15m: Number.isFinite(thresholds.invalidJson15m),
+        handlerFailures15m: Number.isFinite(thresholds.handlerFailures15m),
+        invoiceWriteFailures15m: Number.isFinite(thresholds.invoiceWriteFailures15m),
+        stateWriteFailures15m: Number.isFinite(thresholds.stateWriteFailures15m),
+        unknownEvents24h: Number.isFinite(thresholds.unknownEvents24h),
+        backfillStaleHours: Number.isFinite(thresholds.backfillStaleHours) && thresholds.backfillStaleHours > 0,
       };
 
       const alerts = {
@@ -15146,7 +15058,7 @@ export function createApp(options: CreateAppOptions = {}){
         backfillStaleExceeded: enabled.backfillStaleHours
           ? backfillLastRunAgeSeconds !== null
             ? backfillLastRunAgeSeconds > Math.max(0, Math.floor(thresholds.backfillStaleHours * 3600))
-            : true
+            : false
           : false,
       };
 

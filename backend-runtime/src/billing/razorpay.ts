@@ -38,14 +38,16 @@ function getRazorpayPlanIdForAppPlan(planId: PlanId): string {
 }
 
 export function verifyRazorpayWebhookSignature(options: {
-  rawBody: string;
+  rawBody: Buffer;
   signatureHeader: string;
   webhookSecret: string;
 }): boolean {
-  const { rawBody, signatureHeader, webhookSecret } = options;
+  const { rawBody } = options;
+  const signatureHeader = (options.signatureHeader || '').trim().toLowerCase();
+  const webhookSecret = (options.webhookSecret || '').trim();
   if (!signatureHeader || !webhookSecret) return false;
 
-  const expected = crypto.createHmac('sha256', webhookSecret).update(rawBody, 'utf8').digest('hex');
+  const expected = crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureHeader));
   } catch {
@@ -147,7 +149,16 @@ export async function cancelRazorpaySubscription(options: {
 
   const raw = (await response.json().catch(() => ({}))) as Record<string, any>;
   if (!response.ok) {
-    const message = typeof raw?.error?.description === 'string' ? raw.error.description : 'Razorpay subscription cancel failed';
+    const description = typeof raw?.error?.description === 'string' ? String(raw.error.description) : '';
+    const normalized = description.trim().toLowerCase();
+
+    // Razorpay can return a non-2xx response if the subscription is already cancelled.
+    // Treat this as a successful, idempotent cancellation.
+    if (response.status === 400 && normalized && normalized.includes('cancel') && normalized.includes('already')) {
+      return { ok: true, raw };
+    }
+
+    const message = description || 'Razorpay subscription cancel failed';
     const error = new Error(message);
     (error as any).status = response.status;
     (error as any).providerPayload = raw;

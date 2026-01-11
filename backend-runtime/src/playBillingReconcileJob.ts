@@ -451,7 +451,7 @@ async function runPlayBillingReconcileJob(options: { reason: 'startup' | 'interv
       };
 
       if (!lock.acquired) {
-        console.warn('[play_billing_reconcile] skipped: lock not acquired', {
+        console.info('[play_billing_reconcile] skipped: lock not acquired', {
           reason: options.reason,
           docPath: lock.docPath,
           currentHolderId: lock.currentHolderId,

@@ -220,42 +220,6 @@ describe('billing cancellation policies', () => {
     assert.equal(found.metadata.mode, 'immediate');
   });
 
-  it('switch-to-free/cancel returns cancelled=true when a downgrade is scheduled and logs an audit event', async () => {
-    const tenantId = 't_cancel_scheduled_1';
-    const db = makeInMemoryFirestore();
-    const auditEvents = [];
-
-    await db.collection('tenantBilling').doc(tenantId).set(
-      {
-        planId: 'pro',
-        status: 'active',
-        cancelAtCycleEnd: true,
-        scheduledDowngradePlanId: 'free',
-        scheduledDowngradeAt: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
-        billingProvider: 'other',
-      },
-      { merge: false }
-    );
-
-    const { server, base } = await startServer({ tenantId, db, auditEvents });
-    servers.add(server);
-
-    const response = await fetch(`${base}/billing/switch-to-free/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tenantId }),
-    });
-
-    assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.equal(payload.ok, true);
-    assert.equal(payload.cancelled, true);
-
-    const found = auditEvents.find((entry) => entry.action === 'billing_downgrade_to_free_cancelled');
-    assert.ok(found);
-    assert.equal(found.tenantId, tenantId);
-  });
-
   it('switch-to-free schedules a Razorpay cancel-at-cycle-end and writes audit metadata', async () => {
     const tenantId = 't_schedule_razorpay_1';
     const db = makeInMemoryFirestore();
@@ -317,67 +281,5 @@ describe('billing cancellation policies', () => {
     assert.equal(found.tenantId, tenantId);
     assert.equal(found.metadata.provider, 'razorpay');
     assert.equal(found.metadata.subscriptionId, 'sub_test_123');
-  });
-
-  it('switch-to-free/cancel resumes Razorpay and clears scheduled downgrade fields', async () => {
-    const tenantId = 't_cancel_razorpay_1';
-    const db = makeInMemoryFirestore();
-    const auditEvents = [];
-
-    await db.collection('tenantBilling').doc(tenantId).set(
-      {
-        planId: 'pro',
-        status: 'active',
-        cancelAtCycleEnd: true,
-        scheduledDowngradePlanId: 'free',
-        scheduledDowngradeAt: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
-        billingProvider: 'razorpay',
-        subscriptionId: 'sub_resume_456',
-      },
-      { merge: false }
-    );
-
-    let resumeArgs = null;
-    const app = createApp({
-      overrides: {
-        getFirestore: () => db,
-        requireTenantMembershipAccess: async () => ({ tenantId, role: 'admin', membershipId: 'm1' }),
-        logTenantAuditEvent: async (event) => auditEvents.push(event),
-        resumeRazorpaySubscription: async (args) => {
-          resumeArgs = args;
-          return { ok: true };
-        },
-      },
-    });
-    const server = app.listen(0);
-    await new Promise((resolve) => server.once('listening', resolve));
-    servers.add(server);
-    const base = `http://127.0.0.1:${server.address().port}`;
-
-    const response = await fetch(`${base}/billing/switch-to-free/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tenantId }),
-    });
-
-    assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.equal(payload.ok, true);
-    assert.equal(payload.cancelled, true);
-
-    assert.ok(resumeArgs);
-    assert.equal(resumeArgs.subscriptionId, 'sub_resume_456');
-
-    const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
-    const billing = billingSnap.data();
-    assert.equal(Boolean(billing.cancelAtCycleEnd), false);
-    assert.equal('scheduledDowngradePlanId' in billing, false);
-    assert.equal('scheduledDowngradeAt' in billing, false);
-
-    const found = auditEvents.find((entry) => entry.action === 'billing_downgrade_to_free_cancelled');
-    assert.ok(found);
-    assert.equal(found.tenantId, tenantId);
-    assert.equal(found.metadata.provider, 'razorpay');
-    assert.equal(found.metadata.subscriptionId, 'sub_resume_456');
   });
 });
