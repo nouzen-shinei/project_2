@@ -851,7 +851,7 @@ export const NoticeDetailModal: React.FC<NoticeDetailModalProps> = ({
                   disabled={!user?.uid || Boolean(reactionBusy)}
                 >
                   <Text style={[styles.reactionChipText, { color: theme.text }]}>＋</Text>
-                  <Text style={[styles.reactionChipCount, { color: theme.textSecondary }]}>More</Text>
+                  {/* <Text style={[styles.reactionChipCount, { color: theme.textSecondary }]}>More</Text> */}
                 </TouchableOpacity>
               </View>
 

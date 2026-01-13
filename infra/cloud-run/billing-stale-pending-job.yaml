@@ -43,13 +43,13 @@ spec:
 
                 - name: BILLING_STALE_PENDING_RUN_LEASE_MS
                   value: "7200000"
-                
-                  # Email notifications (base URL + internal auth key).
-                  # Do NOT hardcode the key here; inject via Secret Manager / deploy-time secrets.
-                  - name: EMAIL_BACKEND_BASE_URL
-                    value: "https://my-email-backend.fly.dev"
-                  - name: EMAIL_BACKEND_INTERNAL_KEY
-                    value: ""
+
+                # Email notifications (base URL + internal auth key).
+                # Do NOT hardcode the key here; inject via Secret Manager / deploy-time secrets.
+                - name: EMAIL_BACKEND_BASE_URL
+                  value: "https://my-email-backend.fly.dev"
+                - name: EMAIL_BACKEND_INTERNAL_KEY
+                  value: ""
 
                 # Needed only to cancel Razorpay subscriptions (credentials should be injected via
                 # Cloud Run env overrides or Secret Manager, not committed).

@@ -403,7 +403,7 @@ function normalizeSubscriptionStatus(value: unknown): string | null {
 function desiredBillingStatusFromSubscriptionStatus(status: string | null): 'active' | 'delinquent' | 'canceled' {
   if (!status) return 'delinquent';
   if (status === 'active' || status === 'authenticated') return 'active';
-  if (status === 'cancelled' || status === 'completed') return 'canceled';
+  if (status === 'cancelled' || status === 'completed' || status === 'expired') return 'canceled';
   if (status === 'halted' || status === 'failed' || status === 'pending') return 'delinquent';
   return 'delinquent';
 }
@@ -740,7 +740,29 @@ export async function runBillingBackfill(db: admin.firestore.Firestore, options:
       }
 
       // Reconcile tenantBilling + tenants billingTier conservatively
-      const shouldBePlanId: PlanId = desiredStatus === 'canceled' ? 'free' : planIdFromNotes;
+      const currentPlanId: PlanId = normalizePlanId((billingData as any).planId);
+      const currentPlanVariantId = typeof (billingData as any).planVariantId === 'string' ? (billingData as any).planVariantId.trim() : '';
+      const currentCouponCode = typeof (billingData as any).couponCode === 'string' ? (billingData as any).couponCode.trim() : '';
+
+      // Strong signals of a paid activation:
+      // - we already considered the tenant on a paid plan previously, OR
+      // - we can see at least one captured payment for this subscription.
+      const hasCapturedPaymentEvidence = providerCapturedPaymentIds.size > 0;
+
+      let effectiveDesiredStatus = desiredStatus;
+      if (effectiveDesiredStatus === 'delinquent' && currentPlanId === 'free' && !hasCapturedPaymentEvidence) {
+        // Common case: user started checkout but never paid; subscription ends up pending/failed/halted.
+        // Don't "upgrade" or show paid-plan delinquency for a Free tenant without any captured payment evidence.
+        effectiveDesiredStatus = 'canceled';
+      }
+
+      const paidPlanCandidate: PlanId = planIdFromNotes !== 'free' ? planIdFromNotes : currentPlanId;
+      if (effectiveDesiredStatus !== 'canceled' && paidPlanCandidate === 'free') {
+        // Avoid writing a confusing state like free+delinquent when we can't confidently resolve a paid plan.
+        effectiveDesiredStatus = 'canceled';
+      }
+
+      const shouldBePlanId: PlanId = effectiveDesiredStatus === 'canceled' ? 'free' : paidPlanCandidate;
 
       let limitsSnapshot: ReturnType<typeof toTenantBillingLimitsSnapshot> | null = null;
       if (desiredStatus === 'active' && shouldBePlanId !== 'free') {
@@ -758,18 +780,22 @@ export async function runBillingBackfill(db: admin.firestore.Firestore, options:
       const nowIso = new Date().toISOString();
       const billingPatch: Record<string, unknown> = {
         planId: shouldBePlanId,
-        planVariantId: desiredStatus === 'canceled' ? null : planVariantIdFromNotes || null,
-        couponCode: desiredStatus === 'canceled' ? null : couponCodeFromNotes || null,
-        status: desiredStatus,
+        planVariantId:
+          effectiveDesiredStatus === 'canceled'
+            ? null
+            : (planVariantIdFromNotes || currentPlanVariantId || '').trim() || null,
+        couponCode:
+          effectiveDesiredStatus === 'canceled' ? null : (couponCodeFromNotes || currentCouponCode || '').trim() || null,
+        status: effectiveDesiredStatus,
         billingProvider: 'razorpay',
         subscriptionId,
-        ...(desiredStatus === 'active' ? { renewalDate: renewalDate } : {}),
+        ...(effectiveDesiredStatus === 'active' ? { renewalDate: renewalDate } : {}),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         backfillRunId: runId,
         backfilledAtIso: nowIso,
       };
 
-      if (desiredStatus === 'active') {
+      if (effectiveDesiredStatus === 'active') {
         billingPatch.cancelAtCycleEnd = admin.firestore.FieldValue.delete();
         billingPatch.scheduledDowngradePlanId = admin.firestore.FieldValue.delete();
         billingPatch.scheduledDowngradeAt = admin.firestore.FieldValue.delete();
@@ -779,7 +805,7 @@ export async function runBillingBackfill(db: admin.firestore.Firestore, options:
           billingPatch.limitsSnapshot = limitsSnapshot;
           billingPatch.limitsSnapshotAt = admin.firestore.FieldValue.serverTimestamp();
         }
-      } else if (desiredStatus === 'canceled') {
+      } else if (effectiveDesiredStatus === 'canceled') {
         billingPatch.cancelAtCycleEnd = admin.firestore.FieldValue.delete();
         billingPatch.scheduledDowngradePlanId = admin.firestore.FieldValue.delete();
         billingPatch.scheduledDowngradeAt = admin.firestore.FieldValue.delete();
@@ -810,8 +836,8 @@ export async function runBillingBackfill(db: admin.firestore.Firestore, options:
       if (!effective.dryRun) {
         await tenantRef.set(
           stripUndefinedDeep({
-            ...(desiredStatus === 'active' || desiredStatus === 'canceled' ? { billingTier: shouldBePlanId } : {}),
-            ...(desiredStatus === 'canceled' ? { quotas: admin.firestore.FieldValue.delete() } : {}),
+            ...(effectiveDesiredStatus === 'active' || effectiveDesiredStatus === 'canceled' ? { billingTier: shouldBePlanId } : {}),
+            ...(effectiveDesiredStatus === 'canceled' ? { quotas: admin.firestore.FieldValue.delete() } : {}),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             billingBackfillRunId: runId,
             billingBackfilledAtIso: nowIso,

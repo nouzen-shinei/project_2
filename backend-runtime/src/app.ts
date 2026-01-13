@@ -3744,7 +3744,13 @@ async function loadTenantCurrentBilling(
           const sourceEvent = typeof (inv as any).sourceEvent === 'string' ? String((inv as any).sourceEvent).trim() : '';
           const rawEvent = typeof (inv as any).rawEvent === 'string' ? String((inv as any).rawEvent).trim() : '';
           const isSynthetic = (inv as any).isSynthetic === true;
-          const isAutopayAuthenticated = (sourceEvent || rawEvent) === 'subscription.authenticated' && isSynthetic;
+          const autopayEvent = (sourceEvent || rawEvent) as string;
+          const isAutopayAuthenticated =
+            isSynthetic &&
+            (autopayEvent === 'subscription.authenticated' ||
+              // Razorpay can emit `subscription.activated` for UPI AutoPay/mandate flows
+              // before the first charge is actually captured.
+              autopayEvent === 'subscription.activated');
 
           invoiceCheckoutRequired = true;
           invoiceCheckoutRequiredSince = toIsoTimestamp((inv as any).issuedAt ?? (inv as any).createdAt) ?? undefined;
@@ -11719,19 +11725,63 @@ export function createApp(options: CreateAppOptions = {}){
       const existingCheckoutRequired = (billing as any).checkoutRequired === true;
       const existingSubscriptionId =
         typeof (billing as any).subscriptionId === 'string' ? String((billing as any).subscriptionId).trim() : '';
+      const existingRazorpayKeyId =
+        typeof (billing as any).razorpayKeyId === 'string' ? String((billing as any).razorpayKeyId).trim() : '';
+      const envRazorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
       const existingBillingAttemptId =
         typeof (billing as any).billingAttemptId === 'string' ? String((billing as any).billingAttemptId).trim() : '';
       const pendingPlanVariantId =
         typeof (billing as any).pendingPlanVariantId === 'string' ? String((billing as any).pendingPlanVariantId).trim() : '';
       const requestedPlanVariantId = typeof payload.planVariantId === 'string' ? payload.planVariantId.trim() : '';
 
-      const canReuseExistingPendingSubscription =
+      let canReuseExistingPendingSubscription =
         provider === 'razorpay' &&
         existingCheckoutRequired &&
         existingBillingProvider === 'razorpay' &&
         Boolean(existingSubscriptionId) &&
         // Only reuse automatically if the caller isn't trying to change variants.
         (!requestedPlanVariantId || !pendingPlanVariantId || requestedPlanVariantId === pendingPlanVariantId);
+
+      // If billing state was created under a different Razorpay key (test vs live), do not reuse.
+      // Reusing a subscription created in one environment with a key from another will cause
+      // checkout.js to fail with 400 "Invalid request payload".
+      if (canReuseExistingPendingSubscription && existingRazorpayKeyId && envRazorpayKeyId && existingRazorpayKeyId !== envRazorpayKeyId) {
+        canReuseExistingPendingSubscription = false;
+      }
+
+      // If we can't verify the subscription in the current Razorpay environment, clear stale pending
+      // markers so a fresh subscription can be created.
+      if (canReuseExistingPendingSubscription) {
+        let subscriptionExists = true;
+        try {
+          await fetchRazorpaySubscription({ subscriptionId: existingSubscriptionId });
+        } catch {
+          subscriptionExists = false;
+        }
+
+        if (!subscriptionExists) {
+          canReuseExistingPendingSubscription = false;
+          try {
+            await billingRef.set(
+              {
+                checkoutRequired: false,
+                checkoutRequiredProvider: admin.firestore.FieldValue.delete(),
+                checkoutRequiredSinceIso: admin.firestore.FieldValue.delete(),
+                billingAttemptId: admin.firestore.FieldValue.delete(),
+                subscriptionId: admin.firestore.FieldValue.delete(),
+                pendingPlanVariantId: admin.firestore.FieldValue.delete(),
+                pendingPlanId: admin.firestore.FieldValue.delete(),
+                pendingCouponCode: admin.firestore.FieldValue.delete(),
+                razorpayKeyId: admin.firestore.FieldValue.delete(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          } catch {
+            // Best-effort cleanup; proceed to create a new subscription regardless.
+          }
+        }
+      }
 
       if (canReuseExistingPendingSubscription) {
         const lockTtlMinutesRaw = Number.parseInt((process.env.BILLING_CHECKOUT_LOCK_TTL_MINUTES || '').trim() || '15', 10);
@@ -11784,6 +11834,7 @@ export function createApp(options: CreateAppOptions = {}){
           ...(payload.cancelUrl ? { cancelUrl: payload.cancelUrl } : {}),
           metadata: {
             ...(payload.metadata || {}),
+            ...(existingRazorpayKeyId || envRazorpayKeyId ? { razorpayKeyId: existingRazorpayKeyId || envRazorpayKeyId } : {}),
             razorpaySubscriptionId: existingSubscriptionId,
             ...(pendingPlanVariantId ? { planVariantId: pendingPlanVariantId } : {}),
             planId: effectiveReusePlanId,
@@ -11939,6 +11990,8 @@ export function createApp(options: CreateAppOptions = {}){
           ? normalizePlanId(payload.metadata.planId)
           : planId;
 
+      const razorpayKeyIdAtCreation = provider === 'razorpay' ? (process.env.RAZORPAY_KEY_ID || '').trim() : '';
+
       // Note: nowIso is already computed above (used for lock/pending reuse checks).
       const record: BillingCheckoutSessionRecord = {
         tenantId: tenantAccess.tenantId,
@@ -11949,6 +12002,7 @@ export function createApp(options: CreateAppOptions = {}){
         ...(() => {
           const metadata = {
             ...(payload.metadata || {}),
+            ...(razorpayKeyIdAtCreation ? { razorpayKeyId: razorpayKeyIdAtCreation } : {}),
             ...(razorpaySubscription?.subscriptionId ? { razorpaySubscriptionId: razorpaySubscription.subscriptionId } : {}),
           };
           return Object.keys(metadata).length ? { metadata } : {};
@@ -12030,6 +12084,7 @@ export function createApp(options: CreateAppOptions = {}){
               checkoutRequiredSinceIso: nowIso,
               billingAttemptId,
               billingProvider: 'razorpay',
+              ...(razorpayKeyIdAtCreation ? { razorpayKeyId: razorpayKeyIdAtCreation } : {}),
               ...(razorpaySubscription?.subscriptionId ? { subscriptionId: razorpaySubscription.subscriptionId } : {}),
               // Best-effort: remember plan intent for history/debugging.
               ...(payload.metadata && typeof payload.metadata.planVariantId === 'string' ? { pendingPlanVariantId: payload.metadata.planVariantId } : {}),
@@ -12215,12 +12270,15 @@ export function createApp(options: CreateAppOptions = {}){
         return res.status(400).json({ error: 'provider_not_supported' });
       }
 
-      const keyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+      const meta = (data.metadata && typeof data.metadata === 'object' ? data.metadata : {}) as Record<string, any>;
+
+      const storedKeyId = typeof meta.razorpayKeyId === 'string' ? meta.razorpayKeyId.trim() : '';
+      const envKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+      const keyId = storedKeyId || envKeyId;
       if (!keyId) {
         return res.status(503).json({ error: 'razorpay_unconfigured' });
       }
 
-      const meta = (data.metadata && typeof data.metadata === 'object' ? data.metadata : {}) as Record<string, any>;
       const subscriptionId = typeof meta.razorpaySubscriptionId === 'string' ? meta.razorpaySubscriptionId.trim() : '';
       if (!subscriptionId) {
         return res.status(409).json({ error: 'subscription_missing' });
@@ -12322,6 +12380,42 @@ export function createApp(options: CreateAppOptions = {}){
       // If this tenant is billed via Razorpay and we have a subscription id, schedule cancellation
       // at the end of the current billing cycle so there are no further charges.
       if (billingProvider === 'razorpay' && subscriptionId) {
+        // Enforce: cancellation should only be possible after we have evidence of a captured payment.
+        // This prevents cancel attempts during UPI AutoPay mandate authentication / open-invoice states
+        // where the subscription may appear "active" but no charge has been captured yet.
+        if ((billingData as any).checkoutRequired === true) {
+          return res.status(409).json({
+            error: 'payment_not_captured_yet',
+            message: 'This subscription has a pending payment. Please wait for payment confirmation, then try again.',
+          });
+        }
+
+        let hasPaidInvoiceForSubscription = false;
+        try {
+          const invoicesRef = db.collection('billingInvoices').doc(tenantId).collection('invoices');
+          const paidByProviderSub = await invoicesRef
+            .where('status', '==', 'paid')
+            .where('providerSubscriptionId', '==', subscriptionId)
+            .limit(1)
+            .get();
+          hasPaidInvoiceForSubscription = !paidByProviderSub.empty;
+
+          if (!hasPaidInvoiceForSubscription) {
+            const paidBySub = await invoicesRef.where('status', '==', 'paid').where('subscriptionId', '==', subscriptionId).limit(1).get();
+            hasPaidInvoiceForSubscription = !paidBySub.empty;
+          }
+        } catch {
+          // Best-effort. If we cannot verify, stay conservative.
+          hasPaidInvoiceForSubscription = false;
+        }
+
+        if (!hasPaidInvoiceForSubscription) {
+          return res.status(409).json({
+            error: 'payment_not_captured_yet',
+            message: 'This subscription cannot be cancelled until the first payment is captured. Please wait for payment confirmation, then try again.',
+          });
+        }
+
         try {
           await cancelRazorpaySubscriptionImpl({ subscriptionId, cancelAtCycleEnd: true });
         } catch (error) {
@@ -12531,6 +12625,39 @@ export function createApp(options: CreateAppOptions = {}){
       const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
 
       if (billingProvider === 'razorpay' && subscriptionId) {
+        // Enforce: do not allow immediate cancellation until payment is captured.
+        if ((billingData as any).checkoutRequired === true) {
+          return res.status(409).json({
+            error: 'payment_not_captured_yet',
+            message: 'This subscription has a pending payment. Please wait for payment confirmation, then try again.',
+          });
+        }
+
+        let hasPaidInvoiceForSubscription = false;
+        try {
+          const invoicesRef = db.collection('billingInvoices').doc(tenantId).collection('invoices');
+          const paidByProviderSub = await invoicesRef
+            .where('status', '==', 'paid')
+            .where('providerSubscriptionId', '==', subscriptionId)
+            .limit(1)
+            .get();
+          hasPaidInvoiceForSubscription = !paidByProviderSub.empty;
+
+          if (!hasPaidInvoiceForSubscription) {
+            const paidBySub = await invoicesRef.where('status', '==', 'paid').where('subscriptionId', '==', subscriptionId).limit(1).get();
+            hasPaidInvoiceForSubscription = !paidBySub.empty;
+          }
+        } catch {
+          hasPaidInvoiceForSubscription = false;
+        }
+
+        if (!hasPaidInvoiceForSubscription) {
+          return res.status(409).json({
+            error: 'payment_not_captured_yet',
+            message: 'This subscription cannot be cancelled until the first payment is captured. Please wait for payment confirmation, then try again.',
+          });
+        }
+
         try {
           await cancelRazorpaySubscriptionImpl({ subscriptionId, cancelAtCycleEnd: false });
         } catch (error) {

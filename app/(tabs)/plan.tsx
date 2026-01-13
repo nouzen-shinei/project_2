@@ -464,7 +464,10 @@ export default function PlanAndBillingScreen() {
   const isSubscriptionManagementBlocked = requiresWebsiteForSubscriptionManagement || requiresAppForSubscriptionManagement;
 
   const canUpdatePaymentMethod =
-    !isSubscriptionManagementBlocked && !isAndroidGooglePlayBilling && (isDelinquent || isRazorpayCheckoutRequired);
+    !isSubscriptionManagementBlocked &&
+    !isAndroidGooglePlayBilling &&
+    !isAwaitingAutopayConfirmation &&
+    (isDelinquent || isRazorpayCheckoutRequired);
   const isCheckoutBusy = !!checkoutVariantBusy;
   const downgradeToFreeScheduled =
     currentBilling?.planId !== 'free' && currentBilling?.cancelAtCycleEnd === true && currentBilling?.scheduledDowngradePlanId === 'free';
@@ -988,7 +991,11 @@ export default function PlanAndBillingScreen() {
 
   const shouldShowCancelSubscriptionActions =
     canManageBilling &&
+    !isSubscriptionManagementBlocked &&
     !isAwaitingAutopayConfirmation &&
+    !isPendingPaid &&
+    !isDelinquent &&
+    currentBilling?.status === 'active' &&
     !downgradeToFreeScheduled &&
     currentPlanDisplay.id !== 'free' &&
     currentPlanDisplay.id !== 'enterprise';

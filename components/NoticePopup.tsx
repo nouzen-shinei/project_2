@@ -718,7 +718,7 @@ const NoticePopup: React.FC<NoticePopupProps> = ({ visible, onClose, notices }) 
                   disabled={!user?.uid || Boolean(reactionBusy)}
                 >
                   <Text style={[styles.reactionChipText, { color: theme.text }]}>＋</Text>
-                  <Text style={[styles.reactionChipCount, { color: theme.textSecondary }]}>More</Text>
+                  {/* <Text style={[styles.reactionChipCount, { color: theme.textSecondary }]}>More</Text> */}
                 </TouchableOpacity>
               </View>
 

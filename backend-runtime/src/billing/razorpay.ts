@@ -21,6 +21,28 @@ export interface RazorpaySubscriptionCreateResult {
   raw: Record<string, any>;
 }
 
+async function getCurrentTenantPlanId(
+  billingRef: admin.firestore.DocumentReference
+): Promise<'free' | 'pro' | 'enterprise' | null> {
+  try {
+    const snap = await billingRef.get();
+    const data = snap.exists ? (snap.data() ?? {}) : {};
+    const raw =
+      typeof (data as any).planId === 'string'
+        ? String((data as any).planId)
+        : typeof (data as any).plan === 'string'
+          ? String((data as any).plan)
+          : '';
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === 'free' || normalized === 'pro' || normalized === 'enterprise') {
+      return normalized;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function getEnv(name: string): string {
   return (process.env[name] || '').trim();
 }
@@ -80,9 +102,17 @@ export async function createRazorpaySubscription(options: {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const startAt = nowSeconds + 5 * 60; // give user a few minutes to complete checkout
 
+  // Razorpay validates `end_time` / mandate expiry (computed from plan interval + `total_count`).
+  // Large counts can exceed provider limits and fail checkout initiation, e.g.:
+  // - "end_time must be between 946684800 and 4765046400"
+  // - "expire_at cannot be more than 30 years for upi"
+  // For monthly plans, 30 years ~= 360 cycles.
+  const totalCountRaw = Number.parseInt(getEnv('RAZORPAY_SUBSCRIPTION_TOTAL_COUNT') || '360', 10);
+  const totalCount = Number.isFinite(totalCountRaw) ? Math.max(1, Math.min(360, totalCountRaw)) : 360;
+
   const payload = {
     plan_id: razorpayPlanId,
-    total_count: 1200, // long-running monthly subscription
+    total_count: totalCount,
     quantity: 1,
     customer_notify: options.customerNotify === false ? 0 : 1,
     start_at: startAt,
@@ -839,6 +869,12 @@ export async function handleRazorpayWebhook(options: {
 
   // Explicit failure events (best-effort). These can occur in addition to subscription.pending.
   if (event === 'payment.failed') {
+    // Do not mark a Free tenant delinquent due to an unpaid initial checkout attempt.
+    const currentPlanId = await getCurrentTenantPlanId(billingRef);
+    if (currentPlanId === 'free') {
+      return { ok: true, provider: 'razorpay' };
+    }
+
     try {
       await billingRef.set(
         {
@@ -963,6 +999,12 @@ export async function handleRazorpayWebhook(options: {
           ...(billingAttemptId ? { billingAttemptId } : {}),
         },
       });
+    }
+
+    // If the tenant is currently on Free, do not upgrade them or mark them delinquent.
+    const currentPlanId = await getCurrentTenantPlanId(billingRef);
+    if (currentPlanId === 'free') {
+      return { ok: true, provider: 'razorpay' };
     }
 
     try {
@@ -1188,6 +1230,13 @@ export async function handleRazorpayWebhook(options: {
       });
     }
 
+    // A started-but-unpaid initial checkout can yield pending events.
+    // If the tenant is currently on Free, do not upgrade them or mark them delinquent.
+    const currentPlanId = await getCurrentTenantPlanId(billingRef);
+    if (currentPlanId === 'free') {
+      return { ok: true, provider: 'razorpay' };
+    }
+
     try {
       await billingRef.set(
         {
@@ -1233,7 +1282,7 @@ export async function handleRazorpayWebhook(options: {
     return { ok: true, provider: 'razorpay' };
   }
 
-  if (event === 'subscription.completed' || event === 'subscription.cancelled') {
+  if (event === 'subscription.completed' || event === 'subscription.cancelled' || event === 'subscription.expired') {
     // If an open invoice exists for this subscription, mark it void.
     if (subscriptionId) {
       await updateOpenInvoicesForSubscription({

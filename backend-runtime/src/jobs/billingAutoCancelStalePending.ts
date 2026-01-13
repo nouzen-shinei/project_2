@@ -818,6 +818,9 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
   const startedAtIso = new Date().toISOString();
   const runId = crypto.randomUUID();
   const thresholdMs = options.thresholdHours * 60 * 60 * 1000;
+  // UPI AutoPay mandate flows can take time between mandate authentication and first capture.
+  // Never auto-cancel these attempts earlier than this minimum, even if thresholdHours is smaller.
+  const razorpayAutopayMinMs = 24 * 60 * 60 * 1000;
   const cutoffMs = Date.now() - thresholdMs;
   const cutoffIso = new Date(cutoffMs).toISOString();
 
@@ -1084,6 +1087,40 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
         let cancelledCurrentAttempt = false;
 
         for (const attempt of attempts) {
+          const isRazorpayAutopayAuthenticatedAttempt = (() => {
+            if (attempt.provider !== 'razorpay') return false;
+            for (const doc of attempt.invoiceDocs) {
+              try {
+                const data = (doc.data() || {}) as any;
+                const isSynthetic = data?.isSynthetic === true;
+                if (!isSynthetic) continue;
+                const sourceEvent = typeof data?.sourceEvent === 'string' ? String(data.sourceEvent).trim() : '';
+                const rawEvent = typeof data?.rawEvent === 'string' ? String(data.rawEvent).trim() : '';
+                const ev = sourceEvent || rawEvent;
+                if (ev === 'subscription.authenticated' || ev === 'subscription.activated') {
+                  return true;
+                }
+              } catch {
+                // ignore
+              }
+            }
+            return false;
+          })();
+
+          if (isRazorpayAutopayAuthenticatedAttempt) {
+            const sinceMs = Date.parse(attempt.sinceIso);
+            const ageMs = Number.isFinite(sinceMs) ? Date.now() - sinceMs : Number.POSITIVE_INFINITY;
+            if (ageMs < razorpayAutopayMinMs) {
+              log(options.verbose, 'skipping autopay-authenticated razorpay attempt (too recent to auto-cancel)', {
+                tenantId,
+                attemptKey: attempt.attemptKey,
+                subscriptionId: attempt.subscriptionId,
+                ageHours: Math.round((ageMs / (60 * 60 * 1000)) * 10) / 10,
+              });
+              continue;
+            }
+          }
+
           const isAttemptCurrent = (() => {
             if (attempt.billingAttemptId && billingAttemptId) {
               return attempt.billingAttemptId === billingAttemptId;

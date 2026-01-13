@@ -17,6 +17,9 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useRouter } from 'expo-router';
 import { RefreshCw, X } from 'lucide-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
+import * as WebBrowser from 'expo-web-browser';
 
 import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
@@ -95,6 +98,7 @@ export default function BillingHistoryScreen() {
   const router = useRouter();
   const { theme } = useTheme();
   const { activeTenant, activeMembership, loading: tenantLoading } = useTenant();
+  const isNativeMobile = Platform.OS === 'ios' || Platform.OS === 'android';
 
   const focusCountRef = useRef(0);
   const refreshSpin = useRef(new Animated.Value(0)).current;
@@ -503,18 +507,35 @@ export default function BillingHistoryScreen() {
   const openInvoice = async (url?: string) => {
     if (!url) return;
     try {
-      const canOpen = await Linking.canOpenURL(url);
-      if (canOpen) await Linking.openURL(url);
+      if (!isNativeMobile) {
+        const canOpen = await Linking.canOpenURL(url);
+        if (canOpen) await Linking.openURL(url);
+        return;
+      }
+
+      // Native: keep the user inside the app surface.
+      await WebBrowser.openBrowserAsync(url, {
+        presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
+        enableBarCollapsing: true,
+        showTitle: true,
+      });
     } catch {
       // ignore
     }
+  };
+
+  const makeSafePdfFilename = (value: string): string => {
+    const raw = (value || '').trim() || 'invoice';
+    const safe = raw.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
+    const withExt = safe.toLowerCase().endsWith('.pdf') ? safe : `${safe}.pdf`;
+    return withExt || 'invoice.pdf';
   };
 
   const handleInvoiceDownload = useCallback(
     async (invoice: BillingHistoryInvoice) => {
       if (!activeTenant?.id) return;
 
-      if (Platform.OS === 'web') {
+      if (!isNativeMobile) {
         setGeneratingInvoiceId(invoice.id);
         try {
           const blob = await billingService.downloadInvoicePdf(activeTenant.id, invoice.id);
@@ -552,6 +573,37 @@ export default function BillingHistoryScreen() {
             const nextInvoices = (prev.invoices || []).map((inv) => (inv.id === invoice.id ? { ...inv, downloadUrl: url } : inv));
             return { ...prev, invoices: nextInvoices };
           });
+          // Native: download to a local file and share/open it.
+          if (isNativeMobile) {
+            const baseName = String(invoice.invoiceNumber || invoice.id || 'invoice');
+            const filename = makeSafePdfFilename(baseName);
+            const dir = `${FileSystem.cacheDirectory || FileSystem.documentDirectory || ''}invoices/`;
+            if (dir) {
+              try {
+                await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+              } catch {
+                // ignore
+              }
+              const localUri = `${dir}${filename}`;
+              const downloaded = await FileSystem.downloadAsync(url, localUri);
+              const finalUri = downloaded?.uri || localUri;
+
+              const sharingAvailable = await Sharing.isAvailableAsync().catch(() => false);
+              if (sharingAvailable) {
+                await Sharing.shareAsync(finalUri, {
+                  mimeType: 'application/pdf',
+                  dialogTitle: 'Invoice',
+                  UTI: 'com.adobe.pdf',
+                });
+                return;
+              }
+            }
+            // Fallback: open inside an in-app browser if we can't share.
+            await openInvoice(url);
+            return;
+          }
+
+          // Web fallback (keeps existing behavior)
           await openInvoice(url);
         } else if (existing) {
           await openInvoice(existing);
