@@ -1007,6 +1007,7 @@ export interface TenantBillingPlanVariantOverridePayload {
   tenantId: string;
   planVariantId: string;
   note?: string;
+  cancelExistingSubscription?: 'none' | 'immediate' | 'end_of_cycle';
 }
 
 export interface TenantBillingPlanVariantOverrideResponse {
@@ -1358,6 +1359,9 @@ export interface BillingSummaryResponse {
   status: 'trial' | 'active' | 'delinquent' | 'canceled';
   renewalDate?: string;
   checkoutRequired?: boolean;
+  subscriptionProvider?: 'razorpay' | 'google_play' | 'unknown';
+  subscriptionId?: string;
+  cancelAtCycleEnd?: boolean;
   invoices: BillingInvoiceRecord[];
 }
 
@@ -1387,6 +1391,7 @@ export async function fetchBillingHistory(
     tenantId?: string;
     pageSize?: number;
     limitInvoices?: number;
+    cancelExistingSubscription?: 'none' | 'immediate' | 'end_of_cycle';
     limitChanges?: number;
     cursorInvoiceAt?: string;
     cursorInvoiceId?: string;

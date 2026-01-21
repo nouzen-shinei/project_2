@@ -856,8 +856,18 @@ export default function PlanAndBillingScreen() {
           const parsed = parseJsonMessage(rawMessage);
           const code = typeof parsed?.error === 'string' ? parsed.error : '';
           setSwitchToFreeModalStatusType('error');
+          if (code === 'plan_locked_by_org') {
+            const serverMessage = typeof parsed?.message === 'string' ? parsed.message.trim() : '';
+            setSwitchToFreeModalStatusMessage(
+              serverMessage || 'This subscription plan was updated by our organization. Please contact support to change the plan.'
+            );
+            return;
+          }
           if (code === 'razorpay_cancel_failed') {
-            setSwitchToFreeModalStatusMessage('We could not cancel your subscription right now. Please try again later.');
+            const serverMessage = typeof parsed?.message === 'string' ? parsed.message.trim() : '';
+            setSwitchToFreeModalStatusMessage(
+              serverMessage || 'We could not cancel your subscription right now. Please try again later.'
+            );
             return;
           }
           setSwitchToFreeModalStatusMessage(toFriendlyBillingErrorMessage(rawMessage) || 'Unable to switch to Free');

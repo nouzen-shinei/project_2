@@ -88,6 +88,7 @@ export interface BillingHistoryInvoice {
   status: 'paid' | 'open' | 'failed' | 'void' | 'uncollectible';
   issuedAt?: string;
   dueAt?: string;
+  updatedAt?: string;
   downloadUrl?: string;
   provider?: string;
   planId?: string;
@@ -125,6 +126,7 @@ export interface BillingHistoryChange {
 
 export interface BillingHistoryResponse {
   tenantId: string;
+  timeZone?: string;
   invoices: BillingHistoryInvoice[];
   changes: BillingHistoryChange[];
   totals?: {

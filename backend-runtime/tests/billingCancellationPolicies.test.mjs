@@ -282,4 +282,64 @@ describe('billing cancellation policies', () => {
     assert.equal(found.metadata.provider, 'razorpay');
     assert.equal(found.metadata.subscriptionId, 'sub_test_123');
   });
+
+  it('switch-to-free is blocked when the plan is organization-managed (admin override)', async () => {
+    const tenantId = 't_switch_to_free_locked_1';
+    const db = makeInMemoryFirestore();
+    const auditEvents = [];
+
+    await db
+      .collection('tenantBilling')
+      .doc(tenantId)
+      .set({ planId: 'pro', status: 'active', planLockedByOrg: true }, { merge: false });
+    await db.collection('tenants').doc(tenantId).set({ billingTier: 'pro' }, { merge: false });
+
+    const { server, base } = await startServer({ tenantId, db, auditEvents });
+    servers.add(server);
+
+    const response = await fetch(`${base}/billing/switch-to-free`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenantId }),
+    });
+
+    assert.equal(response.status, 409);
+    const payload = await response.json();
+    assert.equal(payload.error, 'plan_locked_by_org');
+    assert.ok(typeof payload.message === 'string');
+
+    const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
+    assert.equal(billingSnap.data().planId, 'pro');
+    assert.equal(auditEvents.length, 0);
+  });
+
+  it('switch-to-free/immediate is blocked when the plan is organization-managed (admin override)', async () => {
+    const tenantId = 't_switch_to_free_locked_2';
+    const db = makeInMemoryFirestore();
+    const auditEvents = [];
+
+    await db
+      .collection('tenantBilling')
+      .doc(tenantId)
+      .set({ planId: 'pro', status: 'active', planLockedByOrg: true }, { merge: false });
+    await db.collection('tenants').doc(tenantId).set({ billingTier: 'pro' }, { merge: false });
+
+    const { server, base } = await startServer({ tenantId, db, auditEvents });
+    servers.add(server);
+
+    const response = await fetch(`${base}/billing/switch-to-free/immediate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenantId }),
+    });
+
+    assert.equal(response.status, 409);
+    const payload = await response.json();
+    assert.equal(payload.error, 'plan_locked_by_org');
+    assert.ok(typeof payload.message === 'string');
+
+    const billingSnap = await db.collection('tenantBilling').doc(tenantId).get();
+    assert.equal(billingSnap.data().planId, 'pro');
+    assert.equal(auditEvents.length, 0);
+  });
 });

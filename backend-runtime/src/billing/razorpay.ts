@@ -99,9 +99,6 @@ export async function createRazorpaySubscription(options: {
     throw new Error('razorpay_missing_plan_mapping');
   }
 
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const startAt = nowSeconds + 5 * 60; // give user a few minutes to complete checkout
-
   // Razorpay validates `end_time` / mandate expiry (computed from plan interval + `total_count`).
   // Large counts can exceed provider limits and fail checkout initiation, e.g.:
   // - "end_time must be between 946684800 and 4765046400"
@@ -115,7 +112,6 @@ export async function createRazorpaySubscription(options: {
     total_count: totalCount,
     quantity: 1,
     customer_notify: options.customerNotify === false ? 0 : 1,
-    start_at: startAt,
     notes: {
       tenantId: options.tenantId,
       planId: options.planId,
@@ -618,22 +614,75 @@ export async function handleRazorpayWebhook(options: {
       return invoicesCol.doc(options.paymentId);
     }
 
-    // Prefer updating an existing "open" invoice (created from subscription.authenticated)
-    // to avoid duplicate records when payment status transitions to paid/failed.
+    // Prefer updating an existing invoice for this subscription to avoid duplicates.
+    // Priority:
+    // 1) invoice already linked to this paymentId (idempotency)
+    // 2) an "open" invoice (created from subscription.* events) to transition it
+    // IMPORTANT: avoid composite indexes by filtering in-memory.
     try {
-      const openSnap = await invoicesCol
-        .where('providerSubscriptionId', '==', normalizedSubscriptionId)
-        .where('status', '==', 'open')
-        .limit(1)
-        .get();
-      if (!openSnap.empty) {
-        return openSnap.docs[0].ref;
+      const snap = await invoicesCol.where('providerSubscriptionId', '==', normalizedSubscriptionId).limit(25).get();
+      if (!snap.empty) {
+        const byPaymentId = snap.docs.find((doc) => {
+          const data = doc.data() || {};
+          const pid = typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : null;
+          return pid === options.paymentId;
+        });
+        if (byPaymentId) return byPaymentId.ref;
+
+        const open = snap.docs.find((doc) => {
+          const data = doc.data() || {};
+          return (data as any).status === 'open';
+        });
+        if (open) return open.ref;
       }
     } catch {
       // ignore and fall back to payment-id keyed record
     }
 
     return invoicesCol.doc(options.paymentId);
+  }
+
+  async function hasPaidInvoiceForSubscriptionCycle(options: {
+    tenantId: string;
+    subscriptionId: string;
+    billingPeriodStart?: string | null;
+    billingPeriodEnd?: string | null;
+    limit?: number;
+  }): Promise<boolean> {
+    const tenantId = (options.tenantId || '').trim();
+    const subscriptionId = (options.subscriptionId || '').trim();
+    if (!tenantId || !subscriptionId) return false;
+
+    const invoicesCol = db.collection('billingInvoices').doc(tenantId).collection('invoices');
+    const max = Math.max(1, Math.min(25, Math.trunc(options.limit ?? 25)));
+
+    try {
+      const snap = await invoicesCol.where('providerSubscriptionId', '==', subscriptionId).limit(max).get();
+      if (snap.empty) return false;
+
+      const start = options.billingPeriodStart || null;
+      const end = options.billingPeriodEnd || null;
+
+      const paidDocs = snap.docs.filter((doc) => {
+        const data = doc.data() || {};
+        return (data as any).status === 'paid';
+      });
+      if (!paidDocs.length) return false;
+
+      if (start || end) {
+        const exact = paidDocs.find((doc) => {
+          const data = doc.data() || {};
+          const s = typeof (data as any).billingPeriodStart === 'string' ? (data as any).billingPeriodStart : null;
+          const e = typeof (data as any).billingPeriodEnd === 'string' ? (data as any).billingPeriodEnd : null;
+          return (start ? s === start : true) && (end ? e === end : true);
+        });
+        return Boolean(exact);
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async function resolveOpenInvoiceRefForSubscriptionCycle(options: {
@@ -745,11 +794,25 @@ export async function handleRazorpayWebhook(options: {
             ? paymentEntity.created_at
             : createdAt
       );
-      const targetRef = await resolveInvoiceRefForPayment({
-        tenantId: tenantIdFromNotes,
-        paymentId,
-        subscriptionId: subscriptionId || undefined,
-      });
+
+      // If we previously created a synthetic OPEN invoice for this same subscription cycle
+      // (from subscription.* events), update that existing doc to PAID instead of creating
+      // a new PAID doc keyed by paymentId. This prevents OPEN+PAID duplicates in Billing History.
+      const existingOpenRef = subscriptionId
+        ? await resolveOpenInvoiceRefForSubscriptionCycle({
+            tenantId: tenantIdFromNotes,
+            subscriptionId,
+            billingPeriodStart: subscriptionPeriodStart || null,
+            billingPeriodEnd: subscriptionPeriodEnd || null,
+          })
+        : null;
+      const targetRef =
+        existingOpenRef ||
+        (await resolveInvoiceRefForPayment({
+          tenantId: tenantIdFromNotes,
+          paymentId,
+          subscriptionId: subscriptionId || undefined,
+        }));
       try {
         await targetRef.set(
           {
@@ -1054,6 +1117,7 @@ export async function handleRazorpayWebhook(options: {
   // app upgrades right after checkout.
   if (event === 'subscription.charged' || event === 'subscription.activated' || event === 'subscription.authenticated') {
     const isAuthenticatedEvent = event === 'subscription.authenticated';
+    const isActivatedEvent = event === 'subscription.activated';
     const currentEnd = subscriptionEntity?.current_end;
     const renewalDate = toIsoFromUnixSeconds(currentEnd);
     const renewalDateDisplay = formatIsoIstForDisplay(renewalDate);
@@ -1112,98 +1176,304 @@ export async function handleRazorpayWebhook(options: {
       // ignore
     }
 
-    // Persist an invoice record even when Razorpay doesn't include `payload.payment.entity`.
-    // Accounting rule: without a real paymentId/capture, we keep the invoice as "open".
-    if (!paymentId && subscriptionId) {
-      let amountInr = 0;
-      try {
-        if (planVariantIdFromNotes) {
-          const variant = await getPlanVariantById(db, planVariantIdFromNotes);
-          if (variant && Number.isFinite(variant.priceInr)) {
-            amountInr = Math.max(0, Math.trunc(variant.priceInr));
+    // Handle invoice creation/update for subscription events.
+    // CRITICAL: payment.captured is the authoritative source for invoice status.
+    // Subscription events (authenticated/activated/charged) may include paymentId but often
+    // lack capture indicators even when payment was already captured. To avoid overwriting
+    // a paid invoice with open status, we skip invoice updates when paymentId exists but
+    // capture status is ambiguous. Let payment.captured handle it.
+    if (subscriptionId) {
+      if (paymentId) {
+        // Payment entity is included in subscription webhook.
+        // Only update invoice if we can definitively confirm capture status.
+        const isCaptured =
+          paymentStatus === 'captured' ||
+          (typeof paymentEntity?.captured_at === 'number' && paymentEntity.captured_at > 0) ||
+          paymentEntity?.captured === true;
+
+        // SKIP invoice updates when paymentId exists but capture status is unclear.
+        // This prevents overwriting status='paid' (set by payment.captured) with status='open'.
+        if (!isCaptured) {
+          // payment.captured will handle this invoice; don't interfere.
+          // Continue to update tenant billing state but skip invoice record.
+        } else {
+          // Captured confirmed in subscription event - safe to mark paid.
+          const amountPaise = typeof paymentEntity?.amount === 'number' ? paymentEntity.amount : 0;
+          const amountInr = Math.round(amountPaise / 100);
+          const issuedAt = toIsoFromUnixSeconds(typeof paymentEntity?.created_at === 'number' ? paymentEntity.created_at : createdAt);
+          const capturedAt = toIsoFromUnixSeconds(
+            typeof paymentEntity?.captured_at === 'number'
+              ? paymentEntity.captured_at
+              : typeof paymentEntity?.created_at === 'number'
+                ? paymentEntity.created_at
+                : createdAt
+          );
+          const authorizedAt = toIsoFromUnixSeconds(
+            typeof paymentEntity?.authorized_at === 'number'
+              ? paymentEntity.authorized_at
+              : typeof paymentEntity?.created_at === 'number'
+                ? paymentEntity.created_at
+                : createdAt
+          );
+          
+          const targetRef = await resolveInvoiceRefForPayment({
+            tenantId: tenantIdFromNotes,
+            paymentId,
+            subscriptionId,
+          });
+          
+          try {
+            await targetRef.set(
+              {
+                amountInr,
+                status: 'paid',
+                provider: 'razorpay',
+                issuedAt: issuedAt || new Date().toISOString(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                planId: planIdFromNotes,
+                planVariantId: planVariantIdFromNotes || null,
+                couponCode: couponCodeFromNotes || null,
+                isSynthetic: false,
+                sourceEvent: event,
+                providerPaymentId: paymentId,
+                providerSubscriptionId: subscriptionId || null,
+                subscriptionId: subscriptionId || null,
+                ...(billingAttemptId ? { billingAttemptId } : {}),
+                rawEvent: event,
+                payerEmail: payerEmail || null,
+                method: paymentMethod || null,
+                cardLast4: cardLast4 || null,
+                cardNetwork: cardNetwork || null,
+                upiVpaMasked: upiVpaMasked || null,
+                authorizedAt: authorizedAt || null,
+                capturedAt: capturedAt || null,
+                billingPeriodStart: subscriptionPeriodStart || null,
+                billingPeriodEnd: subscriptionPeriodEnd || null,
+                createdByEmail: createdByEmail || null,
+                createdByUid: createdByUid || null,
+                createdByRole: createdByRole || null,
+                createdByMembershipId: createdByMembershipId || null,
+              },
+              { merge: true }
+            );
+          } catch (error) {
+            inc('billing_invoice_write_failures_total', { provider: 'razorpay', event, operation: 'upsert_paid_invoice_from_subscription_event' });
+            throw error;
           }
         }
-      } catch {
-        amountInr = 0;
-      }
+      } else {
+        // No payment details yet - create/update an "open" invoice.
+        // If we already have a PAID invoice for this subscription cycle (due to event ordering
+        // or retries), do NOT create a new OPEN invoice (it can later get flipped to PAID and
+        // show as a duplicate payment in the UI).
+        const alreadyPaidForCycle = await hasPaidInvoiceForSubscriptionCycle({
+          tenantId: tenantIdFromNotes,
+          subscriptionId,
+          billingPeriodStart: subscriptionPeriodStart || null,
+          billingPeriodEnd: subscriptionPeriodEnd || null,
+        });
+        if (!alreadyPaidForCycle) {
+          let amountInr = 0;
+          try {
+            if (planVariantIdFromNotes) {
+              const variant = await getPlanVariantById(db, planVariantIdFromNotes);
+              if (variant && Number.isFinite(variant.priceInr)) {
+                amountInr = Math.max(0, Math.trunc(variant.priceInr));
+              }
+            }
+          } catch {
+            amountInr = 0;
+          }
 
-      const issuedAt = toIsoFromUnixSeconds(createdAt) || new Date().toISOString();
-      const syntheticId = `sub_${subscriptionId}_${subscriptionPeriodEnd || issuedAt}_open`;
+          const issuedAt = toIsoFromUnixSeconds(createdAt) || new Date().toISOString();
+          const syntheticId = `sub_${subscriptionId}_${subscriptionPeriodEnd || issuedAt}_open`;
 
-      const existingRef = await resolveOpenInvoiceRefForSubscriptionCycle({
-        tenantId: tenantIdFromNotes,
-        subscriptionId,
-        billingPeriodStart: subscriptionPeriodStart || null,
-        billingPeriodEnd: subscriptionPeriodEnd || null,
-      });
+          const existingRef = await resolveOpenInvoiceRefForSubscriptionCycle({
+            tenantId: tenantIdFromNotes,
+            subscriptionId,
+            billingPeriodStart: subscriptionPeriodStart || null,
+            billingPeriodEnd: subscriptionPeriodEnd || null,
+          });
 
-      try {
-        await db
-          .collection('billingInvoices')
-          .doc(tenantIdFromNotes)
-          .collection('invoices')
-          .doc(existingRef ? existingRef.id : syntheticId)
-          .set(
-            {
-              amountInr,
-              status: 'open',
-              provider: 'razorpay',
-              issuedAt,
-              planId: planIdFromNotes,
-              planVariantId: planVariantIdFromNotes || null,
-              couponCode: couponCodeFromNotes || null,
-              isSynthetic: true,
-              sourceEvent: event,
-              providerPaymentId: null,
-              providerSubscriptionId: subscriptionId || null,
-              subscriptionId: subscriptionId || null,
-              rawEvent: event,
-              payerEmail: payerEmail || null,
-              method: paymentMethod || null,
-              cardLast4: cardLast4 || null,
-              cardNetwork: cardNetwork || null,
-              upiVpaMasked: upiVpaMasked || null,
-              billingPeriodStart: subscriptionPeriodStart || null,
-              billingPeriodEnd: subscriptionPeriodEnd || null,
-              createdByEmail: createdByEmail || null,
-              createdByUid: createdByUid || null,
-              createdByRole: createdByRole || null,
-              createdByMembershipId: createdByMembershipId || null,
-            },
-            { merge: true }
-          );
-      } catch (error) {
-        inc('billing_invoice_write_failures_total', { provider: 'razorpay', event, operation: 'upsert_open_invoice' });
-        throw error;
+          try {
+            // Always merge to avoid overwriting fields from earlier events.
+            await db
+              .collection('billingInvoices')
+              .doc(tenantIdFromNotes)
+              .collection('invoices')
+              .doc(existingRef ? existingRef.id : syntheticId)
+              .set(
+                {
+                  amountInr,
+                  status: 'open',
+                  provider: 'razorpay',
+                  issuedAt,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  planId: planIdFromNotes,
+                  planVariantId: planVariantIdFromNotes || null,
+                  couponCode: couponCodeFromNotes || null,
+                  isSynthetic: true,
+                  sourceEvent: event,
+                  providerPaymentId: null,
+                  providerSubscriptionId: subscriptionId || null,
+                  subscriptionId: subscriptionId || null,
+                  rawEvent: event,
+                  payerEmail: payerEmail || null,
+                  method: paymentMethod || null,
+                  cardLast4: cardLast4 || null,
+                  cardNetwork: cardNetwork || null,
+                  upiVpaMasked: upiVpaMasked || null,
+                  billingPeriodStart: subscriptionPeriodStart || null,
+                  billingPeriodEnd: subscriptionPeriodEnd || null,
+                  createdByEmail: createdByEmail || null,
+                  createdByUid: createdByUid || null,
+                  createdByRole: createdByRole || null,
+                  createdByMembershipId: createdByMembershipId || null,
+                },
+                { merge: true }
+              );
+          } catch (error) {
+            inc('billing_invoice_write_failures_total', { provider: 'razorpay', event, operation: 'upsert_open_invoice' });
+            throw error;
+          }
+        }
       }
     }
 
     // Notification policy:
-    // - subscription.authenticated: push-only (no email, no notice)
-    // - subscription.activated/charged: notify only when actual payment is captured (payment.captured)
-    if (isAuthenticatedEvent) {
-      const bodyLines: string[] = [`Your ${planIdFromNotes.toUpperCase()} subscription is authenticated.`];
-      if (renewalDateDisplay) bodyLines.push(`Next billing: ${renewalDateDisplay}.`);
-      void sendTenantBillingEventNotification({
-        tenantId: tenantIdFromNotes,
-        tenantName: undefined,
-        kind: 'subscription_charged',
-        title: 'Subscription authenticated',
-        body: bodyLines.join('\n'),
-        priority: 'low',
-        sendEmail: false,
-        createNotice: false,
-        metadata: {
-          provider: 'razorpay',
-          planId: planIdFromNotes,
-          subscriptionId: subscriptionId || null,
-          renewalDate: renewalDate || null,
-          createdByEmail: createdByEmail || null,
-          createdByUid: createdByUid || null,
-          createdByRole: createdByRole || null,
-          createdByMembershipId: createdByMembershipId || null,
-        },
-      }).catch(() => undefined);
+    // - subscription.authenticated: push-only (no email, no notice), but suppress when payment is charged immediately
+    // - subscription.activated: send a "Subscription activated" notification when activation occurs without an immediate charge
+    // - payment.captured: source-of-truth for payment notifications (and first-time activation when payment is immediate)
+
+    // If Razorpay includes a payment entity or marks the subscription as already active,
+    // treat this as "payment is (or will be) charged immediately" and suppress the lower-signal
+    // authenticated notification to avoid double-notifying.
+    const isImmediateChargeContext =
+      Boolean(paymentId) ||
+      paymentStatus === 'captured' ||
+      paymentStatus === 'authorized' ||
+      subscriptionStatus === 'active';
+
+    if (isActivatedEvent && subscriptionId) {
+      // Always attempt to send "Subscription activated" for subscription.activated, but
+      // dedupe against activationNotifiedSubscriptionId (payment.captured may have already
+      // sent activation for immediate-charge checkouts).
+      let shouldNotifyActivated = false;
+      try {
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(billingRef);
+          const data = snap.exists ? snap.data() ?? {} : {};
+          const lastNotifiedSub =
+            typeof (data as any).activationNotifiedSubscriptionId === 'string'
+              ? (data as any).activationNotifiedSubscriptionId
+              : null;
+
+          if (lastNotifiedSub !== subscriptionId) {
+            shouldNotifyActivated = true;
+            const nowIso = new Date().toISOString();
+            tx.set(
+              billingRef,
+              {
+                activationNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+                activationNotifiedAtIso: nowIso,
+                activationNotifiedSubscriptionId: subscriptionId,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+        });
+      } catch {
+        // Best-effort; if the tx fails, still attempt to send the notification (webhook idempotency
+        // plus dedupeKey below should keep this from spamming).
+        shouldNotifyActivated = true;
+      }
+
+      if (shouldNotifyActivated) {
+        const bodyLines: string[] = [`Your ${planIdFromNotes.toUpperCase()} subscription is activated.`];
+        if (renewalDateDisplay) bodyLines.push(`Next billing: ${renewalDateDisplay}.`);
+        void sendTenantBillingEventNotification({
+          tenantId: tenantIdFromNotes,
+          tenantName: undefined,
+          kind: 'subscription_activated',
+          title: 'Subscription activated',
+          body: bodyLines.join('\n'),
+          priority: 'medium',
+          dedupeKey: `razorpay:subscription_activated:${subscriptionId}`,
+          metadata: {
+            provider: 'razorpay',
+            planId: planIdFromNotes,
+            subscriptionId,
+            renewalDate: renewalDate || null,
+            createdByEmail: createdByEmail || null,
+            createdByUid: createdByUid || null,
+            createdByRole: createdByRole || null,
+            createdByMembershipId: createdByMembershipId || null,
+          },
+        }).catch(() => undefined);
+      }
+    }
+
+    if (isAuthenticatedEvent && !isImmediateChargeContext) {
+      // Push-only heads-up that mandate/auth succeeded, but avoid duplicate notifications.
+      let shouldNotifyAuthenticated = Boolean(subscriptionId);
+      if (subscriptionId) {
+        try {
+          await db.runTransaction(async (tx) => {
+            const snap = await tx.get(billingRef);
+            const data = snap.exists ? snap.data() ?? {} : {};
+            const lastNotifiedSub =
+              typeof (data as any).authenticatedNotifiedSubscriptionId === 'string'
+                ? (data as any).authenticatedNotifiedSubscriptionId
+                : null;
+
+            if (lastNotifiedSub === subscriptionId) {
+              shouldNotifyAuthenticated = false;
+              return;
+            }
+
+            const nowIso = new Date().toISOString();
+            tx.set(
+              billingRef,
+              {
+                authenticatedNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+                authenticatedNotifiedAtIso: nowIso,
+                authenticatedNotifiedSubscriptionId: subscriptionId,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          });
+        } catch {
+          shouldNotifyAuthenticated = true;
+        }
+      }
+
+      if (shouldNotifyAuthenticated) {
+        const bodyLines: string[] = [`Your ${planIdFromNotes.toUpperCase()} subscription is authenticated.`];
+        if (renewalDateDisplay) bodyLines.push(`Next billing: ${renewalDateDisplay}.`);
+        void sendTenantBillingEventNotification({
+          tenantId: tenantIdFromNotes,
+          tenantName: undefined,
+          kind: 'subscription_charged',
+          title: 'Subscription authenticated',
+          body: bodyLines.join('\n'),
+          priority: 'low',
+          sendEmail: false,
+          createNotice: false,
+          dedupeKey: subscriptionId ? `razorpay:subscription_authenticated:${subscriptionId}` : undefined,
+          metadata: {
+            provider: 'razorpay',
+            planId: planIdFromNotes,
+            subscriptionId: subscriptionId || null,
+            renewalDate: renewalDate || null,
+            createdByEmail: createdByEmail || null,
+            createdByUid: createdByUid || null,
+            createdByRole: createdByRole || null,
+            createdByMembershipId: createdByMembershipId || null,
+          },
+        }).catch(() => undefined);
+      }
     }
 
     return { ok: true, provider: 'razorpay' };
@@ -1311,6 +1581,34 @@ export async function handleRazorpayWebhook(options: {
       const current = currentSnap.exists ? (currentSnap.data() ?? {}) : {};
       const currentProvider = typeof (current as any).billingProvider === 'string' ? String((current as any).billingProvider).toLowerCase() : '';
       const currentSubId = typeof (current as any).subscriptionId === 'string' ? String((current as any).subscriptionId).trim() : '';
+
+      // Admin plan override may cancel the subscription as part of switching plans.
+      // In that case, avoid any webhook-driven downgrade and avoid the generic "Subscription cancelled" notice.
+      const suppressUntilIso =
+        typeof (current as any).suppressProviderCancelNotificationUntilIso === 'string'
+          ? String((current as any).suppressProviderCancelNotificationUntilIso)
+          : '';
+      const suppressActive = Boolean(suppressUntilIso) && Date.now() < Date.parse(suppressUntilIso);
+      const ctx = (current as any).lastSystemCancelContext as any;
+      const ctxSource = typeof ctx?.source === 'string' ? String(ctx.source) : '';
+      const ctxSubId = typeof ctx?.subscriptionId === 'string' ? String(ctx.subscriptionId) : '';
+      const matchesCtxSub = !subscriptionId || !ctxSubId || ctxSubId === subscriptionId;
+
+      if (suppressActive && ctxSource === 'admin_console_plan_override' && matchesCtxSub) {
+        try {
+          await billingRef.set(
+            {
+              suppressProviderCancelNotificationUntilIso: admin.firestore.FieldValue.delete(),
+              lastSystemCancelContext: admin.firestore.FieldValue.delete(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        } catch {
+          // ignore
+        }
+        return { ok: true, provider: 'razorpay' };
+      }
 
       if (subscriptionId && currentProvider === 'razorpay' && currentSubId && currentSubId !== subscriptionId) {
         // This is not the active subscription anymore; don't touch tenant plan state.

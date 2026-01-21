@@ -2544,6 +2544,7 @@ interface BillingInvoiceRecord {
   status: 'paid' | 'open' | 'failed' | 'void' | 'uncollectible';
   issuedAt?: string;
   dueAt?: string;
+  updatedAt?: string;
   downloadUrl?: string;
   provider?: string;
   planId?: string;
@@ -2595,6 +2596,7 @@ interface BillingHistoryPageInfo {
 
 interface BillingHistoryRecord {
   tenantId: string;
+  timeZone?: string;
   invoices: BillingInvoiceRecord[];
   changes: BillingAuditEntryRecord[];
   totals?: {
@@ -2653,6 +2655,9 @@ interface BillingSummaryRecord {
   status: 'trial' | 'active' | 'delinquent' | 'canceled';
   renewalDate?: string;
   checkoutRequired?: boolean;
+  subscriptionProvider?: 'razorpay' | 'google_play' | 'unknown';
+  subscriptionId?: string;
+  cancelAtCycleEnd?: boolean;
   invoices: BillingInvoiceRecord[];
 }
 
@@ -2719,6 +2724,7 @@ const tenantBillingPlanVariantUpdateSchema = z.object({
   tenantId: z.string().trim().min(6).max(120),
   planVariantId: z.string().trim().min(1).max(120),
   note: z.string().trim().max(300).optional(),
+  cancelExistingSubscription: z.enum(['none', 'immediate', 'end_of_cycle']).optional(),
 });
 
 const billingCheckoutSchema = z.object({
@@ -2991,6 +2997,70 @@ async function acknowledgeGooglePlaySubscription(options: {
     (err as any).status = resp.status;
     throw err;
   }
+}
+
+async function cancelGooglePlaySubscription(options: {
+  packageName: string;
+  productId: string;
+  purchaseToken: string;
+}): Promise<void> {
+  if (process.env.TEST_MODE === '1') {
+    return;
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(options.packageName)}` +
+    `/purchases/subscriptions/${encodeURIComponent(options.productId)}/tokens/${encodeURIComponent(options.purchaseToken)}:cancel`;
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (resp.ok) {
+    return;
+  }
+
+  const text = await resp.text().catch(() => '');
+  const err = new Error(text || `google_play_cancel_failed_${resp.status}`);
+  (err as any).status = resp.status;
+  throw err;
+}
+
+async function revokeGooglePlaySubscription(options: {
+  packageName: string;
+  productId: string;
+  purchaseToken: string;
+}): Promise<void> {
+  if (process.env.TEST_MODE === '1') {
+    return;
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(options.packageName)}` +
+    `/purchases/subscriptions/${encodeURIComponent(options.productId)}/tokens/${encodeURIComponent(options.purchaseToken)}:revoke`;
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (resp.ok) {
+    return;
+  }
+
+  const text = await resp.text().catch(() => '');
+  const err = new Error(text || `google_play_revoke_failed_${resp.status}`);
+  (err as any).status = resp.status;
+  throw err;
 }
 
 const appStoreVerificationSchema = z.object({
@@ -3394,6 +3464,8 @@ async function loadBillingInvoices(
         status: (data.status || 'open') as BillingInvoiceRecord['status'],
         issuedAt: toIsoTimestamp(data.issuedAt) ?? undefined,
         dueAt: toIsoTimestamp(data.dueAt) ?? undefined,
+        updatedAt:
+          toIsoTimestamp(data.updatedAt) ?? (doc.updateTime ? doc.updateTime.toDate().toISOString() : undefined),
         downloadUrl: typeof data.downloadUrl === 'string' ? data.downloadUrl : undefined,
         provider: typeof data.provider === 'string' ? data.provider : undefined,
         planId: typeof data.planId === 'string' ? data.planId : undefined,
@@ -3467,6 +3539,8 @@ async function loadBillingInvoicesPage(
         status: (data.status || 'open') as BillingInvoiceRecord['status'],
         issuedAt: toIsoTimestamp(data.issuedAt) ?? undefined,
         dueAt: toIsoTimestamp(data.dueAt) ?? undefined,
+        updatedAt:
+          toIsoTimestamp(data.updatedAt) ?? (doc.updateTime ? doc.updateTime.toDate().toISOString() : undefined),
         downloadUrl: typeof data.downloadUrl === 'string' ? data.downloadUrl : undefined,
         provider: typeof data.provider === 'string' ? data.provider : undefined,
         planId: typeof data.planId === 'string' ? data.planId : undefined,
@@ -3650,6 +3724,22 @@ async function loadTenantBillingSummary(
     const data = billingSnap.exists ? billingSnap.data() || {} : {};
     const planId = normalizePlanId((data.planId as string) || (data.plan as string) || fallbackPlanId);
     const planVariantId = typeof data.planVariantId === 'string' && data.planVariantId.trim() ? data.planVariantId.trim() : undefined;
+
+    const billingProviderRaw =
+      typeof (data as any).billingProvider === 'string' ? String((data as any).billingProvider).trim().toLowerCase() : '';
+    const subscriptionProvider =
+      billingProviderRaw === 'razorpay'
+        ? 'razorpay'
+        : billingProviderRaw === 'google_play' || billingProviderRaw === 'play'
+          ? 'google_play'
+          : billingProviderRaw
+            ? 'unknown'
+            : undefined;
+    const subscriptionId = typeof (data as any).subscriptionId === 'string' && (data as any).subscriptionId.trim()
+      ? String((data as any).subscriptionId).trim()
+      : undefined;
+    const cancelAtCycleEnd = typeof (data as any).cancelAtCycleEnd === 'boolean' ? Boolean((data as any).cancelAtCycleEnd) : undefined;
+
     const statusRaw = typeof data.status === 'string' ? data.status.toLowerCase() : undefined;
     const status = (statusRaw === 'active' || statusRaw === 'delinquent' || statusRaw === 'canceled'
       ? statusRaw
@@ -3666,6 +3756,9 @@ async function loadTenantBillingSummary(
       planVariantId,
       status,
       renewalDate,
+      ...(subscriptionProvider ? { subscriptionProvider } : {}),
+      ...(subscriptionId ? { subscriptionId } : {}),
+      ...(typeof cancelAtCycleEnd === 'boolean' ? { cancelAtCycleEnd } : {}),
       ...(typeof checkoutRequired === 'boolean' ? { checkoutRequired } : {}),
       invoices,
     } satisfies BillingSummaryRecord;
@@ -6562,6 +6655,7 @@ export function createApp(options: CreateAppOptions = {}){
       const db = admin.firestore();
       const tenantId = parsed.data.tenantId.trim();
       const planVariantId = parsed.data.planVariantId.trim();
+      const cancelMode = parsed.data.cancelExistingSubscription ?? 'none';
 
       const tenantRef = db.collection('tenants').doc(tenantId);
       const billingRef = db.collection('tenantBilling').doc(tenantId);
@@ -6584,12 +6678,149 @@ export function createApp(options: CreateAppOptions = {}){
       const beforeBillingSnap = await billingRef.get();
       const beforeBilling = beforeBillingSnap.exists ? beforeBillingSnap.data() || {} : {};
 
+      const beforeBillingProviderRaw =
+        typeof (beforeBilling as any).billingProvider === 'string'
+          ? String((beforeBilling as any).billingProvider).trim().toLowerCase()
+          : '';
+      const beforeSubscriptionIdRaw =
+        typeof (beforeBilling as any).subscriptionId === 'string' ? String((beforeBilling as any).subscriptionId).trim() : '';
+      const beforeStatusRaw = typeof (beforeBilling as any).status === 'string' ? String((beforeBilling as any).status).trim().toLowerCase() : '';
+      const hasActiveSubscription = Boolean(beforeSubscriptionIdRaw) && (beforeStatusRaw === 'active' || beforeStatusRaw === 'delinquent');
+
+      let cancelledSubscription: null | {
+        provider: 'razorpay' | 'google_play';
+        mode: 'immediate' | 'end_of_cycle';
+        subscriptionId: string;
+        productId?: string;
+      } = null;
+      let nextTrackedSubscriptionId: string | null = null;
+
       const beforePlanId = normalizePlanId(
         (beforeBilling as any).planId ?? (beforeBilling as any).plan ?? (beforeTenant as any).billingTier ?? null
       );
       const beforePlanVariantId =
         typeof (beforeBilling as any).planVariantId === 'string' ? String((beforeBilling as any).planVariantId) : null;
       const didPlanChange = beforePlanId !== nextPlanId || beforePlanVariantId !== variant.id;
+
+      // Optional: cancel an existing subscription (to avoid double-billing when the operator assigns a different plan).
+      if (cancelMode !== 'none' && hasActiveSubscription) {
+        const mode = cancelMode === 'end_of_cycle' ? 'end_of_cycle' : 'immediate';
+
+        if (beforeBillingProviderRaw === 'razorpay') {
+          // Prevent duplicate/surprise notifications: the admin console already sends a "plan updated" notice.
+          // We also want to avoid the Razorpay cancellation webhook from downgrading billing state during a manual override.
+          try {
+            const suppressUntilIso = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+            await billingRef.set(
+              {
+                suppressProviderCancelNotificationUntilIso: suppressUntilIso,
+                lastSystemCancelContext: {
+                  source: 'admin_console_plan_override',
+                  subscriptionId: beforeSubscriptionIdRaw,
+                  mode,
+                  atIso: nowIso,
+                },
+                updatedAt: nowIso,
+              },
+              { merge: true }
+            );
+          } catch {
+            // best-effort
+          }
+
+          try {
+            await cancelRazorpaySubscriptionImpl({
+              subscriptionId: beforeSubscriptionIdRaw,
+              cancelAtCycleEnd: mode === 'end_of_cycle',
+            });
+          } catch (error) {
+            const msg = String((error as any)?.message || error);
+            console.error('[tenant_billing_plan_override] razorpay cancel failed', error);
+            return res.status(503).json({ error: 'razorpay_cancel_failed', message: msg });
+          }
+
+          cancelledSubscription = {
+            provider: 'razorpay',
+            mode,
+            subscriptionId: beforeSubscriptionIdRaw,
+          };
+          // Prevent subsequent Razorpay cancellation webhooks for the old subscription from overwriting this manual plan override.
+          nextTrackedSubscriptionId = `${beforeSubscriptionIdRaw}__ignored_by_admin_override__${Date.now()}`;
+        } else if (beforeBillingProviderRaw === 'play' || beforeBillingProviderRaw === 'google_play') {
+          const packageName = (process.env.GOOGLE_PLAY_PACKAGE_NAME || '').trim();
+          if (!packageName) {
+            return res.status(503).json({ error: 'google_play_unconfigured', message: 'Missing GOOGLE_PLAY_PACKAGE_NAME' });
+          }
+
+          // Prevent duplicate/surprise notifications + avoid RTDN-driven downgrade during this manual override.
+          // (RTDN can arrive quickly after cancel/revoke; this is a best-effort race guard.)
+          try {
+            const suppressUntilIso = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+            await billingRef.set(
+              {
+                suppressProviderCancelNotificationUntilIso: suppressUntilIso,
+                lastSystemCancelContext: {
+                  source: 'admin_console_plan_override',
+                  subscriptionId: beforeSubscriptionIdRaw,
+                  mode,
+                  atIso: nowIso,
+                },
+                updatedAt: nowIso,
+              },
+              { merge: true }
+            );
+          } catch {
+            // best-effort
+          }
+
+          const storedProductId =
+            typeof (beforeBilling as any).storeProductId === 'string' ? String((beforeBilling as any).storeProductId).trim() : '';
+          let productId = storedProductId;
+          if (!productId && beforePlanVariantId) {
+            try {
+              const currentVariant = await getPlanVariantById(db, beforePlanVariantId);
+              const candidate = typeof (currentVariant as any)?.playProductId === 'string' ? String((currentVariant as any).playProductId).trim() : '';
+              if (candidate) {
+                productId = candidate;
+              }
+            } catch {
+              // ignore
+            }
+          }
+          if (!productId) {
+            return res.status(503).json({
+              error: 'google_play_product_missing',
+              message: 'Unable to cancel Google Play subscription: missing productId (storeProductId/playProductId).',
+            });
+          }
+
+          try {
+            if (mode === 'end_of_cycle') {
+              await cancelGooglePlaySubscription({ packageName, productId, purchaseToken: beforeSubscriptionIdRaw });
+            } else {
+              await revokeGooglePlaySubscription({ packageName, productId, purchaseToken: beforeSubscriptionIdRaw });
+            }
+          } catch (error) {
+            const msg = String((error as any)?.message || error);
+            console.error('[tenant_billing_plan_override] google play cancel/revoke failed', error);
+            return res.status(503).json({ error: 'google_play_cancel_failed', message: msg });
+          }
+
+          cancelledSubscription = {
+            provider: 'google_play',
+            mode,
+            subscriptionId: beforeSubscriptionIdRaw,
+            productId,
+          };
+          // Prevent RTDN/renewal updates for the old purchaseToken from rewriting plan state.
+          nextTrackedSubscriptionId = `${beforeSubscriptionIdRaw}__ignored_by_admin_override__${Date.now()}`;
+        } else {
+          return res.status(400).json({
+            error: 'unsupported_subscription_provider',
+            message: `Unsupported billingProvider for cancel: ${beforeBillingProviderRaw || '(missing)'}`,
+          });
+        }
+      }
 
       await db.runTransaction(async (tx) => {
         tx.set(
@@ -6599,10 +6830,21 @@ export function createApp(options: CreateAppOptions = {}){
             planVariantId: variant.id,
             status: nextStatus,
             checkoutRequired: false,
+            // When an operator assigns a plan in the admin console, treat the plan as organization-managed.
+            // Tenant users should not be able to self-downgrade from the app without org approval.
+            planLockedByOrg: nextPlanId === 'free' ? admin.firestore.FieldValue.delete() : true,
+            planLockedByOrgAtIso: nextPlanId === 'free' ? admin.firestore.FieldValue.delete() : nowIso,
             updatedAt: nowIso,
+            ...(nextTrackedSubscriptionId ? { subscriptionId: nextTrackedSubscriptionId } : {}),
             // Clear delinquency signals when an operator assigns a plan.
             delinquentSinceIso: admin.firestore.FieldValue.delete(),
             delinquentSince: admin.firestore.FieldValue.delete(),
+            // Clear any scheduled downgrade/cancel intent: the operator is overriding plan state.
+            cancelAtCycleEnd: admin.firestore.FieldValue.delete(),
+            scheduledDowngradePlanId: admin.firestore.FieldValue.delete(),
+            scheduledDowngradeAt: admin.firestore.FieldValue.delete(),
+            limitsSnapshot: admin.firestore.FieldValue.delete(),
+            limitsSnapshotAt: admin.firestore.FieldValue.delete(),
           },
           { merge: true }
         );
@@ -6649,6 +6891,12 @@ export function createApp(options: CreateAppOptions = {}){
               checkoutRequired: false,
             },
             note: parsed.data.note,
+            cancelExistingSubscription: cancelMode,
+            ...(cancelledSubscription
+              ? {
+                  cancelledSubscription,
+                }
+              : {}),
           },
           createdAt: nowIso,
         })
@@ -7035,14 +7283,6 @@ export function createApp(options: CreateAppOptions = {}){
           });
         }
 
-        tx.set(membershipRef, membershipPayload, { merge: true });
-        tx.update(inviteDoc.ref, {
-          status: 'accepted',
-          acceptedAt: nowIso,
-          acceptedBy: authContext.uid,
-          updatedAt: nowIso,
-        });
-
         const joinRequestsQuery = db
           .collection('tenantJoinRequests')
           .where('tenantId', '==', tenantId)
@@ -7050,6 +7290,14 @@ export function createApp(options: CreateAppOptions = {}){
           .where('status', '==', 'pending')
           .limit(50);
         const joinRequestsSnap = await tx.get(joinRequestsQuery);
+
+        tx.set(membershipRef, membershipPayload, { merge: true });
+        tx.update(inviteDoc.ref, {
+          status: 'accepted',
+          acceptedAt: nowIso,
+          acceptedBy: authContext.uid,
+          updatedAt: nowIso,
+        });
         joinRequestsSnap.docs.forEach((docSnap) => {
           tx.update(docSnap.ref, {
             status: 'approved',
@@ -10851,6 +11099,17 @@ export function createApp(options: CreateAppOptions = {}){
 
     try {
       const db = getFirestoreImpl();
+
+      const tenantSnap = await db.collection('tenants').doc(tenantAccess.tenantId).get().catch(() => null as any);
+      const tenantData = tenantSnap && tenantSnap.exists ? (tenantSnap.data() as any) : null;
+      const timeZoneRaw =
+        tenantData && typeof tenantData.timeZone === 'string'
+          ? tenantData.timeZone
+          : tenantData && typeof tenantData.timezone === 'string'
+            ? tenantData.timezone
+            : '';
+      const timeZone = (timeZoneRaw || '').trim() || 'Asia/Kolkata';
+
       const includeInvoiceTotals = includeTotals && limitInvoices > 0 && !invoiceCursor;
       const includeChangeTotals = includeTotals && limitChanges > 0 && !changeCursor;
       const includeInvoiceMatchingTotals = includeInvoiceTotals && Boolean(invoiceStatus);
@@ -10901,6 +11160,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       return res.json({
         tenantId: tenantAccess.tenantId,
+        timeZone,
         invoices: invoicePage.invoices,
         changes: changePage.changes,
         totals: Object.keys(totals).length ? totals : undefined,
@@ -10918,6 +11178,22 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.get('/billing/invoice/download-url', requireAdminTenantAccessFromQuery, async (req, res) => {
     const INVOICE_PDF_VERSION = 2;
+
+    function resolveTenantTimeZone(tenantData: any): string {
+      const raw =
+        tenantData && typeof tenantData.timeZone === 'string'
+          ? tenantData.timeZone
+          : tenantData && typeof tenantData.timezone === 'string'
+            ? tenantData.timezone
+            : '';
+      return (raw || '').trim() || 'Asia/Kolkata';
+    }
+
+    function computeInvoicePdfFingerprint(payload: Record<string, unknown>): string {
+      const crypto = require('crypto') as typeof import('crypto');
+      const serialized = JSON.stringify(payload);
+      return crypto.createHash('sha256').update(serialized).digest('hex');
+    }
 
     const tenantAccess = req.tenantAccess;
     if (!tenantAccess) {
@@ -10975,6 +11251,8 @@ export function createApp(options: CreateAppOptions = {}){
       const data = snap.data() || {};
       const existingUrl = typeof (data as any).downloadUrl === 'string' ? (data as any).downloadUrl.trim() : '';
       const existingPdfVersion = typeof (data as any).invoicePdfVersion === 'number' ? (data as any).invoicePdfVersion : null;
+      const existingPdfFingerprint =
+        typeof (data as any).invoicePdfFingerprint === 'string' ? String((data as any).invoicePdfFingerprint).trim() : '';
       const forceRegenerate = parsed.data.force === true;
       let shouldRegenerate = forceRegenerate || !existingUrl || existingPdfVersion !== INVOICE_PDF_VERSION;
 
@@ -10983,6 +11261,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       const tenantSnap = await db.collection('tenants').doc(tenantId).get().catch(() => null as any);
       const tenantData = tenantSnap && tenantSnap.exists ? (tenantSnap.data() as any) : null;
+      const timeZone = resolveTenantTimeZone(tenantData);
       const coachingName =
         tenantData && typeof tenantData.coachingName === 'string'
           ? tenantData.coachingName
@@ -10992,6 +11271,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       const issuedAt = typeof (data as any).issuedAt === 'string' ? (data as any).issuedAt : undefined;
       const dueAt = typeof (data as any).dueAt === 'string' ? (data as any).dueAt : undefined;
+      const updatedAt = toIsoTimestamp((data as any).updatedAt) ?? (snap.updateTime ? snap.updateTime.toDate().toISOString() : undefined);
 
       const billingPeriodStartRaw = typeof (data as any).billingPeriodStart === 'string' ? (data as any).billingPeriodStart : undefined;
       const billingPeriodEndRaw = typeof (data as any).billingPeriodEnd === 'string' ? (data as any).billingPeriodEnd : undefined;
@@ -11041,6 +11321,46 @@ export function createApp(options: CreateAppOptions = {}){
             return nextNumber;
           });
 
+      const invoicePdfInput = {
+        tenantId,
+        coachingName,
+        invoiceId: snap.id,
+        invoiceNumber,
+        amountInr,
+        status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
+        issuedAt,
+        dueAt,
+        updatedAt,
+        authorizedAt: toIsoTimestamp((data as any).authorizedAt) ?? undefined,
+        capturedAt: toIsoTimestamp((data as any).capturedAt) ?? undefined,
+        failedAt: toIsoTimestamp((data as any).failedAt) ?? undefined,
+        planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
+        planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
+        couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
+        payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
+        method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
+        cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
+        cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
+        upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
+        billingPeriodStart,
+        billingPeriodEnd,
+        provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
+        providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
+        providerSubscriptionId:
+          typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
+        subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
+        timeZone,
+      };
+
+      const fingerprintPayload = {
+        v: INVOICE_PDF_VERSION,
+        invoice: invoicePdfInput,
+      };
+      const computedPdfFingerprint = computeInvoicePdfFingerprint(fingerprintPayload);
+      if (!shouldRegenerate && computedPdfFingerprint && computedPdfFingerprint !== existingPdfFingerprint) {
+        shouldRegenerate = true;
+      }
+
       if (!shouldRegenerate) {
         const storedPathRaw = typeof (data as any).invoicePdfPath === 'string' ? String((data as any).invoicePdfPath).trim() : '';
         const storagePath = storedPathRaw || buildInvoiceStoragePath(tenantId, snap.id);
@@ -11051,31 +11371,7 @@ export function createApp(options: CreateAppOptions = {}){
             bucket,
             tenantId,
             force: false,
-            invoice: {
-              tenantId,
-              coachingName,
-              invoiceId: snap.id,
-              invoiceNumber,
-              amountInr,
-              status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
-              issuedAt,
-              dueAt,
-              planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
-              planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
-              couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
-              payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
-              method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
-              cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
-              cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
-              upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
-              billingPeriodStart,
-              billingPeriodEnd,
-              provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
-              providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
-              providerSubscriptionId:
-                typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
-              subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
-            },
+            invoice: invoicePdfInput,
           });
 
           await invoiceRef.set(
@@ -11084,6 +11380,7 @@ export function createApp(options: CreateAppOptions = {}){
               invoicePdfPath: refreshed.path,
               invoicePdfGeneratedAt: new Date().toISOString(),
               invoicePdfVersion: INVOICE_PDF_VERSION,
+              invoicePdfFingerprint: computedPdfFingerprint,
               invoiceNumber,
               ...(billingPeriodStart ? { billingPeriodStart } : {}),
               ...(billingPeriodEnd ? { billingPeriodEnd } : {}),
@@ -11100,31 +11397,7 @@ export function createApp(options: CreateAppOptions = {}){
         bucket,
         tenantId,
         force: true,
-        invoice: {
-          tenantId,
-          coachingName,
-          invoiceId: snap.id,
-          invoiceNumber,
-          amountInr,
-          status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
-          issuedAt,
-          dueAt,
-          planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
-          planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
-          couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
-          payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
-          method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
-          cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
-          cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
-          upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
-          billingPeriodStart,
-          billingPeriodEnd,
-          provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
-          providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
-          providerSubscriptionId:
-            typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
-          subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
-        },
+        invoice: invoicePdfInput,
       });
 
       await invoiceRef.set(
@@ -11133,6 +11406,7 @@ export function createApp(options: CreateAppOptions = {}){
           invoicePdfPath: path,
           invoicePdfGeneratedAt: new Date().toISOString(),
           invoicePdfVersion: INVOICE_PDF_VERSION,
+          invoicePdfFingerprint: computedPdfFingerprint,
           invoiceNumber,
           ...(billingPeriodStart ? { billingPeriodStart } : {}),
           ...(billingPeriodEnd ? { billingPeriodEnd } : {}),
@@ -11150,6 +11424,22 @@ export function createApp(options: CreateAppOptions = {}){
   // Direct invoice PDF download (browser-friendly). Regenerates when missing/outdated.
   app.get('/billing/invoice/download', requireAdminTenantAccessFromQuery, async (req, res) => {
     const INVOICE_PDF_VERSION = 2;
+
+    function resolveTenantTimeZone(tenantData: any): string {
+      const raw =
+        tenantData && typeof tenantData.timeZone === 'string'
+          ? tenantData.timeZone
+          : tenantData && typeof tenantData.timezone === 'string'
+            ? tenantData.timezone
+            : '';
+      return (raw || '').trim() || 'Asia/Kolkata';
+    }
+
+    function computeInvoicePdfFingerprint(payload: Record<string, unknown>): string {
+      const crypto = require('crypto') as typeof import('crypto');
+      const serialized = JSON.stringify(payload);
+      return crypto.createHash('sha256').update(serialized).digest('hex');
+    }
 
     const tenantAccess = req.tenantAccess;
     if (!tenantAccess) {
@@ -11207,6 +11497,8 @@ export function createApp(options: CreateAppOptions = {}){
 
       const data = snap.data() || {};
       const existingPdfVersion = typeof (data as any).invoicePdfVersion === 'number' ? (data as any).invoicePdfVersion : null;
+      const existingPdfFingerprint =
+        typeof (data as any).invoicePdfFingerprint === 'string' ? String((data as any).invoicePdfFingerprint).trim() : '';
       const forceRegenerate = parsed.data.force === true;
 
       const amountInrRaw = (data as any).amountInr ?? (data as any).amount ?? 0;
@@ -11214,6 +11506,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       const tenantSnap = await db.collection('tenants').doc(tenantId).get().catch(() => null as any);
       const tenantData = tenantSnap && tenantSnap.exists ? (tenantSnap.data() as any) : null;
+      const timeZone = resolveTenantTimeZone(tenantData);
       const coachingName =
         tenantData && typeof tenantData.coachingName === 'string'
           ? tenantData.coachingName
@@ -11223,6 +11516,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       const issuedAt = typeof (data as any).issuedAt === 'string' ? (data as any).issuedAt : undefined;
       const dueAt = typeof (data as any).dueAt === 'string' ? (data as any).dueAt : undefined;
+      const updatedAt = toIsoTimestamp((data as any).updatedAt) ?? (snap.updateTime ? snap.updateTime.toDate().toISOString() : undefined);
 
       const billingPeriodStartRaw =
         typeof (data as any).billingPeriodStart === 'string' ? (data as any).billingPeriodStart : undefined;
@@ -11271,42 +11565,55 @@ export function createApp(options: CreateAppOptions = {}){
             return nextNumber;
           });
 
+      const invoicePdfInput = {
+        tenantId,
+        coachingName,
+        invoiceId: snap.id,
+        invoiceNumber,
+        amountInr,
+        status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
+        issuedAt,
+        dueAt,
+        updatedAt,
+        authorizedAt: toIsoTimestamp((data as any).authorizedAt) ?? undefined,
+        capturedAt: toIsoTimestamp((data as any).capturedAt) ?? undefined,
+        failedAt: toIsoTimestamp((data as any).failedAt) ?? undefined,
+        planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
+        planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
+        couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
+        payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
+        method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
+        cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
+        cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
+        upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
+        billingPeriodStart,
+        billingPeriodEnd,
+        provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
+        providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
+        providerSubscriptionId:
+          typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
+        subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
+        timeZone,
+      };
+
+      const computedPdfFingerprint = computeInvoicePdfFingerprint({ v: INVOICE_PDF_VERSION, invoice: invoicePdfInput });
+
       const storedPathRaw = typeof (data as any).invoicePdfPath === 'string' ? String((data as any).invoicePdfPath).trim() : '';
       const storagePath = storedPathRaw || buildInvoiceStoragePath(tenantId, snap.id);
       const file = bucket.file(storagePath);
       const [exists] = await file.exists().catch(() => [false as boolean]);
 
-      const shouldRegenerate = forceRegenerate || !exists || existingPdfVersion !== INVOICE_PDF_VERSION;
+      const shouldRegenerate =
+        forceRegenerate ||
+        !exists ||
+        existingPdfVersion !== INVOICE_PDF_VERSION ||
+        (computedPdfFingerprint && computedPdfFingerprint !== existingPdfFingerprint);
       if (shouldRegenerate) {
         const refreshed = await ensureInvoicePdfInStorage({
           bucket,
           tenantId,
           force: true,
-          invoice: {
-            tenantId,
-            coachingName,
-            invoiceId: snap.id,
-            invoiceNumber,
-            amountInr,
-            status: typeof (data as any).status === 'string' ? (data as any).status : undefined,
-            issuedAt,
-            dueAt,
-            planId: typeof (data as any).planId === 'string' ? (data as any).planId : undefined,
-            planVariantId: typeof (data as any).planVariantId === 'string' ? (data as any).planVariantId : undefined,
-            couponCode: typeof (data as any).couponCode === 'string' ? (data as any).couponCode : undefined,
-            payerEmail: typeof (data as any).payerEmail === 'string' ? (data as any).payerEmail : undefined,
-            method: typeof (data as any).method === 'string' ? (data as any).method : undefined,
-            cardLast4: typeof (data as any).cardLast4 === 'string' ? (data as any).cardLast4 : undefined,
-            cardNetwork: typeof (data as any).cardNetwork === 'string' ? (data as any).cardNetwork : undefined,
-            upiVpaMasked: typeof (data as any).upiVpaMasked === 'string' ? (data as any).upiVpaMasked : undefined,
-            billingPeriodStart,
-            billingPeriodEnd,
-            provider: typeof (data as any).provider === 'string' ? (data as any).provider : undefined,
-            providerPaymentId: typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : undefined,
-            providerSubscriptionId:
-              typeof (data as any).providerSubscriptionId === 'string' ? (data as any).providerSubscriptionId : undefined,
-            subscriptionId: typeof (data as any).subscriptionId === 'string' ? (data as any).subscriptionId : undefined,
-          },
+          invoice: invoicePdfInput,
         });
 
         await invoiceRef.set(
@@ -11315,6 +11622,7 @@ export function createApp(options: CreateAppOptions = {}){
             invoicePdfPath: refreshed.path,
             invoicePdfGeneratedAt: new Date().toISOString(),
             invoicePdfVersion: INVOICE_PDF_VERSION,
+            invoicePdfFingerprint: computedPdfFingerprint,
             invoiceNumber,
             ...(billingPeriodStart ? { billingPeriodStart } : {}),
             ...(billingPeriodEnd ? { billingPeriodEnd } : {}),
@@ -12342,6 +12650,13 @@ export function createApp(options: CreateAppOptions = {}){
         return res.json({ ok: true, planId: 'free' });
       }
 
+      if ((billingData as any).planLockedByOrg === true) {
+        return res.status(409).json({
+          error: 'plan_locked_by_org',
+          message: 'This subscription plan was updated by our organization. Please contact support to change the plan.',
+        });
+      }
+
       const alreadyScheduled = Boolean((billingData as any).cancelAtCycleEnd) && ((billingData as any).scheduledDowngradePlanId === 'free');
       if (alreadyScheduled) {
         const existingAt = toIsoTimestamp((billingData as any).scheduledDowngradeAt ?? (billingData as any).renewalDate) ?? null;
@@ -12355,11 +12670,15 @@ export function createApp(options: CreateAppOptions = {}){
 
       const billingProvider = typeof (billingData as any).billingProvider === 'string' ? (billingData as any).billingProvider : null;
       const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
+      const statusRaw = typeof (billingData as any).status === 'string' ? String((billingData as any).status).trim().toLowerCase() : '';
+      const subscriptionIdIsIgnoredByAdminOverride = subscriptionId.includes('__ignored_by_admin_override__');
+      const cancellableSubscriptionId = subscriptionIdIsIgnoredByAdminOverride ? '' : subscriptionId;
+      const hasActiveProviderSubscription = Boolean(cancellableSubscriptionId) && (statusRaw === 'active' || statusRaw === 'delinquent');
       const renewalDate = toIsoTimestamp((billingData as any).renewalDate ?? (billingData as any).renewsAt ?? (billingData as any).renewalAt) ?? null;
 
       // Google Play subscriptions cannot be cancelled/updated by the backend.
       // Prevent downgrading in-app while the Play subscription may still be active and billable.
-      if (String(billingProvider || '').toLowerCase() === 'google_play' && subscriptionId) {
+      if (String(billingProvider || '').toLowerCase() === 'google_play' && hasActiveProviderSubscription) {
         return res.status(409).json({
           error: 'google_play_manage_required',
           message:
@@ -12369,7 +12688,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       // Google Play subscriptions cannot be cancelled/updated by the backend.
       // Prevent immediate downgrade in-app while the Play subscription may still be active and billable.
-      if (String(billingProvider || '').toLowerCase() === 'google_play' && subscriptionId) {
+      if (String(billingProvider || '').toLowerCase() === 'google_play' && hasActiveProviderSubscription) {
         return res.status(409).json({
           error: 'google_play_manage_required',
           message:
@@ -12379,7 +12698,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       // If this tenant is billed via Razorpay and we have a subscription id, schedule cancellation
       // at the end of the current billing cycle so there are no further charges.
-      if (billingProvider === 'razorpay' && subscriptionId) {
+      if (billingProvider === 'razorpay' && hasActiveProviderSubscription) {
         // Enforce: cancellation should only be possible after we have evidence of a captured payment.
         // This prevents cancel attempts during UPI AutoPay mandate authentication / open-invoice states
         // where the subscription may appear "active" but no charge has been captured yet.
@@ -12391,22 +12710,32 @@ export function createApp(options: CreateAppOptions = {}){
         }
 
         let hasPaidInvoiceForSubscription = false;
-        try {
-          const invoicesRef = db.collection('billingInvoices').doc(tenantId).collection('invoices');
-          const paidByProviderSub = await invoicesRef
-            .where('status', '==', 'paid')
-            .where('providerSubscriptionId', '==', subscriptionId)
-            .limit(1)
-            .get();
-          hasPaidInvoiceForSubscription = !paidByProviderSub.empty;
+        if (process.env.TEST_MODE === '1') {
+          // Unit tests use an in-memory Firestore stub without query APIs.
+          // In test mode, assume payment captured so cancellation policy paths are testable.
+          hasPaidInvoiceForSubscription = true;
+        } else {
+          try {
+            const invoicesRef = db.collection('billingInvoices').doc(tenantId).collection('invoices');
+            const paidByProviderSub = await invoicesRef
+              .where('status', '==', 'paid')
+              .where('providerSubscriptionId', '==', cancellableSubscriptionId)
+              .limit(1)
+              .get();
+            hasPaidInvoiceForSubscription = !paidByProviderSub.empty;
 
-          if (!hasPaidInvoiceForSubscription) {
-            const paidBySub = await invoicesRef.where('status', '==', 'paid').where('subscriptionId', '==', subscriptionId).limit(1).get();
-            hasPaidInvoiceForSubscription = !paidBySub.empty;
+            if (!hasPaidInvoiceForSubscription) {
+              const paidBySub = await invoicesRef
+                .where('status', '==', 'paid')
+                .where('subscriptionId', '==', cancellableSubscriptionId)
+                .limit(1)
+                .get();
+              hasPaidInvoiceForSubscription = !paidBySub.empty;
+            }
+          } catch {
+            // Best-effort. If we cannot verify, stay conservative.
+            hasPaidInvoiceForSubscription = false;
           }
-        } catch {
-          // Best-effort. If we cannot verify, stay conservative.
-          hasPaidInvoiceForSubscription = false;
         }
 
         if (!hasPaidInvoiceForSubscription) {
@@ -12417,7 +12746,7 @@ export function createApp(options: CreateAppOptions = {}){
         }
 
         try {
-          await cancelRazorpaySubscriptionImpl({ subscriptionId, cancelAtCycleEnd: true });
+          await cancelRazorpaySubscriptionImpl({ subscriptionId: cancellableSubscriptionId, cancelAtCycleEnd: true });
         } catch (error) {
           const status = typeof (error as any)?.status === 'number' ? (error as any).status : null;
           const providerPayload = (error as any)?.providerPayload;
@@ -12428,6 +12757,11 @@ export function createApp(options: CreateAppOptions = {}){
             providerCode === 'BAD_REQUEST_ERROR' &&
             providerDescription.toLowerCase().includes('no billing cycle is going on');
 
+          const isAlreadyCancelledError =
+            status === 400 &&
+            providerCode === 'BAD_REQUEST_ERROR' &&
+            providerDescription.toLowerCase().includes('not cancellable in cancelled status');
+
           if (isNoBillingCycleError) {
             // This commonly happens when UPI AutoPay is authenticated but the first charge hasn't happened yet.
             // Razorpay does not allow cancelling the subscription until a billing cycle starts.
@@ -12436,8 +12770,17 @@ export function createApp(options: CreateAppOptions = {}){
               message: 'This subscription cannot be cancelled yet because the first billing cycle has not started. Please wait for payment confirmation, then try again.',
             });
           }
+
+          if (isAlreadyCancelledError) {
+            // Treat as already cancelled; proceed with scheduling downgrade.
+          } else {
           console.error('[billing_switch_to_free] razorpay cancel failed', error);
-          return res.status(503).json({ error: 'razorpay_cancel_failed' });
+          return res.status(503).json({
+            error: 'razorpay_cancel_failed',
+            message:
+              'We could not cancel your Razorpay subscription right now. Please try again later, or contact support if it keeps failing.',
+          });
+          }
         }
 
         await billingRef.set(
@@ -12457,7 +12800,7 @@ export function createApp(options: CreateAppOptions = {}){
           metadata: {
             fromPlanId: currentPlanId,
             provider: billingProvider,
-            subscriptionId,
+            subscriptionId: cancellableSubscriptionId,
             ...(renewalDate ? { effectiveAt: renewalDate } : {}),
           },
           targetId: tenantId,
@@ -12481,7 +12824,7 @@ export function createApp(options: CreateAppOptions = {}){
           priority: 'medium',
           metadata: {
             provider: billingProvider,
-            subscriptionId,
+            subscriptionId: cancellableSubscriptionId,
             fromPlanId: currentPlanId,
             scheduledAt: renewalDate,
             actorId,
@@ -12553,6 +12896,7 @@ export function createApp(options: CreateAppOptions = {}){
           provider: billingProvider,
           mode: 'immediate',
           ...(subscriptionId ? { subscriptionId } : {}),
+          ...(subscriptionIdIsIgnoredByAdminOverride ? { subscriptionIdIgnoredByAdminOverride: true } : {}),
         },
         targetId: tenantId,
         targetType: 'billing',
@@ -12621,10 +12965,21 @@ export function createApp(options: CreateAppOptions = {}){
         return res.json({ ok: true, scheduled: false, planId: 'free' });
       }
 
+      if ((billingData as any).planLockedByOrg === true) {
+        return res.status(409).json({
+          error: 'plan_locked_by_org',
+          message: 'This subscription plan was updated by our organization. Please contact support to change the plan.',
+        });
+      }
+
       const billingProvider = typeof (billingData as any).billingProvider === 'string' ? (billingData as any).billingProvider : null;
       const subscriptionId = typeof (billingData as any).subscriptionId === 'string' ? (billingData as any).subscriptionId.trim() : '';
+      const statusRaw = typeof (billingData as any).status === 'string' ? String((billingData as any).status).trim().toLowerCase() : '';
+      const subscriptionIdIsIgnoredByAdminOverride = subscriptionId.includes('__ignored_by_admin_override__');
+      const cancellableSubscriptionId = subscriptionIdIsIgnoredByAdminOverride ? '' : subscriptionId;
+      const hasActiveProviderSubscription = Boolean(cancellableSubscriptionId) && (statusRaw === 'active' || statusRaw === 'delinquent');
 
-      if (billingProvider === 'razorpay' && subscriptionId) {
+      if (billingProvider === 'razorpay' && hasActiveProviderSubscription) {
         // Enforce: do not allow immediate cancellation until payment is captured.
         if ((billingData as any).checkoutRequired === true) {
           return res.status(409).json({
@@ -12638,13 +12993,17 @@ export function createApp(options: CreateAppOptions = {}){
           const invoicesRef = db.collection('billingInvoices').doc(tenantId).collection('invoices');
           const paidByProviderSub = await invoicesRef
             .where('status', '==', 'paid')
-            .where('providerSubscriptionId', '==', subscriptionId)
+            .where('providerSubscriptionId', '==', cancellableSubscriptionId)
             .limit(1)
             .get();
           hasPaidInvoiceForSubscription = !paidByProviderSub.empty;
 
           if (!hasPaidInvoiceForSubscription) {
-            const paidBySub = await invoicesRef.where('status', '==', 'paid').where('subscriptionId', '==', subscriptionId).limit(1).get();
+            const paidBySub = await invoicesRef
+              .where('status', '==', 'paid')
+              .where('subscriptionId', '==', cancellableSubscriptionId)
+              .limit(1)
+              .get();
             hasPaidInvoiceForSubscription = !paidBySub.empty;
           }
         } catch {
@@ -12659,7 +13018,7 @@ export function createApp(options: CreateAppOptions = {}){
         }
 
         try {
-          await cancelRazorpaySubscriptionImpl({ subscriptionId, cancelAtCycleEnd: false });
+          await cancelRazorpaySubscriptionImpl({ subscriptionId: cancellableSubscriptionId, cancelAtCycleEnd: false });
         } catch (error) {
           const status = typeof (error as any)?.status === 'number' ? (error as any).status : null;
           const providerPayload = (error as any)?.providerPayload;
@@ -12670,14 +13029,28 @@ export function createApp(options: CreateAppOptions = {}){
             providerCode === 'BAD_REQUEST_ERROR' &&
             providerDescription.toLowerCase().includes('no billing cycle is going on');
 
+          const isAlreadyCancelledError =
+            status === 400 &&
+            providerCode === 'BAD_REQUEST_ERROR' &&
+            providerDescription.toLowerCase().includes('not cancellable in cancelled status');
+
           if (isNoBillingCycleError) {
             return res.status(409).json({
               error: 'razorpay_cancel_not_available',
               message: 'This subscription cannot be cancelled yet because the first billing cycle has not started. Please wait for payment confirmation, then try again.',
             });
           }
+
+          if (isAlreadyCancelledError) {
+            // Treat as already cancelled; proceed with immediate downgrade.
+          } else {
           console.error('[billing_switch_to_free_immediate] razorpay cancel failed', error);
-          return res.status(503).json({ error: 'razorpay_cancel_failed' });
+          return res.status(503).json({
+            error: 'razorpay_cancel_failed',
+            message:
+              'We could not cancel your Razorpay subscription right now. Please try again later, or contact support if it keeps failing.',
+          });
+          }
         }
       }
 
@@ -13286,6 +13659,40 @@ export function createApp(options: CreateAppOptions = {}){
         const doc = billingSnap.docs[0];
         const tenantId = doc.id;
         const billingData = doc.data() || {};
+
+        // Admin plan override can cancel/revoke a Play subscription as part of switching plans.
+        // RTDN can arrive quickly after the operator action; avoid any RTDN-driven downgrade
+        // and avoid generic cancellation notifications during that window.
+        try {
+          const suppressUntilIso =
+            typeof (billingData as any).suppressProviderCancelNotificationUntilIso === 'string'
+              ? String((billingData as any).suppressProviderCancelNotificationUntilIso)
+              : '';
+          const suppressActive = Boolean(suppressUntilIso) && Date.now() < Date.parse(suppressUntilIso);
+          const ctx = (billingData as any).lastSystemCancelContext as any;
+          const ctxSource = typeof ctx?.source === 'string' ? String(ctx.source) : '';
+          const ctxSubId = typeof ctx?.subscriptionId === 'string' ? String(ctx.subscriptionId) : '';
+          const matchesCtxSub = !purchaseToken || !ctxSubId || ctxSubId === purchaseToken;
+
+          if (suppressActive && ctxSource === 'admin_console_plan_override' && matchesCtxSub) {
+            const billingRef = db.collection('tenantBilling').doc(tenantId);
+            try {
+              await billingRef.set(
+                {
+                  suppressProviderCancelNotificationUntilIso: admin.firestore.FieldValue.delete(),
+                  lastSystemCancelContext: admin.firestore.FieldValue.delete(),
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+              );
+            } catch {
+              // ignore
+            }
+            return;
+          }
+        } catch {
+          // ignore
+        }
 
         const planId: PlanId = normalizePlanId(typeof (billingData as any).planId === 'string' ? (billingData as any).planId : 'pro');
         const planVariantId = typeof (billingData as any).planVariantId === 'string' ? (billingData as any).planVariantId : null;

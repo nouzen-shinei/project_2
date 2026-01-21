@@ -307,6 +307,7 @@ export function TenantDirectoryPanel() {
   const [billingCatalogError, setBillingCatalogError] = useState<string | null>(null);
   const [billingPlanVariantDraft, setBillingPlanVariantDraft] = useState<string>('');
   const [billingPlanVariantNote, setBillingPlanVariantNote] = useState<string>('');
+  const [billingPlanCancelMode, setBillingPlanCancelMode] = useState<'none' | 'end_of_cycle' | 'immediate'>('none');
   const [billingPlanVariantSaving, setBillingPlanVariantSaving] = useState(false);
   const [billingPlanVariantError, setBillingPlanVariantError] = useState<string | null>(null);
   const [billingPlanVariantSuccess, setBillingPlanVariantSuccess] = useState<string | null>(null);
@@ -352,14 +353,25 @@ export function TenantDirectoryPanel() {
     ];
   }, [billingCatalogPlans]);
 
-  const isCustomEnterpriseCurrent = useMemo(() => {
-    const current = (billingSummary?.planVariantId || '').trim();
-    return current === CUSTOM_ENTERPRISE_VARIANT_ID;
-  }, [billingSummary?.planVariantId]);
-
   const isCustomEnterpriseDraft = useMemo(() => {
     return billingPlanVariantDraft.trim() === CUSTOM_ENTERPRISE_VARIANT_ID;
   }, [billingPlanVariantDraft]);
+
+  const currentSubscriptionProvider = (billingSummary?.subscriptionProvider || '').toLowerCase();
+  const currentSubscriptionId = (billingSummary?.subscriptionId || '').trim();
+  const hasActiveSubscription =
+    Boolean(currentSubscriptionId) && (billingSummary?.status === 'active' || billingSummary?.status === 'delinquent');
+
+  const cancelModeHelp = useMemo(() => {
+    if (!hasActiveSubscription) return 'No active subscription detected for this tenant.';
+    if (currentSubscriptionProvider === 'razorpay') {
+      return 'Razorpay: “End of cycle” keeps access until renewal; “Immediate” cancels now.';
+    }
+    if (currentSubscriptionProvider === 'google_play') {
+      return 'Google Play: “End of cycle” cancels at period end; “Immediate” revokes access now.';
+    }
+    return 'Subscription provider is unknown; cancellation may be unavailable.';
+  }, [currentSubscriptionProvider, hasActiveSubscription]);
 
   const buildExportFileName = useCallback(
     (suffix: string) => {
@@ -1755,11 +1767,24 @@ export function TenantDirectoryPanel() {
           tenantId: inspectorTenant.id,
           planVariantId,
           note: billingPlanVariantNote.trim() || undefined,
+          cancelExistingSubscription: hasActiveSubscription ? billingPlanCancelMode : 'none',
         });
         setBillingPlanVariantSuccess('Plan updated successfully.');
         setBillingPlanVariantNote('');
+        setBillingPlanCancelMode('none');
         setInspectorTenant(response.tenant);
         setResults((prev) => prev.map((tenant) => (tenant.id === response.tenant.id ? response.tenant : tenant)));
+
+        // Refresh billing snapshot immediately so provider/subscription/status changes show up right away.
+        try {
+          const refreshed = await fetchBillingSummary({
+            tenantId: response.tenant.id,
+            planId: normalizePlanId(response.tenant.billingTier),
+          });
+          setBillingSummary(refreshed);
+        } catch {
+          // Best-effort: the periodic effect will re-sync.
+        }
       } catch (err) {
         console.warn('[TenantDirectoryPanel] billing plan override failed', err);
         if (err instanceof ApiError) {
@@ -1773,7 +1798,7 @@ export function TenantDirectoryPanel() {
         setBillingPlanVariantSaving(false);
       }
     },
-    [billingPlanVariantDraft, billingPlanVariantNote, inspectorTenant, setResults],
+    [billingPlanCancelMode, billingPlanVariantDraft, billingPlanVariantNote, hasActiveSubscription, inspectorTenant, setResults],
   );
 
   useEffect(() => {
@@ -1783,7 +1808,11 @@ export function TenantDirectoryPanel() {
     setBillingError(null);
     fetchBillingSummary({ tenantId: inspectorTenantId, planId: selectedPlanId })
       .then((summary) => {
-        if (!cancelled) setBillingSummary(summary);
+        if (!cancelled) {
+          setBillingSummary(summary);
+          // Reset cancel mode when switching tenants.
+          setBillingPlanCancelMode('none');
+        }
       })
       .catch((err) => {
         if (cancelled) return;
@@ -2275,6 +2304,29 @@ export function TenantDirectoryPanel() {
                   </select>
                 </label>
                 <label>
+                  Cancel existing subscription
+                  <select
+                    value={billingPlanCancelMode}
+                    onChange={(event) => setBillingPlanCancelMode(event.target.value as any)}
+                    disabled={
+                      billingPlanVariantSaving ||
+                      !hasActiveSubscription ||
+                      !(
+                        currentSubscriptionProvider === 'razorpay' ||
+                        currentSubscriptionProvider === 'google_play'
+                      )
+                    }
+                  >
+                    <option value="none">Do not cancel</option>
+                    <option value="end_of_cycle">Cancel at end of billing cycle</option>
+                    <option value="immediate">Cancel immediately</option>
+                  </select>
+                  <span className="muted small-text">
+                    {cancelModeHelp}
+                    {hasActiveSubscription && currentSubscriptionProvider ? ` (provider: ${currentSubscriptionProvider})` : ''}
+                  </span>
+                </label>
+                <label>
                   Operator note
                   <input
                     value={billingPlanVariantNote}
@@ -2325,83 +2377,67 @@ export function TenantDirectoryPanel() {
                   <p className="muted small-text">Checkout session required before plan activation.</p>
                 )}
 
-                {isCustomEnterpriseCurrent ? (
-                  <div className="tenant-quota-card" style={{ marginTop: '0.75rem' }}>
-                    <div className="tenant-quota-header">
-                      <div>
-                        <h4>Quota overrides</h4>
-                        <p className="muted small-text">
-                          Adjust tenant quotas. Leave blank to keep the existing value or type “unlimited” to remove the cap.
-                        </p>
-                      </div>
-                      <div className="tenant-membership-actions">
-                        <button type="button" className="text-button" onClick={handleQuotaReset} disabled={quotaSaving}>
-                          <RefreshCcw size={14} /> Clear
-                        </button>
-                      </div>
+                <div className="tenant-quota-card" style={{ marginTop: '0.75rem' }}>
+                  <div className="tenant-quota-header">
+                    <div>
+                      <h4>Quota overrides</h4>
+                      <p className="muted small-text">
+                        Adjust tenant quotas. Leave blank to keep the existing value or type “unlimited” to remove the cap.
+                      </p>
                     </div>
-                    {quotaError && (
-                      <div className="tenant-error">
-                        <strong>Quota issue:</strong> {quotaError}
-                      </div>
-                    )}
-                    {quotaSuccess && (
-                      <div className="tenant-success">
-                        <strong>Quota update:</strong> {quotaSuccess}
-                      </div>
-                    )}
-                    <form className="tenant-quota-grid" onSubmit={handleQuotaSubmit}>
-                      {QUOTA_FIELDS.map((field) => (
-                        <label key={field.key}>
-                          {field.label}
-                          <input
-                            value={quotaForm[field.key]}
-                            onChange={(event) => handleQuotaFieldChange(field.key, event.target.value)}
-                            placeholder={quotaPlaceholderFor(field.key)}
-                            disabled={quotaSaving}
-                          />
-                          <span className="muted small-text">{field.helper}</span>
-                        </label>
-                      ))}
-                      <label style={{ gridColumn: '1 / -1' }}>
-                        Operator note
+                    <div className="tenant-membership-actions">
+                      <button type="button" className="text-button" onClick={handleQuotaReset} disabled={quotaSaving}>
+                        <RefreshCcw size={14} /> Clear
+                      </button>
+                    </div>
+                  </div>
+                  {quotaError && (
+                    <div className="tenant-error">
+                      <strong>Quota issue:</strong> {quotaError}
+                    </div>
+                  )}
+                  {quotaSuccess && (
+                    <div className="tenant-success">
+                      <strong>Quota update:</strong> {quotaSuccess}
+                    </div>
+                  )}
+                  <form className="tenant-quota-grid" onSubmit={handleQuotaSubmit}>
+                    {QUOTA_FIELDS.map((field) => (
+                      <label key={field.key}>
+                        {field.label}
                         <input
-                          value={quotaForm.note}
-                          onChange={(event) =>
-                            setQuotaForm((prev) => ({
-                              ...prev,
-                              note: event.target.value,
-                            }))
-                          }
-                          placeholder="Optional context to store in audit log"
+                          value={quotaForm[field.key]}
+                          onChange={(event) => handleQuotaFieldChange(field.key, event.target.value)}
+                          placeholder={quotaPlaceholderFor(field.key)}
                           disabled={quotaSaving}
                         />
+                        <span className="muted small-text">{field.helper}</span>
                       </label>
-                      <div className="tenant-membership-filter-actions" style={{ gridColumn: '1 / -1' }}>
-                        <button className="primary-button" type="submit" disabled={quotaSaving}>
-                          {quotaSaving ? 'Saving…' : 'Save overrides'}
-                        </button>
-                        <button type="button" className="text-button" onClick={handleQuotaReset} disabled={quotaSaving}>
-                          <RefreshCcw size={14} /> Reset
-                        </button>
-                      </div>
-                    </form>
-                  </div>
-                ) : (
-                  <div className="tenant-quota-card" style={{ marginTop: '0.75rem' }}>
-                    <div className="tenant-quota-header">
-                      <div>
-                        <h4>Quota overrides</h4>
-                        <p className="muted small-text">
-                          Quota overrides are only available for the “Custom (Enterprise)” plan.
-                          {isCustomEnterpriseDraft
-                            ? ' Click “Assign plan variant” to apply it, then customize limits.'
-                            : ' Select it in Billing → Assign plan variant to customize limits.'}
-                        </p>
-                      </div>
+                    ))}
+                    <label style={{ gridColumn: '1 / -1' }}>
+                      Operator note
+                      <input
+                        value={quotaForm.note}
+                        onChange={(event) =>
+                          setQuotaForm((prev) => ({
+                            ...prev,
+                            note: event.target.value,
+                          }))
+                        }
+                        placeholder="Optional context to store in audit log"
+                        disabled={quotaSaving}
+                      />
+                    </label>
+                    <div className="tenant-membership-filter-actions" style={{ gridColumn: '1 / -1' }}>
+                      <button className="primary-button" type="submit" disabled={quotaSaving}>
+                        {quotaSaving ? 'Saving…' : 'Save overrides'}
+                      </button>
+                      <button type="button" className="text-button" onClick={handleQuotaReset} disabled={quotaSaving}>
+                        <RefreshCcw size={14} /> Reset
+                      </button>
                     </div>
-                  </div>
-                )}
+                  </form>
+                </div>
                 <div style={{ paddingTop: '0.75rem' }}>
                   <p className="muted small-text">Payments</p>
                   <form className="tenant-membership-filters" onSubmit={(event) => event.preventDefault()}>

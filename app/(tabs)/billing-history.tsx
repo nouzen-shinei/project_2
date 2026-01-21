@@ -27,14 +27,68 @@ import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { billingService, type BillingHistoryResponse, type BillingHistoryInvoice, type BillingHistoryChange } from '@/services/billingService';
 import { describeBillingChange } from '@/lib/billingChangeDescriptions';
 
-function formatBillingDate(value?: string) {
+function formatBillingDate(value?: string, timeZone?: string) {
   if (!value || typeof value !== 'string') return null;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return null;
   try {
-    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone });
   } catch {
+    // Fallback for runtimes without ICU timezone support (common on some RN builds).
+    if ((timeZone || '').trim() === 'Asia/Kolkata') {
+      const istMs = d.getTime() + 330 * 60 * 1000;
+      const ist = new Date(istMs);
+      try {
+        return ist.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+      } catch {
+        return value;
+      }
+    }
     return value;
+  }
+}
+
+function formatBillingDateTime(value?: string, timeZone?: string) {
+  if (!value || typeof value !== 'string') return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  try {
+    return d.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone,
+    });
+  } catch {
+    if ((timeZone || '').trim() === 'Asia/Kolkata') {
+      const istMs = d.getTime() + 330 * 60 * 1000;
+      const ist = new Date(istMs);
+      try {
+        return ist.toLocaleString(undefined, {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+      } catch {
+        return value;
+      }
+    }
+
+    try {
+      return d.toLocaleString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return value;
+    }
   }
 }
 
@@ -51,8 +105,9 @@ function describeChange(entry: BillingHistoryChange): { title: string; subtitle?
   return describeBillingChange(entry, { context: 'history', formatAmountInr, formatBillingDate });
 }
 
-function describeInvoice(invoice: BillingHistoryInvoice): { title: string; subtitle?: string } {
-  const date = formatBillingDate(invoice.issuedAt) || formatBillingDate(invoice.dueAt);
+function describeInvoice(invoice: BillingHistoryInvoice, options?: { timeZone?: string }): { title: string; subtitle?: string } {
+  const timeZone = options?.timeZone;
+  const date = formatBillingDate(invoice.issuedAt, timeZone) || formatBillingDate(invoice.dueAt, timeZone);
   const rawStatus = (invoice.status || 'open').toLowerCase();
   const status = rawStatus === 'void' ? 'FAILED' : rawStatus.toUpperCase();
   const amount = formatAmountInr(invoice.amountInr);
@@ -60,6 +115,16 @@ function describeInvoice(invoice: BillingHistoryInvoice): { title: string; subti
 
   const details: string[] = [];
   if (date) details.push(date);
+
+  const paidAt = formatBillingDateTime(invoice.capturedAt, timeZone);
+  const failedAt = formatBillingDateTime(invoice.failedAt, timeZone);
+  const authorizedAt = formatBillingDateTime(invoice.authorizedAt, timeZone);
+  if (paidAt) details.push(`Paid at: ${paidAt}`);
+  else if (failedAt) details.push(`Failed at: ${failedAt}`);
+  else if (authorizedAt) details.push(`Authorized at: ${authorizedAt}`);
+
+  const updatedAt = formatBillingDateTime(invoice.updatedAt, timeZone);
+  if (updatedAt) details.push(`Last updated: ${updatedAt}`);
   if (invoice.planVariantId || invoice.planId) {
     const planLabel = invoice.planId ? String(invoice.planId).toUpperCase() : 'PLAN';
     const variantLabel = invoice.planVariantId ? ` (${invoice.planVariantId})` : '';
@@ -73,8 +138,8 @@ function describeInvoice(invoice: BillingHistoryInvoice): { title: string; subti
     details.push(`Method: ${methodLabel}${cardSuffix}${upiSuffix}`);
   }
   if (invoice.billingPeriodStart || invoice.billingPeriodEnd) {
-    const start = formatBillingDate(invoice.billingPeriodStart) || invoice.billingPeriodStart;
-    const end = formatBillingDate(invoice.billingPeriodEnd) || invoice.billingPeriodEnd;
+    const start = formatBillingDate(invoice.billingPeriodStart, timeZone) || invoice.billingPeriodStart;
+    const end = formatBillingDate(invoice.billingPeriodEnd, timeZone) || invoice.billingPeriodEnd;
     if (start && end) details.push(`Period: ${start} → ${end}`);
     else if (end) details.push(`Period end: ${end}`);
   }
@@ -363,6 +428,8 @@ export default function BillingHistoryScreen() {
 
   const normalizedQuery = useMemo(() => normalizeSearch(searchQuery), [searchQuery]);
 
+  const tenantTimeZone = history?.timeZone || 'Asia/Kolkata';
+
   const filteredInvoices = useMemo(() => {
     const source = invoices || [];
     const statusFiltered =
@@ -387,6 +454,7 @@ export default function BillingHistoryScreen() {
             inv.rawEvent,
             inv.errorCode,
             inv.errorDescription,
+            inv.updatedAt,
             String(inv.amountInr ?? ''),
           ]
             .filter(Boolean)
@@ -854,7 +922,7 @@ export default function BillingHistoryScreen() {
                 </View>
               ) : filteredInvoices.length ? (
                 filteredInvoices.map((inv) => {
-                  const desc = describeInvoice(inv);
+                  const desc = describeInvoice(inv, { timeZone: tenantTimeZone });
                   const downloading = generatingInvoiceId === inv.id;
                   return (
                     <View key={inv.id} style={[styles.rowCard, { backgroundColor: theme.surface, borderColor: theme.border }]}>

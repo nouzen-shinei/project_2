@@ -8,10 +8,12 @@ type InvoicePdfInput = {
   tenantId: string;
   coachingName?: string;
   tenantName?: string;
+  timeZone?: string;
   invoiceId: string;
   invoiceNumber?: string;
   issuedAt?: string;
   dueAt?: string;
+  updatedAt?: string;
   status?: string;
   planId?: string;
   planVariantId?: string;
@@ -22,6 +24,9 @@ type InvoicePdfInput = {
   cardLast4?: string;
   cardNetwork?: string;
   upiVpaMasked?: string;
+  authorizedAt?: string;
+  capturedAt?: string;
+  failedAt?: string;
   billingPeriodStart?: string;
   billingPeriodEnd?: string;
   provider?: string;
@@ -43,18 +48,22 @@ function formatInr(amountInr: number): string {
   }
 }
 
-function formatDateLine(value?: string): string | null {
+function formatDateLine(value?: string, timeZone?: string): string | null {
   if (!value) return null;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return value;
   try {
-    return d.toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' });
+    return d.toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric', timeZone });
   } catch {
-    return value;
+    try {
+      return d.toLocaleDateString('en-IN', { year: 'numeric', month: 'short', day: 'numeric' });
+    } catch {
+      return value;
+    }
   }
 }
 
-function formatDateTimeLine(value?: string): string | null {
+function formatDateTimeLine(value?: string, timeZone?: string): string | null {
   if (!value) return null;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return value;
@@ -65,9 +74,20 @@ function formatDateTimeLine(value?: string): string | null {
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+      timeZone,
     });
   } catch {
-    return value;
+    try {
+      return d.toLocaleString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return value;
+    }
   }
 }
 
@@ -147,6 +167,8 @@ export async function generateInvoicePdfBuffer(input: InvoicePdfInput): Promise<
     doc.on('error', (err: unknown) => reject(err));
   });
 
+  const timeZone = (input.timeZone || '').trim() || 'Asia/Kolkata';
+
   const companyName = 'Vipika Learning Pvt. Ltd.';
   const companyTagline = 'Student-first learning tools';
   const companyAddress = '3rd Floor, MG Road, Bengaluru, Karnataka 560001, India';
@@ -154,13 +176,13 @@ export async function generateInvoicePdfBuffer(input: InvoicePdfInput): Promise<
   const companyPhone = '+91 90000 00000';
   const companyGstin = 'GSTIN: 29ABCDE1234F1Z5';
 
-  const issued = formatDateLine(input.issuedAt) || '—';
-  const due = formatDateLine(input.dueAt) || '—';
+  const issued = formatDateTimeLine(input.issuedAt, timeZone) || formatDateLine(input.issuedAt, timeZone) || '—';
+  const due = formatDateTimeLine(input.dueAt, timeZone) || formatDateLine(input.dueAt, timeZone) || '—';
   const rawStatus = (input.status || 'open').trim().toLowerCase();
   const status = rawStatus === 'void' ? 'FAILED' : safeUpper(rawStatus);
   const amount = formatInr(input.amountInr);
-  const billingStart = formatDateLine(input.billingPeriodStart) || input.billingPeriodStart || '';
-  const billingEnd = formatDateLine(input.billingPeriodEnd) || input.billingPeriodEnd || '';
+  const billingStart = formatDateLine(input.billingPeriodStart, timeZone) || input.billingPeriodStart || '';
+  const billingEnd = formatDateLine(input.billingPeriodEnd, timeZone) || input.billingPeriodEnd || '';
   // Use an ASCII separator to avoid font glyph issues in PDF rendering.
   const billingPeriod = billingStart && billingEnd ? `${billingStart} - ${billingEnd}` : billingEnd || billingStart || '—';
 
@@ -339,7 +361,16 @@ export async function generateInvoicePdfBuffer(input: InvoicePdfInput): Promise<
   doc.text(`Provider: ${input.provider || '—'}`);
   doc.text(`Payment ID: ${input.providerPaymentId || '—'}`);
   doc.text(`Method: ${method}${methodDetail ? ` · ${methodDetail}` : ''}`);
-  doc.text(`Recorded at: ${formatDateTimeLine(input.issuedAt) || '—'}`);
+  const paymentAt =
+    formatDateTimeLine(input.capturedAt, timeZone) ||
+    formatDateTimeLine(input.failedAt, timeZone) ||
+    formatDateTimeLine(input.authorizedAt, timeZone) ||
+    null;
+  const updatedAt = formatDateTimeLine(input.updatedAt, timeZone);
+  doc.text(`Issued at: ${formatDateTimeLine(input.issuedAt, timeZone) || '—'}`);
+  doc.text(`Payment time: ${paymentAt || '—'}`);
+  doc.text(`Last updated: ${updatedAt || '—'}`);
+  doc.text(`Timezone: ${timeZone}`);
 
   doc.moveDown(0.9);
   doc.font('Helvetica').fontSize(9.5).fillColor('#6B7280');

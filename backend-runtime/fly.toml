@@ -5,7 +5,7 @@ kill_signal = "SIGINT"
 kill_timeout = 15
 
 [build]
-  # Uses existing Dockerfile
+  dockerfile = "Dockerfile"
 
 [env]
   PORT = "8080"

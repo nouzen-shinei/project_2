@@ -335,19 +335,51 @@ async function resolveInvoiceRefForPayment(options: {
 }) {
   const invoicesCol = options.db.collection('billingInvoices').doc(options.tenantId).collection('invoices');
 
+  // Strong idempotency: if we already have an invoice doc for this payment, always reuse it.
+  // This prevents the backfill from generating duplicate invoice docs (and later duplicate invoice
+  // numbers/PDFs) for the same Razorpay paymentId.
+  try {
+    const directRef = invoicesCol.doc(options.paymentId);
+    const directSnap = await directRef.get();
+    if (directSnap.exists) {
+      return directRef;
+    }
+  } catch {
+    // ignore
+  }
+
+  // Next-best: find any invoice already linked to this providerPaymentId.
+  try {
+    const snap = await invoicesCol.where('providerPaymentId', '==', options.paymentId).limit(1).get();
+    if (!snap.empty) {
+      return snap.docs[0].ref;
+    }
+  } catch {
+    // ignore and fall back
+  }
+
   const normalizedSubscriptionId = (options.subscriptionId || '').trim();
   if (!normalizedSubscriptionId) {
     return invoicesCol.doc(options.paymentId);
   }
 
+  // Prefer updating an existing invoice for this subscription to avoid duplicates.
+  // IMPORTANT: avoid composite indexes by filtering in-memory.
   try {
-    const openSnap = await invoicesCol
-      .where('providerSubscriptionId', '==', normalizedSubscriptionId)
-      .where('status', '==', 'open')
-      .limit(1)
-      .get();
-    if (!openSnap.empty) {
-      return openSnap.docs[0].ref;
+    const snap = await invoicesCol.where('providerSubscriptionId', '==', normalizedSubscriptionId).limit(25).get();
+    if (!snap.empty) {
+      const byPaymentId = snap.docs.find((doc) => {
+        const data = doc.data() || {};
+        const pid = typeof (data as any).providerPaymentId === 'string' ? (data as any).providerPaymentId : null;
+        return pid === options.paymentId;
+      });
+      if (byPaymentId) return byPaymentId.ref;
+
+      const open = snap.docs.find((doc) => {
+        const data = doc.data() || {};
+        return (data as any).status === 'open';
+      });
+      if (open) return open.ref;
     }
   } catch {
     // ignore and fall back
