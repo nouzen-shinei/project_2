@@ -536,6 +536,7 @@ async function fetchExpoPushTokens(
         const tokenRaw = typeof payload.expoPushToken === 'string' ? payload.expoPushToken.trim() : '';
         if (!tokenRaw) return;
         if (payload.isDeleted === true) return;
+        if (payload.isOnline !== true) return;
         if (payload.notificationsEnabled === false) return;
         if (payload.pushTokenStatus === 'missing') return;
         const isExpoToken = /^(ExponentPushToken|ExpoPushToken)/i.test(tokenRaw);

@@ -39,7 +39,7 @@ export function injectCSP(opts: InjectOptions = {}) {
 
   // If we have style hashes we can drop unsafe-inline; else keep it for dev.
   const styleSrc = styleHashesEnabled
-    ? ["'self'", styleHashes].join(' ')
+    ? ["'self'", "'unsafe-hashes'", styleHashes].join(' ')
     : ["'self'", "'unsafe-inline'"].join(' ');
 
   // NOTE: Some directives (frame-ancestors, report-uri, report-to) are ignored by browsers when delivered via <meta>.

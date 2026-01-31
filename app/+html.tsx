@@ -1,7 +1,5 @@
 // Learn more https://docs.expo.dev/router/reference/static-rendering/#root-html
 
-import { ScrollViewStyleReset } from 'expo-router/html';
-
 // Web-only: configures the root HTML for every web page.
 // Runs in Node.js environments during static rendering.
 export default function Root({ children }: { children: React.ReactNode }) {
@@ -10,9 +8,10 @@ export default function Root({ children }: { children: React.ReactNode }) {
       <head>
         <meta charSet="utf-8" />
         <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
-        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
-
-        {/* PWA / installability */}
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1.00001, viewport-fit=cover"
+        />
         <meta name="application-name" content="Tuition Manager" />
         <meta name="description" content="Complete tuition and coaching class management solution" />
         <meta name="theme-color" content="#4f46e5" />
@@ -23,12 +22,43 @@ export default function Root({ children }: { children: React.ReactNode }) {
 
         <link rel="manifest" href="/manifest.json" />
         <link rel="apple-touch-icon" sizes="180x180" href="/pwa/apple-touch-icon-180.png" />
-
-        {/* 
-          Disable body scrolling on web. This makes ScrollView components work closer to how they do on native.
-          If you want body scrolling, remove this line.
-        */}
-        <ScrollViewStyleReset />
+        <style
+          // eslint-disable-next-line react/no-danger
+          dangerouslySetInnerHTML={{
+            __html: `
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+}
+#root {
+  flex-shrink: 0;
+  flex-basis: auto;
+  flex-grow: 1;
+  display: flex;
+  flex: 1;
+}
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+  height: calc(100% + env(safe-area-inset-top));
+}
+body {
+  display: flex;
+  overflow-y: auto;
+  overscroll-behavior-y: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -ms-overflow-style: scrollbar;
+  -webkit-overflow-scrolling: touch;
+}
+`,
+          }}
+        />
       </head>
       <body>{children}</body>
     </html>

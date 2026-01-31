@@ -63,6 +63,7 @@ interface CachedDeviceRecord {
   notificationsEnabled?: boolean;
   noticeNotificationsEnabled?: boolean;
   isDeleted?: boolean;
+  isOnline?: boolean;
 }
 
 function coerceTrimmedString(value: unknown): string | null {
@@ -222,6 +223,7 @@ async function getDevicesForUser(db: FirestoreLike, email: string): Promise<Cach
       'notificationsEnabled',
       'noticeNotificationsEnabled',
       'isDeleted',
+      'isOnline',
       'deviceId'
     )
     .get();
@@ -238,6 +240,7 @@ async function getDevicesForUser(db: FirestoreLike, email: string): Promise<Cach
         notificationsEnabled: data?.notificationsEnabled,
         noticeNotificationsEnabled: data?.noticeNotificationsEnabled,
         isDeleted: data?.isDeleted,
+        isOnline: data?.isOnline,
       };
     })
     .filter((record) => Boolean(record.token));
@@ -246,6 +249,7 @@ async function getDevicesForUser(db: FirestoreLike, email: string): Promise<Cach
 function shouldDeliverToDevice(device: CachedDeviceRecord): boolean {
   if (!device.token) return false;
   if (device.isDeleted) return false;
+  if (device.isOnline !== true) return false;
   if (device.notificationsEnabled === false) return false;
   if (device.noticeNotificationsEnabled === false) return false;
   return true;

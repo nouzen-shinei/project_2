@@ -9,6 +9,7 @@ kill_timeout = 15
 
 [env]
   PORT = "8080"
+  CORS_ALLOW_ORIGINS = "https://tuitionmanager.app"
   WHATSAPP_QUEUE_CONCURRENCY = "4"
   WHATSAPP_QUEUE_NAME = "wa-reminders"
   JOB_RETENTION_MS = "604800000"

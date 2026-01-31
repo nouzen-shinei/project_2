@@ -271,7 +271,6 @@ export async function generateInvoicePdfBuffer(input: InvoicePdfInput): Promise<
   if (input.payerEmail) {
     doc.text(`Contact: ${input.payerEmail}`, colLeftX, doc.y, { width: colWidth });
   }
-  doc.text(`Subscription: ${input.subscriptionId || input.providerSubscriptionId || '—'}`, colLeftX, doc.y, { width: colWidth });
 
   let metaY = sectionTop;
   doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827').text('INVOICE DETAILS', colRightX, metaY, { width: colWidth, align: 'right' });

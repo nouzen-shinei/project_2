@@ -42,6 +42,7 @@ export interface DailyQuoteJobStats {
     duplicateToken: number;
     outsideWindow: number;
     deletedDevice: number;
+    offlineDevice: number;
   };
   timeOfDayBreakdown: Record<DailyQuoteTimeOfDay, { attempted: number; sent: number }>;
   quote: Quote;
@@ -319,6 +320,7 @@ export async function runDailyQuoteJob(options: DailyQuoteJobOptions = {}): Prom
         duplicateToken: 0,
         outsideWindow: 0,
         deletedDevice: 0,
+        offlineDevice: 0,
       },
       timeOfDayBreakdown: {
         morning: { attempted: 0, sent: 0 },
@@ -412,6 +414,7 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
       duplicateToken: 0,
       outsideWindow: 0,
       deletedDevice: 0,
+      offlineDevice: 0,
     },
     timeOfDayBreakdown: {
       morning: { attempted: 0, sent: 0 },
@@ -514,6 +517,18 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
             deviceId,
             token: expoPushTokenRaw,
             preferenceTimestamp,
+          });
+        }
+        continue;
+      }
+
+      if (deviceData.isOnline !== true) {
+        stats.skipped.offlineDevice += 1;
+        if (debugMatch) {
+          console.log('[daily_quote_job] debug skipped offlineDevice', {
+            userEmail,
+            deviceId,
+            token: expoPushTokenRaw,
           });
         }
         continue;

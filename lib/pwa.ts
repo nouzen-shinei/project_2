@@ -97,9 +97,15 @@ export function registerServiceWorker() {
   }
 
   const doRegister = () => {
-    navigator.serviceWorker
-      .register('/service-worker.js')
+    fetch('/service-worker.js', { method: 'HEAD', cache: 'no-store' })
+      .then((res) => {
+        if (!res.ok) return null;
+        const ct = res.headers.get('content-type') || '';
+        if (!ct.includes('javascript')) return null;
+        return navigator.serviceWorker.register('/service-worker.js');
+      })
       .then((registration) => {
+        if (!registration) return;
         // Check for updates periodically
         registration.addEventListener('updatefound', () => {
           const newWorker = registration.installing;

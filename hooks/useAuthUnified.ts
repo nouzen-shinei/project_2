@@ -35,6 +35,9 @@ import { Platform } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import { teamMembershipNotifier, TeamMembershipChangePayload } from '@/services/teamMembershipNotifier';
 import { tenantService } from '@/services/tenantService';
+import { chatCacheService } from '@/services/chatCacheService';
+import { notificationService } from '@/services/notificationService';
+import { settingsService } from '@/services/settingsService';
 import type { TenantMembershipRole } from '@/types';
 // Lazy-load deviceTrackingService to avoid import cycles (typed)
 type DeviceTrackingServiceType = typeof import('../services/deviceTrackingService').deviceTrackingService;
@@ -94,6 +97,8 @@ let globalAuthState: {
   isInitialized: boolean;
   isOffline?: boolean;
   authorizationErrorPending?: boolean; // Flag to preserve authorization errors
+  reloginRequired?: boolean;
+  reloginReason?: string | null;
   roleChangeNotice?: { oldRole: 'user' | 'admin'; newRole: 'user' | 'admin'; at: number } | null;
 } = {
   user: null,
@@ -102,6 +107,8 @@ let globalAuthState: {
   isInitialized: false,
   isOffline: false,
   authorizationErrorPending: false,
+  reloginRequired: false,
+  reloginReason: null,
   roleChangeNotice: null,
 };
 
@@ -149,6 +156,9 @@ let lastSyncedRole: 'user' | 'admin' | null = null;
 // Track how authorized emails were last loaded: from Firestore (authoritative), from cache, or error
 // Prevent concurrent revalidation attempts
 let revalidationInProgress = false;
+let permissionDeniedCounter = 0;
+let lastPermissionDeniedAt = 0;
+let permissionRecoveryInFlight: Promise<void> | null = null;
 
 // Global variable to track current presence user (for debugging)
 let currentPresenceUser: string | null = null;
@@ -156,6 +166,138 @@ let currentPresenceUser: string | null = null;
 // Notify all listeners of state changes
 function notifyListeners() {
   authListeners.forEach(listener => listener({ ...globalAuthState }));
+}
+
+const PERMISSION_DENIED_MARKERS = [
+  'missing or insufficient permissions',
+  'insufficient permissions',
+  'permission-denied',
+];
+
+function isPermissionDeniedError(error: unknown): boolean {
+  if (!error) return false;
+  const errorAny = error as any;
+  const code = (errorAny?.code || '').toString().toLowerCase();
+  if (code === 'permission-denied') return true;
+  const message = (typeof error === 'string' ? error : errorAny?.message || '').toString().toLowerCase();
+  if (!message) return false;
+  return PERMISSION_DENIED_MARKERS.some((marker) => message.includes(marker));
+}
+
+async function attemptPermissionRecovery(reason?: string): Promise<void> {
+  if (permissionRecoveryInFlight) {
+    return permissionRecoveryInFlight;
+  }
+  const user = auth.currentUser;
+  if (!user) return;
+  if (globalAuthState.isOffline) return;
+  permissionRecoveryInFlight = (async () => {
+    try {
+      logger.debug('🔄 Attempting permission recovery via token refresh', { reason });
+      await user.getIdToken(true);
+      await revalidateAuthorizationOnReconnect(2, 400);
+      clearReloginRequired();
+      logger.debug('✅ Permission recovery attempt completed');
+    } catch (error) {
+      logger.warn('⚠️ Permission recovery attempt failed', error);
+    } finally {
+      permissionRecoveryInFlight = null;
+    }
+  })();
+  return permissionRecoveryInFlight;
+}
+
+function flagReloginRequired(reason?: string, error?: unknown): void {
+  if (globalAuthState.reloginRequired) return;
+  if (!globalAuthState.user) return;
+  if (globalAuthState.isOffline) return;
+  if (!isPermissionDeniedError(error)) return;
+  const now = Date.now();
+  if (now - lastPermissionDeniedAt > 30000) {
+    permissionDeniedCounter = 0;
+  }
+  lastPermissionDeniedAt = now;
+  permissionDeniedCounter += 1;
+
+  if (permissionDeniedCounter <= 1) {
+    void attemptPermissionRecovery(reason);
+    return;
+  }
+
+  globalAuthState.reloginRequired = true;
+  globalAuthState.reloginReason = reason || null;
+  notifyListeners();
+}
+
+function clearReloginRequired(): void {
+  const hadState = Boolean(globalAuthState.reloginRequired || globalAuthState.reloginReason);
+  globalAuthState.reloginRequired = false;
+  globalAuthState.reloginReason = null;
+  permissionDeniedCounter = 0;
+  lastPermissionDeniedAt = 0;
+  if (hadState) {
+    notifyListeners();
+  }
+}
+
+async function clearUserScopedStorage(): Promise<void> {
+  const explicitKeys: string[] = [
+    STORAGE_KEYS.cachedUserData,
+    STORAGE_KEYS.cachedAuthorizedEmails,
+    STORAGE_KEYS.userProfile,
+    STORAGE_KEYS.appSettings,
+    STORAGE_KEYS.authorizedEmails,
+    STORAGE_KEYS.customProfilePicture,
+    STORAGE_KEYS.useCustomProfilePicture,
+    STORAGE_KEYS.selectedTenantId,
+    STORAGE_KEYS.cachedTenantMemberships,
+    STORAGE_KEYS.tenantNotificationPreferenceDrafts,
+    STORAGE_KEYS.cacheLastClearedAt,
+    'userToken',
+    'notificationPreferences',
+    'pendingMessages',
+    'notice_reaction_emojis_v1',
+    'apiQuoteCache',
+    'dashboardData',
+    'pendingAutoFeeActions',
+    'rejectedAutoFeeActions',
+    'paymentReminderPrefs',
+    'last_active_at',
+    'chat_cache_v3_encryption_key',
+  ];
+
+  try {
+    const allKeys = await AsyncStorage.getAllKeys();
+    const keysToRemove = new Set(explicitKeys);
+    for (const key of allKeys) {
+      if (key.startsWith('chat-cache:')) {
+        keysToRemove.add(key);
+      }
+    }
+    if (keysToRemove.size) {
+      await AsyncStorage.multiRemove(Array.from(keysToRemove));
+    }
+  } catch (error) {
+    logger.warn('⚠️ Failed to clear user-scoped storage:', error);
+  }
+
+  try {
+    await chatCacheService.clearAllMediaCaches();
+  } catch (error) {
+    logger.warn('⚠️ Failed to clear chat media cache:', error);
+  }
+
+  try {
+    await notificationService.cleanup();
+  } catch (error) {
+    logger.warn('⚠️ Failed to cleanup notification service:', error);
+  }
+
+  try {
+    settingsService.clearCache();
+  } catch (error) {
+    logger.warn('⚠️ Failed to clear settings cache:', error);
+  }
 }
 
 // Offline caching utilities
@@ -1336,6 +1478,7 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
 
             // Update global auth state
             globalAuthState.user = authUser;
+            clearReloginRequired();
             confirmRoleSyncTracking(authUser.role);
         globalAuthState.loading = false;
         globalAuthState.error = null;
@@ -1413,6 +1556,8 @@ async function signOut(): Promise<void> {
     
     // Clear cached user data
     await cacheUserData(null);
+    await clearAuthorizedEmailsCache();
+    await clearUserScopedStorage();
     
     // Sign out from Google on mobile
     if (Platform.OS !== 'web') {
@@ -1436,6 +1581,9 @@ async function signOut(): Promise<void> {
     
     // Clear any stored auth data
     await AsyncStorage.removeItem('userToken');
+
+    // Clear relogin-required state after successful sign out
+    clearReloginRequired();
     
     logger.debug('Sign out completed successfully');
   } catch (error: any) {
@@ -1658,6 +1806,7 @@ function initializeAuth() {
         await cacheUserData(authUser);
         
         globalAuthState.user = authUser;
+        clearReloginRequired();
         confirmRoleSyncTracking(authUser.role);
         globalAuthState.loading = false;
         globalAuthState.error = null;
@@ -2690,6 +2839,7 @@ export function useAuth() {
     isInitialized: state.isInitialized,
     isOffline: state.isOffline || false,
   roleChangeNotice: state.roleChangeNotice || null,
+    reloginRequired: state.reloginRequired || false,
     signInWithGoogle,
     signOut,
     isAuthenticated: !!state.user,
@@ -2719,4 +2869,6 @@ export const authService = {
   updateTypingStatus,
   getCleanErrorMessage,
   isDeviceBanError,
+  flagReloginRequired,
+  clearReloginRequired,
 };

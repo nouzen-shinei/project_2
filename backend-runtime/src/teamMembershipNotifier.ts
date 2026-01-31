@@ -69,6 +69,7 @@ interface CachedDeviceRecord {
   notificationsEnabled?: boolean;
   teamNotificationsEnabled?: boolean;
   isDeleted?: boolean;
+  isOnline?: boolean;
 }
 
 let firestoreOverride: FirestoreLike | null = null;
@@ -204,6 +205,7 @@ async function getDevicesForUser(email: string): Promise<CachedDeviceRecord[]> {
       'notificationsEnabled',
       'teamNotificationsEnabled',
       'isDeleted',
+      'isOnline',
       'deviceId'
     )
     .get();
@@ -220,6 +222,7 @@ async function getDevicesForUser(email: string): Promise<CachedDeviceRecord[]> {
         notificationsEnabled: data?.notificationsEnabled,
         teamNotificationsEnabled: data?.teamNotificationsEnabled,
         isDeleted: data?.isDeleted,
+        isOnline: data?.isOnline,
       };
     })
     .filter(record => Boolean(record.token));
@@ -231,6 +234,7 @@ async function getDevicesForUser(email: string): Promise<CachedDeviceRecord[]> {
 function shouldDeliverToDevice(device: CachedDeviceRecord): boolean {
   if (!device.token) return false;
   if (device.isDeleted) return false;
+  if (device.isOnline !== true) return false;
   if (device.notificationsEnabled === false) return false;
   if (device.teamNotificationsEnabled === false) return false;
   return true;

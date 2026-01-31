@@ -145,7 +145,7 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
   }, [codes]);
 
   const statusFilterOptions = useMemo<CodeStatusFilter[]>(() => {
-    const options: CodeStatusFilter[] = ['all', 'active'];
+    const options: CodeStatusFilter[] = ['all', 'active', 'revoked', 'expired'];
     availableStatusFilters.forEach((status) => {
       if (!options.includes(status as CodeStatusFilter)) {
         options.push(status as CodeStatusFilter);

@@ -10,7 +10,7 @@
     "build": "npm run build:web",
     "prebuild:preview": "node scripts/verifyEnv.js --profile preview && node scripts/enforceProdEnv.js preview",
     "prebuild:production": "node scripts/verifyEnv.js --profile production && node scripts/enforceProdEnv.js production",
-    "build:web": "node scripts/verifyEnv.js --profile production && node scripts/enforceProdEnv.js production && expo export --platform web && node scripts/generateStyleScriptHashes.mjs dist csp-hashes.json",
+    "build:web": "node scripts/verifyEnv.js --profile production && node scripts/enforceProdEnv.js production && expo export --platform web && node scripts/stripHtmlComments.mjs dist && node scripts/generateStyleScriptHashes.mjs dist csp-hashes.json",
     "lint": "expo lint",
     "test:unit": "node scripts/runTests.js",
     "migrate:logs": "ts-node scripts/migrateLogsToLogger.ts",

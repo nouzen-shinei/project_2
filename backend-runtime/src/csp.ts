@@ -43,7 +43,7 @@ export function buildCsp(opts: CspBuildOptions = {}): CspResult {
 
   const scriptSrc = ["'self'", scriptHashes, ...extraScript].filter(Boolean).join(' ');
   const styleSrc = hashes.style?.length
-    ? ["'self'", styleHashes].join(' ')
+    ? ["'self'", "'unsafe-hashes'", styleHashes].join(' ')
     : ["'self'", "'unsafe-inline'"].join(' ');
 
   const connectSrc = ["'self'", 'https:', 'wss:', 'data:', 'blob:', ...extraConnect].join(' ');

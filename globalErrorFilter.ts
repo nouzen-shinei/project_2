@@ -2,6 +2,7 @@
 
 import { Platform } from 'react-native';
 import { maybeShowStorageLimitReachedAlert } from './services/storageLimitAlert';
+import { authService } from './hooks/useAuthUnified';
 
 /**
  * Suppress the noisy React-Native-Web warning:
@@ -23,6 +24,7 @@ export function installErrorFilter() {
   const originalWarn = console.warn;
 
   let handling = false;
+  let reloginHandling = false;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function maybeHandleStorageLimit(args: any[], context: string) {
@@ -50,7 +52,23 @@ export function installErrorFilter() {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function maybeHandleReloginRequired(args: any[], context: string) {
+    if (reloginHandling) return;
+    try {
+      reloginHandling = true;
+      for (const arg of args) {
+        authService.flagReloginRequired?.(context, arg);
+      }
+    } finally {
+      reloginHandling = false;
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function patchedConsoleError(...args: any[]) {
+    // App-level: surface relogin-required flow on Firestore permission errors.
+    maybeHandleReloginRequired(args, 'globalErrorFilter.console.error');
+
     // App-level: surface tenant storage limit errors consistently.
     maybeHandleStorageLimit(args, 'globalErrorFilter.console.error');
 
@@ -74,6 +92,7 @@ export function installErrorFilter() {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function patchedConsoleWarn(...args: any[]) {
+    maybeHandleReloginRequired(args, 'globalErrorFilter.console.warn');
     maybeHandleStorageLimit(args, 'globalErrorFilter.console.warn');
     // @ts-ignore – preserve original signature
     originalWarn.apply(console, args);
@@ -90,6 +109,7 @@ export function installErrorFilter() {
       window.addEventListener('unhandledrejection', (event) => {
         try {
           maybeShowStorageLimitReachedAlert((event as any)?.reason, 'globalErrorFilter.unhandledrejection');
+          authService.flagReloginRequired?.('globalErrorFilter.unhandledrejection', (event as any)?.reason);
         } catch {
           // ignore
         }
@@ -98,6 +118,7 @@ export function installErrorFilter() {
         try {
           const err = (event as any)?.error ?? (event as any)?.message;
           maybeShowStorageLimitReachedAlert(err, 'globalErrorFilter.window.error');
+          authService.flagReloginRequired?.('globalErrorFilter.window.error', err);
         } catch {
           // ignore
         }

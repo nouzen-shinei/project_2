@@ -54,6 +54,7 @@ import { tryPresentModalAlert } from '../services/modalAlertService';
 import { wasStorageLimitReachedAlertShownRecently } from '../services/storageLimitAlert';
 import { runtimeEndpoints } from '../services/runtimeEndpoints';
 import { ensurePwaHeadTags, initPWAInstallPrompt, registerServiceWorker } from '../lib/pwa';
+import ReloginRequiredModal from '../components/ReloginRequiredModal';
 
 SplashScreen.preventAutoHideAsync();
 // Install console/error & event filters (web-only)
@@ -428,6 +429,7 @@ export default function RootLayout() {
                   © vipika.in
                 </Text>
               </View>
+              <ReloginRequiredModal />
               <StatusBar style="auto" />
               <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
             </ModalAlertProvider>
@@ -450,6 +452,7 @@ export default function RootLayout() {
                 <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
                 <Stack.Screen name="+not-found" options={{ headerShown: false }} />
               </Stack>
+              <ReloginRequiredModal />
               <StatusBar style="auto" />
               <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
             </ModalAlertProvider>
@@ -467,6 +470,7 @@ export default function RootLayout() {
           <ThemeProvider>
             <ModalAlertProvider>
               <LoginScreen />
+              <ReloginRequiredModal />
               <StatusBar style="auto" />
               <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
             </ModalAlertProvider>
@@ -491,6 +495,7 @@ export default function RootLayout() {
                   router={router}
                   onTenantBootstrapped={() => setTenantBootstrapped(true)}
                 />
+                <ReloginRequiredModal />
                 <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
               </ModalAlertProvider>
             </ThemeProvider>

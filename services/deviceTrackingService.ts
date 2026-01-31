@@ -1608,6 +1608,19 @@ class DeviceTrackingService {
       const email = userEmail || this.currentUserEmail;
       if (this.currentDeviceId && email) {
         await this.updateDeviceStatus(email, this.currentDeviceId, false);
+
+        try {
+          const deviceDocRef = doc(firestore, 'user_devices', email, 'devices', this.currentDeviceId);
+          await updateDoc(deviceDocRef, {
+            expoPushToken: deleteField(),
+            pushTokenStatus: 'missing',
+            needsExpoPushTokenRefresh: true,
+            lastPushTokenErrorAt: this.createResolvedTimestamp(),
+            lastPushTokenErrorCode: 'logged_out',
+          });
+        } catch (error) {
+          logger.warn('Failed to clear expo push token on logout:', error);
+        }
         
         // Stop heartbeat
         if (this.heartbeatInterval) {
@@ -2105,6 +2118,14 @@ class DeviceTrackingService {
         return false;
       }
 
+      if (!device.isOnline) {
+        logger.debug('Skipping device notification: device is offline', {
+          userEmail,
+          deviceId,
+        });
+        return false;
+      }
+
   const allowWhenDisabled = notification?.data?.allowWhenDisabled === true;
   const notificationType = notification?.data?.type;
   const isChatNotification = notificationType === 'chat_message';
@@ -2415,7 +2436,11 @@ class DeviceTrackingService {
       const ACTIVE_CHAT_SUPPRESSION_WINDOW_MS = 45_000;
 
       const targetDevices = devices.filter(device => {
-        if (onlineOnly && (!device.isOnline || device.isDeleted)) {
+        if (!device.isOnline || device.isDeleted) {
+          return false;
+        }
+
+        if (onlineOnly && device.isDeleted) {
           return false;
         }
 
@@ -3530,6 +3555,7 @@ class DeviceTrackingService {
         deletedByName: adminName,
         deletionReason: reason,
         updatedAt: this.createResolvedTimestamp(),
+        isOnline: false,
         logoutSignal: true, // Ensure logout signal is set
       };
 
@@ -4229,7 +4255,12 @@ class DeviceTrackingService {
           lastActivityType: 'logout',
           manualLogoutAt: this.createResolvedTimestamp(),
           logoutType: 'manual',
-          isOnline: false
+          isOnline: false,
+          expoPushToken: deleteField(),
+          pushTokenStatus: 'missing',
+          needsExpoPushTokenRefresh: true,
+          lastPushTokenErrorAt: this.createResolvedTimestamp(),
+          lastPushTokenErrorCode: 'logged_out',
         };
 
         const cleanUpdates = this.cleanUndefinedValues(updates);
