@@ -21,9 +21,15 @@ export interface RazorpaySubscriptionCreateResult {
   raw: Record<string, any>;
 }
 
-async function getCurrentTenantPlanId(
+type TenantBillingGuard = {
+  planId: 'free' | 'pro' | 'enterprise' | null;
+  planLockedByOrg: boolean;
+  subscriptionId: string | null;
+};
+
+async function getCurrentTenantBillingGuard(
   billingRef: admin.firestore.DocumentReference
-): Promise<'free' | 'pro' | 'enterprise' | null> {
+): Promise<TenantBillingGuard> {
   try {
     const snap = await billingRef.get();
     const data = snap.exists ? (snap.data() ?? {}) : {};
@@ -34,12 +40,16 @@ async function getCurrentTenantPlanId(
           ? String((data as any).plan)
           : '';
     const normalized = raw.trim().toLowerCase();
-    if (normalized === 'free' || normalized === 'pro' || normalized === 'enterprise') {
-      return normalized;
-    }
-    return null;
+    const planId = normalized === 'free' || normalized === 'pro' || normalized === 'enterprise' ? normalized : null;
+    const planLockedByOrg = (data as any).planLockedByOrg === true;
+    const subscriptionIdRaw = typeof (data as any).subscriptionId === 'string' ? String((data as any).subscriptionId).trim() : '';
+    return {
+      planId,
+      planLockedByOrg,
+      subscriptionId: subscriptionIdRaw ? subscriptionIdRaw : null,
+    };
   } catch {
-    return null;
+    return { planId: null, planLockedByOrg: false, subscriptionId: null };
   }
 }
 
@@ -107,11 +117,16 @@ export async function createRazorpaySubscription(options: {
   const totalCountRaw = Number.parseInt(getEnv('RAZORPAY_SUBSCRIPTION_TOTAL_COUNT') || '360', 10);
   const totalCount = Number.isFinite(totalCountRaw) ? Math.max(1, Math.min(360, totalCountRaw)) : 360;
 
+  const expireMinutesRaw = Number.parseInt(getEnv('RAZORPAY_SUBSCRIPTION_EXPIRE_MINUTES') || '15', 10);
+  const expireMinutes = Number.isFinite(expireMinutesRaw) ? Math.max(1, Math.min(1440, expireMinutesRaw)) : 15;
+  const expireBy = Math.floor(Date.now() / 1000) + expireMinutes * 60;
+
   const payload = {
     plan_id: razorpayPlanId,
     total_count: totalCount,
     quantity: 1,
     customer_notify: options.customerNotify === false ? 0 : 1,
+    expire_by: expireBy,
     notes: {
       tenantId: options.tenantId,
       planId: options.planId,
@@ -933,8 +948,17 @@ export async function handleRazorpayWebhook(options: {
   // Explicit failure events (best-effort). These can occur in addition to subscription.pending.
   if (event === 'payment.failed') {
     // Do not mark a Free tenant delinquent due to an unpaid initial checkout attempt.
-    const currentPlanId = await getCurrentTenantPlanId(billingRef);
-    if (currentPlanId === 'free') {
+    const current = await getCurrentTenantBillingGuard(billingRef);
+    if (current.planId === 'free') {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.planLockedByOrg === true) {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.subscriptionId && current.subscriptionId.includes('__ignored_by_admin_override__')) {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.subscriptionId && subscriptionId && current.subscriptionId !== subscriptionId) {
       return { ok: true, provider: 'razorpay' };
     }
 
@@ -1065,8 +1089,17 @@ export async function handleRazorpayWebhook(options: {
     }
 
     // If the tenant is currently on Free, do not upgrade them or mark them delinquent.
-    const currentPlanId = await getCurrentTenantPlanId(billingRef);
-    if (currentPlanId === 'free') {
+    const current = await getCurrentTenantBillingGuard(billingRef);
+    if (current.planId === 'free') {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.planLockedByOrg === true) {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.subscriptionId && current.subscriptionId.includes('__ignored_by_admin_override__')) {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.subscriptionId && subscriptionId && current.subscriptionId !== subscriptionId) {
       return { ok: true, provider: 'razorpay' };
     }
 
@@ -1502,12 +1535,22 @@ export async function handleRazorpayWebhook(options: {
 
     // A started-but-unpaid initial checkout can yield pending events.
     // If the tenant is currently on Free, do not upgrade them or mark them delinquent.
-    const currentPlanId = await getCurrentTenantPlanId(billingRef);
-    if (currentPlanId === 'free') {
+    const current = await getCurrentTenantBillingGuard(billingRef);
+    if (current.planId === 'free') {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.planLockedByOrg === true) {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.subscriptionId && current.subscriptionId.includes('__ignored_by_admin_override__')) {
+      return { ok: true, provider: 'razorpay' };
+    }
+    if (current.subscriptionId && subscriptionId && current.subscriptionId !== subscriptionId) {
       return { ok: true, provider: 'razorpay' };
     }
 
     try {
+      const nowIso = new Date().toISOString();
       await billingRef.set(
         {
           planId: planIdFromNotes,
@@ -1518,8 +1561,9 @@ export async function handleRazorpayWebhook(options: {
           subscriptionId: subscriptionId || null,
           checkoutRequired: true,
           checkoutRequiredProvider: 'razorpay',
+          checkoutRequiredSinceIso: nowIso,
           delinquentSince: admin.firestore.FieldValue.serverTimestamp(),
-          delinquentSinceIso: new Date().toISOString(),
+          delinquentSinceIso: nowIso,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
         { merge: true }

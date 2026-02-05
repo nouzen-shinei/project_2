@@ -689,6 +689,9 @@ async function runPlayBillingReconcileJob(options: { reason: 'startup' | 'interv
 
         // Payment pending.
         if (paymentState === 0) {
+          if ((billing as any).planLockedByOrg === true) {
+            continue;
+          }
           if (!dryRun) {
             await billingRef.set(
               stripUndefinedDeep({

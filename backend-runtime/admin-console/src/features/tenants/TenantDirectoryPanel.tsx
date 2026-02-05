@@ -359,8 +359,17 @@ export function TenantDirectoryPanel() {
 
   const currentSubscriptionProvider = (billingSummary?.subscriptionProvider || '').toLowerCase();
   const currentSubscriptionId = (billingSummary?.subscriptionId || '').trim();
+  const subscriptionIgnoredByAdmin = currentSubscriptionId.includes('__ignored_by_admin_override__');
+  const razorpayStatusActive =
+    currentSubscriptionProvider === 'razorpay'
+      ? (billingSummary?.subscriptionProviderStatus || '').toLowerCase() === 'active'
+      : true;
   const hasActiveSubscription =
-    Boolean(currentSubscriptionId) && (billingSummary?.status === 'active' || billingSummary?.status === 'delinquent');
+    Boolean(currentSubscriptionId) &&
+    billingSummary?.status === 'active' &&
+    billingSummary?.checkoutRequired !== true &&
+    !subscriptionIgnoredByAdmin &&
+    razorpayStatusActive;
 
   const cancelModeHelp = useMemo(() => {
     if (!hasActiveSubscription) return 'No active subscription detected for this tenant.';
@@ -2324,6 +2333,7 @@ export function TenantDirectoryPanel() {
                   <span className="muted small-text">
                     {cancelModeHelp}
                     {hasActiveSubscription && currentSubscriptionProvider ? ` (provider: ${currentSubscriptionProvider})` : ''}
+                    {hasActiveSubscription && currentSubscriptionId ? ` · subscription: ${currentSubscriptionId}` : ''}
                   </span>
                 </label>
                 <label>

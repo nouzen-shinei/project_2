@@ -2656,6 +2656,7 @@ interface BillingSummaryRecord {
   renewalDate?: string;
   checkoutRequired?: boolean;
   subscriptionProvider?: 'razorpay' | 'google_play' | 'unknown';
+  subscriptionProviderStatus?: string;
   subscriptionId?: string;
   cancelAtCycleEnd?: boolean;
   invoices: BillingInvoiceRecord[];
@@ -3741,15 +3742,56 @@ async function loadTenantBillingSummary(
     const cancelAtCycleEnd = typeof (data as any).cancelAtCycleEnd === 'boolean' ? Boolean((data as any).cancelAtCycleEnd) : undefined;
 
     const statusRaw = typeof data.status === 'string' ? data.status.toLowerCase() : undefined;
-    const status = (statusRaw === 'active' || statusRaw === 'delinquent' || statusRaw === 'canceled'
+    let status = (statusRaw === 'active' || statusRaw === 'delinquent' || statusRaw === 'canceled'
       ? statusRaw
       : planId === 'free'
         ? 'trial'
         : 'active') as BillingSummaryRecord['status'];
-    const renewalDate = toIsoTimestamp(data.renewalDate ?? data.renewsAt ?? data.renewalAt) ?? undefined;
+    let renewalDate = toIsoTimestamp(data.renewalDate ?? data.renewsAt ?? data.renewalAt) ?? undefined;
+    let subscriptionProviderStatus: string | undefined;
     // A Free plan should never be shown as "pending".
-    const checkoutRequired = planId === 'free' ? false : typeof data.checkoutRequired === 'boolean' ? data.checkoutRequired : undefined;
+    let checkoutRequired = planId === 'free' ? false : typeof data.checkoutRequired === 'boolean' ? data.checkoutRequired : undefined;
     const invoices = await loadBillingInvoices(db, tenantId);
+
+    const planLockedByOrg = (data as any).planLockedByOrg === true;
+    const subscriptionIgnoredByAdmin = Boolean(subscriptionId) && subscriptionId?.includes('__ignored_by_admin_override__');
+    if (
+      subscriptionProvider === 'razorpay' &&
+      subscriptionId &&
+      (status === 'active' || status === 'delinquent') &&
+      !planLockedByOrg &&
+      !subscriptionIgnoredByAdmin
+    ) {
+      try {
+        const fetched = await fetchRazorpaySubscription({ subscriptionId });
+        const providerStatus = (fetched.status || '').trim().toLowerCase();
+        subscriptionProviderStatus = providerStatus || undefined;
+        if (providerStatus === 'cancelled' || providerStatus === 'expired' || providerStatus === 'completed') {
+          status = 'canceled';
+          renewalDate = undefined;
+          if (billingSnap.exists) {
+            await billingSnap.ref.set(
+              {
+                status: 'canceled',
+                renewalDate: null,
+                cancelAtCycleEnd: false,
+                checkoutRequired: false,
+                checkoutRequiredProvider: admin.firestore.FieldValue.delete(),
+                checkoutRequiredSinceIso: admin.firestore.FieldValue.delete(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+        } else if (providerStatus === 'created' || providerStatus === 'pending') {
+          status = planId === 'free' ? 'trial' : 'delinquent';
+          renewalDate = undefined;
+          checkoutRequired = planId === 'free' ? false : true;
+        }
+      } catch (error) {
+        console.warn('[billing] failed to reconcile razorpay subscription status', tenantId, subscriptionId, error);
+      }
+    }
     return {
       tenantId,
       planId,
@@ -3757,6 +3799,7 @@ async function loadTenantBillingSummary(
       status,
       renewalDate,
       ...(subscriptionProvider ? { subscriptionProvider } : {}),
+      ...(subscriptionProviderStatus ? { subscriptionProviderStatus } : {}),
       ...(subscriptionId ? { subscriptionId } : {}),
       ...(typeof cancelAtCycleEnd === 'boolean' ? { cancelAtCycleEnd } : {}),
       ...(typeof checkoutRequired === 'boolean' ? { checkoutRequired } : {}),
@@ -13914,6 +13957,9 @@ export function createApp(options: CreateAppOptions = {}){
         }
 
         if (notificationType === 5 /* ON_HOLD */ || notificationType === 6 /* IN_GRACE_PERIOD */) {
+          if ((billingData as any).planLockedByOrg === true) {
+            return;
+          }
           const delinquentKey = `${purchaseToken}:${notificationType}:${expiryIso || 'unknown'}`;
           if (delinquentKey === lastDelinquentKey) {
             return;
