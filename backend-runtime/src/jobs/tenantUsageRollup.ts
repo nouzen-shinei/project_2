@@ -20,6 +20,17 @@ const METRIC_LABELS: Record<UsageMetricKey, string> = {
 const ALERT_THROTTLE_HOURS = Math.max(1, Number(process.env.USAGE_ALERT_THROTTLE_HOURS ?? '24'));
 const ALERT_THROTTLE_MS = ALERT_THROTTLE_HOURS * 60 * 60 * 1000;
 
+function parseBoolean(value?: string | null): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+const SKIP_REMINDERS = parseBoolean(process.env.USAGE_ROLLUP_SKIP_REMINDERS);
+const SKIP_PAYMENTS = parseBoolean(process.env.USAGE_ROLLUP_SKIP_PAYMENTS);
+const SKIP_CHAT = parseBoolean(process.env.USAGE_ROLLUP_SKIP_CHAT);
+const SKIP_STORAGE = parseBoolean(process.env.USAGE_ROLLUP_SKIP_STORAGE);
+
 const DEFAULT_STORAGE_PREFIXES: Array<{ label: string; template: string }> = [
   { label: 'tenant-branding', template: 'tenant-branding/{tenantId}' },
   { label: 'chat-files', template: 'chat-files/{tenantId}' },
@@ -731,20 +742,18 @@ async function collectMetrics(
   if (staffWarning) warnings.push(`[staffSeats] ${staffWarning}`);
 
   const fallbackReminders = normalizeReminderFallback(existingData?.remindersSent);
-  const [remindersSent, remindersWarning] = await withFallback(
-    () => collectReminderBreakdown(db, tenant.id, month),
-    fallbackReminders
-  );
+  const [remindersSent, remindersWarning] = SKIP_REMINDERS
+    ? [fallbackReminders, null]
+    : await withFallback(() => collectReminderBreakdown(db, tenant.id, month), fallbackReminders);
   if (remindersWarning) warnings.push(`[reminders] ${remindersWarning}`);
 
   const fallbackPaymentsReceived: PaymentsReceivedBreakdown = {
     count: getNumber((existingData as any)?.paymentsReceived?.count ?? (existingData as any)?.paymentsReceivedCount ?? 0),
     amount: getNumber((existingData as any)?.paymentsReceived?.amount ?? (existingData as any)?.paymentsReceivedAmount ?? 0),
   };
-  const [paymentsReceived, paymentsWarning] = await withFallback(
-    () => collectPaymentsReceived(db, tenant.id, month),
-    fallbackPaymentsReceived
-  );
+  const [paymentsReceived, paymentsWarning] = SKIP_PAYMENTS
+    ? [fallbackPaymentsReceived, null]
+    : await withFallback(() => collectPaymentsReceived(db, tenant.id, month), fallbackPaymentsReceived);
   if (paymentsWarning) warnings.push(`[paymentsReceived] ${paymentsWarning}`);
 
   const [noticePosts, noticesWarning] = await withFallback(
@@ -763,19 +772,18 @@ async function collectMetrics(
     messageCount: getNumber(existingData?.chatMessages),
     attachmentBytes: getNumber(existingData?.chatAttachmentBytes),
   };
-  const [chatActivity, chatWarning] = await withFallback(
-    () => collectChatActivity(realtimeDb, tenant.id, month),
-    fallbackChatMetrics
-  );
+  const [chatActivity, chatWarning] = SKIP_CHAT
+    ? [fallbackChatMetrics, null]
+    : await withFallback(() => collectChatActivity(realtimeDb, tenant.id, month), fallbackChatMetrics);
   if (chatWarning) warnings.push(`[chatMessages] ${chatWarning}`);
 
-  const [storageEstimate, storageWarning] = await withFallback(
-    () => estimateStorageBytes(db, bucket, tenant.id),
-    {
-      totalBytes: typeof existingData?.storageBytes === 'number' ? existingData.storageBytes : 0,
-      sources: Array.isArray(existingData?.storageSources) ? existingData.storageSources : [],
-    }
-  );
+  const storageFallback = {
+    totalBytes: typeof existingData?.storageBytes === 'number' ? existingData.storageBytes : 0,
+    sources: Array.isArray(existingData?.storageSources) ? existingData.storageSources : [],
+  };
+  const [storageEstimate, storageWarning] = SKIP_STORAGE
+    ? [storageFallback, null]
+    : await withFallback(() => estimateStorageBytes(db, bucket, tenant.id), storageFallback);
   if (storageWarning) warnings.push(`[storage] ${storageWarning}`);
 
   let storageBytes = storageEstimate.totalBytes;

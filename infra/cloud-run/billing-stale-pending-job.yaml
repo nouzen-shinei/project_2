@@ -12,11 +12,16 @@ spec:
       template:
         spec:
           serviceAccountName: billing-stale-pending-job@tution-app-6c0c3.iam.gserviceaccount.com
+          maxRetries: 1
           timeoutSeconds: 1800
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime:latest
               command: ["npm"]
               args: ["run", "billing:stale-pending"]
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
               env:
                 - name: FIREBASE_PROJECT_ID
                   value: tution-app-6c0c3

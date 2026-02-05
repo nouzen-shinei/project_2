@@ -2,6 +2,8 @@
 
 These commands wire the production Cloud Run jobs defined under `../cloud-run` to Cloud Scheduler using the real project (`tution-app-6c0c3`) and service accounts.
 
+For development or low-usage environments, the schedules below are already tuned to reduce cost (hourly refresh, daily stale-billing sweep). Increase frequency only when you have meaningful traffic and data volume.
+
 ## Prerequisites
 
 ```bash
@@ -53,7 +55,7 @@ Use `gcloud scheduler jobs update http usage-rollup-nightly …` to tweak schedu
 ```bash
 gcloud scheduler jobs create http usage-refresh-queue \
   --project=$PROJECT_ID --location=$REGION \
-  --schedule="*/5 * * * *" \
+  --schedule="0 * * * *" \
   --http-method=POST \
   --uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/usage-refresh-job:run" \
   --oauth-service-account-email=$SCHEDULER_SA \
@@ -68,9 +70,9 @@ gcloud scheduler jobs create http usage-refresh-queue \
 Runs the `billing:stale-pending` sweeper which cancels subscriptions, marks open invoices as failed, and downgrades to Free when no first payment is made within the threshold.
 
 ```bash
-gcloud scheduler jobs create http billing-stale-pending-hourly \
+gcloud scheduler jobs create http billing-stale-pending-daily \
   --project=$PROJECT_ID --location=$REGION \
-  --schedule="0 * * * *" \
+  --schedule="30 3 * * *" \
   --http-method=POST \
   --uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/billing-stale-pending-job:run" \
   --oauth-service-account-email=$SCHEDULER_SA \

@@ -12,11 +12,16 @@ spec:
       template:
         spec:
           serviceAccountName: usage-refresh-job@tution-app-6c0c3.iam.gserviceaccount.com
+          maxRetries: 1
           timeoutSeconds: 900
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime:latest
               command: ["npm"]
               args: ["run", "usage:refresh-worker"]
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
               env:
                 - name: FIREBASE_PROJECT_ID
                   value: tution-app-6c0c3
@@ -25,8 +30,16 @@ spec:
                 - name: FIREBASE_STORAGE_BUCKET
                   value: tution-app-6c0c3.firebasestorage.app
                 - name: USAGE_REFRESH_BATCH_LIMIT
-                  value: "5"
+                  value: "1"
                 - name: USAGE_REFRESH_DRY_RUN
                   value: "0"
                 - name: USAGE_REFRESH_VERBOSE
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_REMINDERS
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_PAYMENTS
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_CHAT
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_STORAGE
                   value: "0"

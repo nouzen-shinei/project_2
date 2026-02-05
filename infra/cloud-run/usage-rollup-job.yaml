@@ -12,11 +12,16 @@ spec:
       template:
         spec:
           serviceAccountName: usage-rollup-job@tution-app-6c0c3.iam.gserviceaccount.com
+          maxRetries: 1
           timeoutSeconds: 1800
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime:latest
               command: ["npm"]
               args: ["run", "usage:rollup:scheduled"]
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
               env:
                 - name: FIREBASE_PROJECT_ID
                   value: tution-app-6c0c3
@@ -35,4 +40,12 @@ spec:
                 - name: USAGE_ROLLUP_DRY_RUN
                   value: "0"
                 - name: USAGE_ROLLUP_VERBOSE
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_REMINDERS
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_PAYMENTS
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_CHAT
+                  value: "0"
+                - name: USAGE_ROLLUP_SKIP_STORAGE
                   value: "0"
