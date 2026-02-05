@@ -2733,7 +2733,7 @@ const billingCheckoutSchema = z.object({
   planId: z.enum(['free', 'pro', 'enterprise']).optional(),
   planVariantId: z.string().trim().min(1).max(80).optional(),
   couponCode: z.string().trim().max(40).optional(),
-  provider: z.enum(['stripe', 'razorpay']).default('stripe'),
+  provider: z.enum(['stripe', 'razorpay']).default('razorpay'),
   successUrl: z.string().trim().url().optional(),
   cancelUrl: z.string().trim().url().optional(),
   metadata: z.record(z.string().trim().max(200)).optional(),
