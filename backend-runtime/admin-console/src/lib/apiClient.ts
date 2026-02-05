@@ -1360,6 +1360,7 @@ export interface BillingSummaryResponse {
   renewalDate?: string;
   checkoutRequired?: boolean;
   subscriptionProvider?: 'razorpay' | 'google_play' | 'unknown';
+  subscriptionProviderStatus?: string;
   subscriptionId?: string;
   cancelAtCycleEnd?: boolean;
   invoices: BillingInvoiceRecord[];
