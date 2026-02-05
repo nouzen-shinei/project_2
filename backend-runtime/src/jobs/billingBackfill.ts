@@ -775,6 +775,12 @@ export async function runBillingBackfill(db: admin.firestore.Firestore, options:
       const currentPlanId: PlanId = normalizePlanId((billingData as any).planId);
       const currentPlanVariantId = typeof (billingData as any).planVariantId === 'string' ? (billingData as any).planVariantId.trim() : '';
       const currentCouponCode = typeof (billingData as any).couponCode === 'string' ? (billingData as any).couponCode.trim() : '';
+      const currentStatusRaw = typeof (billingData as any).status === 'string' ? (billingData as any).status.trim().toLowerCase() : '';
+      const currentStatus =
+        currentStatusRaw === 'active' || currentStatusRaw === 'delinquent' || currentStatusRaw === 'canceled' || currentStatusRaw === 'trial'
+          ? currentStatusRaw
+          : '';
+      const planLockedByOrg = (billingData as any).planLockedByOrg === true;
 
       // Strong signals of a paid activation:
       // - we already considered the tenant on a paid plan previously, OR
@@ -782,13 +788,26 @@ export async function runBillingBackfill(db: admin.firestore.Firestore, options:
       const hasCapturedPaymentEvidence = providerCapturedPaymentIds.size > 0;
 
       let effectiveDesiredStatus = desiredStatus;
+      if (planLockedByOrg) {
+        if (currentStatus === 'active' || currentStatus === 'trial') {
+          effectiveDesiredStatus = 'active';
+        } else if (currentStatus === 'canceled') {
+          effectiveDesiredStatus = 'canceled';
+        } else if (currentStatus === 'delinquent') {
+          effectiveDesiredStatus = 'delinquent';
+        }
+      }
       if (effectiveDesiredStatus === 'delinquent' && currentPlanId === 'free' && !hasCapturedPaymentEvidence) {
         // Common case: user started checkout but never paid; subscription ends up pending/failed/halted.
         // Don't "upgrade" or show paid-plan delinquency for a Free tenant without any captured payment evidence.
         effectiveDesiredStatus = 'canceled';
       }
 
-      const paidPlanCandidate: PlanId = planIdFromNotes !== 'free' ? planIdFromNotes : currentPlanId;
+      const paidPlanCandidate: PlanId = planLockedByOrg
+        ? currentPlanId
+        : planIdFromNotes !== 'free'
+          ? planIdFromNotes
+          : currentPlanId;
       if (effectiveDesiredStatus !== 'canceled' && paidPlanCandidate === 'free') {
         // Avoid writing a confusing state like free+delinquent when we can't confidently resolve a paid plan.
         effectiveDesiredStatus = 'canceled';
