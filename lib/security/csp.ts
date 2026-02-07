@@ -55,7 +55,7 @@ export function injectCSP(opts: InjectOptions = {}) {
     // Fonts & images allow data: URIs for embedded assets
     `img-src 'self' data: https:`,
     `font-src 'self' data: https:`,
-  `media-src 'self' data: https:`,
+  `media-src 'self' data: blob: https:`,
     `style-src ${styleSrc} https:`,
     `script-src ${scriptSrc}`,
   // Allow websocket (dev) & https API calls, and data/blob URIs for local file reads on web

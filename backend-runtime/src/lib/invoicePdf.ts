@@ -156,6 +156,14 @@ function safeUpper(value?: string): string {
   return (value || '').trim().toUpperCase();
 }
 
+function truncateValue(value?: string, maxLength = 35): string | null {
+  const trimmed = (value || '').trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= maxLength) return trimmed;
+  if (maxLength <= 3) return trimmed.slice(0, maxLength);
+  return `${trimmed.slice(0, maxLength - 3)}...`;
+}
+
 export async function generateInvoicePdfBuffer(input: InvoicePdfInput): Promise<Buffer> {
   const doc = new PDFDocument({ size: 'A4', margin: 48 });
 
@@ -266,8 +274,12 @@ export async function generateInvoicePdfBuffer(input: InvoicePdfInput): Promise<
   doc.moveDown(0.35);
   doc.font('Helvetica').fontSize(10).fillColor('#000000');
   const coachingDisplay = input.coachingName || input.tenantName || '—';
+  const subscriptionId = truncateValue(input.subscriptionId || input.providerSubscriptionId, 24);
   doc.text(`Coaching: ${coachingDisplay}`, colLeftX, doc.y, { width: colWidth });
   doc.text(`Tenant ID: ${input.tenantId}`, colLeftX, doc.y, { width: colWidth });
+  if (subscriptionId) {
+    doc.text(`Sub ID: ${subscriptionId}`, colLeftX, doc.y, { width: colWidth });
+  }
   if (input.payerEmail) {
     doc.text(`Contact: ${input.payerEmail}`, colLeftX, doc.y, { width: colWidth });
   }

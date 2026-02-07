@@ -304,13 +304,13 @@ export function EnhancedChatInterface({ recipientId }: EnhancedChatInterfaceProp
     }
 
     try {
-  const effectiveUrl = await chatCacheService.getMediaForDownload(url, fileName, localHint, 'high');
+      const effectiveUrl = await chatCacheService.getMediaForDownload(url, fileName, localHint, 'high');
 
       if (Platform.OS === 'web') {
         const isLocalWebUrl = typeof effectiveUrl === 'string' && (effectiveUrl.startsWith('blob:') || effectiveUrl.startsWith('data:'));
         if (!isLocalWebUrl) {
-          const isAccessible = await FileDownloadUtil.checkFileAccessibility(effectiveUrl);
-          if (!isAccessible) {
+          const availability = await FileDownloadUtil.checkFileAvailability(effectiveUrl, { timeoutMs: 5000 });
+          if (availability === 'missing') {
             Alert.alert('File Not Available', 'This file is no longer accessible.');
             return;
           }
@@ -341,7 +341,14 @@ export function EnhancedChatInterface({ recipientId }: EnhancedChatInterfaceProp
       throw new Error('Download failed');
     } catch (error) {
       logger.error('Enhanced chat download failed', error);
-      Alert.alert('Download Failed', 'This file may have been deleted or is unavailable.');
+      Alert.alert(
+        'Network Error',
+        'Unable to reach the file. Check your connection and try again.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Retry', onPress: () => handleDownloadFile(url, fileName, localHint) },
+        ]
+      );
     }
   }, []);
 

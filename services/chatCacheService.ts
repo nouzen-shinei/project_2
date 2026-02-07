@@ -1288,6 +1288,18 @@ class ChatCacheService {
 		}
 		if (Platform.OS === 'web') {
 			try {
+				if (options?.lazy) {
+					const cached = await webMediaCache.getCached(remoteUrl, MEDIA_TTL_MS);
+					if (cached) {
+						return cached;
+					}
+					webMediaCache
+						.fetchAndCache(remoteUrl, MEDIA_TTL_MS)
+						.catch((error) => {
+							logger.debug('Deferred web media download failed', { remoteUrl, error });
+						});
+					return remoteUrl;
+				}
 				const resolved = await webMediaCache.fetchAndCache(remoteUrl, MEDIA_TTL_MS);
 				return resolved || remoteUrl;
 			} catch (error) {
@@ -1561,7 +1573,7 @@ class ChatCacheService {
 			return AUDIO_PLACEHOLDER_DATA_URI;
 		}
 
-		if (!isImageFile(attachment.fileType || '')) {
+		if (!isImageFile(attachment.fileType || '', attachment.fileName)) {
 			return undefined;
 		}
 

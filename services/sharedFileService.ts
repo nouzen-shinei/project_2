@@ -11,6 +11,7 @@ export type SharedFileRecord = {
   tenantId?: string;
   createdAt?: string;
   createdByEmail?: string;
+  webUrl?: string;
   file?: {
     url: string;
     fileName: string;
@@ -82,6 +83,27 @@ const normalizeHttpUrl = (value?: string | null): string | null => {
   return null;
 };
 
+const extractWebUrlFromSmartLink = (shareUrl?: string | null): string | null => {
+  const trimmed = (shareUrl || '').trim();
+  if (!trimmed) return null;
+  if (/\/shared\//i.test(trimmed)) return normalizeHttpUrl(trimmed);
+
+  try {
+    const parsed = new URL(trimmed);
+    if (!/\/l$/i.test(parsed.pathname)) return null;
+    const candidate = parsed.searchParams.get('u');
+    return normalizeHttpUrl(candidate);
+  } catch {
+    return null;
+  }
+};
+
+const selectPreferredShareUrl = (input: { shareUrl?: string | null; webUrl?: string | null }): string => {
+  const web = normalizeHttpUrl(input.webUrl) || (input.webUrl || '').trim();
+  if (web) return web;
+  return normalizeHttpUrl(input.shareUrl) || (input.shareUrl || '').trim() || '';
+};
+
 const resolvePublicApiBaseUrl = (): string | null => {
   const snap = runtimeEndpoints.getSnapshot();
   const fromSnap = normalizeHttpUrl(snap.apiBaseUrl || snap.notificationsApiBaseUrl || snap.wabaApiBaseUrl || snap.chatApiBaseUrl);
@@ -122,6 +144,7 @@ const cacheKeyForFile = (tenantId: string, fileUrl: string): string => {
 type CachedSmartShareLink = {
   fileUrl: string;
   shareUrl: string;
+  webUrl?: string;
   token?: string;
   createdAt?: string;
 };
@@ -157,27 +180,52 @@ export const sharedFileService = {
       if (!raw) return null;
       const parsed = JSON.parse(raw) as CachedSmartShareLink;
       const shareUrl = typeof parsed?.shareUrl === 'string' ? parsed.shareUrl.trim() : '';
+      let webUrl = typeof parsed?.webUrl === 'string' ? parsed.webUrl.trim() : '';
       const storedFileUrl = typeof parsed?.fileUrl === 'string' ? parsed.fileUrl.trim() : '';
-      if (!shareUrl || !storedFileUrl || storedFileUrl !== fileUrl) return null;
-      inMemoryShareUrlByFile.set(memKey, shareUrl);
-      return shareUrl;
+      if (!storedFileUrl || storedFileUrl !== fileUrl) return null;
+
+      if (!webUrl && shareUrl) {
+        const derived = extractWebUrlFromSmartLink(shareUrl);
+        if (derived) {
+          webUrl = derived;
+          const payload: CachedSmartShareLink = {
+            fileUrl: storedFileUrl,
+            shareUrl,
+            webUrl,
+            token: typeof parsed?.token === 'string' ? parsed.token.trim() : undefined,
+            createdAt: typeof parsed?.createdAt === 'string' ? parsed.createdAt : undefined,
+          };
+          try {
+            await AsyncStorage.setItem(cacheKeyForFile(tenantId, storedFileUrl), JSON.stringify(payload));
+          } catch {
+            // ignore
+          }
+        }
+      }
+      const preferred = selectPreferredShareUrl({ shareUrl, webUrl });
+      if (!preferred) return null;
+      inMemoryShareUrlByFile.set(memKey, preferred);
+      return preferred;
     } catch {
       return null;
     }
   },
 
-  async cacheSmartShareLink(input: { tenantId: string; fileUrl: string; shareUrl: string; token?: string }): Promise<void> {
+  async cacheSmartShareLink(input: { tenantId: string; fileUrl: string; shareUrl: string; webUrl?: string; token?: string }): Promise<void> {
     const tenantId = (input.tenantId || '').trim();
     const fileUrl = (input.fileUrl || '').trim();
     const shareUrl = (input.shareUrl || '').trim();
-    if (!tenantId || !fileUrl || !shareUrl) return;
+    const webUrl = (input.webUrl || '').trim();
+    const preferred = selectPreferredShareUrl({ shareUrl, webUrl });
+    if (!tenantId || !fileUrl || !preferred) return;
 
     const memKey = `${tenantId}::${fileUrl}`;
-    inMemoryShareUrlByFile.set(memKey, shareUrl);
+    inMemoryShareUrlByFile.set(memKey, preferred);
 
     const payload: CachedSmartShareLink = {
       fileUrl,
       shareUrl,
+      webUrl: webUrl || undefined,
       token: (input.token || '').trim() || undefined,
       createdAt: new Date().toISOString(),
     };
@@ -213,14 +261,16 @@ export const sharedFileService = {
       throw new Error(text || `Share link resolve failed (${res.status})`);
     }
 
-    const data = (await res.json()) as { shareUrl?: string };
+    const data = (await res.json()) as { shareUrl?: string; webUrl?: string };
     const shareUrl = typeof data?.shareUrl === 'string' ? data.shareUrl.trim() : '';
-    if (!shareUrl) {
+    const webUrl = typeof data?.webUrl === 'string' ? data.webUrl.trim() : '';
+    const preferred = selectPreferredShareUrl({ shareUrl, webUrl });
+    if (!preferred) {
       throw new Error('Share link resolve failed (missing shareUrl)');
     }
 
-    await sharedFileService.cacheSmartShareLink({ tenantId: input.tenantId, fileUrl: input.fileUrl, shareUrl, token: input.shareToken });
-    return shareUrl;
+    await sharedFileService.cacheSmartShareLink({ tenantId: input.tenantId, fileUrl: input.fileUrl, shareUrl, webUrl, token: input.shareToken });
+    return preferred;
   },
 
   async createShareToken(input: {
@@ -230,7 +280,7 @@ export const sharedFileService = {
     fileType?: string;
     fileSize?: number;
     thumbnailUrl?: string;
-  }): Promise<{ token: string; shareUrl: string }> {
+  }): Promise<{ token: string; shareUrl: string; webUrl?: string }> {
     const base = resolveAuthedApiBaseUrl();
     if (!base) {
       throw new Error('Backend URL not configured for sharing');
@@ -262,18 +312,20 @@ export const sharedFileService = {
       throw new Error(text || `Share create failed (${res.status})`);
     }
 
-    const data = (await res.json()) as { token?: string; shareUrl?: string };
+    const data = (await res.json()) as { token?: string; shareUrl?: string; webUrl?: string };
     const shareToken = typeof data?.token === 'string' ? data.token.trim() : '';
     if (!shareToken) {
       throw new Error('Share create failed (missing token)');
     }
 
     const shareUrl = typeof data?.shareUrl === 'string' ? data.shareUrl.trim() : '';
-    if (!shareUrl) {
+    const webUrl = typeof data?.webUrl === 'string' ? data.webUrl.trim() : '';
+    const preferred = selectPreferredShareUrl({ shareUrl, webUrl });
+    if (!preferred) {
       throw new Error('Share create failed (missing shareUrl)');
     }
 
-    return { token: shareToken, shareUrl };
+    return { token: shareToken, shareUrl: preferred, webUrl };
   },
 
   async ensureSmartShareLink(input: {
@@ -333,7 +385,13 @@ export const sharedFileService = {
         thumbnailUrl: input.thumbnailUrl,
       });
 
-      await sharedFileService.cacheSmartShareLink({ tenantId: normalizedTenantId, fileUrl: rawUrl, shareUrl: created.shareUrl, token: created.token });
+      await sharedFileService.cacheSmartShareLink({
+        tenantId: normalizedTenantId,
+        fileUrl: rawUrl,
+        shareUrl: created.shareUrl,
+        webUrl: created.webUrl,
+        token: created.token,
+      });
       return created.shareUrl;
     })().catch((err) => {
       // Drop failed entries so a retry can happen.

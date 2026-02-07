@@ -1,12 +1,13 @@
 import { logger } from '@/lib/logger';
 import React, { useMemo, useState, useCallback, useEffect } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Alert, Linking, Dimensions, Platform } from 'react-native';
-import { FileText, Eye, Download, Share, ExternalLink } from 'lucide-react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Alert, Linking, Platform, ActivityIndicator } from 'react-native';
+import { FileText, Download, Share, ExternalLink } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
 import { formatFileSize } from '../lib/fileUtils';
 import { ShareModal } from './ShareModal';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
+import { PdfNativeRenderer } from './PdfNativeRenderer';
 
 const sanitizeFileName = (name: string) => name.replace(/[^a-zA-Z0-9._-]/g, '_');
 const ensurePdfExtension = (name: string) =>
@@ -22,11 +23,12 @@ interface PdfViewerProps {
   onDownload?: () => void;
   onShare?: () => void;
   remoteFileUrl?: string;
+  previewHeight?: number;
 }
 
 type ThemeShape = ReturnType<typeof useTheme>['theme'];
 
-const createPdfViewerStyles = (theme: ThemeShape) =>
+const createPdfViewerStyles = (theme: ThemeShape, previewHeight: number) =>
   StyleSheet.create({
     container: {
       backgroundColor: theme.surface,
@@ -97,6 +99,32 @@ const createPdfViewerStyles = (theme: ThemeShape) =>
       borderWidth: 1,
       borderColor: theme.border,
     },
+    previewContainer: {
+      marginTop: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    previewFrame: {
+      width: '100%',
+      // maxWidth: 620,
+      height: previewHeight,
+      borderRadius: 12,
+      overflow: 'hidden',
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.background,
+    },
+    previewLoading: {
+      width: '100%',
+      // maxWidth: 620,
+      height: previewHeight,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.background,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
     description: {
       fontSize: 14,
       color: theme.textSecondary,
@@ -111,6 +139,7 @@ const arePdfViewerPropsEqual = (prev: PdfViewerProps, next: PdfViewerProps) => {
   if (prev.fileName !== next.fileName) return false;
   if ((prev.fileSize ?? 0) !== (next.fileSize ?? 0)) return false;
   if ((prev.remoteFileUrl ?? '') !== (next.remoteFileUrl ?? '')) return false;
+  if ((prev.previewHeight ?? 0) !== (next.previewHeight ?? 0)) return false;
   if (prev.onDownload !== next.onDownload) return false;
   if (prev.onShare !== next.onShare) return false;
   return true;
@@ -123,8 +152,10 @@ function PdfViewerInner({
   onDownload, 
   onShare,
   remoteFileUrl,
+  previewHeight = 100,
 }: PdfViewerProps) {
   const { theme } = useTheme();
+  const isWeb = Platform.OS === 'web';
   const [isLoading, setIsLoading] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const isLocalFile = Platform.OS !== 'web' && fileUrl.startsWith('file://');
@@ -133,10 +164,8 @@ function PdfViewerInner({
   const [localFileUri, setLocalFileUri] = useState<string | null>(
     isLocalFile ? fileUrl : null
   );
+  const [inlineUri, setInlineUri] = useState<string | null>(null);
   
-  // Get screen dimensions to determine if it's a small screen
-  const screenWidth = Dimensions.get('window').width;
-  const isSmallScreen = screenWidth < 575;
 
   useEffect(() => {
     if (isLocalFile) {
@@ -203,44 +232,33 @@ function PdfViewerInner({
     return downloadResult.uri;
   }, [downloadFileName, fileUrl, isLocalFile, localFileUri, remoteUrl]);
 
-  const handleOpen = useCallback(async () => {
-    if (Platform.OS === 'web' && typeof window !== 'undefined') {
-      window.open(remoteUrl, '_blank', 'noopener,noreferrer');
-      return;
-    }
+  useEffect(() => {
+    let cancelled = false;
 
-    try {
-      setIsLoading(true);
-      const uriToOpen = await ensureLocalFile();
-
-      if (Platform.OS === 'android') {
-        const contentUri = await FileSystem.getContentUriAsync(uriToOpen);
-        try {
-          await IntentLauncher.startActivityAsync(ANDROID_VIEW_INTENT, {
-            data: contentUri,
-            type: 'application/pdf',
-            flags:
-              FLAG_GRANT_READ_URI_PERMISSION |
-              FLAG_ACTIVITY_NEW_TASK,
-          });
-        } catch (intentError) {
-          logger.warn('PDF intent launch failed, falling back to Linking', intentError);
-          await Linking.openURL(contentUri);
-        }
-      } else {
-        await Linking.openURL(uriToOpen);
+    const loadInline = async () => {
+      if (Platform.OS === 'web') {
+        setInlineUri(remoteUrl);
+        return;
       }
-    } catch (error) {
-      logger.error('Error opening PDF:', error);
+
       try {
-        await Linking.openURL(remoteUrl);
-      } catch (linkError) {
-        logger.error('Error opening URL:', linkError);
-        Alert.alert('Error', 'Unable to open PDF file');
+        const localUri = await ensureLocalFile();
+        if (!cancelled) {
+          setInlineUri(localUri);
+        }
+      } catch (error) {
+        logger.error('PdfViewer: inline preview failed', error);
+        if (!cancelled) {
+          setInlineUri(remoteUrl);
+        }
       }
-    } finally {
-      setIsLoading(false);
-    }
+    };
+
+    void loadInline();
+
+    return () => {
+      cancelled = true;
+    };
   }, [ensureLocalFile, remoteUrl]);
 
   const handleDownload = () => {
@@ -257,23 +275,34 @@ function PdfViewerInner({
 
   const handleOpenExternal = async () => {
     try {
-      if (isLocalFile) {
-        if (Platform.OS === 'android') {
-          const contentUri = await FileSystem.getContentUriAsync(fileUrl);
-          await Linking.openURL(contentUri);
-        } else {
-          await Linking.openURL(fileUrl);
-        }
+      setIsLoading(true);
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        window.open(remoteUrl, '_blank', 'noopener,noreferrer');
         return;
       }
-      await Linking.openURL(remoteUrl);
+      const localUri = isLocalFile ? fileUrl : await ensureLocalFile();
+
+      if (Platform.OS === 'android') {
+        const contentUri = await FileSystem.getContentUriAsync(localUri);
+        await IntentLauncher.startActivityAsync(ANDROID_VIEW_INTENT, {
+          data: contentUri,
+          flags: FLAG_GRANT_READ_URI_PERMISSION | FLAG_ACTIVITY_NEW_TASK,
+          type: 'application/pdf',
+        });
+        return;
+      }
+
+      await Linking.openURL(localUri);
     } catch (error) {
       logger.error('Error opening external URL:', error);
       Alert.alert('Error', 'Unable to open PDF in external app');
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const styles = useMemo(() => createPdfViewerStyles(theme), [theme]);
+  const styles = useMemo(() => createPdfViewerStyles(theme, previewHeight), [theme, previewHeight]);
+  const IFrame = useMemo(() => ('iframe' as any), []);
 
   return (
     <View style={styles.container}>
@@ -288,24 +317,46 @@ function PdfViewerInner({
         </View>
       </View>
 
+      <View style={styles.previewContainer}>
+        {inlineUri ? (
+          isWeb ? (
+            <View style={styles.previewFrame}>
+              <IFrame
+                src={remoteUrl}
+                title={fileName}
+                style={{ width: '100%', height: '100%', border: 'none' }}
+              />
+            </View>
+          ) : (
+            <PdfNativeRenderer
+              uri={inlineUri}
+              style={styles.previewFrame}
+              loadingColor={theme.textSecondary}
+              onError={(error: unknown) => {
+                logger.error('PdfViewer: native render failed', error);
+              }}
+            />
+          )
+        ) : (
+          <View style={styles.previewLoading}>
+            <ActivityIndicator size="small" color={theme.textSecondary} />
+          </View>
+        )}
+      </View>
+
       <View style={styles.actions}>
         <TouchableOpacity 
-          style={styles.primaryButton} 
-          onPress={handleOpen}
+          style={styles.primaryButton}
+          onPress={handleOpenExternal}
           disabled={isLoading}
         >
-          <Eye size={20} color="white" />
+          <ExternalLink size={20} color="white" />
           <Text style={styles.primaryButtonText}>
-            {isLoading ? 'Opening...' : 'Open'}
+            {isLoading ? 'Opening...' : 'Open external'}
           </Text>
         </TouchableOpacity>
 
         <View style={styles.actionButtons}>
-          {!isSmallScreen && (
-            <TouchableOpacity style={styles.actionButton} onPress={handleOpenExternal}>
-              <ExternalLink size={20} color={theme.textSecondary} />
-            </TouchableOpacity>
-          )}
           <TouchableOpacity style={styles.actionButton} onPress={handleDownload}>
             <Download size={20} color={theme.textSecondary} />
           </TouchableOpacity>
@@ -316,7 +367,7 @@ function PdfViewerInner({
       </View>
 
       <Text style={styles.description}>
-        Tap Open to download and view in your preferred PDF app
+        PDF preview is shown inline. Open externally for full reader controls.
       </Text>
 
       <ShareModal

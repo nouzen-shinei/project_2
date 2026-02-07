@@ -4,6 +4,8 @@ import { logger } from '@/lib/logger';
 
 import { Platform } from 'react-native';
 
+export type FileAvailability = 'ok' | 'missing' | 'unknown';
+
 const deriveFileNameFromUrl = (url: string): string | null => {
   const raw = (url || '').trim();
   if (!raw) return null;
@@ -161,16 +163,41 @@ export const FileDownloadUtil = {
   },
 
   async checkFileAccessibility(fileUrl: string): Promise<boolean> {
+    const availability = await this.checkFileAvailability(fileUrl);
+    return availability === 'ok';
+  },
+
+  async checkFileAvailability(
+    fileUrl: string,
+    options?: { timeoutMs?: number }
+  ): Promise<FileAvailability> {
     if (fileUrl.startsWith('blob:') || fileUrl.startsWith('data:')) {
-      return true;
+      return 'ok';
     }
     try {
-      const response = await fetch(fileUrl, { method: 'HEAD' });
-      return response.ok;
+      const controller = new AbortController();
+      const timeoutMs = Math.max(0, options?.timeoutMs ?? 0);
+      const timeoutId = timeoutMs
+        ? setTimeout(() => controller.abort(), timeoutMs)
+        : null;
+
+      const response = await fetch(fileUrl, { method: 'HEAD', signal: controller.signal });
+
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      if (response.ok) {
+        return 'ok';
+      }
+
+      if (response.status === 404 || response.status === 410) {
+        return 'missing';
+      }
+
+      return 'unknown';
     } catch (error) {
-      // Silently handle 404s and network errors for deleted files
-      // Don't log expected 404 errors to avoid console spam
-      return false;
+      return 'unknown';
     }
   }
 };

@@ -1,0 +1,13 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.sneha.tution",
+      "sha256_cert_fingerprints": [
+        "39:A3:DB:A6:A5:51:85:AE:18:12:5F:AC:D8:96:E9:56:97:1A:9D:0E",
+        "A2:CD:74:16:E8:D1:4C:D7:34:09:9B:07:6C:1C:93:5C:C6:A7:46:8B"
+      ]
+    }
+  }
+]

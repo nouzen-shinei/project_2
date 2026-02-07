@@ -57,7 +57,7 @@ export function buildCsp(opts: CspBuildOptions = {}): CspResult {
     "form-action 'self'",
     "img-src 'self' data: https:",
     "font-src 'self' data: https:",
-  "media-src 'self' data: https:",
+  "media-src 'self' data: blob: https:",
     `style-src ${styleSrc} https:`,
     `script-src ${scriptSrc}`,
   `connect-src ${connectSrc}`,

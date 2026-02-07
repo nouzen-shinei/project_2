@@ -21,11 +21,36 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.sneha.tution",
+      "associatedDomains": [
+        "applinks:tuitionmanager.app"
+      ],
       "buildNumber": "20250902"
     },
     "android": {
       "package": "com.sneha.tution",
       "edgeToEdgeEnabled": true,
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "tuitionmanager.app",
+              "pathPrefix": "/shared/"
+            },
+            {
+              "scheme": "https",
+              "host": "tuitionmanager.app",
+              "pathPrefix": "/s/"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ],
       "permissions": [
         "CAMERA",
         "INTERNET",

@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -156,6 +157,8 @@ const InviteOverlay = ({ token }: InviteOverlayProps) => {
   const { refreshTenants } = useTenant();
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const isNarrow = width < 490;
 
   const [invite, setInvite] = useState<TenantInvite | null>(null);
   const [tenant, setTenant] = useState<Tenant | null>(null);
@@ -388,20 +391,20 @@ const InviteOverlay = ({ token }: InviteOverlayProps) => {
             contentContainerStyle={styles.cardContent}
             showsVerticalScrollIndicator={false}
           >
-            <View style={styles.closeRow}>
-              <TouchableOpacity
-                style={[styles.closeButton, { borderColor: theme.border, backgroundColor: theme.surface }]}
-                onPress={dismiss}
-                accessibilityRole="button"
-                accessibilityLabel="Close invite"
-              >
-                <X size={16} color={theme.textSecondary} />
-              </TouchableOpacity>
-            </View>
             <View style={styles.heroHeader}>
-              <View style={[styles.heroBadge, { borderColor: `${theme.primary}35`, backgroundColor: `${theme.primary}15` }]}> 
-                <Sparkles size={16} color={theme.primary} />
-                <Text style={[styles.heroBadgeText, { color: theme.primary }]}>Team invite</Text>
+              <View style={styles.heroHeaderRow}>
+                <View style={[styles.heroBadge, { borderColor: `${theme.primary}35`, backgroundColor: `${theme.primary}15` }]}> 
+                  <Sparkles size={16} color={theme.primary} />
+                  <Text style={[styles.heroBadgeText, { color: theme.primary }]}>Team invite</Text>
+                </View>
+                <TouchableOpacity
+                  style={[styles.closeButton, { borderColor: theme.border, backgroundColor: theme.surface }]}
+                  onPress={dismiss}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close invite"
+                >
+                  <X size={16} color={theme.textSecondary} />
+                </TouchableOpacity>
               </View>
               <Text style={[styles.heroTitle, { color: theme.text }]}>{heroTitle}</Text>
               <Text style={[styles.heroSubtitle, { color: theme.textSecondary }]}>{heroSubtitle}</Text>
@@ -439,7 +442,14 @@ const InviteOverlay = ({ token }: InviteOverlayProps) => {
             {!!infoChips.length && (
               <View style={styles.infoGrid}>
                 {infoChips.map(({ id, label, value, Icon }) => (
-                  <View key={id} style={[styles.infoChip, { borderColor: theme.border }]}> 
+                  <View
+                    key={id}
+                    style={[
+                      styles.infoChip,
+                      isNarrow && styles.infoChipFull,
+                      { borderColor: theme.border },
+                    ]}
+                  > 
                     <View style={[styles.infoIcon, { backgroundColor: `${theme.primary}12` }]}> 
                       <Icon size={14} color={theme.primary} />
                     </View>
@@ -574,10 +584,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 28,
     paddingVertical: 24,
   },
-  closeRow: {
-    width: '100%',
-    alignItems: 'flex-end',
-  },
   closeButton: {
     borderWidth: 1,
     borderRadius: 999,
@@ -585,6 +591,12 @@ const styles = StyleSheet.create({
   },
   heroHeader: {
     marginBottom: 20,
+  },
+  heroHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
   },
   heroBadge: {
     alignSelf: 'flex-start',
@@ -658,6 +670,9 @@ const styles = StyleSheet.create({
     padding: 14,
     flexBasis: '48%',
     gap: 12,
+  },
+  infoChipFull: {
+    flexBasis: '100%',
   },
   infoIcon: {
     width: 32,

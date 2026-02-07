@@ -23,6 +23,7 @@ import {
   AppState,
   AppStateStatus,
   InteractionManager,
+  Alert,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import Toast from 'react-native-toast-message';
@@ -746,6 +747,7 @@ export default function Chat() {
   const [selectedImageUri, setSelectedImageUri] = useState<string>('');
   const [lastViewedRemoteImage, setLastViewedRemoteImage] = useState<string | undefined>(undefined);
   const [brokenFileUrls, setBrokenFileUrls] = useState<Set<string>>(new Set());
+  const [networkErrorUrls, setNetworkErrorUrls] = useState<Set<string>>(new Set());
   const [fileValidationCache] = useState<Map<string, number>>(new Map()); // Cache file validation results
   const [showImageShareModal, setShowImageShareModal] = useState(false);
   
@@ -945,7 +947,7 @@ export default function Chat() {
       // Image attachments
       if (m.attachments && Array.isArray(m.attachments)) {
         m.attachments.forEach((att: any) => {
-          if (att?.url && isImageFile(att.fileType)) prefetch(att.url);
+          if (att?.url && isImageFile(att.fileType, att.fileName)) prefetch(att.url);
         });
       }
     });
@@ -4316,6 +4318,28 @@ export default function Chat() {
     }
   };
 
+  const markNetworkError = useCallback((url: string) => {
+    if (!url || !/^https?:\/\//i.test(url)) {
+      return;
+    }
+    setNetworkErrorUrls(prev => {
+      if (prev.has(url)) return prev;
+      const next = new Set(prev);
+      next.add(url);
+      return next;
+    });
+  }, []);
+
+  const clearNetworkError = useCallback((url: string) => {
+    if (!url) return;
+    setNetworkErrorUrls(prev => {
+      if (!prev.has(url)) return prev;
+      const next = new Set(prev);
+      next.delete(url);
+      return next;
+    });
+  }, []);
+
   const handleDownloadFile = async (fileUrl: string, fileName: string, localHint?: string) => {
     // Show starting download toast notification immediately
     Toast.show({
@@ -4326,20 +4350,22 @@ export default function Chat() {
     });
 
     try {
+      let effectiveUrl = fileUrl;
       const trimmedHint = localHint?.trim();
       const safeLocalHint =
         trimmedHint && trimmedHint.startsWith('file://') && !trimmedHint.toLowerCase().includes('/chat-media-previews/')
           ? trimmedHint
           : undefined;
-      const effectiveUrl = await chatCacheService.getMediaForDownload(fileUrl, fileName, safeLocalHint, 'high');
+      effectiveUrl = await chatCacheService.getMediaForDownload(fileUrl, fileName, safeLocalHint, 'high');
 
       if (Platform.OS === 'web') {
         // For web, check if URL is accessible first
         const isLocalWebUrl = effectiveUrl.startsWith('blob:') || effectiveUrl.startsWith('data:');
         if (!isLocalWebUrl) {
-          const isAccessible = await FileDownloadUtil.checkFileAccessibility(effectiveUrl);
-          if (!isAccessible) {
+          const availability = await FileDownloadUtil.checkFileAvailability(effectiveUrl, { timeoutMs: 5000 });
+          if (availability === 'missing') {
             setBrokenFileUrls(prev => new Set([...prev, fileUrl]));
+            clearNetworkError(fileUrl);
             Toast.show({
               type: 'error',
               text1: 'File Not Available',
@@ -4352,6 +4378,8 @@ export default function Chat() {
         
         // Use the new download utility that handles CORS properly
         await FileDownloadUtil.downloadFile(effectiveUrl, fileName);
+
+        clearNetworkError(fileUrl);
         
         Toast.show({
           type: 'success',
@@ -4378,6 +4406,7 @@ export default function Chat() {
 
         const canShare = await Sharing.isAvailableAsync();
         if (!canShare) {
+          clearNetworkError(fileUrl);
           Toast.show({
             type: 'success',
             text1: 'Saved to device',
@@ -4388,6 +4417,7 @@ export default function Chat() {
         }
 
         await Sharing.shareAsync(downloadResult.uri);
+        clearNetworkError(fileUrl);
         Toast.show({
           type: 'success',
           text1: 'Download Complete',
@@ -4397,13 +4427,32 @@ export default function Chat() {
       }
     } catch (error) {
       logger.error('Download error:', error);
-      setBrokenFileUrls(prev => new Set([...prev, fileUrl]));
-      Toast.show({
-        type: 'error',
-        text1: 'Download Failed',
-        text2: 'This file is no longer available or has been deleted.',
-        position: 'top',
-      });
+      let availability: 'ok' | 'missing' | 'unknown' = 'unknown';
+      if (Platform.OS === 'web') {
+        availability = await FileDownloadUtil.checkFileAvailability(fileUrl, { timeoutMs: 5000 });
+      }
+
+      if (availability === 'missing') {
+        setBrokenFileUrls(prev => new Set([...prev, fileUrl]));
+        clearNetworkError(fileUrl);
+        Toast.show({
+          type: 'error',
+          text1: 'File Not Available',
+          text2: 'This file has been deleted or is no longer accessible.',
+          position: 'top',
+        });
+        return;
+      }
+
+      markNetworkError(fileUrl);
+      Alert.alert(
+        'Network Error',
+        'Unable to reach the file. Check your connection and try again.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Retry', onPress: () => handleDownloadFile(fileUrl, fileName, localHint) },
+        ]
+      );
     }
   };
 
@@ -4453,8 +4502,21 @@ export default function Chat() {
     }
   };
 
-  const handleImageError = (fileUrl: string) => {
-    setBrokenFileUrls(prev => new Set([...prev, fileUrl]));
+  const handleImageError = async (fileUrl: string) => {
+    if (!fileUrl || fileUrl.startsWith('file://') || fileUrl.startsWith('blob:') || fileUrl.startsWith('data:')) {
+      return;
+    }
+
+    const availability = await FileDownloadUtil.checkFileAvailability(fileUrl, { timeoutMs: 5000 });
+    if (availability === 'missing') {
+      setBrokenFileUrls(prev => new Set([...prev, fileUrl]));
+      clearNetworkError(fileUrl);
+      return;
+    }
+
+    if (availability === 'unknown') {
+      markNetworkError(fileUrl);
+    }
   };
 
   // Handle sticker selection and sending
@@ -4735,26 +4797,9 @@ export default function Chat() {
   };
 
   // Check if a file URL is accessible (for web platform)
-  const checkFileAccessibility = async (fileUrl: string) => {
-    if (Platform.OS !== 'web') return true; // Skip check on mobile
-    if (fileUrl.startsWith('blob:') || fileUrl.startsWith('data:')) return true;
-    
-    try {
-      // Use a more silent approach to avoid console spam
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-      
-      const response = await fetch(fileUrl, { 
-        method: 'HEAD',
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-      return response.ok;
-    } catch (error) {
-      // Silently handle errors - 404s are expected for deleted files
-      return false;
-    }
+  const checkFileAvailability = async (fileUrl: string) => {
+    if (Platform.OS !== 'web') return 'ok';
+    return FileDownloadUtil.checkFileAvailability(fileUrl, { timeoutMs: 5000 });
   };
 
   // Validate file URLs when messages change (optimized to reduce console spam)
@@ -4804,15 +4849,22 @@ export default function Chat() {
           
           const results = await Promise.allSettled(
             batch.map(async (url) => {
-              const isAccessible = await checkFileAccessibility(url);
-              fileValidationCache.set(url, now); // Cache the check
-              return { url, isAccessible };
+              const availability = await checkFileAvailability(url);
+              if (availability !== 'unknown') {
+                fileValidationCache.set(url, now); // Cache ok/missing checks
+              }
+              return { url, availability };
             })
           );
 
           results.forEach(result => {
-            if (result.status === 'fulfilled' && !result.value.isAccessible) {
+            if (result.status !== 'fulfilled') return;
+            if (result.value.availability === 'missing') {
               brokenUrls.push(result.value.url);
+              return;
+            }
+            if (result.value.availability === 'ok') {
+              clearNetworkError(result.value.url);
             }
           });
 
@@ -4831,7 +4883,7 @@ export default function Chat() {
       const timeout = setTimeout(validateFiles, 2000);
       return () => clearTimeout(timeout);
     }
-  }, [messages, brokenFileUrls, selectedTeamMember?.email, effectiveUser?.email]);
+  }, [messages, brokenFileUrls, selectedTeamMember?.email, effectiveUser?.email, clearNetworkError]);
 
   const removeSelectedFile = (index: number) => {
     const newFiles = selectedFiles.filter((_, i) => i !== index);
@@ -5087,7 +5139,6 @@ export default function Chat() {
                   <Heart 
                     size={20} 
                     color={getReactionStatus(msg.id, 'heart').hasUserReacted ? '#ef4444' : theme.textSecondary}
-                    fill={getReactionStatus(msg.id, 'heart').hasUserReacted ? '#ef4444' : 'none'}
                   />
                   {getReactionStatus(msg.id, 'heart').count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
@@ -5106,7 +5157,6 @@ export default function Chat() {
                   <Star 
                     size={20} 
                     color={getReactionStatus(msg.id, 'star').hasUserReacted ? '#fbbf24' : theme.textSecondary}
-                    fill={getReactionStatus(msg.id, 'star').hasUserReacted ? '#fbbf24' : 'none'}
                   />
                   {getReactionStatus(msg.id, 'star').count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
@@ -5125,8 +5175,6 @@ export default function Chat() {
                   <Smile 
                     size={20} 
                     color={getReactionStatus(msg.id, 'smile').hasUserReacted ? '#1e1c1cff' : theme.textSecondary}
-                    fill={getReactionStatus(msg.id, 'smile').hasUserReacted ? '#8b5cf6' : 'none'}
-                    strokeWidth={getReactionStatus(msg.id, 'smile').hasUserReacted ? 2 : 1}
                   />
                   {getReactionStatus(msg.id, 'smile').count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
@@ -5149,7 +5197,7 @@ export default function Chat() {
                   return (
                     <View key={reactionType} style={styles.reactionTypeContainer}>
                       <View style={styles.reactionIcon}>
-                        {reactionType === 'heart' ? <Heart size={12} color="#ef4444" fill="#ef4444" /> : reactionType === 'star' ? <Star size={12} color="#fbbf24" fill="#fbbf24" /> : reactionType === 'smile' ? <Smile size={12} color="#8b5cf6" fill="#e0d4f7" strokeWidth={2} /> : null}
+                        {reactionType === 'heart' ? <Heart size={12} color="#ef4444" /> : reactionType === 'star' ? <Star size={12} color="#fbbf24" /> : reactionType === 'smile' ? <Smile size={12} color="#8b5cf6" /> : null}
                       </View>
                       <View style={styles.profilePicsRow}>
                         {Array.isArray(reactionStatus.users) && reactionStatus.users
@@ -5563,7 +5611,10 @@ export default function Chat() {
                   <>
                     {/* Handle new multiple attachments format */}
                     {Array.isArray(msg.attachments) && msg.attachments.length > 0 && (msg.attachments as HydratedAttachment[]).map((attachment, index: number) => (
-                      <View key={index} style={{ marginBottom: index < msg.attachments.length - 1 ? 8 : 0 }}>
+                      <View
+                        key={index}
+                        style={{ marginBottom: index < msg.attachments.length - 1 ? 8 : 0, alignItems: 'center' }}
+                      >
                         {brokenFileUrls.has(attachment.url) ? (
                           // Show placeholder for deleted/missing files
                           <View style={[styles.deletedFileAttachment, { backgroundColor: theme.background, borderColor: theme.border }]}>
@@ -5582,7 +5633,7 @@ export default function Chat() {
                               </Text>
                             </View>
                           </View>
-                        ) : isVideoFile(attachment.fileType) ? (
+                        ) : isVideoFile(attachment.fileType, attachment.fileName) ? (
                           <FileViewer
                             fileUrl={attachment.resolvedUrl || attachment.url}
                             fileName={attachment.fileName || 'Video File'}
@@ -5592,7 +5643,7 @@ export default function Chat() {
                             remoteFileUrl={attachment.url}
                             // Use FileViewer's built-in ShareModal
                           />
-                        ) : isImageFile(attachment.fileType) ? (
+                        ) : isImageFile(attachment.fileType, attachment.fileName) ? (
                           <TouchableOpacity onPress={() => { void handleImageView(attachment.resolvedUrl || attachment.url, attachment.url, attachment.fileName); }}>
                             <ProgressiveImage
                               uri={attachment.resolvedUrl || attachment.url}
@@ -5613,6 +5664,21 @@ export default function Chat() {
                             remoteFileUrl={attachment.url}
                             // Use FileViewer's built-in ShareModal
                           />
+                        )}
+                        {networkErrorUrls.has(attachment.url) && !brokenFileUrls.has(attachment.url) && (
+                          <View style={[styles.networkErrorAttachment, { backgroundColor: theme.background, borderColor: theme.border }]}>
+                            <View style={styles.networkErrorInfo}>
+                              <AlertCircle size={16} color={theme.textSecondary} />
+                              <Text style={[styles.networkErrorText, { color: theme.textSecondary }]}>Network error. Tap retry.</Text>
+                            </View>
+                            <TouchableOpacity
+                              style={[styles.networkErrorRetryButton, { borderColor: theme.primary }]}
+                              onPress={() => handleDownloadFile(attachment.url, attachment.fileName || 'File', attachment.resolvedUrl)}
+                            >
+                              <RotateCcw size={14} color={theme.primary} />
+                              <Text style={[styles.networkErrorRetryText, { color: theme.primary }]}>Retry</Text>
+                            </TouchableOpacity>
+                          </View>
                         )}
                       </View>
                     ))}
@@ -6207,8 +6273,8 @@ export default function Chat() {
                 return candidate;
               })();
               const fileSizeValue = file.fileSize || file.size;
-              const isImage = mimeType ? isImageFile(mimeType) : false;
-              const isVideo = mimeType ? isVideoFile(mimeType) : false;
+              const isImage = mimeType ? isImageFile(mimeType, safePreviewName) : false;
+              const isVideo = mimeType ? isVideoFile(mimeType, safePreviewName) : false;
               const thumbnailUri = file.thumbnail || file.preview || file.poster || null;
 
               return (
@@ -6330,12 +6396,46 @@ export default function Chat() {
             </Text>
           </View>
         ) : (
-          <ProgressiveImage
-            uri={selectedImageUri}
-            style={styles.fullScreenImage}
-            resizeMode="contain"
-            onError={() => handleImageError(selectedImageUri)}
-          />
+          <View style={styles.imageViewerContent}>
+            <ProgressiveImage
+              uri={selectedImageUri}
+              style={styles.fullScreenImage}
+              resizeMode="contain"
+              onError={() => handleImageError(lastViewedRemoteImage || selectedImageUri)}
+            />
+            {networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+              <TouchableOpacity
+                style={styles.imageRetryBadge}
+                onPress={() => {
+                  const sourceUri = lastViewedRemoteImage || selectedImageUri;
+                  clearNetworkError(sourceUri);
+                  setSelectedImageUri(sourceUri);
+                }}
+              >
+                <RotateCcw size={14} color="#ffffff" />
+                <Text style={styles.imageRetryText}>Retry</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+        {!brokenFileUrls.has(selectedImageUri) && networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+          <View style={[styles.imageViewerNetworkError, { backgroundColor: 'rgba(0, 0, 0, 0.55)', borderColor: 'rgba(255, 255, 255, 0.2)' }]}>
+            <View style={styles.networkErrorInfo}>
+              <AlertCircle size={16} color="#ffffff" />
+              <Text style={[styles.networkErrorText, { color: '#ffffff' }]}>Network error. Tap retry.</Text>
+            </View>
+            <TouchableOpacity
+              style={[styles.networkErrorRetryButton, { borderColor: '#ffffff' }]}
+              onPress={() => {
+                const sourceUri = lastViewedRemoteImage || selectedImageUri;
+                clearNetworkError(sourceUri);
+                setSelectedImageUri(sourceUri);
+              }}
+            >
+              <RotateCcw size={14} color="#ffffff" />
+              <Text style={[styles.networkErrorRetryText, { color: '#ffffff' }]}>Retry</Text>
+            </TouchableOpacity>
+          </View>
         )}
         {/* Action buttons positioned at the bottom with proper spacing */}
         {!brokenFileUrls.has(selectedImageUri) && (
@@ -8332,6 +8432,41 @@ const styles = StyleSheet.create({
     borderStyle: 'dashed',
     opacity: 0.6,
   },
+  networkErrorAttachment: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    marginTop: 6,
+    borderWidth: 1,
+    alignSelf: 'stretch',
+  },
+  networkErrorInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
+  networkErrorText: {
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+    marginLeft: 8,
+  },
+  networkErrorRetryButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginLeft: 10,
+  },
+  networkErrorRetryText: {
+    fontSize: 12,
+    fontFamily: 'Inter-Medium',
+    marginLeft: 6,
+  },
   fileInfo: {
     flex: 1,
     marginLeft: 12,
@@ -8906,6 +9041,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  imageViewerContent: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   imageViewerCloseButton: {
     position: 'absolute',
     top: 60,
@@ -8918,6 +9059,23 @@ const styles = StyleSheet.create({
   fullScreenImage: {
     width: '100%',
     height: '100%',
+  },
+  imageRetryBadge: {
+    position: 'absolute',
+    bottom: 110,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+  },
+  imageRetryText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontFamily: 'Inter-Medium',
+    marginLeft: 6,
   },
   imageViewerButtonContainer: {
     position: 'absolute',
@@ -8936,6 +9094,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingVertical: 12,
     borderRadius: 25,
+  },
+  imageViewerNetworkError: {
+    position: 'absolute',
+    top: 110,
+    left: 20,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
   },
   imageViewerButtonText: {
     color: '#ffffff',

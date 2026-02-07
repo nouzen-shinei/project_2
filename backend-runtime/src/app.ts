@@ -641,10 +641,10 @@ async function buildTenantInviteLinkServer(token: string): Promise<string> {
 async function buildSmartSharedFileLinkServer(token: string): Promise<{ shareUrl: string; webUrl: string }> {
   const base = await resolveWebAppBaseUrlServer();
   const safeToken = encodeURIComponent((token || '').trim());
-  const webUrl = `${base}/shared/${safeToken}`;
+  const webUrl = `${base}/s/${safeToken}`;
   const q = new URLSearchParams();
   q.set('u', webUrl);
-  q.set('dl', `shared/${(token || '').trim()}`);
+  q.set('dl', `s/${(token || '').trim()}`);
   const shareUrl = `${base}/l?${q.toString()}`;
   return { shareUrl, webUrl };
 }
@@ -5198,7 +5198,8 @@ export function createApp(options: CreateAppOptions = {}){
     // Allow hidden iframes Firebase may use for long-poll control
     extraFrame: [
       'https://*.firebasedatabase.app',
-      'https://tution-app-6c0c3.firebaseapp.com'
+      'https://tution-app-6c0c3.firebaseapp.com',
+      'https://firebasestorage.googleapis.com'
     ]
   }));
 
@@ -5544,7 +5545,7 @@ export function createApp(options: CreateAppOptions = {}){
         }),
       );
 
-      return res.json({ token, shareUrl });
+      return res.json({ token, shareUrl, webUrl });
     } catch (error) {
       console.error('[shared_files] create failed', error);
       return res.status(500).json({ error: 'internal_error' });
@@ -5582,8 +5583,18 @@ export function createApp(options: CreateAppOptions = {}){
       if (existing?.token) {
         const data = existing.data || {};
         const existingShareUrl = typeof (data as any)?.shareUrl === 'string' ? String((data as any).shareUrl).trim() : '';
-        if (existingShareUrl) {
-          return res.json({ token: existing.token, shareUrl: existingShareUrl, existing: true });
+        const existingWebUrl = typeof (data as any)?.webUrl === 'string' ? String((data as any).webUrl).trim() : '';
+        if (existingShareUrl || existingWebUrl) {
+          if (!existingWebUrl) {
+            const { webUrl } = await buildSmartSharedFileLinkServer(existing.token);
+            try {
+              await db.collection('sharedFiles').doc(existing.token).set({ webUrl, updatedAt: new Date().toISOString() }, { merge: true });
+            } catch {
+              // ignore
+            }
+            return res.json({ token: existing.token, shareUrl: existingShareUrl, webUrl, existing: true });
+          }
+          return res.json({ token: existing.token, shareUrl: existingShareUrl, webUrl: existingWebUrl, existing: true });
         }
         const { shareUrl, webUrl } = await buildSmartSharedFileLinkServer(existing.token);
         // Best-effort backfill
@@ -5592,7 +5603,7 @@ export function createApp(options: CreateAppOptions = {}){
         } catch {
           // ignore
         }
-        return res.json({ token: existing.token, shareUrl, existing: true });
+        return res.json({ token: existing.token, shareUrl, webUrl, existing: true });
       }
     } catch (error) {
       // Fail open to creation; do not block sharing if index is missing.
@@ -5632,7 +5643,7 @@ export function createApp(options: CreateAppOptions = {}){
         }),
       );
 
-      return res.json({ token, shareUrl, existing: false });
+      return res.json({ token, shareUrl, webUrl, existing: false });
     } catch (error) {
       console.error('[shared_files] resolve-or-create failed', error);
       return res.status(500).json({ error: 'internal_error' });
@@ -5674,8 +5685,18 @@ export function createApp(options: CreateAppOptions = {}){
       }
 
       const existingShareUrl = typeof data?.shareUrl === 'string' ? String(data.shareUrl).trim() : '';
-      if (existingShareUrl) {
-        return res.json({ token, shareUrl: existingShareUrl });
+      const existingWebUrl = typeof data?.webUrl === 'string' ? String(data.webUrl).trim() : '';
+      if (existingShareUrl || existingWebUrl) {
+        if (!existingWebUrl) {
+          const { webUrl } = await buildSmartSharedFileLinkServer(token);
+          try {
+            await ref.set({ webUrl, updatedAt: new Date().toISOString() }, { merge: true });
+          } catch {
+            // ignore
+          }
+          return res.json({ token, shareUrl: existingShareUrl, webUrl });
+        }
+        return res.json({ token, shareUrl: existingShareUrl, webUrl: existingWebUrl });
       }
 
       const { shareUrl, webUrl } = await buildSmartSharedFileLinkServer(token);
@@ -5686,7 +5707,7 @@ export function createApp(options: CreateAppOptions = {}){
         // ignore
       }
 
-      return res.json({ token, shareUrl });
+      return res.json({ token, shareUrl, webUrl });
     } catch (error) {
       console.error('[shared_files] link failed', error);
       return res.status(500).json({ error: 'internal_error' });
@@ -10515,10 +10536,22 @@ export function createApp(options: CreateAppOptions = {}){
     const ext = inferExtensionFromContentType(contentType, extFallback);
     const safeExt = sanitizeStorageSegment(ext) || 'bin';
 
+    const hashStorageKey = (value: string): string => {
+      return crypto.createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 20);
+    };
+
+    const normalizeConversationFolder = (value: string): string => {
+      const trimmed = value.trim();
+      if (!trimmed) return 'unassigned';
+      if (trimmed.startsWith('c_') && trimmed.length >= 10) return trimmed;
+      return `c_${hashStorageKey(trimmed)}`;
+    };
+
     let objectPath = '';
     const purpose: StorageUploadPurpose = parsed.data.purpose;
     if (purpose === 'chat') {
-      const conversationFolder = sanitizeStorageSegment(parsed.data.conversationFolder || 'unassigned') || 'unassigned';
+      const rawConversationFolder = sanitizeStorageSegment(parsed.data.conversationFolder || 'unassigned') || 'unassigned';
+      const conversationFolder = normalizeConversationFolder(rawConversationFolder);
       const safeName = filename || `file.${safeExt}`;
       objectPath = `chat-files/${normalizedTenantId}/${conversationFolder}/${timestamp}_${safeName}`;
     } else if (purpose === 'tenantLogo') {
@@ -10534,12 +10567,13 @@ export function createApp(options: CreateAppOptions = {}){
       const safeName = filename || `receipt.${safeExt}`;
       objectPath = `receipts/${normalizedTenantId}/${feeId}/${timestamp}_${safeName}`;
     } else if (purpose === 'profilePicture') {
-      const emailKey = sanitizeStorageSegment((parsed.data.email || '').toLowerCase().replace(/\s+/g, ''));
-      if (!emailKey) {
+      const emailKeyRaw = sanitizeStorageSegment((parsed.data.email || '').toLowerCase().replace(/\s+/g, ''));
+      if (!emailKeyRaw) {
         await releaseTenantStorageBytes(db, normalizedTenantId, bytes);
         invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
         return res.status(400).json({ error: 'missing_email' });
       }
+      const emailKey = hashStorageKey(emailKeyRaw);
       objectPath = `profile-pictures/${normalizedTenantId}/${emailKey}.jpg`;
     }
 

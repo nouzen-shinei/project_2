@@ -9,12 +9,15 @@ export interface FileInfo {
   supportedActions: string[];
 }
 
+const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif', 'tif', 'tiff', 'ico'];
+const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'avi', 'wmv', 'flv', 'webm', 'mkv', '3gp'];
+
 export const getFileTypeInfo = (mimeType: string, fileName?: string): FileInfo => {
   const type = mimeType.toLowerCase();
   const ext = fileName?.split('.').pop()?.toLowerCase() || '';
 
   // Images
-  if (type.startsWith('image/')) {
+  if (type.startsWith('image/') || IMAGE_EXTENSIONS.includes(ext)) {
     return {
       icon: Image,
       color: '#10B981', // Green
@@ -26,7 +29,7 @@ export const getFileTypeInfo = (mimeType: string, fileName?: string): FileInfo =
   }
 
   // Videos
-  if (type.startsWith('video/')) {
+  if (type.startsWith('video/') || VIDEO_EXTENSIONS.includes(ext)) {
     return {
       icon: Video,
       color: '#EF4444', // Red
@@ -185,12 +188,14 @@ export const formatFileSize = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 };
 
-export const isImageFile = (mimeType: string): boolean => {
-  return mimeType.startsWith('image/');
+export const isImageFile = (mimeType: string, fileName?: string): boolean => {
+  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
+  return mimeType.startsWith('image/') || IMAGE_EXTENSIONS.includes(ext);
 };
 
-export const isVideoFile = (mimeType: string): boolean => {
-  return mimeType.startsWith('video/');
+export const isVideoFile = (mimeType: string, fileName?: string): boolean => {
+  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
+  return mimeType.startsWith('video/') || VIDEO_EXTENSIONS.includes(ext);
 };
 
 export const isAudioFile = (mimeType: string, fileName?: string): boolean => {
