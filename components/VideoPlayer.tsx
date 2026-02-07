@@ -14,6 +14,8 @@ import {
   Modal,
   SafeAreaView,
   StatusBar,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import {
   Play,
@@ -206,6 +208,9 @@ type VideoSourceCacheEntry = {
   duration: number | null;
   previewUri: string | null;
   lastPosition: number;
+  loadedOnce: boolean;
+  lastKnownTime: number;
+  lastKnownWasPlaying: boolean;
   updatedAt: number;
 };
 
@@ -221,6 +226,9 @@ const patchVideoCacheEntry = (key: string, patch: Partial<VideoSourceCacheEntry>
     duration: null,
     previewUri: null,
     lastPosition: 0,
+    loadedOnce: false,
+    lastKnownTime: 0,
+    lastKnownWasPlaying: false,
     updatedAt: Date.now(),
   };
 
@@ -229,6 +237,9 @@ const patchVideoCacheEntry = (key: string, patch: Partial<VideoSourceCacheEntry>
     duration: patch.duration ?? previous.duration,
     previewUri: patch.previewUri ?? previous.previewUri,
     lastPosition: patch.lastPosition ?? previous.lastPosition,
+    loadedOnce: patch.loadedOnce ?? previous.loadedOnce,
+    lastKnownTime: patch.lastKnownTime ?? previous.lastKnownTime,
+    lastKnownWasPlaying: patch.lastKnownWasPlaying ?? previous.lastKnownWasPlaying,
     updatedAt: Date.now(),
   };
 
@@ -241,6 +252,7 @@ interface VideoPlayerLoadedProps {
   fileName: string;
   onDownload?: () => void;
   autoPlay: boolean;
+  initialWasPlaying: boolean;
   showControlsProp: boolean;
   maxHeight: number;
   onSharePress: (event?: GestureResponderEvent) => void;
@@ -265,6 +277,10 @@ type NativeFullscreenConfig = FullscreenSnapshot & {
   sourceUri: string;
 };
 
+type WebFullscreenConfig = FullscreenSnapshot & {
+  sourceUri: string;
+};
+
 type FullscreenReturnState = {
   currentTime: number;
   isMuted: boolean;
@@ -274,6 +290,13 @@ type FullscreenReturnState = {
 
 interface FullscreenVideoModalProps {
   config: NativeFullscreenConfig;
+  onDismiss: (state: FullscreenReturnState) => void;
+  onSharePress: (event?: GestureResponderEvent) => void;
+  onDownload?: () => void;
+}
+
+interface WebFullscreenModalProps {
+  config: WebFullscreenConfig;
   onDismiss: (state: FullscreenReturnState) => void;
   onSharePress: (event?: GestureResponderEvent) => void;
   onDownload?: () => void;
@@ -301,15 +324,19 @@ export default function VideoPlayer({
   const cachedResolvedUri = cachedEntry?.resolvedUri ?? null;
   const cachedDuration = cachedEntry?.duration ?? null;
   const cachedPreview = cachedEntry?.previewUri ?? null;
-  const cachedInitialPosition = cachedEntry?.lastPosition ?? 0;
+  const cachedInitialPosition = Math.max(cachedEntry?.lastKnownTime ?? 0, cachedEntry?.lastPosition ?? 0);
+  const cachedWasPlaying = cachedEntry?.lastKnownWasPlaying ?? false;
 
   const [shouldLoadVideo, setShouldLoadVideo] = useState(() => {
     if (autoPlay || !isWeb || forceImmediateLoad) {
       return true;
     }
+    if (cachedEntry?.loadedOnce) {
+      return true;
+    }
     return Boolean(cachedResolvedUri);
   });
-  const [playRequestId, setPlayRequestId] = useState(() => (autoPlay ? 1 : 0));
+  const [playRequestId, setPlayRequestId] = useState(() => (autoPlay || cachedWasPlaying ? 1 : 0));
   const [showShareModal, setShowShareModal] = useState(false);
   const [resolvedVideoUri, setResolvedVideoUri] = useState<string | null>(() => cachedResolvedUri);
   const [displayDuration, setDisplayDuration] = useState<number | null>(() => cachedDuration);
@@ -341,12 +368,12 @@ export default function VideoPlayer({
       setResolvedVideoUri(cached.resolvedUri ?? null);
       setDisplayDuration(cached.duration ?? null);
       setPreviewUri(thumbnailUrl || cached.previewUri || null);
-      if (forceImmediateLoad || autoPlay || !isWeb) {
+      if (forceImmediateLoad || autoPlay || !isWeb || cached.loadedOnce || cached.lastKnownWasPlaying) {
         setShouldLoadVideo((prev) => (prev ? prev : true));
       } else {
         setShouldLoadVideo((prev) => (prev ? false : prev));
       }
-      setPlayRequestId(autoPlay ? 1 : 0);
+      setPlayRequestId(autoPlay || cached.lastKnownWasPlaying ? 1 : 0);
       return;
     }
 
@@ -357,7 +384,7 @@ export default function VideoPlayer({
 
     if (autoPlay || forceImmediateLoad || !isWeb) {
       setShouldLoadVideo(true);
-      setPlayRequestId(autoPlay ? 1 : 0);
+      setPlayRequestId(autoPlay || cachedWasPlaying ? 1 : 0);
     } else {
       setShouldLoadVideo(false);
       setPlayRequestId(0);
@@ -528,6 +555,7 @@ export default function VideoPlayer({
       cacheKey={cacheKey}
       initialPlaybackPosition={cachedInitialPosition}
       initialResolvedUri={effectiveInitialResolvedUri}
+      initialWasPlaying={cachedWasPlaying}
     />
   ) : (
     renderPlaceholder()
@@ -563,6 +591,7 @@ function VideoPlayerLoaded({
   fileName,
   onDownload,
   autoPlay,
+  initialWasPlaying,
   showControlsProp,
   maxHeight,
   onSharePress,
@@ -576,20 +605,20 @@ function VideoPlayerLoaded({
   initialResolvedUri,
 }: VideoPlayerLoadedProps) {
   const { theme } = useTheme();
-  const [isPlaying, setIsPlaying] = useState(autoPlay);
+  const [isPlaying, setIsPlaying] = useState(autoPlay || initialWasPlaying);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [showControlsVisible, setShowControlsVisible] = useState(showControlsProp);
-  const [isWebFullscreen, setIsWebFullscreen] = useState(false);
+  const [webFullscreenConfig, setWebFullscreenConfig] = useState<WebFullscreenConfig | null>(null);
   const [nativeFullscreenConfig, setNativeFullscreenConfig] = useState<NativeFullscreenConfig | null>(null);
   const [resolving, setResolving] = useState(false);
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
-  const [pendingPlayRequest, setPendingPlayRequest] = useState(autoPlay);
+  const [pendingPlayRequest, setPendingPlayRequest] = useState(autoPlay || initialWasPlaying);
   const videoRef = useRef<any>(null);
-  const videoViewRef = useRef<VideoView>(null as any);
+  const videoViewRef = useRef<React.ElementRef<typeof VideoView> | null>(null);
   const controlsTimeoutRef = useRef<number | null>(null);
   const progressBarRef = useRef<View>(null);
   const progressBarWidthRef = useRef(1);
@@ -607,6 +636,13 @@ function VideoPlayerLoaded({
   const resolvedUriRef = useRef(resolvedUri);
   const playbackRateSyncedRef = useRef(false);
   const pauseForFullscreenRef = useRef(false);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState ?? 'active');
+  const backgroundSnapshotRef = useRef<{ time: number; wasPlaying: boolean } | null>(null);
+  const pendingRestoreRef = useRef(false);
+  const intendedPlayingRef = useRef(autoPlay || initialWasPlaying);
+  const pauseRequestedRef = useRef(false);
+  const lastCacheSyncRef = useRef(0);
+  const pendingCacheSyncRef = useRef<number | null>(null);
 
   useEffect(() => {
     cacheKeyRef.current = cacheKey;
@@ -630,6 +666,14 @@ function VideoPlayerLoaded({
     initialPositionRef.current = normalized;
     hasAppliedInitialPositionRef.current = normalized <= 0;
   }, [initialPlaybackPosition]);
+
+  useEffect(() => {
+    if (!initialWasPlaying) {
+      return;
+    }
+    intendedPlayingRef.current = true;
+    setPendingPlayRequest(true);
+  }, [initialWasPlaying]);
 
   useEffect(() => {
     if (!initialResolvedUri) {
@@ -659,8 +703,31 @@ function VideoPlayerLoaded({
     }
     setDuration((prev) => (Math.abs(prev - next) < 1 / 60 ? prev : next));
   }, []);
+  const syncPlaybackCache = useCallback(
+    (force = false, override?: { time?: number; wasPlaying?: boolean }) => {
+    const key = cacheKeyRef.current;
+    if (!key) {
+      return;
+    }
+    const now = Date.now();
+    if (Platform.OS !== 'web' && !force && now - lastCacheSyncRef.current < 1200) {
+      if (pendingCacheSyncRef.current == null) {
+        pendingCacheSyncRef.current = setTimeout(() => {
+          pendingCacheSyncRef.current = null;
+          syncPlaybackCache(true, override);
+        }, 1200) as unknown as number;
+      }
+      return;
+    }
+    lastCacheSyncRef.current = now;
+    patchVideoCacheEntry(key, {
+      lastKnownTime: override?.time ?? currentTimeRef.current,
+      lastKnownWasPlaying: override?.wasPlaying ?? intendedPlayingRef.current,
+    });
+  }, []);
   const isNativeFullscreenVisible = !!nativeFullscreenConfig;
-  const isFullscreen = Platform.OS === 'web' ? isWebFullscreen : isNativeFullscreenVisible;
+  const isWebFullscreenActive = !!webFullscreenConfig;
+  const isFullscreen = Platform.OS === 'web' ? isWebFullscreenActive : isNativeFullscreenVisible;
 
   const playbackSpeedLabel = useMemo(() => {
     const rounded = Math.round(playbackSpeed * 100) / 100;
@@ -695,6 +762,36 @@ function VideoPlayerLoaded({
       p.playbackRate = playbackSpeed;
     } catch {}
   });
+
+  const restoreFromBackground = useCallback(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+    const snapshot = backgroundSnapshotRef.current;
+    if (!snapshot) {
+      return;
+    }
+    const targetTime = Number.isFinite(snapshot.time) ? snapshot.time : 0;
+    try {
+      player.currentTime = targetTime;
+    } catch (error) {
+      logger.debug?.('VideoPlayer: failed to restore time after background', error);
+    }
+    setCurrentTimeSafe(targetTime);
+
+    if (snapshot.wasPlaying) {
+      try {
+        player.play();
+        setIsPlayingSafe(true);
+      } catch (error) {
+        logger.debug?.('VideoPlayer: failed to resume after background', error);
+        setIsPlayingSafe(false);
+      }
+    }
+
+    backgroundSnapshotRef.current = null;
+    pendingRestoreRef.current = false;
+  }, [player, setCurrentTimeSafe, setIsPlayingSafe]);
 
   const seekToInitialPosition = useCallback(() => {
     const target = initialPositionRef.current;
@@ -883,8 +980,13 @@ function VideoPlayerLoaded({
           logger.debug?.('VideoPlayer: native seek failed', error);
         }
       }
+
+      if (commit) {
+        currentTimeRef.current = newTime;
+        syncPlaybackCache(true, { time: newTime, wasPlaying: intendedPlayingRef.current });
+      }
     },
-    [duration, player, setCurrentTimeSafe]
+    [duration, player, setCurrentTimeSafe, syncPlaybackCache]
   );
 
   const getProgressFromEvent = useCallback(
@@ -966,7 +1068,7 @@ function VideoPlayerLoaded({
         }
 
         const hint = uri.startsWith('file://') ? uri : undefined;
-        const localUri = await chatCacheService.getMediaForDownload(uri, fileName, hint, 'high');
+        const localUri = await chatCacheService.getMediaForDownload(uri, fileName, hint, 'normal', { lazy: true });
         if (cancelled) {
           return;
         }
@@ -974,6 +1076,11 @@ function VideoPlayerLoaded({
         setResolvedUri(finalUri);
         onResolvedUriChange?.(finalUri);
         patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: finalUri });
+        if (/^https?:/i.test(uri) && finalUri === uri) {
+          chatCacheService
+            .getMediaForDownload(uri, fileName, hint, 'low')
+            .catch((error) => logger.debug?.('VideoPlayer: background cache warm failed', error));
+        }
       } catch (error) {
         logger.debug?.('VideoPlayer: failed to resolve cached media', error);
         if (!cancelled) {
@@ -1044,7 +1151,10 @@ function VideoPlayerLoaded({
   const togglePlayPause = () => {
     if (Platform.OS === 'web' && videoRef.current) {
       if (isPlaying) {
+        pauseRequestedRef.current = true;
         videoRef.current.pause();
+        intendedPlayingRef.current = false;
+        syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
       } else {
         restartIfEnded();
         const playPromise = videoRef.current.play();
@@ -1053,6 +1163,9 @@ function VideoPlayerLoaded({
             logger.debug?.('VideoPlayer: play() rejected', error);
           });
         }
+        intendedPlayingRef.current = true;
+        syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: true });
+        pauseRequestedRef.current = false;
       }
     } else if (Platform.OS !== 'web') {
       try {
@@ -1080,7 +1193,24 @@ function VideoPlayerLoaded({
 
   const handleTimeUpdate = () => {
     if (Platform.OS === 'web' && videoRef.current) {
-      setCurrentTimeSafe(videoRef.current.currentTime);
+      const nextTime = videoRef.current.currentTime;
+      if (Number.isFinite(nextTime)) {
+        currentTimeRef.current = nextTime;
+      }
+      setCurrentTimeSafe(nextTime);
+
+      if (Number.isFinite(nextTime)) {
+        const key = cacheKeyRef.current;
+        if (key) {
+          patchVideoCacheEntry(key, {
+            lastKnownTime: nextTime,
+            lastKnownWasPlaying: intendedPlayingRef.current,
+            lastPosition: nextTime,
+          });
+        }
+      }
+
+      // timeupdate is the source of truth on web; keep cache synced directly.
     }
   };
 
@@ -1100,6 +1230,8 @@ function VideoPlayerLoaded({
           playPromise
             .then(() => {
               setIsPlayingSafe(true);
+              intendedPlayingRef.current = true;
+              pauseRequestedRef.current = false;
               setPendingPlayRequest(false);
             })
             .catch((error: unknown) => {
@@ -1108,6 +1240,8 @@ function VideoPlayerLoaded({
             });
         } else {
           setIsPlayingSafe(true);
+          intendedPlayingRef.current = true;
+          pauseRequestedRef.current = false;
           setPendingPlayRequest(false);
         }
       } catch (error) {
@@ -1129,6 +1263,9 @@ function VideoPlayerLoaded({
       const mediaDuration = videoRef.current.duration;
       setDurationSafe(mediaDuration);
       updateDuration(mediaDuration);
+      if (cacheKeyRef.current) {
+        patchVideoCacheEntry(cacheKeyRef.current, { loadedOnce: true });
+      }
       applyPlaybackRate(playbackSpeed);
       if (onPreviewAvailable && typeof document !== 'undefined') {
         const frame = captureFrameFromElement(videoRef.current as any);
@@ -1142,9 +1279,111 @@ function VideoPlayerLoaded({
     }
   };
 
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+
+    const syncFromElement = () => {
+      if (!videoRef.current) {
+        return;
+      }
+      const elementTime = videoRef.current.currentTime;
+      if (Number.isFinite(elementTime)) {
+        currentTimeRef.current = elementTime;
+        syncPlaybackCache(true, {
+          time: elementTime,
+          wasPlaying: intendedPlayingRef.current,
+        });
+      }
+    };
+
+    const resumeIfNeeded = () => {
+      if (!videoRef.current) {
+        return;
+      }
+      if (!intendedPlayingRef.current) {
+        return;
+      }
+      if (document.visibilityState && document.visibilityState !== 'visible') {
+        return;
+      }
+
+      try {
+        const resumeTime = currentTimeRef.current;
+        if (Number.isFinite(resumeTime) && resumeTime > 0) {
+          if (Math.abs(videoRef.current.currentTime - resumeTime) > 0.5) {
+            videoRef.current.currentTime = resumeTime;
+          }
+        }
+        const playPromise = videoRef.current.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => undefined);
+        }
+      } catch (error) {
+        logger.debug?.('VideoPlayer: resume after browser fullscreen failed', error);
+      }
+    };
+
+    const handleFullscreenChange = () => {
+      syncFromElement();
+      resumeIfNeeded();
+    };
+    const handleVisibilityChange = () => {
+      syncFromElement();
+      resumeIfNeeded();
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange as EventListener);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange as EventListener);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [syncPlaybackCache]);
+
   const handleVideoPress = () => {
     setShowControlsVisible(!showControlsProp || !showControlsVisible);
   };
+
+  const handleWebFullscreenDismiss = useCallback(
+    (state: FullscreenReturnState) => {
+      setWebFullscreenConfig(null);
+      setIsMuted(state.isMuted);
+      setPlaybackSpeed(state.playbackSpeed);
+      setCurrentTimeSafe(state.currentTime);
+      currentTimeRef.current = state.currentTime;
+      intendedPlayingRef.current = state.wasPlaying;
+      pauseRequestedRef.current = false;
+      syncPlaybackCache(true, { time: state.currentTime, wasPlaying: state.wasPlaying });
+
+      if (Platform.OS === 'web' && videoRef.current) {
+        try {
+          videoRef.current.muted = state.isMuted;
+          videoRef.current.playbackRate = state.playbackSpeed;
+          videoRef.current.currentTime = state.currentTime;
+          if (state.wasPlaying) {
+            const playPromise = videoRef.current.play?.();
+            if (playPromise?.catch) {
+              playPromise.catch(() => undefined);
+            }
+            setIsPlayingSafe(true);
+          } else {
+            videoRef.current.pause?.();
+            setIsPlayingSafe(false);
+          }
+        } catch (error) {
+          logger.debug?.('VideoPlayer: failed to restore inline web playback', error);
+        }
+      }
+    },
+    [setCurrentTimeSafe, setIsPlayingSafe, syncPlaybackCache]
+  );
+
+  // Web fullscreen handled via modal to avoid browser fullscreen resets.
 
   const cyclePlaybackSpeed = useCallback(() => {
     setShowControlsVisible(true);
@@ -1186,26 +1425,27 @@ function VideoPlayerLoaded({
   const handleFullscreenPress = () => {
     if (Platform.OS === 'web' && videoRef.current && typeof document !== 'undefined') {
       try {
-        if (!isFullscreen) {
-          const request =
-            videoRef.current.requestFullscreen?.() || (videoRef.current as any).webkitRequestFullscreen?.();
-          if (request instanceof Promise) {
-            request.catch((error: unknown) => {
-              logger.warn('VideoPlayer: failed to enter fullscreen', error);
-            });
-          }
-          setIsWebFullscreen(true);
-        } else {
-          if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
-            const exit = document.exitFullscreen?.() || (document as any).webkitExitFullscreen?.();
-            if (exit instanceof Promise) {
-              exit.catch((error: unknown) => {
-                logger.warn('VideoPlayer: failed to exit fullscreen', error);
-              });
-            }
-          }
-          setIsWebFullscreen(false);
+        if (webFullscreenConfig) {
+          return;
         }
+
+        const wasPlaying = isPlaying;
+        try {
+          pauseRequestedRef.current = true;
+          videoRef.current.pause?.();
+        } catch (error) {
+          logger.debug?.('VideoPlayer: failed to pause before web fullscreen', error);
+        }
+        setIsPlayingSafe(false);
+        intendedPlayingRef.current = false;
+
+        setWebFullscreenConfig({
+          sourceUri: resolvedUriRef.current || uri,
+          startTime: Number.isFinite(currentTimeRef.current) ? currentTimeRef.current : 0,
+          isMuted,
+          playbackSpeed,
+          wasPlaying,
+        });
       } catch (error) {
         logger.warn('VideoPlayer: fullscreen toggle error', error);
       }
@@ -1361,6 +1601,54 @@ function VideoPlayerLoaded({
     if (Platform.OS === 'web') {
       return;
     }
+    if (pendingRestoreRef.current && status === 'readyToPlay') {
+      restoreFromBackground();
+    }
+  }, [restoreFromBackground, status]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+
+    const handleAppStateChange = (nextState: AppStateStatus) => {
+      const previous = appStateRef.current;
+      appStateRef.current = nextState;
+
+        if (isNativeFullscreenVisible) {
+          return;
+        }
+
+      if (nextState !== 'active') {
+        backgroundSnapshotRef.current = {
+          time: currentTimeRef.current,
+          wasPlaying: isPlaying,
+        };
+        pendingRestoreRef.current = true;
+        try {
+          player.pause();
+        } catch (error) {
+          logger.debug?.('VideoPlayer: pause on background failed', error);
+        }
+        setIsPlayingSafe(false);
+        return;
+      }
+
+      if (previous !== 'active' && pendingRestoreRef.current && status === 'readyToPlay') {
+        restoreFromBackground();
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => {
+      subscription.remove?.();
+    };
+  }, [isNativeFullscreenVisible, isPlaying, player, restoreFromBackground, setIsPlayingSafe, status]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
     if (!nativePlaying && pauseForFullscreenRef.current) {
       return;
     }
@@ -1375,11 +1663,19 @@ function VideoPlayerLoaded({
 
   useEffect(() => {
     if (Platform.OS !== 'web') {
-      setIsLoadingSafe(status === 'loading');
       const nativeDuration = player.duration || 0;
       if (nativeDuration > 0) {
         setDurationSafe(nativeDuration);
         updateDuration(nativeDuration);
+        if (cacheKeyRef.current) {
+          patchVideoCacheEntry(cacheKeyRef.current, { loadedOnce: true });
+        }
+      }
+
+      if (status === 'loading' && nativeDuration > 0) {
+        setIsLoadingSafe(false);
+      } else {
+        setIsLoadingSafe(status === 'loading');
       }
     }
   }, [player, setDurationSafe, setIsLoadingSafe, status, updateDuration]);
@@ -1407,7 +1703,18 @@ function VideoPlayerLoaded({
   }, [isPlaying, uri]);
 
   useEffect(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+    syncPlaybackCache(false);
+  }, [currentTime, isPlaying, syncPlaybackCache]);
+
+  useEffect(() => {
     return () => {
+      if (pendingCacheSyncRef.current != null) {
+        clearTimeout(pendingCacheSyncRef.current as unknown as number);
+        pendingCacheSyncRef.current = null;
+      }
       const key = cacheKeyRef.current;
       if (!key) {
         return;
@@ -1420,6 +1727,8 @@ function VideoPlayerLoaded({
         resolvedUri: finalUri,
         duration: durationRef.current ?? null,
         lastPosition: currentTimeRef.current,
+        lastKnownTime: currentTimeRef.current,
+        lastKnownWasPlaying: intendedPlayingRef.current,
       });
     };
   }, [uri]);
@@ -1466,9 +1775,35 @@ function VideoPlayerLoaded({
         src={resolvedUri}
         style={{ width: '100%', height: '100%', backgroundColor: '#000', borderRadius: 8 }}
         onTimeUpdate={handleTimeUpdate}
+        onSeeked={() => {
+          if (videoRef.current) {
+            const t = videoRef.current.currentTime;
+            if (Number.isFinite(t)) {
+              currentTimeRef.current = t;
+              const key = cacheKeyRef.current;
+              if (key) {
+                patchVideoCacheEntry(key, {
+                  lastKnownTime: t,
+                  lastKnownWasPlaying: intendedPlayingRef.current,
+                  lastPosition: t,
+                });
+              }
+            }
+          }
+        }}
         onLoadedMetadata={handleLoadedMetadata}
-        onPlay={() => setIsPlayingSafe(true)}
-        onPause={() => setIsPlayingSafe(false)}
+        onPlay={() => {
+          intendedPlayingRef.current = true;
+          pauseRequestedRef.current = false;
+          setIsPlayingSafe(true);
+        }}
+        onPause={() => {
+          setIsPlayingSafe(false);
+          if (pauseRequestedRef.current) {
+            intendedPlayingRef.current = false;
+            pauseRequestedRef.current = false;
+          }
+        }}
         muted={isMuted}
         playsInline
         preload="auto"
@@ -1592,7 +1927,7 @@ function VideoPlayerLoaded({
 
               <TouchableOpacity style={styles.controlButton} onPress={handleFullscreenPress}>
                 {Platform.OS === 'web' ? (
-                  isWebFullscreen ? <Minimize size={20} color="white" /> : <Maximize size={20} color="white" />
+                  isWebFullscreenActive ? <Minimize size={20} color="white" /> : <Maximize size={20} color="white" />
                 ) : (
                   <Maximize size={20} color="white" />
                 )}
@@ -1609,7 +1944,7 @@ function VideoPlayerLoaded({
       <VideoView
         ref={videoViewRef as any}
         style={styles.inlineVideoSurface}
-        player={player}
+        player={player as unknown as any}
         nativeControls={false}
         allowsPictureInPicture
         allowsFullscreen
@@ -1647,8 +1982,19 @@ function VideoPlayerLoaded({
     </>
   );
 
-
-  return Platform.OS === 'web' ? renderWebVideo() : renderMobileVideo();
+  return (
+    <>
+      {Platform.OS === 'web' ? renderWebVideo() : renderMobileVideo()}
+      {Platform.OS === 'web' && webFullscreenConfig ? (
+        <WebFullscreenModal
+          config={webFullscreenConfig}
+          onDismiss={handleWebFullscreenDismiss}
+          onSharePress={onSharePress}
+          onDownload={onDownload}
+        />
+      ) : null}
+    </>
+  );
 }
 
 function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: FullscreenVideoModalProps) {
@@ -1670,6 +2016,9 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
   const progressBarPageXRef = useRef<number | null>(null);
   const initialSyncDoneRef = useRef(false);
   const playbackRateSyncedRef = useRef(false);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState ?? 'active');
+  const backgroundSnapshotRef = useRef<{ time: number; wasPlaying: boolean } | null>(null);
+  const pendingRestoreRef = useRef(false);
 
   const setIsPlayingSafe = useCallback((next: boolean) => {
     setIsPlaying((prev) => (prev === next ? prev : next));
@@ -1766,6 +2115,36 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
     [player]
   );
 
+  const restoreFromBackground = useCallback(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+    const snapshot = backgroundSnapshotRef.current;
+    if (!snapshot) {
+      return;
+    }
+    const targetTime = Number.isFinite(snapshot.time) ? snapshot.time : 0;
+    try {
+      player.currentTime = targetTime;
+    } catch (error) {
+      logger.debug?.('FullscreenVideoModal: restore time failed', error);
+    }
+    setCurrentTimeSafe(targetTime);
+
+    if (snapshot.wasPlaying) {
+      try {
+        player.play();
+        setIsPlayingSafe(true);
+      } catch (error) {
+        logger.debug?.('FullscreenVideoModal: resume after background failed', error);
+        setIsPlayingSafe(false);
+      }
+    }
+
+    backgroundSnapshotRef.current = null;
+    pendingRestoreRef.current = false;
+  }, [player, setCurrentTimeSafe, setIsPlayingSafe]);
+
   useEffect(() => {
     initialSyncDoneRef.current = false;
     playbackRateSyncedRef.current = false;
@@ -1861,6 +2240,50 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
       }
     }
   }, [player, setCurrentTimeSafe, setDurationSafe, setIsLoadingSafe, setIsPlayingSafe, startTime, status, wasPlaying]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+    if (pendingRestoreRef.current && status === 'readyToPlay') {
+      restoreFromBackground();
+    }
+  }, [restoreFromBackground, status]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+
+    const handleAppStateChange = (nextState: AppStateStatus) => {
+      const previous = appStateRef.current;
+      appStateRef.current = nextState;
+
+      if (nextState !== 'active') {
+        backgroundSnapshotRef.current = {
+          time: Number.isFinite(currentTime) ? currentTime : 0,
+          wasPlaying: isPlaying,
+        };
+        pendingRestoreRef.current = true;
+        try {
+          player.pause();
+        } catch (error) {
+          logger.debug?.('FullscreenVideoModal: pause on background failed', error);
+        }
+        setIsPlayingSafe(false);
+        return;
+      }
+
+      if (previous !== 'active' && pendingRestoreRef.current && status === 'readyToPlay') {
+        restoreFromBackground();
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => {
+      subscription.remove?.();
+    };
+  }, [currentTime, isPlaying, player, restoreFromBackground, setIsPlayingSafe, status]);
 
   useEffect(() => {
     setIsPlayingSafe(!!nativePlaying);
@@ -2106,7 +2529,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
           <View style={styles.fullscreenVideoWrapper}>
             <VideoView
               style={styles.fullscreenVideoSurface}
-              player={player}
+              player={player as unknown as any}
               nativeControls={false}
               allowsPictureInPicture
               allowsFullscreen
@@ -2232,6 +2655,482 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
   );
 }
 
+function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload }: WebFullscreenModalProps) {
+  const { theme } = useTheme();
+  const { sourceUri, startTime, isMuted: initialMuted, playbackSpeed: initialSpeed, wasPlaying } = config;
+
+  const [isPlaying, setIsPlaying] = useState(wasPlaying);
+  const [isMuted, setIsMuted] = useState(initialMuted);
+  const [playbackSpeed, setPlaybackSpeed] = useState(initialSpeed);
+  const [currentTime, setCurrentTime] = useState(startTime);
+  const [duration, setDuration] = useState(0);
+  const [showControls, setShowControls] = useState(true);
+  const [isDraggingProgress, setIsDraggingProgress] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const intendedPlayingRef = useRef(wasPlaying);
+  const pauseRequestedRef = useRef(false);
+  const controlsTimeoutRef = useRef<number | null>(null);
+  const progressBarRef = useRef<View>(null);
+  const progressBarWidthRef = useRef(1);
+  const progressBarPageXRef = useRef<number | null>(null);
+
+  const setCurrentTimeSafe = useCallback((next: number) => {
+    if (!Number.isFinite(next)) {
+      return;
+    }
+    setCurrentTime((prev) => (Math.abs(prev - next) < 1 / 60 ? prev : next));
+  }, []);
+
+  const applyPlaybackRate = useCallback((rate: number) => {
+    if (!Number.isFinite(rate)) {
+      return;
+    }
+    if (videoRef.current) {
+      try {
+        videoRef.current.playbackRate = rate;
+      } catch (error) {
+        logger.debug?.('WebFullscreenModal: failed to set playback rate', error);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    setIsPlaying(wasPlaying);
+    setIsMuted(initialMuted);
+    setPlaybackSpeed(initialSpeed);
+    setCurrentTimeSafe(startTime);
+  }, [initialMuted, initialSpeed, setCurrentTimeSafe, startTime, wasPlaying]);
+
+  useEffect(() => {
+    applyPlaybackRate(playbackSpeed);
+  }, [applyPlaybackRate, playbackSpeed]);
+
+  useEffect(() => {
+    if (controlsTimeoutRef.current) {
+      clearTimeout(controlsTimeoutRef.current);
+      controlsTimeoutRef.current = null;
+    }
+
+    if (showControls && isPlaying && !isDraggingProgress) {
+      controlsTimeoutRef.current = window.setTimeout(() => {
+        setShowControls(false);
+      }, 3000);
+    }
+
+    return () => {
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = null;
+      }
+    };
+  }, [showControls, isPlaying, isDraggingProgress]);
+
+  const handleLoadedMetadata = () => {
+    if (!videoRef.current) {
+      return;
+    }
+    const mediaDuration = videoRef.current.duration || 0;
+    if (mediaDuration > 0) {
+      setDuration(mediaDuration);
+    }
+    try {
+      videoRef.current.currentTime = startTime || 0;
+    } catch (error) {
+      logger.debug?.('WebFullscreenModal: failed to set start time', error);
+    }
+    videoRef.current.muted = isMuted;
+    applyPlaybackRate(playbackSpeed);
+
+    if (wasPlaying) {
+      const playPromise = videoRef.current.play?.();
+      if (playPromise?.catch) {
+        playPromise.catch(() => undefined);
+      }
+      intendedPlayingRef.current = true;
+      pauseRequestedRef.current = false;
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    if (videoRef.current) {
+      const nextTime = videoRef.current.currentTime;
+      setCurrentTimeSafe(nextTime);
+      // Keep modal time in sync with the element on every update.
+    }
+  };
+
+  const togglePlayPause = () => {
+    if (!videoRef.current) {
+      return;
+    }
+    if (isPlaying) {
+      pauseRequestedRef.current = true;
+      videoRef.current.pause();
+      setIsPlaying(false);
+      intendedPlayingRef.current = false;
+    } else {
+      const playPromise = videoRef.current.play?.();
+      if (playPromise?.catch) {
+        playPromise.catch(() => undefined);
+      }
+      setIsPlaying(true);
+      intendedPlayingRef.current = true;
+      pauseRequestedRef.current = false;
+    }
+    setShowControls(true);
+  };
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+
+    const resumeIfNeeded = () => {
+      if (!videoRef.current) {
+        return;
+      }
+      if (!intendedPlayingRef.current) {
+        return;
+      }
+      if (document.visibilityState && document.visibilityState !== 'visible') {
+        return;
+      }
+
+      try {
+        if (Number.isFinite(currentTime) && currentTime > 0) {
+          if (Math.abs(videoRef.current.currentTime - currentTime) > 0.5) {
+            videoRef.current.currentTime = currentTime;
+          }
+        }
+        const playPromise = videoRef.current.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => undefined);
+        }
+      } catch (error) {
+        logger.debug?.('WebFullscreenModal: resume after browser fullscreen failed', error);
+      }
+    };
+
+    const handleFullscreenChange = () => {
+      resumeIfNeeded();
+    };
+    const handleVisibilityChange = () => {
+      resumeIfNeeded();
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange as EventListener);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange as EventListener);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [currentTime]);
+
+  const toggleMute = () => {
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    if (videoRef.current) {
+      videoRef.current.muted = nextMuted;
+    }
+    setShowControls(true);
+  };
+
+  const cyclePlaybackSpeed = useCallback(() => {
+    setShowControls(true);
+    const currentRate = playbackSpeed;
+    const currentIndex = PLAYBACK_SPEEDS.findIndex((rate) => Math.abs(rate - currentRate) < 0.001);
+    const fallbackIndex = Math.max(PLAYBACK_SPEEDS.indexOf(1), 0);
+    const safeIndex = currentIndex >= 0 ? currentIndex : fallbackIndex;
+    const nextRate = PLAYBACK_SPEEDS[(safeIndex + 1) % PLAYBACK_SPEEDS.length];
+
+    applyPlaybackRate(nextRate);
+    setPlaybackSpeed(nextRate);
+  }, [applyPlaybackRate, playbackSpeed]);
+
+  const handleProgressBarLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      const { width } = event.nativeEvent.layout;
+      if (Number.isFinite(width) && width > 0) {
+        progressBarWidthRef.current = width;
+      }
+
+      if (progressBarRef.current && typeof progressBarRef.current.measure === 'function') {
+        progressBarRef.current.measure((_x, _y, measuredWidth, _height, pageX) => {
+          if (Number.isFinite(measuredWidth) && measuredWidth > 0) {
+            progressBarWidthRef.current = measuredWidth;
+          }
+          if (typeof pageX === 'number' && Number.isFinite(pageX)) {
+            progressBarPageXRef.current = pageX;
+          }
+        });
+      }
+    },
+    []
+  );
+
+  const resolveLocationX = useCallback((evt: GestureResponderEvent) => {
+    const { locationX, pageX } = evt.nativeEvent;
+    if (typeof locationX === 'number' && Number.isFinite(locationX)) {
+      return locationX;
+    }
+    if (
+      typeof pageX === 'number' &&
+      Number.isFinite(pageX) &&
+      progressBarPageXRef.current != null &&
+      Number.isFinite(progressBarPageXRef.current)
+    ) {
+      return pageX - (progressBarPageXRef.current as number);
+    }
+    return null;
+  }, []);
+
+  const calculateScrubProgress = useCallback((locationX: number | null) => {
+    if (locationX == null) {
+      return null;
+    }
+    const width = progressBarWidthRef.current;
+    if (!Number.isFinite(width) || width <= 0) {
+      return null;
+    }
+    const ratio = clamp(locationX / width, 0, 1);
+    return ratio * 100;
+  }, []);
+
+  const applyScrubProgress = useCallback(
+    (progressValue: number | null, commit: boolean) => {
+      if (progressValue == null) {
+        return;
+      }
+
+      const normalized = clamp(progressValue / 100, 0, 1);
+      const baseDuration = duration > 0 ? duration : 0;
+      const newTime = baseDuration * normalized;
+
+      if (Number.isFinite(newTime)) {
+        setCurrentTimeSafe(newTime);
+      }
+
+      if (!commit || !videoRef.current) {
+        return;
+      }
+
+      try {
+        videoRef.current.currentTime = newTime;
+      } catch (error) {
+        logger.debug?.('WebFullscreenModal: seek failed', error);
+      }
+    },
+    [duration, setCurrentTimeSafe]
+  );
+
+  const getProgressFromEvent = useCallback(
+    (evt: GestureResponderEvent) => {
+      const location = resolveLocationX(evt);
+      return calculateScrubProgress(location);
+    },
+    [calculateScrubProgress, resolveLocationX]
+  );
+
+  const progressPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: (evt) => {
+          setIsDraggingProgress(true);
+          setShowControls(true);
+          applyScrubProgress(getProgressFromEvent(evt), false);
+        },
+        onPanResponderMove: (evt) => {
+          setShowControls(true);
+          applyScrubProgress(getProgressFromEvent(evt), false);
+        },
+        onPanResponderRelease: (evt) => {
+          setIsDraggingProgress(false);
+          setShowControls(true);
+          applyScrubProgress(getProgressFromEvent(evt), true);
+        },
+        onPanResponderTerminate: (evt) => {
+          setIsDraggingProgress(false);
+          setShowControls(true);
+          applyScrubProgress(getProgressFromEvent(evt), true);
+        },
+        onPanResponderTerminationRequest: () => false,
+      }),
+    [applyScrubProgress, getProgressFromEvent]
+  );
+
+  const handleClose = useCallback(() => {
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch (error) {
+        logger.debug?.('WebFullscreenModal: pause on close failed', error);
+      }
+    }
+    onDismiss({
+      currentTime,
+      isMuted,
+      playbackSpeed,
+      wasPlaying: isPlaying,
+    });
+  }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed]);
+
+  const formattedProgressLabel = useMemo(() => {
+    return `${formatTime(currentTime)} / ${formatTime(duration)}`;
+  }, [currentTime, duration]);
+
+  return (
+    <Modal
+      visible
+      animationType="fade"
+      presentationStyle="fullScreen"
+      onRequestClose={handleClose}
+      statusBarTranslucent
+    >
+      <SafeAreaView style={styles.webFullscreenRoot}>
+        <TouchableOpacity activeOpacity={1} style={styles.webFullscreenTouchable} onPress={() => setShowControls((v) => !v)}>
+          <View style={styles.webFullscreenVideoWrapper}>
+            <video
+              ref={videoRef}
+              src={sourceUri}
+              style={{ width: '100%', height: '100%', backgroundColor: '#000' }}
+              onLoadedMetadata={handleLoadedMetadata}
+              onTimeUpdate={handleTimeUpdate}
+              onSeeked={() => {
+                if (videoRef.current) {
+                  const t = videoRef.current.currentTime;
+                  if (Number.isFinite(t)) {
+                    setCurrentTimeSafe(t);
+                  }
+                }
+              }}
+              onPlay={() => {
+                intendedPlayingRef.current = true;
+                pauseRequestedRef.current = false;
+                setIsPlaying(true);
+              }}
+              onPause={() => {
+                setIsPlaying(false);
+                if (pauseRequestedRef.current) {
+                  intendedPlayingRef.current = false;
+                  pauseRequestedRef.current = false;
+                }
+              }}
+              muted={isMuted}
+              playsInline
+              preload="auto"
+            />
+
+            {showControls ? (
+              <View style={styles.fullscreenOverlay}>
+                <View style={styles.fullscreenTopRow}>
+                  <TouchableOpacity
+                    style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
+                    onPress={(event) => {
+                      event.stopPropagation?.();
+                      handleClose();
+                    }}
+                  >
+                    <X size={20} color="white" />
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.fullscreenControlButton}
+                    onPress={(event) => {
+                      event.stopPropagation?.();
+                      onSharePress(event);
+                    }}
+                  >
+                    <Share2 size={20} color="white" />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.fullscreenMainControls}>
+                  <TouchableOpacity
+                    style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
+                    onPress={togglePlayPause}
+                  >
+                    {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.fullscreenBottomControls}>
+                  <View style={styles.fullscreenProgressRow}>
+                    <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
+
+                    <View style={styles.fullscreenProgressContainer}>
+                      <View
+                        ref={progressBarRef}
+                        collapsable={false}
+                        style={styles.fullscreenProgressBarTouchable}
+                        onLayout={handleProgressBarLayout}
+                        {...progressPanResponder.panHandlers}
+                      >
+                        <View style={styles.fullscreenProgressBar}>
+                          <View style={[styles.fullscreenProgressFill, { width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }]} />
+                          <View
+                            style={[
+                              styles.fullscreenProgressThumb,
+                              {
+                                left: `${duration > 0 ? (currentTime / duration) * 100 : 0}%`,
+                                transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
+                              },
+                            ]}
+                          />
+                        </View>
+                      </View>
+                    </View>
+                  </View>
+
+                  <View style={styles.fullscreenActionsRow}>
+                    <View style={styles.fullscreenActionsLeft}>
+                      <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
+                        {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
+                      </TouchableOpacity>
+
+                      {onDownload ? (
+                        <TouchableOpacity
+                          style={styles.fullscreenControlButton}
+                          onPress={(event) => {
+                            event.stopPropagation?.();
+                            onDownload();
+                          }}
+                        >
+                          <Download size={20} color="white" />
+                        </TouchableOpacity>
+                      ) : null}
+                    </View>
+
+                    <View style={styles.fullscreenActionsRight}>
+                      <TouchableOpacity
+                        style={[styles.fullscreenControlButton, styles.fullscreenSpeedButton]}
+                        onPress={cyclePlaybackSpeed}
+                        accessibilityRole="button"
+                        accessibilityLabel="Toggle playback speed"
+                      >
+                        <Text style={styles.fullscreenSpeedLabel}>{`${Math.round(playbackSpeed * 100) / 100}x`}</Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity style={styles.fullscreenControlButton} onPress={handleClose}>
+                        <Minimize size={20} color="white" />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                </View>
+              </View>
+            ) : null}
+          </View>
+        </TouchableOpacity>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 const styles = StyleSheet.create({
   container: {
     borderRadius: 8,
@@ -2243,6 +3142,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
     borderRadius: 8,
     overflow: 'hidden',
+  },
+  webFullscreenRoot: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  webFullscreenTouchable: {
+    flex: 1,
+  },
+  webFullscreenVideoWrapper: {
+    flex: 1,
+    position: 'relative',
+    backgroundColor: '#000',
   },
   hiddenInlineWhileFullscreen: {
     opacity: 0,

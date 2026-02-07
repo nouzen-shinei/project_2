@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Platform, Text, TouchableOpacity, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
 import { sharedFileService, normalizeSharedFileName, type SharedFileRecord } from '@/services/sharedFileService';
@@ -17,6 +18,37 @@ export default function SharedFileViewPage() {
   const [loading, setLoading] = useState(true);
   const [record, setRecord] = useState<SharedFileRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const tryOpenNativeApp = useCallback(() => {
+    if (Platform.OS !== 'web') return;
+    if (!token.trim()) return;
+
+    const isProbablyMobile = (() => {
+      try {
+        const ua = (navigator.userAgent || '').toLowerCase();
+        return /android|iphone|ipad|ipod/.test(ua);
+      } catch {
+        return false;
+      }
+    })();
+
+    if (!isProbablyMobile) return;
+
+    const scheme = 'com.sneha.tution';
+    const safeToken = encodeURIComponent(token.trim());
+    const deepLink = `${scheme}://shared/${safeToken}`;
+
+    try {
+      window.location.href = deepLink;
+    } catch {
+      // ignore
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    tryOpenNativeApp();
+  }, [tryOpenNativeApp]);
 
   useEffect(() => {
     let mounted = true;
@@ -61,14 +93,19 @@ export default function SharedFileViewPage() {
 
     try {
       if (Platform.OS === 'web' && typeof document !== 'undefined') {
+        const response = await fetch(fileUrl, { mode: 'cors' });
+        if (!response.ok) {
+          throw new Error('Download failed');
+        }
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = fileUrl;
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
+        a.href = objectUrl;
         a.download = sanitizeFileName(fileName);
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
+        URL.revokeObjectURL(objectUrl);
         return;
       }
 
@@ -98,19 +135,22 @@ export default function SharedFileViewPage() {
   const cardBg = theme.surface;
 
   return (
-    <View style={{ flex: 1, backgroundColor: headerBg, padding: 16 }}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+    <SafeAreaView edges={['top']} style={{ flex: 1, backgroundColor: headerBg }}>
+      <View style={{ flex: 1, padding: 16 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 12 }}>
+        {Platform.OS === 'web' ? (
+          <TouchableOpacity
+            onPress={tryOpenNativeApp}
+            style={{ marginRight: 10, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, backgroundColor: cardBg, borderWidth: 1, borderColor: theme.border }}
+          >
+            <Text style={{ color: theme.text, fontWeight: '600' }}>Open in app</Text>
+          </TouchableOpacity>
+        ) : null}
         <TouchableOpacity
-          onPress={() => {
-            try {
-              router.back();
-            } catch {
-              router.replace('/(tabs)');
-            }
-          }}
+          onPress={() => router.replace('/(tabs)')}
           style={{ paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, backgroundColor: cardBg, borderWidth: 1, borderColor: theme.border }}
         >
-          <Text style={{ color: theme.text, fontWeight: '600' }}>Back</Text>
+          <Text style={{ color: theme.text, fontWeight: '600' }}>Close</Text>
         </TouchableOpacity>
       </View>
 
@@ -145,9 +185,11 @@ export default function SharedFileViewPage() {
             thumbnailUrl={thumbnailUrl}
             onDownload={handleDownload}
             remoteFileUrl={fileUrl}
+            previewHeight={450}
           />
         </View>
       )}
-    </View>
+      </View>
+    </SafeAreaView>
   );
 }

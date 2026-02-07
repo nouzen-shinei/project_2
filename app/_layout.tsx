@@ -77,7 +77,8 @@ if (typeof document !== 'undefined') {
         'https://*.firebasedatabase.app',
         'https://tution-app-6c0c3.firebaseapp.com',
         'https://checkout.razorpay.com',
-        'https://api.razorpay.com'
+        'https://api.razorpay.com',
+        'https://firebasestorage.googleapis.com'
       ]
     });
   } catch {}
@@ -182,7 +183,23 @@ export default function RootLayout() {
   const segmentsRef = useRef(segments);
   const [hasRedirected, setHasRedirected] = useState(false);
 
-  const isPublicRoute = Array.isArray(segments) && (segments[0] === 'l' || segments[0] === 'shared');
+  const isPublicRoute = (() => {
+    if (Array.isArray(segments) && segments.length > 0) {
+      return segments[0] === 'l' || segments[0] === 'shared' || segments[0] === 'invite';
+    }
+
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      const path = window.location.pathname.toLowerCase();
+      return (
+        path === '/l' ||
+        path.startsWith('/l/') ||
+        path.startsWith('/shared') ||
+        path.startsWith('/invite')
+      );
+    }
+
+    return false;
+  })();
 
   // Load runtime backend endpoints (Firestore + cache) early.
   useEffect(() => {
@@ -448,8 +465,11 @@ export default function RootLayout() {
             <ModalAlertProvider>
               <Stack screenOptions={{ headerShown: false }}>
                 <Stack.Screen name="l" options={{ headerShown: false }} />
+                <Stack.Screen name="s/index" options={{ headerShown: false }} />
+                <Stack.Screen name="s/[token]" options={{ headerShown: false }} />
                 <Stack.Screen name="shared/index" options={{ headerShown: false }} />
                 <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
+                <Stack.Screen name="invite/[token]" options={{ headerShown: false }} />
                 <Stack.Screen name="+not-found" options={{ headerShown: false }} />
               </Stack>
               <ReloginRequiredModal />

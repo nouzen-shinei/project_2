@@ -1,7 +1,19 @@
 import { logger } from '@/lib/logger';
 import React, { useMemo, useState, useCallback, useEffect } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Alert, Linking, Platform, Image } from 'react-native';
-import { Download, Share, ExternalLink, Eye } from 'lucide-react-native';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  Linking,
+  Platform,
+  Image,
+  Modal,
+  SafeAreaView,
+  useWindowDimensions,
+} from 'react-native';
+import { Download, Share, ExternalLink, Eye, X } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
 import {
   getFileTypeInfo,
@@ -18,6 +30,7 @@ import { CodeViewer } from './CodeViewer';
 import { ShareModal } from './ShareModal';
 import { AudioPlayer } from './AudioPlayer';
 import VideoPlayer from './VideoPlayer';
+import ProgressiveImage from './ui/ProgressiveImage';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
 
@@ -64,6 +77,7 @@ interface FileViewerProps {
   onDownload?: () => void;
   onShare?: () => void;
   remoteFileUrl?: string;
+  previewHeight?: number;
 }
 
 export function FileViewer({
@@ -76,6 +90,7 @@ export function FileViewer({
   onDownload,
   onShare,
   remoteFileUrl,
+  previewHeight,
 }: FileViewerProps) {
   const { theme } = useTheme();
   const fileInfo = getFileTypeInfo(fileType, fileName);
@@ -103,6 +118,7 @@ export function FileViewer({
         onDownload={onDownload}
         onShare={onShare}
         remoteFileUrl={downloadSource}
+        previewHeight={previewHeight}
       />
     );
   }
@@ -119,7 +135,7 @@ export function FileViewer({
     );
   }
 
-  if (isVideoFile(fileType)) {
+  if (isVideoFile(fileType, fileName)) {
     return (
       <VideoPlayer
         uri={fileUrl}
@@ -132,14 +148,12 @@ export function FileViewer({
     );
   }
 
-  if (isImageFile(fileType)) {
+  if (isImageFile(fileType, fileName)) {
     return (
-      <MemoizedGenericFileViewer
+      <ImageAttachmentViewer
         fileUrl={fileUrl}
         fileName={fileName}
-        fileType={fileType}
         fileSize={fileSize}
-        fileInfo={fileInfo}
         onDownload={onDownload}
         onShare={onShare}
         remoteFileUrl={downloadSource}
@@ -180,6 +194,17 @@ interface GenericFileViewerProps {
   remoteFileUrl?: string;
 }
 
+interface ImageAttachmentViewerProps {
+  fileUrl: string;
+  fileName: string;
+  fileSize?: number;
+  onDownload?: () => void;
+  onShare?: () => void;
+  thumbnailUrl?: string;
+  isPreviewAsset?: boolean;
+  remoteFileUrl?: string;
+}
+
 type ThemeShape = ReturnType<typeof useTheme>['theme'];
 
 const getCategoryDescription = (category: string): string => {
@@ -207,6 +232,9 @@ const createGenericFileViewerStyles = (
       marginVertical: 8,
       borderWidth: 1,
       borderColor: theme.border,
+      width: '100%',
+      // maxWidth: 720,
+      alignSelf: 'center',
     },
     header: {
       flexDirection: 'row',
@@ -238,6 +266,7 @@ const createGenericFileViewerStyles = (
       fontWeight: '600',
       color: theme.text,
       marginBottom: 4,
+      flexWrap: 'wrap',
     },
     fileType: {
       fontSize: 12,
@@ -253,6 +282,7 @@ const createGenericFileViewerStyles = (
     actions: {
       flexDirection: 'row',
       justifyContent: 'space-between',
+      width: '100%',
     },
     primaryButton: {
       backgroundColor: canOpen ? theme.primary : theme.border,
@@ -324,6 +354,153 @@ const createGenericFileViewerStyles = (
     },
   });
 
+const createImageViewerStyles = (theme: ThemeShape) =>
+  StyleSheet.create({
+    container: {
+      backgroundColor: theme.surface,
+      borderRadius: 12,
+      padding: 12,
+      marginVertical: 8,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: 'center',
+      width: '100%',
+      // maxWidth: 720,
+      alignSelf: 'center',
+    },
+    imageWrapper: {
+      borderRadius: 12,
+      overflow: 'hidden',
+      backgroundColor: theme.background,
+    },
+    image: {
+      width: '100%',
+      height: '100%',
+    },
+    metaRow: {
+      marginTop: 10,
+      width: '100%',
+    },
+    fileName: {
+      fontSize: 15,
+      fontWeight: '600',
+      color: theme.text,
+      flexWrap: 'wrap',
+    },
+    fileSize: {
+      marginTop: 4,
+      fontSize: 13,
+      color: theme.textSecondary,
+    },
+    actions: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      marginTop: 12,
+      width: '100%',
+    },
+    primaryButton: {
+      backgroundColor: theme.primary,
+      borderRadius: 8,
+      paddingVertical: 10,
+      paddingHorizontal: 18,
+      flexDirection: 'row',
+      alignItems: 'center',
+      flex: 1,
+      justifyContent: 'center',
+      marginRight: 8,
+    },
+    primaryButtonText: {
+      color: 'white',
+      fontSize: 15,
+      fontWeight: '600',
+      marginLeft: 8,
+    },
+    actionButtons: {
+      flexDirection: 'row',
+      gap: 8,
+    },
+    actionButton: {
+      padding: 12,
+      borderRadius: 8,
+      backgroundColor: theme.background,
+      borderWidth: 1,
+      borderColor: theme.border,
+    },
+    previewBadge: {
+      position: 'absolute',
+      top: 10,
+      left: 10,
+      backgroundColor: 'rgba(0, 0, 0, 0.55)',
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      borderRadius: 999,
+    },
+    previewBadgeText: {
+      color: 'white',
+      fontSize: 11,
+      fontWeight: '600',
+      letterSpacing: 0.4,
+    },
+    modalBackdrop: {
+      flex: 1,
+      backgroundColor: 'rgba(0, 0, 0, 0.86)',
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    modalContainer: {
+      flex: 1,
+      width: '100%',
+    },
+    modalHeader: {
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    modalTitle: {
+      color: 'white',
+      fontSize: 16,
+      fontWeight: '600',
+      flex: 1,
+      marginRight: 12,
+    },
+    modalCloseButton: {
+      padding: 6,
+      borderRadius: 999,
+      backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    },
+    modalImageWrapper: {
+      flex: 1,
+      paddingHorizontal: 16,
+      paddingBottom: 24,
+    },
+    modalImage: {
+      width: '100%',
+      height: '100%',
+    },
+    modalActions: {
+      flexDirection: 'row',
+      justifyContent: 'center',
+      gap: 12,
+      paddingBottom: 20,
+    },
+    modalActionButton: {
+      paddingVertical: 10,
+      paddingHorizontal: 18,
+      borderRadius: 999,
+      backgroundColor: 'rgba(255, 255, 255, 0.15)',
+      flexDirection: 'row',
+      alignItems: 'center',
+    },
+    modalActionText: {
+      color: 'white',
+      fontSize: 14,
+      fontWeight: '600',
+      marginLeft: 8,
+    },
+  });
+
 const areGenericFileViewerPropsEqual = (
   prev: GenericFileViewerProps,
   next: GenericFileViewerProps
@@ -354,6 +531,122 @@ const MemoizedGenericFileViewer = React.memo(
   GenericFileViewerInner,
   areGenericFileViewerPropsEqual
 );
+
+function ImageAttachmentViewer({
+  fileUrl,
+  fileName,
+  fileSize,
+  onDownload,
+  onShare,
+  thumbnailUrl,
+  isPreviewAsset,
+  remoteFileUrl,
+}: ImageAttachmentViewerProps) {
+  const { theme } = useTheme();
+  const { width } = useWindowDimensions();
+  const [showModal, setShowModal] = useState(false);
+  const [showShareModal, setShowShareModal] = useState(false);
+
+  const remoteUrl = remoteFileUrl || fileUrl;
+  const previewOnly = Boolean(isPreviewAsset && remoteFileUrl && remoteFileUrl !== fileUrl);
+  const previewUri = thumbnailUrl || fileUrl;
+  const fullUri = previewOnly ? remoteUrl : fileUrl;
+  const isLocalTarget = Platform.OS !== 'web' && fullUri.startsWith('file://');
+  const shareUrl = isLocalTarget ? fullUri : remoteUrl;
+
+  const cardWidth = Math.min(Math.max(width * 0.78, 240), 420);
+  const cardHeight = Math.min(320, Math.round(cardWidth * 0.7));
+
+  const styles = useMemo(() => createImageViewerStyles(theme), [theme]);
+
+  const handleDownload = () => {
+    if (onDownload) {
+      onDownload();
+    } else {
+      Alert.alert('Download', 'Download functionality not implemented');
+    }
+  };
+
+  const handleShare = () => {
+    setShowShareModal(true);
+  };
+
+  return (
+    <View style={styles.container}>
+      <TouchableOpacity
+        style={[styles.imageWrapper, { width: cardWidth, height: cardHeight }]}
+        activeOpacity={0.9}
+        onPress={() => setShowModal(true)}
+      >
+        <ProgressiveImage uri={previewUri} style={styles.image} resizeMode="cover" />
+        {previewOnly && (
+          <View style={styles.previewBadge}>
+            <Text style={styles.previewBadgeText}>Preview</Text>
+          </View>
+        )}
+      </TouchableOpacity>
+
+      <View style={styles.metaRow}>
+        <Text style={styles.fileName}>{fileName}</Text>
+        {fileSize ? <Text style={styles.fileSize}>{formatFileSize(fileSize)}</Text> : null}
+      </View>
+
+      <View style={styles.actions}>
+        <TouchableOpacity style={styles.primaryButton} onPress={() => setShowModal(true)}>
+          <Eye size={18} color="white" />
+          <Text style={styles.primaryButtonText}>View</Text>
+        </TouchableOpacity>
+
+        <View style={styles.actionButtons}>
+          <TouchableOpacity style={styles.actionButton} onPress={handleDownload}>
+            <Download size={20} color={theme.textSecondary} />
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
+            <Share size={20} color={theme.textSecondary} />
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <Modal visible={showModal} transparent animationType="fade" onRequestClose={() => setShowModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <SafeAreaView style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle} numberOfLines={1}>{fileName}</Text>
+              <TouchableOpacity
+                style={styles.modalCloseButton}
+                onPress={() => setShowModal(false)}
+              >
+                <X size={18} color="white" />
+              </TouchableOpacity>
+            </View>
+            <View style={styles.modalImageWrapper}>
+              <ProgressiveImage uri={fullUri} style={styles.modalImage} resizeMode="contain" />
+            </View>
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={styles.modalActionButton} onPress={handleDownload}>
+                <Download size={18} color="white" />
+                <Text style={styles.modalActionText}>Download</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalActionButton} onPress={handleShare}>
+                <Share size={18} color="white" />
+                <Text style={styles.modalActionText}>Share</Text>
+              </TouchableOpacity>
+            </View>
+          </SafeAreaView>
+        </View>
+      </Modal>
+
+      <ShareModal
+        visible={showShareModal}
+        onClose={() => setShowShareModal(false)}
+        fileUrl={shareUrl}
+        fileName={fileName}
+        fileSize={fileSize}
+        onDownload={onDownload}
+      />
+    </View>
+  );
+}
 
 function GenericFileViewerInner({
   fileUrl,

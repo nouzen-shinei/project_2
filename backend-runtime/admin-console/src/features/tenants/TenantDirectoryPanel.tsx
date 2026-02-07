@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Building2, Copy, Download, RefreshCcw, Search, X } from 'lucide-react';
 import { SectionCard } from '../../components/SectionCard';
 import {
@@ -1478,9 +1478,17 @@ export function TenantDirectoryPanel() {
     setCheckoutNotice(null);
     try {
       const checkoutPlanId = selectedPlanId === 'free' ? 'pro' : selectedPlanId;
+      const checkoutPlanVariantId =
+        billingSummary?.planVariantId ||
+        billingPlanOptions
+          .filter((plan) => plan.planId === checkoutPlanId && plan.active)
+          .slice()
+          .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0))
+          .map((plan) => plan.id)[0];
       const response = await startBillingCheckout({
         tenantId: inspectorTenant.id,
         planId: checkoutPlanId,
+        ...(checkoutPlanVariantId ? { planVariantId: checkoutPlanVariantId } : {}),
         provider: 'razorpay',
         successUrl: typeof window !== 'undefined' ? window.location.origin : undefined,
         cancelUrl: typeof window !== 'undefined' ? window.location.origin : undefined,
@@ -1503,7 +1511,7 @@ export function TenantDirectoryPanel() {
     } finally {
       setCheckoutLoading(false);
     }
-  }, [inspectorTenant, selectedPlanId]);
+  }, [billingPlanOptions, billingSummary?.planVariantId, inspectorTenant, selectedPlanId]);
 
   useEffect(() => {
     if (!inspectorTenant) {
@@ -2849,8 +2857,8 @@ export function TenantDirectoryPanel() {
                     const isDevicesExpanded = emailKey ? Boolean(memberDeviceExpandedByEmail[emailKey]) : false;
                     const devicePanel = emailKey ? memberDevicesByEmail[emailKey] : null;
                     return (
-                      <>
-                        <tr key={member.id}>
+                      <Fragment key={member.id}>
+                        <tr>
                           <td>
                             <strong>{member.displayName || member.email || 'Unnamed member'}</strong>
                             {member.email && <p className="muted small-text">{member.email}</p>}
@@ -2989,7 +2997,7 @@ export function TenantDirectoryPanel() {
                             </td>
                           </tr>
                         )}
-                      </>
+                      </Fragment>
                     );
                   })}
                 </tbody>

@@ -145,7 +145,7 @@ export function FileViewer({
   }
 
   // For video files, show message text and video placeholder
-  if (isVideoFile(fileType)) {
+  if (isVideoFile(fileType, fileName)) {
     return (
       <View>
         {/* Message text above video player (if present) */}
@@ -217,7 +217,7 @@ export function FileViewer({
   }
 
   // For images, show message text above the image
-  if (isImageFile(fileType)) {
+  if (isImageFile(fileType, fileName)) {
     return (
       <View>
         {/* Message text above image (if present) */}
