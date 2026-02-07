@@ -162,6 +162,95 @@ export const FileDownloadUtil = {
     }
   },
 
+  async downloadFileWithProgress(
+    fileUrl: string,
+    fileName: string,
+    onProgress?: (percent: number) => void
+  ): Promise<boolean> {
+    if (Platform.OS !== 'web') {
+      return false;
+    }
+
+    const reportProgress = (percent: number) => {
+      if (!onProgress) return;
+      const bounded = Math.max(0, Math.min(100, Math.round(percent)));
+      onProgress(bounded);
+    };
+
+    try {
+      const cleanFileName = this.extractCleanFileName(fileUrl, fileName);
+
+      if (fileUrl.startsWith('blob:') || fileUrl.startsWith('data:')) {
+        reportProgress(100);
+        const link = document.createElement('a');
+        link.href = fileUrl;
+        link.download = cleanFileName;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return true;
+      }
+
+      const response = await fetch(fileUrl);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const totalBytes = Number(response.headers.get('content-length') || 0);
+      const hasStream = Boolean(response.body && typeof response.body.getReader === 'function');
+
+      if (!hasStream) {
+        const blobFallback = await response.blob();
+        reportProgress(100);
+        const objectUrl = URL.createObjectURL(blobFallback);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = cleanFileName;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        return true;
+      }
+
+      const reader = response.body!.getReader();
+      const chunks: Uint8Array[] = [];
+      let receivedBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          receivedBytes += value.length;
+          if (totalBytes > 0) {
+            const pct = Math.floor((receivedBytes / totalBytes) * 100);
+            reportProgress(Math.min(99, pct));
+          }
+        }
+      }
+
+      const blobParts = chunks.map((chunk) => Uint8Array.from(chunk));
+      const blob = new Blob(blobParts);
+      reportProgress(100);
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = cleanFileName;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      return true;
+    } catch (error) {
+      logger.error('Download failed:', error);
+      throw error;
+    }
+  },
+
   async checkFileAccessibility(fileUrl: string): Promise<boolean> {
     const availability = await this.checkFileAvailability(fileUrl);
     return availability === 'ok';

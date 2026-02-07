@@ -65,12 +65,16 @@ import RichEditText from '../../components/RichEditText';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useFrameTimingMonitor } from '../../hooks/useFrameTimingMonitor';
 import { getChatPaginationProfile } from '@/lib/chatPaginationConfig';
+import { clearDownloadState, setDownloadState } from '@/lib/downloadStateStore';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { useRouter } from 'expo-router';
 import { tenantService } from '@/services/tenantService';
 import TenantRoleBadge from '@/components/TenantRoleBadge';
 import { normalizeSharedFileName } from '@/services/sharedFileService';
+import { useDownloadState } from '@/hooks/useDownloadState';
+import { setEditingMessageId, setMessageReactionsForMessage } from '@/lib/messageUiStateStore';
+import { useMessageUiState } from '@/hooks/useMessageUiState';
 
 export default function Chat() {
   const { theme, isDarkMode } = useTheme();
@@ -97,7 +101,7 @@ export default function Chat() {
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const sendInFlightRef = useRef(false);
   const [pendingMessages, setPendingMessages] = useState<Map<string, PendingMessage>>(new Map());
-  const [pendingMedia, setPendingMedia] = useState<Map<string, any>>(new Map());
+  const [pendingMedia, setPendingMedia] = useState<Map<string, PendingMediaItem>>(new Map());
   const [pendingAttachments, setPendingAttachments] = useState<Map<string, PendingAttachmentItem>>(new Map());
   const attachmentUploadCancelMap = useRef<Map<string, () => void | Promise<void>>>(new Map());
   const attachmentFinalizeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -324,7 +328,7 @@ export default function Chat() {
     status: 'sending' | 'failed' | 'queued';
     mime?: string;
     source?: 'keyboard' | 'picker';
-  progress?: number; // 0-100 upload progress for local uploads
+    progress?: number; // 0-100 upload progress for local uploads
   }
 
   interface PendingAttachmentItem {
@@ -352,7 +356,7 @@ export default function Chat() {
     if (m.includes('gif') || /\.gif(\?|$)/.test(u)) return 'gif';
     return 'sticker';
   };
-  
+
   // Chat data for selected member
   const {
     messages = [],
@@ -370,7 +374,7 @@ export default function Chat() {
     editMessage: editChatMessage,
     deleteMessage: deleteChatMessage,
   } = useChat(selectedTeamMember?.id, { live: isFocused && isAppActive });
-  // Animation state for new messages
+
   const [animatedMessages, setAnimatedMessages] = useState<Set<string>>(new Set());
   const [previousMessageIds, setPreviousMessageIds] = useState<Set<string>>(new Set());
   
@@ -387,9 +391,8 @@ export default function Chat() {
   const [chatProfileModalVisible, setChatProfileModalVisible] = useState(false);
 
   // Message reactions state with proper typing for any emoji
-  const [messageReactions, setMessageReactions] = useState<Map<string, {
-    [key: string]: Set<string>
-  }>>(new Map());
+  const messageReactionsRef = useRef<Map<string, { [key: string]: Set<string> }>>(new Map());
+  const reactionOptimisticUntilRef = useRef<Map<string, number>>(new Map());
 
   // Emoji picker state for all messages
   // Tenor fallback for sticker URLs on native (webp -> gif)
@@ -495,14 +498,6 @@ export default function Chat() {
   const [selectedMessageForAction, setSelectedMessageForAction] = useState<any | null>(null);
   const [editingMessageInfo, setEditingMessageInfo] = useState<{ id: string; originalText: string } | null>(null);
   const [pendingMessageActions, setPendingMessageActions] = useState<Set<string>>(new Set());
-  // Force FlashList rows to re-render when reactions or editing state change
-  const flashListExtraData = useMemo(
-    () => ({
-      reactions: messageReactions,
-      editingMessageId: editingMessageInfo?.id ?? null,
-    }),
-    [messageReactions, editingMessageInfo?.id]
-  );
 
   const buildDisplayKey = useCallback((message: any): string => {
     if (!message) {
@@ -544,8 +539,88 @@ export default function Chat() {
     return `fallback:${sender}|${recipient}|${timestamp}|${text}|${attachmentsSignature}|${gifUrl}|${stickerUrl}`;
   }, []);
 
+  const normalizeMessageId = useCallback((id: any): string => {
+    if (id === null || id === undefined) {
+      return '';
+    }
+    return String(id);
+  }, []);
+
+  const shouldKeepOptimisticReactions = useCallback(
+    (messageId: string) => {
+      if (!messageId) return false;
+      const until = reactionOptimisticUntilRef.current.get(messageId);
+      if (!until) return false;
+      if (until > Date.now()) return true;
+      reactionOptimisticUntilRef.current.delete(messageId);
+      return false;
+    },
+    []
+  );
+
+  const stableMessageCacheRef = useRef<Map<string, { signature: string; message: any }>>(new Map());
+  const stableDisplayedMessagesRef = useRef<any[]>([]);
+
+  const getMessageRenderSignature = useCallback((message: any): string => {
+    if (!message) {
+      return '';
+    }
+
+    const sender = typeof message.sender === 'string' ? message.sender.toLowerCase() : '';
+    const recipient = typeof message.recipientId === 'string' ? message.recipientId.toLowerCase() : '';
+
+    let timestamp = '';
+    const rawTimestamp = (message as any)?.timestamp;
+    if (typeof rawTimestamp === 'string') {
+      timestamp = rawTimestamp;
+    } else if (rawTimestamp instanceof Date) {
+      timestamp = rawTimestamp.toISOString();
+    } else if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)) {
+      timestamp = new Date(rawTimestamp).toISOString();
+    } else if (rawTimestamp && typeof rawTimestamp.toDate === 'function') {
+      try {
+        timestamp = rawTimestamp.toDate().toISOString();
+      } catch {
+        timestamp = '';
+      }
+    }
+
+    const text = typeof message.text === 'string' ? message.text : '';
+    const editCount = typeof message.editCount === 'number' ? String(message.editCount) : '';
+    const editedAt = message.editedAt ? String(message.editedAt) : '';
+    const deleted = message.deleted ? '1' : '0';
+    const delivered = message.delivered ? '1' : '0';
+    const read = message.read ? '1' : '0';
+    const isSpecial = message.isSpecial ? '1' : '0';
+    const gifUrl = typeof message?.gif?.url === 'string' ? message.gif.url : '';
+    const stickerUrl = typeof message?.sticker?.url === 'string' ? message.sticker.url : '';
+    const attachmentsSignature = Array.isArray(message.attachments)
+      ? (message.attachments as (HydratedAttachment | FileAttachment | { url?: string; fileName?: string; fileType?: string; fileSize?: number; resolvedUrl?: string })[])
+          .map((att) => `${att?.url ?? ''}:${(att as any)?.resolvedUrl ?? ''}:${att?.fileName ?? ''}:${att?.fileType ?? ''}:${att?.fileSize ?? ''}`)
+          .join(',')
+      : '';
+
+    return [
+      sender,
+      recipient,
+      timestamp,
+      text,
+      editCount,
+      editedAt,
+      deleted,
+      delivered,
+      read,
+      isSpecial,
+      gifUrl,
+      stickerUrl,
+      attachmentsSignature,
+    ].join('|');
+  }, []);
+
   const displayedMessages = useMemo(() => {
     if (!Array.isArray(messages) || messages.length === 0) {
+      stableMessageCacheRef.current = new Map();
+      stableDisplayedMessagesRef.current = [];
       return [] as any[];
     }
 
@@ -578,11 +653,36 @@ export default function Chat() {
       }
     });
 
-    const result = Array.from(deduped.values());
+    const nextCache = new Map<string, { signature: string; message: any }>();
+    const result = Array.from(deduped.entries()).map(([key, message]) => {
+      const stableKey = message?.id != null
+        ? `id:${String(message.id)}`
+        : message?.localId != null
+          ? `local:${String(message.localId)}`
+          : `display:${key}`;
+      const signature = getMessageRenderSignature(message);
+      const cached = stableMessageCacheRef.current.get(stableKey);
+      if (cached && cached.signature === signature) {
+        nextCache.set(stableKey, cached);
+        return cached.message;
+      }
+      const entry = { signature, message };
+      nextCache.set(stableKey, entry);
+      return message;
+    });
+
     result.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
+    stableMessageCacheRef.current = nextCache;
+
+    const previous = stableDisplayedMessagesRef.current;
+    if (previous.length === result.length && previous.every((msg, index) => msg === result[index])) {
+      return previous;
+    }
+
+    stableDisplayedMessagesRef.current = result;
     return result;
-  }, [messages, buildDisplayKey]);
+  }, [messages, buildDisplayKey, getMessageRenderSignature]);
 
   const getMessageItemType = useCallback((item: any) => {
     if (!item) return 'unknown';
@@ -637,17 +737,17 @@ export default function Chat() {
 
   useEffect(() => {
     if (!selectedTeamMember?.id) {
-      setMessageReactions(new Map());
+      setLocalMessageReactions(() => new Map());
       return;
     }
 
     const visibleIds = new Set(
       displayedMessages
-        .map((msg: any) => msg?.id)
-        .filter((id: any): id is string => typeof id === 'string')
+        .map((msg: any) => normalizeMessageId(msg?.id))
+        .filter((id: string) => id.length > 0)
     );
 
-    setMessageReactions(prev => {
+    setLocalMessageReactions(prev => {
       if (prev.size === 0) {
         return prev;
       }
@@ -748,8 +848,51 @@ export default function Chat() {
   const [lastViewedRemoteImage, setLastViewedRemoteImage] = useState<string | undefined>(undefined);
   const [brokenFileUrls, setBrokenFileUrls] = useState<Set<string>>(new Set());
   const [networkErrorUrls, setNetworkErrorUrls] = useState<Set<string>>(new Set());
+  const downloadingUrlsRef = useRef<Set<string>>(new Set());
   const [fileValidationCache] = useState<Map<string, number>>(new Map()); // Cache file validation results
   const [showImageShareModal, setShowImageShareModal] = useState(false);
+
+  const syncMessageReactions = useCallback(
+    (prev: Map<string, { [key: string]: Set<string> }>, next: Map<string, { [key: string]: Set<string> }>) => {
+      const changedIds = new Set<string>();
+
+      next.forEach((value, key) => {
+        if (prev.get(key) !== value) {
+          changedIds.add(key);
+        }
+      });
+
+      prev.forEach((_value, key) => {
+        if (!next.has(key)) {
+          changedIds.add(key);
+        }
+      });
+
+      changedIds.forEach((messageId) => {
+        setMessageReactionsForMessage(messageId, next.get(messageId));
+      });
+    },
+    []
+  );
+
+  const setLocalMessageReactions = useCallback(
+    (updater: (prev: Map<string, { [key: string]: Set<string> }>) => Map<string, { [key: string]: Set<string> }>) => {
+      const prev = messageReactionsRef.current;
+      const next = updater(prev);
+      if (next === prev) {
+        return;
+      }
+      messageReactionsRef.current = next;
+      syncMessageReactions(prev, next);
+    },
+    [syncMessageReactions]
+  );
+
+  useEffect(() => {
+    setEditingMessageId(editingMessageInfo?.id ?? null);
+  }, [editingMessageInfo?.id]);
+
+  // Intentionally avoid tying list re-renders to reactions/editing to prevent media interruptions.
   
   // ——— Viewability/prefetch dependencies kept in refs so the handler identity stays stable ———
   const effectiveUser = user || currentUser;
@@ -1320,10 +1463,11 @@ export default function Chat() {
 
   // Handle emoji reactions with Firebase Realtime Database integration
   const handleReaction = async (messageId: string, reactionType: string) => {
-    if (!effectiveUser?.email || !messageId) {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!effectiveUser?.email || !normalizedMessageId) {
       logger.warn('Missing required data for reaction:', { 
         userEmail: !!effectiveUser?.email, 
-        messageId: !!messageId 
+        messageId: !!normalizedMessageId 
       });
       return;
     }
@@ -1331,11 +1475,11 @@ export default function Chat() {
     const userEmail = effectiveUser.email;
     
     // Check if this is a special message
-    const message = messages.find(m => m.id === messageId);
+    const message = messages.find(m => normalizeMessageId(m?.id) === normalizedMessageId);
     const isSpecialMessage = message?.isSpecial === true;
     
     logger.debug('🎯 Reaction Debug Info:', {
-      messageId,
+      messageId: normalizedMessageId,
       messageFound: !!message,
       isSpecial: message?.isSpecial,
       isSpecialMessage,
@@ -1345,9 +1489,11 @@ export default function Chat() {
     
     try {
       // Update local state immediately for responsive UI
-      setMessageReactions(prevReactions => {
+      reactionOptimisticUntilRef.current.set(normalizedMessageId, Date.now() + 1500);
+      setLocalMessageReactions(prevReactions => {
         const newReactions = new Map(prevReactions);
-        const messageReaction = newReactions.get(messageId) || {};
+        const baseReaction = newReactions.get(normalizedMessageId) || {};
+        const messageReaction: { [key: string]: Set<string> } = { ...baseReaction };
         
         if (isSpecialMessage) {
           // For special messages: handle multiple reactions per user
@@ -1361,23 +1507,25 @@ export default function Chat() {
           });
           
           // Check if user already has this specific reaction
-          const hasThisReaction = messageReaction[reactionType] && 
-                                  (messageReaction[reactionType] as Set<string>).has(userEmail);
+          const existingSet = messageReaction[reactionType];
+          const hasThisReaction = existingSet && (existingSet as Set<string>).has(userEmail);
           
           if (hasThisReaction) {
             // Remove this specific reaction (toggle off)
             logger.debug('🔄 Removing specific reaction for special message');
-            messageReaction[reactionType].delete(userEmail);
-            if (messageReaction[reactionType].size === 0) {
+            const nextSet = new Set(existingSet as Set<string>);
+            nextSet.delete(userEmail);
+            if (nextSet.size === 0) {
               delete messageReaction[reactionType];
+            } else {
+              messageReaction[reactionType] = nextSet;
             }
           } else {
             // Add this reaction (don't remove others)
             logger.debug('✅ Adding new reaction for special message');
-            if (!messageReaction[reactionType]) {
-              messageReaction[reactionType] = new Set();
-            }
-            messageReaction[reactionType].add(userEmail);
+            const nextSet = new Set((existingSet as Set<string>) ?? []);
+            nextSet.add(userEmail);
+            messageReaction[reactionType] = nextSet;
           }
         } else {
           // For regular messages: only one reaction per user (existing behavior)
@@ -1392,38 +1540,46 @@ export default function Chat() {
           
           // If user is selecting the same reaction they already have, remove it
           if (currentUserReaction === reactionType) {
-            messageReaction[reactionType].delete(userEmail);
-            if (messageReaction[reactionType].size === 0) {
+            const existingSet = messageReaction[reactionType] as Set<string> | undefined;
+            const nextSet = new Set(existingSet ?? []);
+            nextSet.delete(userEmail);
+            if (nextSet.size === 0) {
               delete messageReaction[reactionType];
+            } else {
+              messageReaction[reactionType] = nextSet;
             }
           } else {
             // Remove user's previous reaction if they had one
             if (currentUserReaction) {
-              messageReaction[currentUserReaction].delete(userEmail);
-              if (messageReaction[currentUserReaction].size === 0) {
+              const previousSet = messageReaction[currentUserReaction] as Set<string> | undefined;
+              const nextPrevSet = new Set(previousSet ?? []);
+              nextPrevSet.delete(userEmail);
+              if (nextPrevSet.size === 0) {
                 delete messageReaction[currentUserReaction];
+              } else {
+                messageReaction[currentUserReaction] = nextPrevSet;
               }
             }
             
             // Add new reaction
-            if (!messageReaction[reactionType]) {
-              messageReaction[reactionType] = new Set();
-            }
-            messageReaction[reactionType].add(userEmail);
+            const nextSet = new Set((messageReaction[reactionType] as Set<string>) ?? []);
+            nextSet.add(userEmail);
+            messageReaction[reactionType] = nextSet;
           }
         }
         
         if (Object.keys(messageReaction).length === 0) {
-          newReactions.delete(messageId);
+          // Keep an explicit empty entry during optimistic window so removals stay visible.
+          newReactions.set(normalizedMessageId, {});
         } else {
-          newReactions.set(messageId, messageReaction);
+          newReactions.set(normalizedMessageId, messageReaction);
         }
         
         return newReactions;
       });
 
       // Save to Firebase Realtime Database
-      const updatedUsers = await chatService.toggleMessageReaction(messageId, reactionType, userEmail);
+      const updatedUsers = await chatService.toggleMessageReaction(normalizedMessageId, reactionType, userEmail);
       
   // Close emoji picker after selection
   setEmojiPickerVisible(false);
@@ -1431,7 +1587,7 @@ export default function Chat() {
   setSelectedMessageForAction(null);
       
       logger.debug('✅ Reaction updated successfully:', { 
-        messageId, 
+        messageId: normalizedMessageId, 
         reactionType, 
         users: updatedUsers 
       });
@@ -1466,11 +1622,7 @@ export default function Chat() {
       // Revert local state on error - this is complex because we need to restore the previous state
       // For simplicity, we'll just refresh the reactions from the server
       // In a production app, you might want to implement more sophisticated rollback logic
-      setMessageReactions(prevReactions => {
-        // Return the previous state unchanged since we can't easily revert the complex logic
-        // The server state will be the source of truth and will be updated via the real-time listener
-        return prevReactions;
-      });
+      setLocalMessageReactions(prevReactions => prevReactions);
       
       Toast.show({
         type: 'error',
@@ -1504,8 +1656,9 @@ export default function Chat() {
   // Handle long press on message to show emoji picker
   const handleMessageLongPress = (messageId: string, event: any) => {
     const { pageX, pageY } = event.nativeEvent;
-    const targetMessage = (messages || []).find((m: any) => m && m.id === messageId) || null;
-    setSelectedMessageForReaction(messageId);
+    const normalizedMessageId = normalizeMessageId(messageId);
+    const targetMessage = (messages || []).find((m: any) => m && normalizeMessageId(m.id) === normalizedMessageId) || null;
+    setSelectedMessageForReaction(normalizedMessageId);
     setSelectedMessageForAction(targetMessage);
     setReactionPickerPosition({ x: pageX, y: pageY });
     setEmojiPickerVisible(true);
@@ -1519,13 +1672,18 @@ export default function Chat() {
 
   // Quick reaction with double tap
   const handleQuickReaction = async (messageId: string) => {
-    await handleReaction(messageId, '❤️');
+    await handleReaction(normalizeMessageId(messageId), '❤️');
   };
 
   // Get reaction status for a message
-  const getReactionStatus = (messageId: string, reactionType: string) => {
-    if (!messageId || !reactionType) return { count: 0, hasUserReacted: false, users: [] };
-    const reactions = messageReactions.get(messageId);
+  const getReactionStatus = (
+    messageId: string,
+    reactionType: string,
+    reactionsOverride?: { [key: string]: Set<string> }
+  ) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId || !reactionType) return { count: 0, hasUserReacted: false, users: [] };
+    const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
     if (!reactions || !reactions[reactionType]) return { count: 0, hasUserReacted: false, users: [] };
     
     const reactionSet = reactions[reactionType];
@@ -1542,12 +1700,14 @@ export default function Chat() {
   };
 
   // Get the user's current reaction(s) for a message
-  const getUserCurrentReaction = (messageId: string) => {
+  const getUserCurrentReaction = (messageId: string, reactionsOverride?: { [key: string]: Set<string> }) => {
     if (!effectiveUser?.email) return null;
-    
-    const message = messages.find(m => m.id === messageId);
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId) return null;
+
+    const message = messages.find(m => normalizeMessageId(m?.id) === normalizedMessageId);
     const isSpecialMessage = message?.isSpecial === true;
-    const reactions = messageReactions.get(messageId);
+    const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
     if (!reactions) return null;
     
     // For special messages, return array of all user's reactions
@@ -1572,13 +1732,18 @@ export default function Chat() {
   };
 
   // Check if both sender and receiver reacted (for glow effect)
-  const shouldGlow = (messageId: string, reactionType: string) => {
-    if (!messageId || !reactionType || !selectedTeamMember) return false;
+  const shouldGlow = (
+    messageId: string,
+    reactionType: string,
+    reactionsOverride?: { [key: string]: Set<string> }
+  ) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId || !reactionType || !selectedTeamMember) return false;
     
-    const message = messages.find(m => m && m.id === messageId);
+    const message = messages.find(m => m && normalizeMessageId(m.id) === normalizedMessageId);
     if (!message) return false;
     
-    const reactions = messageReactions.get(messageId);
+    const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
     if (!reactions || !reactions[reactionType]) return false;
     
     const reactionSet = reactions[reactionType];
@@ -1592,9 +1757,10 @@ export default function Chat() {
   };
 
   // Get all reactions for a message
-  const getAllReactions = (messageId: string) => {
-    if (!messageId) return [];
-    const reactions = messageReactions.get(messageId);
+  const getAllReactions = (messageId: string, reactionsOverride?: { [key: string]: Set<string> }) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId) return [];
+    const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
     if (!reactions) return [];
     
     return Object.entries(reactions)
@@ -2378,14 +2544,25 @@ export default function Chat() {
   // Derive a local Map keyed by message id for existing UI rendering.
   useEffect(() => {
     if (!selectedTeamMember?.id) {
-      setMessageReactions(new Map());
+      setLocalMessageReactions(() => new Map());
       return;
     }
 
     const next = new Map<string, { [key: string]: Set<string> }>();
-    displayedMessages.forEach((msg: any) => {
-      const messageId = typeof msg?.id === 'string' ? msg.id : '';
+    if (!Array.isArray(messages) || messages.length === 0) {
+      setLocalMessageReactions(() => next);
+      return;
+    }
+
+    messages.forEach((msg: any) => {
+      const messageId = msg?.id != null ? String(msg.id) : '';
       if (!messageId) {
+        return;
+      }
+
+      if (shouldKeepOptimisticReactions(messageId)) {
+        const optimistic = messageReactionsRef.current.get(messageId) ?? {};
+        next.set(messageId, optimistic);
         return;
       }
 
@@ -2406,8 +2583,14 @@ export default function Chat() {
       }
     });
 
-    setMessageReactions(next);
-  }, [displayedMessages, selectedTeamMember?.id]);
+    setLocalMessageReactions(() => next);
+
+    reactionOptimisticUntilRef.current.forEach((until, messageId) => {
+      if (until <= Date.now() || !next.has(messageId)) {
+        reactionOptimisticUntilRef.current.delete(messageId);
+      }
+    });
+  }, [messages, selectedTeamMember?.id, shouldKeepOptimisticReactions]);
 
   // Typing indicator derived from presence system (Firestore typingTo).
   useEffect(() => {
@@ -3372,7 +3555,7 @@ export default function Chat() {
         length: textValue.length,
         platform: Platform.OS,
       });
-      setEditingMessageInfo({ id: message.id, originalText: textValue });
+      setEditingMessageInfo({ id: normalizeMessageId(message.id), originalText: textValue });
       setMessage(textValue);
       latestMessageRef.current = textValue;
 
@@ -3430,7 +3613,7 @@ export default function Chat() {
       markMessageActionPending(message.id);
       try {
         await deleteChatMessage(message.id);
-        if (editingMessageInfo?.id === message.id) {
+        if (editingMessageInfo?.id === normalizeMessageId(message.id)) {
           clearInputField();
         }
         Toast.show({
@@ -4340,7 +4523,25 @@ export default function Chat() {
     });
   }, []);
 
+  const getDownloadKey = useCallback((url?: string) => (url || '').trim(), []);
+
   const handleDownloadFile = async (fileUrl: string, fileName: string, localHint?: string) => {
+    const downloadKey = getDownloadKey(fileUrl);
+    if (!downloadKey) return;
+
+    if (downloadingUrlsRef.current.has(downloadKey)) {
+      Toast.show({
+        type: 'info',
+        text1: 'Download in progress',
+        text2: 'Please wait for the current download to finish.',
+        position: 'top',
+      });
+      return;
+    }
+
+    downloadingUrlsRef.current.add(downloadKey);
+    setDownloadState(downloadKey, { isDownloading: true, progress: 0 });
+
     // Show starting download toast notification immediately
     Toast.show({
       type: 'info',
@@ -4377,7 +4578,9 @@ export default function Chat() {
         }
         
         // Use the new download utility that handles CORS properly
-        await FileDownloadUtil.downloadFile(effectiveUrl, fileName);
+        await FileDownloadUtil.downloadFileWithProgress(effectiveUrl, fileName, (percent) => {
+          setDownloadState(downloadKey, { isDownloading: true, progress: percent });
+        });
 
         clearNetworkError(fileUrl);
         
@@ -4398,11 +4601,30 @@ export default function Chat() {
           : `${FileSystem.documentDirectory}${fileName}`;
         const downloadResult = isLocalFile
           ? { status: 200, uri: effectiveUrl }
-          : await FileSystem.downloadAsync(effectiveUrl, downloadPath);
+          : await FileSystem.createDownloadResumable(
+              effectiveUrl,
+              downloadPath,
+              {},
+              (progress) => {
+                const total = progress.totalBytesExpectedToWrite;
+                if (!total || total <= 0) {
+                  return;
+                }
+                const pct = Math.floor((progress.totalBytesWritten / total) * 100);
+                const bounded = Math.max(0, Math.min(99, pct));
+                setDownloadState(downloadKey, { isDownloading: true, progress: bounded });
+              }
+            ).downloadAsync();
+
+        if (!downloadResult) {
+          throw new Error('Download failed');
+        }
 
         if (downloadResult.status !== 200) {
           throw new Error('Download failed');
         }
+
+        setDownloadState(downloadKey, { isDownloading: true, progress: 100 });
 
         const canShare = await Sharing.isAvailableAsync();
         if (!canShare) {
@@ -4453,6 +4675,9 @@ export default function Chat() {
           { text: 'Retry', onPress: () => handleDownloadFile(fileUrl, fileName, localHint) },
         ]
       );
+    } finally {
+      downloadingUrlsRef.current.delete(downloadKey);
+      clearDownloadState(downloadKey);
     }
   };
 
@@ -4970,7 +5195,25 @@ export default function Chat() {
 
   AnimatedMessageWrapper.displayName = 'AnimatedMessageWrapper';
 
-  const renderMessage = (msg: any) => {
+  const MessageRow = React.memo(({ item }: { item: any }) => {
+    const messageId = typeof item?.id === 'string' ? item.id : String(item?.id ?? '');
+    const uiState = useMessageUiState(messageId);
+    const renderedMessage = renderMessage(item, uiState.reactions, uiState.isEditing);
+    if (typeof renderedMessage === 'string') {
+      logger.warn('⚠️ renderMessage returned string:', JSON.stringify(renderedMessage));
+      logger.warn('⚠️ Message object:', JSON.stringify(item, null, 2));
+      return null;
+    }
+    return renderedMessage;
+  });
+
+  MessageRow.displayName = 'MessageRow';
+
+  const renderMessage = (
+    msg: any,
+    reactionsOverride?: { [key: string]: Set<string> },
+    isEditingOverride?: boolean
+  ) => {
     // Defensive check for message validity
     if (!msg || !msg.id) {
       logger.warn('Invalid message object:', msg);
@@ -4986,7 +5229,9 @@ export default function Chat() {
     const isNewMessage = animatedMessages.has(msg.id);
     const actionPending = isMessageActionPending(msg.id);
     const wasEdited = Boolean((msg.editCount && msg.editCount > 0) || msg.editedAt);
-    const isEditingTarget = editingMessageInfo?.id === msg.id;
+    const isEditingTarget = typeof isEditingOverride === 'boolean'
+      ? isEditingOverride
+      : editingMessageInfo?.id === normalizeMessageId(msg.id);
     const pendingOverlay = actionPending ? (
       <View
         pointerEvents="none"
@@ -5140,9 +5385,9 @@ export default function Chat() {
                     size={20} 
                     color={getReactionStatus(msg.id, 'heart').hasUserReacted ? '#ef4444' : theme.textSecondary}
                   />
-                  {getReactionStatus(msg.id, 'heart').count > 0 && (
+                  {getReactionStatus(msg.id, 'heart', reactionsOverride).count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {getReactionStatus(msg.id, 'heart').count}
+                      {getReactionStatus(msg.id, 'heart', reactionsOverride).count}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -5158,9 +5403,9 @@ export default function Chat() {
                     size={20} 
                     color={getReactionStatus(msg.id, 'star').hasUserReacted ? '#fbbf24' : theme.textSecondary}
                   />
-                  {getReactionStatus(msg.id, 'star').count > 0 && (
+                  {getReactionStatus(msg.id, 'star', reactionsOverride).count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {getReactionStatus(msg.id, 'star').count}
+                      {getReactionStatus(msg.id, 'star', reactionsOverride).count}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -5168,17 +5413,17 @@ export default function Chat() {
                   style={[
                     styles.reactionButton, 
                     { backgroundColor: theme.background },
-                    shouldGlow(msg.id, 'smile') && styles.glowingReaction
+                    shouldGlow(msg.id, 'smile', reactionsOverride) && styles.glowingReaction
                   ]}
                   onPress={() => handleReaction(msg.id, 'smile')}
                 >
                   <Smile 
                     size={20} 
-                    color={getReactionStatus(msg.id, 'smile').hasUserReacted ? '#1e1c1cff' : theme.textSecondary}
+                    color={getReactionStatus(msg.id, 'smile', reactionsOverride).hasUserReacted ? '#1e1c1cff' : theme.textSecondary}
                   />
-                  {getReactionStatus(msg.id, 'smile').count > 0 && (
+                  {getReactionStatus(msg.id, 'smile', reactionsOverride).count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {getReactionStatus(msg.id, 'smile').count}
+                      {getReactionStatus(msg.id, 'smile', reactionsOverride).count}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -5188,11 +5433,19 @@ export default function Chat() {
               <View style={styles.reactionProfilePics}>
                 {['heart', 'star', 'smile']
                   .filter((reactionType) => {
-                    const reactionStatus = getReactionStatus(msg.id, reactionType as 'heart' | 'star' | 'smile');
+                    const reactionStatus = getReactionStatus(
+                      msg.id,
+                      reactionType as 'heart' | 'star' | 'smile',
+                      reactionsOverride
+                    );
                     return reactionStatus.count > 0;
                   })
                   .map((reactionType) => {
-                  const reactionStatus = getReactionStatus(msg.id, reactionType as 'heart' | 'star' | 'smile');
+                  const reactionStatus = getReactionStatus(
+                    msg.id,
+                    reactionType as 'heart' | 'star' | 'smile',
+                    reactionsOverride
+                  );
                   
                   return (
                     <View key={reactionType} style={styles.reactionTypeContainer}>
@@ -5384,12 +5637,12 @@ export default function Chat() {
             </TouchableOpacity>
             
             {/* Sticker reactions display */}
-            {getAllReactions(msg.id).length > 0 && (
+            {getAllReactions(msg.id, reactionsOverride).length > 0 && (
               <View style={[
                 styles.messageReactions,
                 isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
               ]}>
-                {getAllReactions(msg.id).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
+                {getAllReactions(msg.id, reactionsOverride).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
                   <TouchableOpacity
                     key={index}
                     style={[
@@ -5516,12 +5769,12 @@ export default function Chat() {
             </TouchableOpacity>
             
             {/* GIF reactions display */}
-            {getAllReactions(msg.id).length > 0 && (
+            {getAllReactions(msg.id, reactionsOverride).length > 0 && (
               <View style={[
                 styles.messageReactions,
                 isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
               ]}>
-                {getAllReactions(msg.id).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
+                {getAllReactions(msg.id, reactionsOverride).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
                   <TouchableOpacity
                     key={index}
                     style={[
@@ -5640,6 +5893,7 @@ export default function Chat() {
                             fileType={attachment.fileType}
                             fileSize={attachment.fileSize}
                             onDownload={() => handleDownloadFile(attachment.url, attachment.fileName, attachment.resolvedUrl)}
+                            downloadKey={getDownloadKey(attachment.url)}
                             remoteFileUrl={attachment.url}
                             // Use FileViewer's built-in ShareModal
                           />
@@ -5661,6 +5915,7 @@ export default function Chat() {
                             fileType={attachment.fileType}
                             fileSize={attachment.fileSize}
                             onDownload={() => handleDownloadFile(attachment.url, attachment.fileName, attachment.resolvedUrl)}
+                            downloadKey={getDownloadKey(attachment.url)}
                             remoteFileUrl={attachment.url}
                             // Use FileViewer's built-in ShareModal
                           />
@@ -5745,12 +6000,12 @@ export default function Chat() {
           </TouchableOpacity>
           
           {/* Message reactions display */}
-          {getAllReactions(msg.id).length > 0 && (
+          {getAllReactions(msg.id, reactionsOverride).length > 0 && (
             <View style={[
               styles.messageReactions,
               isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
             ]}>
-              {getAllReactions(msg.id).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
+              {getAllReactions(msg.id, reactionsOverride).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
                 <TouchableOpacity
                   key={index}
                   style={[
@@ -5772,6 +6027,93 @@ export default function Chat() {
       </AnimatedMessageWrapper>
     );
   };
+
+  const renderMessageItem = useCallback(
+    ({ item, index }: { item: any; index: number }) => {
+      const previousMsg = index > 0 ? displayedMessages[index - 1] : undefined;
+      const dateSeparator = getChatDateSeparator(item.timestamp, previousMsg?.timestamp);
+
+      const shouldShowUnreadSeparator = showUnreadSeparator && unreadSeparatorMessageId === item.id;
+      const shouldShowNewDivider = showNewDivider && newDividerMessageId === item.id && !shouldShowUnreadSeparator;
+
+      return (
+        <View
+          onLayout={(event) => {
+            const { y, height } = event.nativeEvent.layout;
+            const currentDate = getMessageDate(item, previousMsg);
+            if (item.id) {
+              const messageId = String(item.id);
+              const newPosition = { y, height, date: currentDate || '' };
+              setMessagePositions(prev => {
+                const existingPosition = prev[messageId];
+                if (
+                  existingPosition &&
+                  existingPosition.y === newPosition.y &&
+                  existingPosition.height === newPosition.height &&
+                  existingPosition.date === newPosition.date
+                ) {
+                  return prev;
+                }
+                const next = { ...prev };
+                next[messageId] = newPosition;
+                return next;
+              });
+            }
+          }}
+        >
+          {dateSeparator && typeof dateSeparator === 'string' && dateSeparator.trim().length > 0 && (
+            <View style={styles.dateSeparatorContainer}>
+              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
+              <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.textSecondary }]}>
+                {(() => {
+                  const safeDate = String(dateSeparator).trim();
+                  if (!safeDate || safeDate === '.' || safeDate.length === 0) return 'Today';
+                  return safeDate;
+                })()}
+              </Text>
+              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
+            </View>
+          )}
+
+          {shouldShowUnreadSeparator && unreadSeparatorMessageId && (
+            <View style={styles.dateSeparatorContainer}>
+              <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
+              <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: isDarkMode ? '#FF4444' : '#FF0000', fontWeight: '600' }]}> 
+                Unread messages
+              </Text>
+              <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
+            </View>
+          )}
+
+          {shouldShowNewDivider && (
+            <View style={styles.dateSeparatorContainer}>
+              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.primary }]} />
+              <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.primary, fontWeight: '600' }]}> 
+                New messages
+              </Text>
+              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.primary }]} />
+            </View>
+          )}
+
+          <MessageRow item={item} />
+        </View>
+      );
+    },
+    [
+      displayedMessages,
+      getMessageDate,
+      getChatDateSeparator,
+      isDarkMode,
+      newDividerMessageId,
+      showNewDivider,
+      showUnreadSeparator,
+      unreadSeparatorMessageId,
+      theme.border,
+      theme.background,
+      theme.textSecondary,
+      theme.primary,
+    ]
+  );
 
   // Retry a failed pending media item (re-uploads if needed and re-sends)
   const retryPendingMedia = useCallback(async (tempId: string) => {
@@ -6371,115 +6713,134 @@ export default function Chat() {
     </Modal>
   );
 
-  const renderImageViewerModal = () => (
-    <Modal
-      visible={imageViewerVisible}
-      transparent
-      animationType="fade"
-      onRequestClose={() => setImageViewerVisible(false)}
-    >
-      <View style={styles.imageViewerOverlay}>
+  const ImageViewerDownloadButton = React.memo(
+    ({ sourceUri, localHint }: { sourceUri: string; localHint?: string }) => {
+      const downloadKey = getDownloadKey(sourceUri);
+      const downloadState = useDownloadState(downloadKey);
+      const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadState.progress ?? 0)));
+      const downloadLabel = downloadState.isDownloading
+        ? `Downloading ${normalizedProgress}%`
+        : 'Download';
+
+      return (
         <TouchableOpacity
-          style={styles.imageViewerCloseButton}
-          onPress={() => setImageViewerVisible(false)}
+          style={[styles.imageViewerActionButton, { opacity: downloadState.isDownloading ? 0.7 : 1 }]}
+          onPress={() => {
+            const derived = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
+            const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
+            handleDownloadFile(sourceUri, downloadName, localHint);
+          }}
+          disabled={downloadState.isDownloading}
         >
-          <X size={30} color="#ffffff" />
+          <Download size={20} color="#ffffff" />
+          <Text style={styles.imageViewerButtonText}>{downloadLabel}</Text>
         </TouchableOpacity>
-        {brokenFileUrls.has(selectedImageUri) ? (
-          <View style={styles.brokenImageContainer}>
-            <AlertCircle size={64} color="#ffffff" />
-            <Text style={styles.brokenImageText}>
-              Image no longer available
-            </Text>
-            <Text style={styles.brokenImageSubtext}>
-              This image has been deleted or is no longer accessible
-            </Text>
-          </View>
-        ) : (
-          <View style={styles.imageViewerContent}>
-            <ProgressiveImage
-              uri={selectedImageUri}
-              style={styles.fullScreenImage}
-              resizeMode="contain"
-              onError={() => handleImageError(lastViewedRemoteImage || selectedImageUri)}
-            />
-            {networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+      );
+    }
+  );
+
+  const renderImageViewerModal = () => {
+    const sourceUri = lastViewedRemoteImage || selectedImageUri;
+
+    return (
+      <Modal
+        visible={imageViewerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setImageViewerVisible(false)}
+      >
+        <View style={styles.imageViewerOverlay}>
+          <TouchableOpacity
+            style={styles.imageViewerCloseButton}
+            onPress={() => setImageViewerVisible(false)}
+          >
+            <X size={30} color="#ffffff" />
+          </TouchableOpacity>
+          {brokenFileUrls.has(selectedImageUri) ? (
+            <View style={styles.brokenImageContainer}>
+              <AlertCircle size={64} color="#ffffff" />
+              <Text style={styles.brokenImageText}>
+                Image no longer available
+              </Text>
+              <Text style={styles.brokenImageSubtext}>
+                This image has been deleted or is no longer accessible
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.imageViewerContent}>
+              <ProgressiveImage
+                uri={selectedImageUri}
+                style={styles.fullScreenImage}
+                resizeMode="contain"
+                onError={() => handleImageError(lastViewedRemoteImage || selectedImageUri)}
+              />
+              {networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+                <TouchableOpacity
+                  style={styles.imageRetryBadge}
+                  onPress={() => {
+                    const retryUri = lastViewedRemoteImage || selectedImageUri;
+                    clearNetworkError(retryUri);
+                    setSelectedImageUri(retryUri);
+                  }}
+                >
+                  <RotateCcw size={14} color="#ffffff" />
+                  <Text style={styles.imageRetryText}>Retry</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+          {!brokenFileUrls.has(selectedImageUri) && networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+            <View style={[styles.imageViewerNetworkError, { backgroundColor: 'rgba(0, 0, 0, 0.55)', borderColor: 'rgba(255, 255, 255, 0.2)' }]}> 
+              <View style={styles.networkErrorInfo}>
+                <AlertCircle size={16} color="#ffffff" />
+                <Text style={[styles.networkErrorText, { color: '#ffffff' }]}>Network error. Tap retry.</Text>
+              </View>
               <TouchableOpacity
-                style={styles.imageRetryBadge}
+                style={[styles.networkErrorRetryButton, { borderColor: '#ffffff' }]}
                 onPress={() => {
-                  const sourceUri = lastViewedRemoteImage || selectedImageUri;
-                  clearNetworkError(sourceUri);
-                  setSelectedImageUri(sourceUri);
+                  const retryUri = lastViewedRemoteImage || selectedImageUri;
+                  clearNetworkError(retryUri);
+                  setSelectedImageUri(retryUri);
                 }}
               >
                 <RotateCcw size={14} color="#ffffff" />
-                <Text style={styles.imageRetryText}>Retry</Text>
+                <Text style={[styles.networkErrorRetryText, { color: '#ffffff' }]}>Retry</Text>
               </TouchableOpacity>
-            )}
-          </View>
-        )}
-        {!brokenFileUrls.has(selectedImageUri) && networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
-          <View style={[styles.imageViewerNetworkError, { backgroundColor: 'rgba(0, 0, 0, 0.55)', borderColor: 'rgba(255, 255, 255, 0.2)' }]}>
-            <View style={styles.networkErrorInfo}>
-              <AlertCircle size={16} color="#ffffff" />
-              <Text style={[styles.networkErrorText, { color: '#ffffff' }]}>Network error. Tap retry.</Text>
             </View>
-            <TouchableOpacity
-              style={[styles.networkErrorRetryButton, { borderColor: '#ffffff' }]}
-              onPress={() => {
-                const sourceUri = lastViewedRemoteImage || selectedImageUri;
-                clearNetworkError(sourceUri);
-                setSelectedImageUri(sourceUri);
-              }}
-            >
-              <RotateCcw size={14} color="#ffffff" />
-              <Text style={[styles.networkErrorRetryText, { color: '#ffffff' }]}>Retry</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-        {/* Action buttons positioned at the bottom with proper spacing */}
-        {!brokenFileUrls.has(selectedImageUri) && (
-          <View style={styles.imageViewerButtonContainer}>
-            <TouchableOpacity
-              style={styles.imageViewerActionButton}
-              onPress={() => {
-                const sourceUri = lastViewedRemoteImage || selectedImageUri;
-                const derived = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
-                const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
-                handleDownloadFile(sourceUri, downloadName, selectedImageUri);
-              }}
-            >
-              <Download size={20} color="#ffffff" />
-              <Text style={styles.imageViewerButtonText}>Download</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.imageViewerActionButton}
-              onPress={() => setShowImageShareModal(true)}
-            >
-              <Share size={20} color="#ffffff" />
-              <Text style={styles.imageViewerButtonText}>Share</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-        <ShareModal
-          visible={showImageShareModal}
-          onClose={() => setShowImageShareModal(false)}
-          fileUrl={lastViewedRemoteImage || selectedImageUri}
-          fileName={(() => {
-            const src = lastViewedRemoteImage || selectedImageUri;
-            const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
-            return derived && derived !== 'file' ? derived : 'image.jpg';
-          })()}
-          onDownload={() => {
-            const src = lastViewedRemoteImage || selectedImageUri;
-            const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
-            const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
-            handleDownloadFile(src, downloadName, selectedImageUri);
-          }}
-        />
-      </View>
-    </Modal>
-  );
+          )}
+          {/* Action buttons positioned at the bottom with proper spacing */}
+          {!brokenFileUrls.has(selectedImageUri) && (
+            <View style={styles.imageViewerButtonContainer}>
+              <ImageViewerDownloadButton sourceUri={sourceUri} localHint={selectedImageUri} />
+              <TouchableOpacity
+                style={styles.imageViewerActionButton}
+                onPress={() => setShowImageShareModal(true)}
+              >
+                <Share size={20} color="#ffffff" />
+                <Text style={styles.imageViewerButtonText}>Share</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          <ShareModal
+            visible={showImageShareModal}
+            onClose={() => setShowImageShareModal(false)}
+            fileUrl={lastViewedRemoteImage || selectedImageUri}
+            fileName={(() => {
+              const src = lastViewedRemoteImage || selectedImageUri;
+              const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
+              return derived && derived !== 'file' ? derived : 'image.jpg';
+            })()}
+            onDownload={() => {
+              const src = lastViewedRemoteImage || selectedImageUri;
+              const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
+              const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
+              handleDownloadFile(src, downloadName, selectedImageUri);
+            }}
+          />
+        </View>
+      </Modal>
+    );
+  };
 
   // Emoji picker modal for message reactions
   const renderEmojiPickerModal = () => {
@@ -7344,8 +7705,6 @@ export default function Chat() {
           <FlashList
             ref={flatListRef}
             key={selectedTeamMember?.id || selectedTeamMember?.email || 'chat'}
-            // Ensure reactions trigger item re-rendering on native
-            extraData={flashListExtraData}
             data={displayedMessages}
             estimatedItemSize={estimatedItemSize}
             keyExtractor={getMessageKey}
@@ -7419,15 +7778,7 @@ export default function Chat() {
                       </View>
                     )}
 
-                    {(() => {
-                      const renderedMessage = renderMessage(item);
-                      if (typeof renderedMessage === 'string') {
-                        logger.warn('⚠️ renderMessage returned string:', JSON.stringify(renderedMessage));
-                        logger.warn('⚠️ Message object:', JSON.stringify(item, null, 2));
-                        return null;
-                      }
-                      return renderedMessage;
-                    })()}
+                    <MessageRow item={item} />
                   </View>
                 );
               }}

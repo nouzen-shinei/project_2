@@ -3,6 +3,7 @@ import React from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Alert, Linking } from 'react-native';
 import { Download, Share, ExternalLink, Eye } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
+import { useDownloadState } from '@/hooks/useDownloadState';
 import StyledText from './StyledText';
 import { 
   getFileTypeInfo, 
@@ -15,7 +16,7 @@ import {
 } from '../lib/fileUtils';
 // import { AudioPlayer } from './AudioPlayer'; // Temporarily disabled due to issues
 import { PdfViewer } from './PdfViewer';
-import { CodeViewer } from './CodeViewer';
+import { CodeViewer } from '@/components/CodeViewer';
 // import VideoPlayer from './VideoPlayer'; // Temporarily disabled due to issues
 import { ShareModal } from './ShareModal';
 
@@ -29,6 +30,9 @@ interface FileViewerProps {
   messageText?: string; // Add message text prop
   isOwnMessage?: boolean; // Add message ownership prop
   theme?: any; // Add theme prop for consistent styling
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 export function FileViewer({ 
@@ -40,11 +44,20 @@ export function FileViewer({
   onShare,
   messageText,
   isOwnMessage = false,
-  theme: propTheme 
+  theme: propTheme,
+  isDownloading,
+  downloadProgress,
+  downloadKey
 }: FileViewerProps) {
   const { theme } = useTheme();
   const effectiveTheme = propTheme || theme;
   const fileInfo = getFileTypeInfo(fileType, fileName);
+  const resolvedDownloadKey = downloadKey || fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
+  const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = downloadProgress ?? downloadState.progress;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
+  const downloadSuffix = effectiveIsDownloading ? `Downloading ${normalizedProgress}%` : undefined;
 
   // For audio files, use the audio player
   if (isAudioFile(fileType, fileName)) {
@@ -106,11 +119,15 @@ export function FileViewer({
                 paddingVertical: 8,
                 borderRadius: 8,
                 marginTop: 12,
-                alignItems: 'center'
+                alignItems: 'center',
+                opacity: effectiveIsDownloading ? 0.7 : 1,
               }}
               onPress={onDownload}
+              disabled={effectiveIsDownloading}
             >
-              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>Download Audio</Text>
+              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>
+                {downloadSuffix ?? 'Download Audio'}
+              </Text>
             </TouchableOpacity>
           )}
         </View>
@@ -127,6 +144,9 @@ export function FileViewer({
         fileSize={fileSize}
         onDownload={onDownload}
         onShare={onShare}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={downloadKey || fileUrl}
       />
     );
   }
@@ -140,6 +160,9 @@ export function FileViewer({
         fileSize={fileSize}
         onDownload={onDownload}
         onShare={onShare}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={downloadKey || fileUrl}
       />
     );
   }
@@ -204,11 +227,15 @@ export function FileViewer({
                 paddingVertical: 8,
                 borderRadius: 8,
                 marginTop: 12,
-                alignItems: 'center'
+                alignItems: 'center',
+                opacity: effectiveIsDownloading ? 0.7 : 1,
               }}
               onPress={onDownload}
+              disabled={effectiveIsDownloading}
             >
-              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>Download Video</Text>
+              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>
+                {downloadSuffix ?? 'Download Video'}
+              </Text>
             </TouchableOpacity>
           )}
         </View>
@@ -276,11 +303,15 @@ export function FileViewer({
                 paddingVertical: 8,
                 borderRadius: 8,
                 marginTop: 12,
-                alignItems: 'center'
+                alignItems: 'center',
+                opacity: effectiveIsDownloading ? 0.7 : 1,
               }}
               onPress={onDownload}
+              disabled={effectiveIsDownloading}
             >
-              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>Download Image</Text>
+              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>
+                {downloadSuffix ?? 'Download Image'}
+              </Text>
             </TouchableOpacity>
           )}
         </View>
@@ -317,6 +348,8 @@ export function FileViewer({
         fileInfo={fileInfo}
         onDownload={onDownload}
         onShare={onShare}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
       />
     </View>
   );
@@ -330,6 +363,9 @@ interface GenericFileViewerProps {
   fileInfo: ReturnType<typeof getFileTypeInfo>;
   onDownload?: () => void;
   onShare?: () => void;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 function GenericFileViewer({ 
@@ -339,10 +375,18 @@ function GenericFileViewer({
   fileSize, 
   fileInfo,
   onDownload, 
-  onShare 
+  onShare,
+  isDownloading,
+  downloadProgress,
+  downloadKey
 }: GenericFileViewerProps) {
   const { theme } = useTheme();
   const [showShareModal, setShowShareModal] = React.useState(false);
+  const resolvedDownloadKey = downloadKey || fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
+  const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = downloadProgress ?? downloadState.progress;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
 
   const handlePreview = async () => {
     try {
@@ -446,6 +490,11 @@ function GenericFileViewer({
       borderWidth: 1,
       borderColor: theme.border,
     },
+    downloadProgressText: {
+      fontSize: 12,
+      color: theme.textSecondary,
+      fontWeight: '600',
+    },
     description: {
       fontSize: 14,
       color: theme.textSecondary,
@@ -503,8 +552,16 @@ function GenericFileViewer({
         </TouchableOpacity>
 
         <View style={styles.actionButtons}>
-          <TouchableOpacity style={styles.actionButton} onPress={handleDownload}>
-            <Download size={20} color={theme.textSecondary} />
+          <TouchableOpacity
+            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            onPress={handleDownload}
+            disabled={effectiveIsDownloading}
+          >
+            {effectiveIsDownloading ? (
+              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+            ) : (
+              <Download size={20} color={theme.textSecondary} />
+            )}
           </TouchableOpacity>
           <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
             <Share size={20} color={theme.textSecondary} />

@@ -26,13 +26,14 @@ import {
   getMimeTypeFromFileName,
 } from '../lib/fileUtils';
 import { PdfViewer } from './PdfViewer';
-import { CodeViewer } from './CodeViewer';
+import { CodeViewer } from '@/components/CodeViewer';
 import { ShareModal } from './ShareModal';
 import { AudioPlayer } from './AudioPlayer';
 import VideoPlayer from './VideoPlayer';
 import ProgressiveImage from './ui/ProgressiveImage';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
+import { useDownloadState } from '@/hooks/useDownloadState';
 
 const sanitizeFileName = (name: string) => name.replace(/[^a-zA-Z0-9._-]/g, '_');
 const stripExtension = (name: string) => name.replace(/\.[^/.]+$/, '');
@@ -78,6 +79,9 @@ interface FileViewerProps {
   onShare?: () => void;
   remoteFileUrl?: string;
   previewHeight?: number;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 export function FileViewer({
@@ -91,10 +95,14 @@ export function FileViewer({
   onShare,
   remoteFileUrl,
   previewHeight,
+  isDownloading,
+  downloadProgress,
+  downloadKey,
 }: FileViewerProps) {
   const { theme } = useTheme();
   const fileInfo = getFileTypeInfo(fileType, fileName);
   const downloadSource = remoteFileUrl || fileUrl;
+  const resolvedDownloadKey = downloadKey || downloadSource || fileUrl;
 
   if (isAudioFile(fileType, fileName)) {
     return (
@@ -105,6 +113,9 @@ export function FileViewer({
         onDownload={onDownload}
         onShare={onShare}
         shareUrl={downloadSource}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={resolvedDownloadKey}
       />
     );
   }
@@ -119,6 +130,9 @@ export function FileViewer({
         onShare={onShare}
         remoteFileUrl={downloadSource}
         previewHeight={previewHeight}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={resolvedDownloadKey}
       />
     );
   }
@@ -131,6 +145,9 @@ export function FileViewer({
         fileSize={fileSize}
         onDownload={onDownload}
         onShare={onShare}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={resolvedDownloadKey}
       />
     );
   }
@@ -144,6 +161,9 @@ export function FileViewer({
         onShare={onShare}
         shareUrl={downloadSource}
         thumbnailUrl={thumbnailUrl}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={resolvedDownloadKey}
       />
     );
   }
@@ -159,6 +179,9 @@ export function FileViewer({
         remoteFileUrl={downloadSource}
         thumbnailUrl={thumbnailUrl}
         isPreviewAsset={isPreviewAsset}
+        isDownloading={isDownloading}
+        downloadProgress={downloadProgress}
+        downloadKey={resolvedDownloadKey}
       />
     );
   }
@@ -175,6 +198,9 @@ export function FileViewer({
       remoteFileUrl={downloadSource}
       thumbnailUrl={thumbnailUrl}
       isPreviewAsset={isPreviewAsset}
+      isDownloading={isDownloading}
+      downloadProgress={downloadProgress}
+      downloadKey={resolvedDownloadKey}
     />
   );
 }
@@ -192,6 +218,9 @@ interface GenericFileViewerProps {
   isDisabled?: boolean;
   disabledReason?: string;
   remoteFileUrl?: string;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 interface ImageAttachmentViewerProps {
@@ -203,6 +232,9 @@ interface ImageAttachmentViewerProps {
   thumbnailUrl?: string;
   isPreviewAsset?: boolean;
   remoteFileUrl?: string;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 type ThemeShape = ReturnType<typeof useTheme>['theme'];
@@ -311,6 +343,11 @@ const createGenericFileViewerStyles = (
       backgroundColor: theme.background,
       borderWidth: 1,
       borderColor: theme.border,
+    },
+    downloadProgressText: {
+      fontSize: 12,
+      color: theme.textSecondary,
+      fontWeight: '600',
     },
     description: {
       fontSize: 14,
@@ -426,6 +463,11 @@ const createImageViewerStyles = (theme: ThemeShape) =>
       borderWidth: 1,
       borderColor: theme.border,
     },
+    downloadProgressText: {
+      fontSize: 12,
+      color: theme.textSecondary,
+      fontWeight: '600',
+    },
     previewBadge: {
       position: 'absolute',
       top: 10,
@@ -514,6 +556,9 @@ const areGenericFileViewerPropsEqual = (
   if ((prev.isDisabled ?? false) !== (next.isDisabled ?? false)) return false;
   if ((prev.disabledReason ?? '') !== (next.disabledReason ?? '')) return false;
   if ((prev.remoteFileUrl ?? '') !== (next.remoteFileUrl ?? '')) return false;
+  if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+  if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
+  if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
   if (prev.onDownload !== next.onDownload) return false;
   if (prev.onShare !== next.onShare) return false;
 
@@ -541,11 +586,19 @@ function ImageAttachmentViewer({
   thumbnailUrl,
   isPreviewAsset,
   remoteFileUrl,
+  isDownloading,
+  downloadProgress,
+  downloadKey,
 }: ImageAttachmentViewerProps) {
   const { theme } = useTheme();
   const { width } = useWindowDimensions();
   const [showModal, setShowModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+  const resolvedDownloadKey = downloadKey || remoteFileUrl || fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
+  const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = downloadProgress ?? downloadState.progress;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
 
   const remoteUrl = remoteFileUrl || fileUrl;
   const previewOnly = Boolean(isPreviewAsset && remoteFileUrl && remoteFileUrl !== fileUrl);
@@ -598,8 +651,16 @@ function ImageAttachmentViewer({
         </TouchableOpacity>
 
         <View style={styles.actionButtons}>
-          <TouchableOpacity style={styles.actionButton} onPress={handleDownload}>
-            <Download size={20} color={theme.textSecondary} />
+          <TouchableOpacity
+            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            onPress={handleDownload}
+            disabled={effectiveIsDownloading}
+          >
+            {effectiveIsDownloading ? (
+              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+            ) : (
+              <Download size={20} color={theme.textSecondary} />
+            )}
           </TouchableOpacity>
           <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
             <Share size={20} color={theme.textSecondary} />
@@ -623,9 +684,15 @@ function ImageAttachmentViewer({
               <ProgressiveImage uri={fullUri} style={styles.modalImage} resizeMode="contain" />
             </View>
             <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.modalActionButton} onPress={handleDownload}>
+              <TouchableOpacity
+                style={[styles.modalActionButton, { opacity: effectiveIsDownloading ? 0.7 : 1 }]}
+                onPress={handleDownload}
+                disabled={effectiveIsDownloading}
+              >
                 <Download size={18} color="white" />
-                <Text style={styles.modalActionText}>Download</Text>
+                <Text style={styles.modalActionText}>
+                  {effectiveIsDownloading ? `Downloading ${normalizedProgress}%` : 'Download'}
+                </Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.modalActionButton} onPress={handleShare}>
                 <Share size={18} color="white" />
@@ -661,10 +728,18 @@ function GenericFileViewerInner({
   isDisabled = false,
   disabledReason,
   remoteFileUrl,
+  isDownloading,
+  downloadProgress,
+  downloadKey,
 }: GenericFileViewerProps) {
   const { theme } = useTheme();
   const [showShareModal, setShowShareModal] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const resolvedDownloadKey = downloadKey || remoteFileUrl || fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
+  const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = downloadProgress ?? downloadState.progress;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
 
   const remoteUrl = remoteFileUrl || fileUrl;
   const previewOnly = Boolean(isPreviewAsset && remoteFileUrl && remoteFileUrl !== fileUrl);
@@ -878,8 +953,16 @@ function GenericFileViewerInner({
         </TouchableOpacity>
 
         <View style={styles.actionButtons}>
-          <TouchableOpacity style={styles.actionButton} onPress={handleDownload}>
-            <Download size={20} color={theme.textSecondary} />
+          <TouchableOpacity
+            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            onPress={handleDownload}
+            disabled={effectiveIsDownloading}
+          >
+            {effectiveIsDownloading ? (
+              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+            ) : (
+              <Download size={20} color={theme.textSecondary} />
+            )}
           </TouchableOpacity>
           <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
             <Share size={20} color={theme.textSecondary} />

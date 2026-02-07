@@ -22,6 +22,7 @@ import { chatCacheService } from '../services/chatCacheService';
 import * as FileSystem from 'expo-file-system';
 import { useEvent } from 'expo';
 import { useVideoPlayer, VideoView, type VideoSource } from 'expo-video';
+import { useDownloadState } from '@/hooks/useDownloadState';
 
 interface AudioPlayerProps {
   fileUrl: string;
@@ -30,6 +31,9 @@ interface AudioPlayerProps {
   onDownload?: () => void;
   onShare?: () => void;
   shareUrl?: string;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 interface InternalAudioPlayerProps extends AudioPlayerProps {
@@ -44,6 +48,8 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   onDownload,
   onShare,
   shareUrl,
+  isDownloading = false,
+  downloadProgress,
   resolvedUrl,
   resolving,
 }) => {
@@ -56,6 +62,8 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   const [playbackRate, setPlaybackRate] = useState<number>(1);
   const [hasEnded, setHasEnded] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
+  const downloadInFlight = Boolean(isDownloading || downloading);
 
   const progressBarRef = useRef<any>(null);
   const progressMetricsRef = useRef({ width: 0, pageX: 0 });
@@ -504,7 +512,7 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   return (
     <View style={styles.container}>
       <VideoView
-        player={player}
+        player={player as any}
         nativeControls={false}
         allowsFullscreen={false}
         allowsPictureInPicture={false}
@@ -567,8 +575,16 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
 
         <View style={styles.bottomRow}>
           <View style={styles.actionButtons}>
-            <TouchableOpacity style={styles.actionButton} onPress={handleDownload} disabled={downloading}>
-              <Download size={20} color={theme.textSecondary} />
+            <TouchableOpacity
+              style={[styles.actionButton, { opacity: downloadInFlight ? 0.6 : 1 }]}
+              onPress={handleDownload}
+              disabled={downloadInFlight}
+            >
+              {isDownloading ? (
+                <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              ) : (
+                <Download size={20} color={theme.textSecondary} />
+              )}
             </TouchableOpacity>
             <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
               <Share size={20} color={theme.textSecondary} />
@@ -767,6 +783,11 @@ const createStyles = (theme: any) => StyleSheet.create({
     borderRadius: 8,
     backgroundColor: theme.background,
   },
+  downloadProgressText: {
+    fontSize: 12,
+    color: theme.textSecondary,
+    fontWeight: '600',
+  },
   speedButton: {
     paddingVertical: 8,
     paddingHorizontal: 14,
@@ -795,10 +816,15 @@ const createStyles = (theme: any) => StyleSheet.create({
 });
 
 // Main AudioPlayer component that chooses the right implementation
-export function AudioPlayer(props: AudioPlayerProps) {
+function AudioPlayerInner(props: AudioPlayerProps) {
   const { theme } = useTheme();
   const [resolvedUrl, setResolvedUrl] = useState(props.fileUrl);
   const [resolving, setResolving] = useState(false);
+  const downloadState = useDownloadState(
+    props.downloadKey || props.shareUrl || resolvedUrl || props.fileUrl
+  );
+  const effectiveIsDownloading = props.isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = props.downloadProgress ?? downloadState.progress;
 
   const defaultDownload = useCallback(async () => {
     const candidateUrl = props.shareUrl || resolvedUrl || props.fileUrl;
@@ -915,6 +941,7 @@ export function AudioPlayer(props: AudioPlayerProps) {
   if (!isSupported) {
     const styles = createStyles(theme);
     const downloadHandler = props.onDownload ?? (() => void defaultDownload());
+    const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
     
     return (
       <View style={styles.container}>
@@ -941,8 +968,16 @@ export function AudioPlayer(props: AudioPlayerProps) {
           </TouchableOpacity>
 
           <View style={styles.actionButtons}>
-            <TouchableOpacity style={styles.actionButton} onPress={downloadHandler}>
-              <Download size={20} color={theme.textSecondary} />
+            <TouchableOpacity
+              style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+              onPress={downloadHandler}
+              disabled={effectiveIsDownloading}
+            >
+              {effectiveIsDownloading ? (
+                <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              ) : (
+                <Download size={20} color={theme.textSecondary} />
+              )}
             </TouchableOpacity>
             <TouchableOpacity style={styles.actionButton} onPress={() => props.onShare?.()}>
               <Share size={20} color={theme.textSecondary} />
@@ -961,9 +996,24 @@ export function AudioPlayer(props: AudioPlayerProps) {
   const playerProps: InternalAudioPlayerProps = {
     ...props,
     onDownload: props.onDownload ?? (() => void defaultDownload()),
+    isDownloading: effectiveIsDownloading,
+    downloadProgress: effectiveProgress,
     resolvedUrl,
     resolving,
   };
 
   return <ExpoVideoAudioPlayer {...playerProps} />;
 }
+
+const areAudioPlayerPropsEqual = (prev: AudioPlayerProps, next: AudioPlayerProps) => {
+  if (prev.fileUrl !== next.fileUrl) return false;
+  if (prev.fileName !== next.fileName) return false;
+  if ((prev.fileSize ?? 0) !== (next.fileSize ?? 0)) return false;
+  if ((prev.shareUrl ?? '') !== (next.shareUrl ?? '')) return false;
+  if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+  if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
+  if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
+  return true;
+};
+
+export const AudioPlayer = React.memo(AudioPlayerInner, areAudioPlayerPropsEqual);

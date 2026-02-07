@@ -31,6 +31,7 @@ import {
   Clapperboard,
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
+import { useDownloadState } from '@/hooks/useDownloadState';
 import { useEvent } from 'expo';
 import { useVideoPlayer, VideoView, type VideoSource, type VideoPlayer as ExpoVideoPlayer } from 'expo-video';
 import { ShareModal } from './ShareModal';
@@ -201,6 +202,9 @@ interface VideoPlayerProps {
   shareUrl?: string;
   thumbnailUrl?: string;
   controlVariant?: 'full' | 'minimal';
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 type VideoSourceCacheEntry = {
@@ -264,6 +268,8 @@ interface VideoPlayerLoadedProps {
   cacheKey: string;
   initialPlaybackPosition: number;
   initialResolvedUri?: string | null;
+  isDownloading?: boolean;
+  downloadProgress?: number;
 }
 
 type FullscreenSnapshot = {
@@ -293,6 +299,8 @@ interface FullscreenVideoModalProps {
   onDismiss: (state: FullscreenReturnState) => void;
   onSharePress: (event?: GestureResponderEvent) => void;
   onDownload?: () => void;
+  isDownloading?: boolean;
+  downloadProgress?: number;
 }
 
 interface WebFullscreenModalProps {
@@ -300,9 +308,11 @@ interface WebFullscreenModalProps {
   onDismiss: (state: FullscreenReturnState) => void;
   onSharePress: (event?: GestureResponderEvent) => void;
   onDownload?: () => void;
+  isDownloading?: boolean;
+  downloadProgress?: number;
 }
 
-export default function VideoPlayer({
+function VideoPlayer({
   uri,
   fileName = 'video.mp4',
   onDownload,
@@ -314,10 +324,20 @@ export default function VideoPlayer({
   shareUrl,
   thumbnailUrl,
   controlVariant = 'full',
+  isDownloading,
+  downloadProgress,
+  downloadKey,
 }: VideoPlayerProps) {
   const { theme } = useTheme();
   const isWeb = Platform.OS === 'web';
   const isMinimalControls = controlVariant === 'minimal';
+  const downloadState = useDownloadState(downloadKey || shareUrl || uri);
+  const effectiveIsDownloading = typeof isDownloading === 'boolean'
+    ? isDownloading
+    : downloadState.isDownloading;
+  const effectiveProgress = typeof downloadProgress === 'number'
+    ? downloadProgress
+    : downloadState.progress;
   const forceImmediateLoad = isMinimalControls;
   const cacheKey = useMemo(() => `${uri}::${fileName}`, [uri, fileName]);
   const cachedEntry = useMemo(() => getCachedVideoEntry(cacheKey), [cacheKey]);
@@ -352,7 +372,6 @@ export default function VideoPlayer({
   useEffect(() => {
     if (hydratedKeyRef.current === cacheKey) {
       if (thumbnailUrl) {
-        setPreviewUri(thumbnailUrl);
       }
       if ((forceImmediateLoad || autoPlay || !isWeb) && !shouldLoadVideo) {
         setShouldLoadVideo(true);
@@ -556,6 +575,8 @@ export default function VideoPlayer({
       initialPlaybackPosition={cachedInitialPosition}
       initialResolvedUri={effectiveInitialResolvedUri}
       initialWasPlaying={cachedWasPlaying}
+      isDownloading={effectiveIsDownloading}
+      downloadProgress={effectiveProgress}
     />
   ) : (
     renderPlaceholder()
@@ -585,6 +606,23 @@ export default function VideoPlayer({
     </View>
   );
 }
+ 
+   const areVideoPlayerPropsEqual = (prev: VideoPlayerProps, next: VideoPlayerProps) => {
+     if (prev.uri !== next.uri) return false;
+     if ((prev.fileName ?? '') !== (next.fileName ?? '')) return false;
+     if ((prev.shareUrl ?? '') !== (next.shareUrl ?? '')) return false;
+     if ((prev.thumbnailUrl ?? '') !== (next.thumbnailUrl ?? '')) return false;
+     if ((prev.controlVariant ?? 'full') !== (next.controlVariant ?? 'full')) return false;
+     if ((prev.maxHeight ?? 0) !== (next.maxHeight ?? 0)) return false;
+     if ((prev.autoPlay ?? false) !== (next.autoPlay ?? false)) return false;
+     if ((prev.showControlsProp ?? true) !== (next.showControlsProp ?? true)) return false;
+     if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
+     if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
+     if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+     return true;
+   };
+ 
+   export default React.memo(VideoPlayer, areVideoPlayerPropsEqual);
 
 function VideoPlayerLoaded({
   uri,
@@ -603,6 +641,8 @@ function VideoPlayerLoaded({
   cacheKey,
   initialPlaybackPosition,
   initialResolvedUri,
+  isDownloading = false,
+  downloadProgress,
 }: VideoPlayerLoadedProps) {
   const { theme } = useTheme();
   const [isPlaying, setIsPlaying] = useState(autoPlay || initialWasPlaying);
@@ -1813,9 +1853,10 @@ function VideoPlayerLoaded({
     </TouchableOpacity>
   );
 
-  const shouldShowLoading = isLoading || resolving;
+  const shouldShowLoading = isLoading || resolving || !resolvedUri || !(effectiveDuration > 0);
   const shouldShowControls = showControlsProp && showControlsVisible && !shouldShowLoading;
   const disableSpeedControl = shouldShowLoading || !resolvedUri;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
@@ -1827,8 +1868,13 @@ function VideoPlayerLoaded({
 
     return (
       <View style={styles.loadingOverlay}>
-        <ActivityIndicator size="large" color={theme.primary} />
-        <Text style={[styles.loadingText, { color: theme.text }]}>Loading video...</Text>
+        <View style={styles.loadingBadge}>
+          <View style={styles.loadingBadgeRow}>
+            <ActivityIndicator size="small" color={theme.primary} />
+            <Text style={[styles.loadingBadgeText, { color: '#B4C0CF' }]}>Preparing video</Text>
+          </View>
+          <Text style={[styles.loadingBadgeSubtext, { color: theme.textSecondary }]}>Setting up playback...</Text>
+        </View>
       </View>
     );
   };
@@ -1903,8 +1949,16 @@ function VideoPlayerLoaded({
               </TouchableOpacity>
 
               {onDownload ? (
-                <TouchableOpacity style={styles.controlButton} onPress={onDownload}>
-                  <Download size={20} color="white" />
+                <TouchableOpacity
+                  style={[styles.controlButton, isDownloading ? styles.controlButtonDisabled : null]}
+                  onPress={onDownload}
+                  disabled={isDownloading}
+                >
+                  {isDownloading ? (
+                    <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+                  ) : (
+                    <Download size={20} color="white" />
+                  )}
                 </TouchableOpacity>
               ) : null}
             </View>
@@ -1977,6 +2031,8 @@ function VideoPlayerLoaded({
           onDismiss={handleNativeFullscreenDismiss}
           onSharePress={onSharePress}
           onDownload={onDownload}
+          isDownloading={isDownloading}
+          downloadProgress={downloadProgress}
         />
       ) : null}
     </>
@@ -1991,13 +2047,15 @@ function VideoPlayerLoaded({
           onDismiss={handleWebFullscreenDismiss}
           onSharePress={onSharePress}
           onDownload={onDownload}
+          isDownloading={isDownloading}
+          downloadProgress={downloadProgress}
         />
       ) : null}
     </>
   );
 }
 
-function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: FullscreenVideoModalProps) {
+function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isDownloading = false, downloadProgress }: FullscreenVideoModalProps) {
   const { theme } = useTheme();
   const { sourceUri, startTime, isMuted: initialMuted, playbackSpeed: initialSpeed, wasPlaying } = config;
 
@@ -2049,6 +2107,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
       : rounded.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
     return `${formatted}x`;
   }, [playbackSpeed]);
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
 
   const player = useVideoPlayer({ uri: sourceUri }, (p: ExpoVideoPlayer) => {
     p.loop = false;
@@ -2507,7 +2566,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
     });
   }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed, player]);
 
-  const shouldShowLoading = isLoading;
+  const shouldShowLoading = isLoading || !(effectiveDuration > 0);
   const shouldShowControls = showControls && !shouldShowLoading;
   const disableSpeedControl = shouldShowLoading;
   const formattedProgressLabel = useMemo(() => {
@@ -2539,8 +2598,13 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
 
             {shouldShowLoading ? (
               <View style={styles.fullscreenLoadingOverlay}>
-                <ActivityIndicator size="large" color={theme.primary} />
-                <Text style={styles.fullscreenLoadingText}>Loading video...</Text>
+                <View style={styles.fullscreenLoadingBadge}>
+                  <View style={styles.fullscreenLoadingBadgeRow}>
+                    <ActivityIndicator size="small" color={theme.primary} />
+                    <Text style={styles.fullscreenLoadingBadgeText}>Preparing video</Text>
+                  </View>
+                  <Text style={styles.fullscreenLoadingBadgeSubtext}>Setting up playback...</Text>
+                </View>
               </View>
             ) : null}
 
@@ -2614,13 +2678,18 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
 
                       {onDownload ? (
                         <TouchableOpacity
-                          style={styles.fullscreenControlButton}
+                          style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
                           onPress={(event) => {
                             event.stopPropagation?.();
                             onDownload();
                           }}
+                          disabled={isDownloading}
                         >
-                          <Download size={20} color="white" />
+                          {isDownloading ? (
+                            <Text style={styles.fullscreenDownloadProgressText}>{normalizedProgress}%</Text>
+                          ) : (
+                            <Download size={20} color="white" />
+                          )}
                         </TouchableOpacity>
                       ) : null}
                     </View>
@@ -2655,7 +2724,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload }: F
   );
 }
 
-function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload }: WebFullscreenModalProps) {
+function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDownloading = false, downloadProgress }: WebFullscreenModalProps) {
   const { theme } = useTheme();
   const { sourceUri, startTime, isMuted: initialMuted, playbackSpeed: initialSpeed, wasPlaying } = config;
 
@@ -2666,6 +2735,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload }: Web
   const [duration, setDuration] = useState(0);
   const [showControls, setShowControls] = useState(true);
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const intendedPlayingRef = useRef(wasPlaying);
@@ -2980,6 +3050,8 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload }: Web
     });
   }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed]);
 
+  const shouldShowLoading = !(duration > 0);
+  const shouldShowControls = showControls && !shouldShowLoading;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(duration)}`;
   }, [currentTime, duration]);
@@ -3026,7 +3098,19 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload }: Web
               preload="auto"
             />
 
-            {showControls ? (
+            {shouldShowLoading ? (
+              <View style={styles.fullscreenLoadingOverlay}>
+                <View style={styles.fullscreenLoadingBadge}>
+                  <View style={styles.fullscreenLoadingBadgeRow}>
+                    <ActivityIndicator size="small" color={theme.primary} />
+                    <Text style={styles.fullscreenLoadingBadgeText}>Preparing video</Text>
+                  </View>
+                  <Text style={styles.fullscreenLoadingBadgeSubtext}>Setting up playback...</Text>
+                </View>
+              </View>
+            ) : null}
+
+            {shouldShowControls ? (
               <View style={styles.fullscreenOverlay}>
                 <View style={styles.fullscreenTopRow}>
                   <TouchableOpacity
@@ -3095,13 +3179,18 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload }: Web
 
                       {onDownload ? (
                         <TouchableOpacity
-                          style={styles.fullscreenControlButton}
+                          style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
                           onPress={(event) => {
                             event.stopPropagation?.();
                             onDownload();
                           }}
+                          disabled={isDownloading}
                         >
-                          <Download size={20} color="white" />
+                          {isDownloading ? (
+                            <Text style={styles.fullscreenDownloadProgressText}>{normalizedProgress}%</Text>
+                          ) : (
+                            <Download size={20} color="white" />
+                          )}
                         </TouchableOpacity>
                       ) : null}
                     </View>
@@ -3194,6 +3283,34 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontSize: 14,
   },
+  loadingBadge: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: 'rgba(15,20,32,0.75)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.15)',
+    minWidth: 170,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 4,
+  },
+  loadingBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  loadingBadgeText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  loadingBadgeSubtext: {
+    marginTop: 4,
+    fontSize: 12,
+  },
   controlsOverlay: {
     position: 'absolute',
     top: 0,
@@ -3237,6 +3354,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
+  },
+  downloadProgressText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
   },
   controlButtonDisabled: {
     opacity: 0.6,
@@ -3345,6 +3467,36 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: 'rgba(255,255,255,0.92)',
   },
+  fullscreenLoadingBadge: {
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    borderRadius: 16,
+    backgroundColor: 'rgba(15,20,32,0.82)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    alignItems: 'center',
+    minWidth: 190,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 5,
+  },
+  fullscreenLoadingBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  fullscreenLoadingBadgeText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.96)',
+  },
+  fullscreenLoadingBadgeSubtext: {
+    marginTop: 4,
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.78)',
+  },
   fullscreenMainControls: {
     flex: 1,
     flexDirection: 'row',
@@ -3371,6 +3523,11 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 6 },
     shadowRadius: 12,
     elevation: 3,
+  },
+  fullscreenDownloadProgressText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
   },
   fullscreenPlayButton: {
     paddingHorizontal: 18,
