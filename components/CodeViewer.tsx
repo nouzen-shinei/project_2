@@ -6,6 +6,7 @@ import { useTheme } from '../hooks/useTheme';
 import { formatFileSize } from '../lib/fileUtils';
 import * as Clipboard from 'expo-clipboard';
 import { ShareModal } from './ShareModal';
+import { useDownloadState } from '@/hooks/useDownloadState';
 
 interface CodeViewerProps {
   fileUrl: string;
@@ -13,6 +14,9 @@ interface CodeViewerProps {
   fileSize?: number;
   onDownload?: () => void;
   onShare?: () => void;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 type ThemeShape = ReturnType<typeof useTheme>['theme'];
@@ -92,6 +96,11 @@ const createCodeViewerStyles = (theme: ThemeShape, showPreview: boolean) =>
     actionButtonFirst: {
       marginLeft: 0,
     },
+    downloadProgressText: {
+      fontSize: 12,
+      color: theme.textSecondary,
+      fontWeight: '600',
+    },
     previewContainer: {
       backgroundColor: '#1e1e1e',
       borderRadius: 8,
@@ -140,6 +149,9 @@ const areCodeViewerPropsEqual = (prev: CodeViewerProps, next: CodeViewerProps) =
   if (prev.fileUrl !== next.fileUrl) return false;
   if (prev.fileName !== next.fileName) return false;
   if ((prev.fileSize ?? 0) !== (next.fileSize ?? 0)) return false;
+  if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+  if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
+  if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
   if (prev.onDownload !== next.onDownload) return false;
   if (prev.onShare !== next.onShare) return false;
   return true;
@@ -173,13 +185,28 @@ const getLanguageFromFileName = (fileName: string): string => {
   return languageMap[ext] || 'Text';
 };
 
-function CodeViewerInner({ fileUrl, fileName, fileSize, onDownload, onShare }: CodeViewerProps) {
+function CodeViewerInner({
+  fileUrl,
+  fileName,
+  fileSize,
+  onDownload,
+  onShare,
+  isDownloading,
+  downloadProgress,
+  downloadKey,
+}: CodeViewerProps) {
   const { theme } = useTheme();
   const [isLoading, setIsLoading] = useState(false);
   const [content, setContent] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showShareModal, setShowShareModal] = useState(false);
+
+  const resolvedDownloadKey = downloadKey || fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
+  const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = downloadProgress ?? downloadState.progress;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
 
   const styles = useMemo(() => createCodeViewerStyles(theme, showPreview), [theme, showPreview]);
 
@@ -267,10 +294,15 @@ function CodeViewerInner({ fileUrl, fileName, fileSize, onDownload, onShare }: C
 
         <View style={styles.actionButtons}>
           <TouchableOpacity
-            style={[styles.actionButton, styles.actionButtonFirst]}
+            style={[styles.actionButton, styles.actionButtonFirst, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
             onPress={handleDownload}
+            disabled={effectiveIsDownloading}
           >
-            <Download size={20} color={theme.textSecondary} />
+            {effectiveIsDownloading ? (
+              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+            ) : (
+              <Download size={20} color={theme.textSecondary} />
+            )}
           </TouchableOpacity>
           <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
             <Share size={20} color={theme.textSecondary} />

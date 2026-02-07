@@ -8,6 +8,7 @@ import { ShareModal } from './ShareModal';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { PdfNativeRenderer } from './PdfNativeRenderer';
+import { useDownloadState } from '@/hooks/useDownloadState';
 
 const sanitizeFileName = (name: string) => name.replace(/[^a-zA-Z0-9._-]/g, '_');
 const ensurePdfExtension = (name: string) =>
@@ -24,6 +25,9 @@ interface PdfViewerProps {
   onShare?: () => void;
   remoteFileUrl?: string;
   previewHeight?: number;
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadKey?: string;
 }
 
 type ThemeShape = ReturnType<typeof useTheme>['theme'];
@@ -99,6 +103,11 @@ const createPdfViewerStyles = (theme: ThemeShape, previewHeight: number) =>
       borderWidth: 1,
       borderColor: theme.border,
     },
+    downloadProgressText: {
+      fontSize: 12,
+      color: theme.textSecondary,
+      fontWeight: '600',
+    },
     previewContainer: {
       marginTop: 12,
       alignItems: 'center',
@@ -140,6 +149,9 @@ const arePdfViewerPropsEqual = (prev: PdfViewerProps, next: PdfViewerProps) => {
   if ((prev.fileSize ?? 0) !== (next.fileSize ?? 0)) return false;
   if ((prev.remoteFileUrl ?? '') !== (next.remoteFileUrl ?? '')) return false;
   if ((prev.previewHeight ?? 0) !== (next.previewHeight ?? 0)) return false;
+  if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+  if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
+  if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
   if (prev.onDownload !== next.onDownload) return false;
   if (prev.onShare !== next.onShare) return false;
   return true;
@@ -153,11 +165,19 @@ function PdfViewerInner({
   onShare,
   remoteFileUrl,
   previewHeight = 100,
+  isDownloading,
+  downloadProgress,
+  downloadKey,
 }: PdfViewerProps) {
   const { theme } = useTheme();
   const isWeb = Platform.OS === 'web';
   const [isLoading, setIsLoading] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+  const resolvedDownloadKey = downloadKey || remoteFileUrl || fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
+  const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
+  const effectiveProgress = downloadProgress ?? downloadState.progress;
+  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
   const isLocalFile = Platform.OS !== 'web' && fileUrl.startsWith('file://');
   const remoteUrl = remoteFileUrl || fileUrl;
   const shareUrl = isLocalFile ? fileUrl : remoteUrl;
@@ -357,8 +377,16 @@ function PdfViewerInner({
         </TouchableOpacity>
 
         <View style={styles.actionButtons}>
-          <TouchableOpacity style={styles.actionButton} onPress={handleDownload}>
-            <Download size={20} color={theme.textSecondary} />
+          <TouchableOpacity
+            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            onPress={handleDownload}
+            disabled={effectiveIsDownloading}
+          >
+            {effectiveIsDownloading ? (
+              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+            ) : (
+              <Download size={20} color={theme.textSecondary} />
+            )}
           </TouchableOpacity>
           <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
             <Share size={20} color={theme.textSecondary} />
