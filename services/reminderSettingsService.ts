@@ -1,4 +1,5 @@
 import { logger } from '@/lib/logger';
+import { authService } from '@/hooks/useAuthUnified';
 import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
 import { firestore } from '../config/firebase';
 
@@ -107,6 +108,8 @@ export const DEFAULT_REMINDER_SETTINGS: ReminderSettings = {
 class ReminderSettingsService {
   private settingsCache = new Map<string, ReminderSettings>();
   private unsubscribeMap = new Map<string, () => void>();
+  private callbackMap = new Map<string, (settings: ReminderSettings) => void>();
+  private reinitUnsubscribe: (() => void) | null = null;
 
   // These keys are controlled from the admin console/backend and should not be
   // written by the mobile app to avoid clobbering admin policy.
@@ -215,44 +218,77 @@ class ReminderSettingsService {
     }
   }
 
+  private ensureReinitRegistration(): void {
+    if (this.reinitUnsubscribe) return;
+    this.reinitUnsubscribe = authService.registerFirestoreReinit?.((context) => {
+      this.resubscribeAll(context);
+    }) || null;
+  }
+
+  private resubscribeAll(context?: string): void {
+    this.callbackMap.forEach((cb, tenantId) => {
+      this.attachSubscription(tenantId, cb, context || 'reinit');
+    });
+  }
+
+  private attachSubscription(
+    tenantId: string,
+    onUpdate: (settings: ReminderSettings) => void,
+    context?: string,
+  ): () => void {
+    const settingsRef = this.getSettingsRef(tenantId);
+    this.unsubscribeMap.get(tenantId)?.();
+
+    const unsubscribe = onSnapshot(
+      settingsRef,
+      (snapshot) => {
+        const raw = snapshot.exists() ? (snapshot.data() as Partial<ReminderSettings>) : {};
+        const migratedEnglish = migrateVoice(raw.englishVoice, 'en');
+        const migratedHindi = migrateVoice(raw.hindiVoice, 'hi');
+        const data: ReminderSettings = {
+          ...DEFAULT_REMINDER_SETTINGS,
+          ...(raw as any),
+          englishVoice: migratedEnglish || DEFAULT_REMINDER_SETTINGS.englishVoice,
+          hindiVoice: migratedHindi || DEFAULT_REMINDER_SETTINGS.hindiVoice,
+        };
+
+        data.hideDisabledReminderTypes =
+          typeof (raw as any).hideDisabledReminderTypes === 'boolean' ? (raw as any).hideDisabledReminderTypes : undefined;
+
+        this.settingsCache.set(tenantId, data);
+        onUpdate(data);
+      },
+      (error) => {
+        logger.error('Error subscribing to reminder settings:', error);
+        const cached = this.settingsCache.get(tenantId) || DEFAULT_REMINDER_SETTINGS;
+        onUpdate(cached);
+      },
+    );
+
+    this.unsubscribeMap.set(tenantId, unsubscribe);
+
+    if (context) {
+      logger.debug('ReminderSettingsService: reattached subscription', { tenantId, context });
+    }
+
+    return () => {
+      unsubscribe();
+      if (this.unsubscribeMap.get(tenantId) === unsubscribe) {
+        this.unsubscribeMap.delete(tenantId);
+      }
+    };
+  }
+
   subscribeToSettings(tenantId: string, onUpdate: (settings: ReminderSettings) => void): () => void {
     try {
-      const settingsRef = this.getSettingsRef(tenantId);
-      this.unsubscribeMap.get(tenantId)?.();
-
-      const unsubscribe = onSnapshot(
-        settingsRef,
-        (snapshot) => {
-          if (!snapshot.exists()) {
-            onUpdate(DEFAULT_REMINDER_SETTINGS);
-            return;
-          }
-
-          const raw = snapshot.data() as Partial<ReminderSettings>;
-          const settings = {
-            ...DEFAULT_REMINDER_SETTINGS,
-            ...(raw as any),
-            englishVoice: migrateVoice(raw.englishVoice, 'en') || DEFAULT_REMINDER_SETTINGS.englishVoice,
-            hindiVoice: migrateVoice(raw.hindiVoice, 'hi') || DEFAULT_REMINDER_SETTINGS.hindiVoice,
-          } as ReminderSettings;
-
-          settings.hideDisabledReminderTypes =
-            typeof (raw as any).hideDisabledReminderTypes === 'boolean' ? (raw as any).hideDisabledReminderTypes : undefined;
-
-          this.settingsCache.set(tenantId, settings);
-          onUpdate(settings);
-          logger.debug('Real-time reminder settings update received:', settings);
-        },
-        (error) => {
-          logger.error('Error subscribing to reminder settings:', error);
-          onUpdate(DEFAULT_REMINDER_SETTINGS);
-        },
-      );
-
-      this.unsubscribeMap.set(tenantId, unsubscribe);
+      this.callbackMap.set(tenantId, onUpdate);
+      this.ensureReinitRegistration();
+      const unsubscribe = this.attachSubscription(tenantId, onUpdate, 'initial');
       return () => {
         unsubscribe();
-        this.unsubscribeMap.delete(tenantId);
+        if (this.callbackMap.get(tenantId) === onUpdate) {
+          this.callbackMap.delete(tenantId);
+        }
       };
     } catch (error) {
       logger.error('Error setting up reminder settings subscription:', error);
@@ -281,11 +317,13 @@ class ReminderSettingsService {
     if (tenantId) {
       this.unsubscribeMap.get(tenantId)?.();
       this.unsubscribeMap.delete(tenantId);
+      this.callbackMap.delete(tenantId);
       return;
     }
 
     this.unsubscribeMap.forEach((unsubscribe) => unsubscribe());
     this.unsubscribeMap.clear();
+    this.callbackMap.clear();
   }
 
   async resetToDefaults(tenantId: string): Promise<boolean> {

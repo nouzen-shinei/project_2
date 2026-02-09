@@ -11,7 +11,7 @@ export default function ReloginRequiredModal() {
   const { user, reloginRequired } = useAuth();
   const [isProcessing, setIsProcessing] = useState(false);
 
-  const visible = Boolean(user && reloginRequired);
+  const visible = Boolean(reloginRequired);
 
   const handleRelogin = useCallback(async () => {
     if (isProcessing) return;

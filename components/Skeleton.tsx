@@ -113,7 +113,7 @@ export function SkeletonBar({
       onLayout={(e) => setWidth(e.nativeEvent.layout.width || width)}
     >
       {shouldPause ? (
-        <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+        <View style={[StyleSheet.absoluteFill, { pointerEvents: 'none' }]}>
           <LinearGradient
             colors={['transparent', highlightColor, 'transparent']}
             start={{ x: 0.3, y: 0.5 }}
@@ -123,8 +123,7 @@ export function SkeletonBar({
         </View>
       ) : (
         <Animated.View
-          pointerEvents="none"
-          style={[StyleSheet.absoluteFillObject, { transform: [{ translateX }] }]}
+          style={[StyleSheet.absoluteFillObject, { transform: [{ translateX }], pointerEvents: 'none' }]}
         >
           <LinearGradient
             colors={['transparent', highlightColor, 'transparent']}

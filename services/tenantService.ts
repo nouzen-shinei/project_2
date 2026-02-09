@@ -37,6 +37,16 @@ import type {
 import { STORAGE_KEYS } from '@/lib/storageKeys';
 import { teamMembershipNotifier } from './teamMembershipNotifier';
 import { tenantBackendClient, TenantBackendError } from './tenantBackendClient';
+type AuthServiceType = typeof import('../hooks/useAuthUnified').authService;
+let __authService: AuthServiceType | null = null;
+function getAuthService(): AuthServiceType {
+  if (!__authService) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require('../hooks/useAuthUnified');
+    __authService = mod.authService as AuthServiceType;
+  }
+  return __authService;
+}
 
 type MembershipActionInitiatedFrom = 'web' | 'mobile' | 'system';
 
@@ -434,20 +444,42 @@ class TenantService {
     onError?: (error: Error) => void,
   ): () => void {
     const q = query(this.membershipRef, where('userId', '==', userId));
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const memberships = snapshot.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        })) as TenantMembership[];
-        onSuccess(memberships);
-      },
-      (error) => {
-        logger.error('tenantService.listenToMembershipsForUser failed', error);
-        onError?.(error as Error);
-      },
-    );
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
+
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const memberships = snapshot.docs.map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          })) as TenantMembership[];
+          onSuccess(memberships);
+        },
+        (error) => {
+          logger.error('tenantService.listenToMembershipsForUser failed', error);
+          onError?.(error as Error);
+        },
+      );
+
+      if (context) {
+        logger.debug('tenantService.listenToMembershipsForUser reattached', { context });
+      }
+    };
+
+    attach('initial');
+    const unregister = getAuthService().registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   }
 
   async getActiveMembershipsForTenant(tenantId: string): Promise<TenantMembership[]> {
@@ -1098,20 +1130,42 @@ class TenantService {
       where('tenantId', '==', tenantId),
       orderBy('requestedAt', 'desc'),
     );
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const requests = snapshot.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        })) as TenantJoinRequest[];
-        onSuccess(requests);
-      },
-      (error) => {
-        logger.error('tenantService.listenToJoinRequests failed', error);
-        onError?.(error as Error);
-      },
-    );
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
+
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const requests = snapshot.docs.map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          })) as TenantJoinRequest[];
+          onSuccess(requests);
+        },
+        (error) => {
+          logger.error('tenantService.listenToJoinRequests failed', error);
+          onError?.(error as Error);
+        },
+      );
+
+      if (context) {
+        logger.debug('tenantService.listenToJoinRequests reattached', { context, tenantId });
+      }
+    };
+
+    attach('initial');
+    const unregister = getAuthService().registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   }
 
   async createInvite(params: {
@@ -1328,20 +1382,42 @@ class TenantService {
       orderBy('issuedAt', 'desc'),
       limit(limitCount),
     );
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const invites = snapshot.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        })) as TenantInvite[];
-        onSuccess(invites);
-      },
-      (error) => {
-        logger.error('tenantService.listenToInvites failed', error);
-        onError?.(error as Error);
-      },
-    );
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
+
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const invites = snapshot.docs.map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          })) as TenantInvite[];
+          onSuccess(invites);
+        },
+        (error) => {
+          logger.error('tenantService.listenToInvites failed', error);
+          onError?.(error as Error);
+        },
+      );
+
+      if (context) {
+        logger.debug('tenantService.listenToInvites reattached', { context, tenantId });
+      }
+    };
+
+    attach('initial');
+    const unregister = getAuthService().registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   }
 
   listenToIncomingInvites(
@@ -1361,30 +1437,52 @@ class TenantService {
     // which breaks local/dev projects unless an index is created.
     // Instead, fetch all invites for that email (typically small) and sort client-side.
     const q = query(this.inviteRef, where('email', '==', normalizedEmail));
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const invites = snapshot.docs
-          .map((docSnap) => ({
-            id: docSnap.id,
-            ...docSnap.data(),
-          }))
-          .sort((a, b) => {
-            const issuedA = typeof (a as any).issuedAt === 'string' ? Date.parse((a as any).issuedAt) : NaN;
-            const issuedB = typeof (b as any).issuedAt === 'string' ? Date.parse((b as any).issuedAt) : NaN;
-            if (Number.isNaN(issuedA) && Number.isNaN(issuedB)) return 0;
-            if (Number.isNaN(issuedA)) return 1;
-            if (Number.isNaN(issuedB)) return -1;
-            return issuedB - issuedA;
-          }) as TenantInvite[];
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
 
-        onSuccess(invites.slice(0, Math.max(0, limitCount)));
-      },
-      (error) => {
-        logger.error('tenantService.listenToIncomingInvites failed', error);
-        onError?.(error as Error);
-      },
-    );
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const invites = snapshot.docs
+            .map((docSnap) => ({
+              id: docSnap.id,
+              ...docSnap.data(),
+            }))
+            .sort((a, b) => {
+              const issuedA = typeof (a as any).issuedAt === 'string' ? Date.parse((a as any).issuedAt) : NaN;
+              const issuedB = typeof (b as any).issuedAt === 'string' ? Date.parse((b as any).issuedAt) : NaN;
+              if (Number.isNaN(issuedA) && Number.isNaN(issuedB)) return 0;
+              if (Number.isNaN(issuedA)) return 1;
+              if (Number.isNaN(issuedB)) return -1;
+              return issuedB - issuedA;
+            }) as TenantInvite[];
+
+          onSuccess(invites.slice(0, Math.max(0, limitCount)));
+        },
+        (error) => {
+          logger.error('tenantService.listenToIncomingInvites failed', error);
+          onError?.(error as Error);
+        },
+      );
+
+      if (context) {
+        logger.debug('tenantService.listenToIncomingInvites reattached', { context, normalizedEmail });
+      }
+    };
+
+    attach('initial');
+    const unregister = getAuthService().registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   }
 
   async rejectInvite(inviteId: string, actorId: string): Promise<void> {
@@ -1618,20 +1716,42 @@ class TenantService {
       orderBy('createdAt', 'desc'),
       limit(limitCount),
     );
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const codes = snapshot.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        })) as TenantCode[];
-        onSuccess(codes);
-      },
-      (error) => {
-        logger.error('tenantService.listenToCodes failed', error);
-        onError?.(error as Error);
-      },
-    );
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
+
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const codes = snapshot.docs.map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          })) as TenantCode[];
+          onSuccess(codes);
+        },
+        (error) => {
+          logger.error('tenantService.listenToCodes failed', error);
+          onError?.(error as Error);
+        },
+      );
+
+      if (context) {
+        logger.debug('tenantService.listenToCodes reattached', { context, tenantId });
+      }
+    };
+
+    attach('initial');
+    const unregister = getAuthService().registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   }
 
   async logAuditEvent(entry: Omit<TenantAuditLogEntry, 'id' | 'createdAt'>): Promise<void> {

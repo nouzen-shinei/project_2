@@ -868,9 +868,8 @@ const NoticePopup: React.FC<NoticePopupProps> = ({ visible, onClose, notices }) 
 
           {/* Pulse animation for high priority */}
           {currentNotice.priority === 'high' && (
-            <View 
-              style={[styles.pulseRing, { borderColor: theme.error }]} 
-              pointerEvents="none"
+            <View
+              style={[styles.pulseRing, { borderColor: theme.error, pointerEvents: 'none' }]}
             />
           )}
         </View>
@@ -948,11 +947,15 @@ const styles = StyleSheet.create({
   container: {
     width: '100%',
     borderRadius: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.3,
-    shadowRadius: 20,
-    elevation: 15,
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '0 10px 20px rgba(0, 0, 0, 0.3)' }
+      : {
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 10 },
+          shadowOpacity: 0.3,
+          shadowRadius: 20,
+          elevation: 15,
+        }),
     position: 'relative',
     // Allow dynamic sizing while constraining maximum height
     flexDirection: 'column',

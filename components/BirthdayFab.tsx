@@ -13,8 +13,7 @@ export default function BirthdayFab() {
 
   return (
     <View
-      pointerEvents="box-none"
-      style={{ position: 'absolute', right: 16, bottom: Platform.select({ ios: 80, android: 80, default: 80 }), zIndex: 2000 }}
+      style={{ position: 'absolute', right: 16, bottom: Platform.select({ ios: 80, android: 80, default: 80 }), zIndex: 2000, pointerEvents: 'box-none' }}
     >
       <Pressable
         onPress={() => {

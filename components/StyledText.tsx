@@ -430,9 +430,13 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     fontSize: 16,
     color: '#000000',
-    textShadowColor: 'rgba(0, 0, 0, 0.3)',
-    textShadowOffset: { width: 0.5, height: 0.5 },
-    textShadowRadius: 1,
+    ...(Platform.OS === 'web'
+      ? { textShadow: '0.5px 0.5px 1px rgba(0, 0, 0, 0.3)' }
+      : {
+          textShadowColor: 'rgba(0, 0, 0, 0.3)',
+          textShadowOffset: { width: 0.5, height: 0.5 },
+          textShadowRadius: 1,
+        }),
   },
   bold: {
     fontWeight: '800',
@@ -468,9 +472,13 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255, 215, 0, 0.5)',
     fontSize: 15,
     lineHeight: 20,
-    textShadowColor: 'rgba(255, 215, 0, 0.3)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 1,
+    ...(Platform.OS === 'web'
+      ? { textShadow: '0px 1px 1px rgba(255, 215, 0, 0.3)' }
+      : {
+          textShadowColor: 'rgba(255, 215, 0, 0.3)',
+          textShadowOffset: { width: 0, height: 1 },
+          textShadowRadius: 1,
+        }),
   },
   link: {
     color: '#007AFF',

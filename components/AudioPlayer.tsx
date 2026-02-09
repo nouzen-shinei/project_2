@@ -517,9 +517,8 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
         allowsFullscreen={false}
         allowsPictureInPicture={false}
         playsInline
-        pointerEvents="none"
         crossOrigin={crossOrigin}
-        style={styles.hiddenVideo}
+        style={[styles.hiddenVideo, { pointerEvents: 'none' }]}
       />
 
       <View style={styles.header}>

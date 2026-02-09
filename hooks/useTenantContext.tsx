@@ -8,7 +8,7 @@ import type {
   TenantNotificationPreferences,
 } from '@/types';
 import { tenantService } from '@/services/tenantService';
-import { useAuth } from './useAuthUnified';
+import { useAuth, authService } from './useAuthUnified';
 import { logger } from '@/lib/logger';
 
 interface TenantContextValue {
@@ -147,6 +147,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
         },
         (listenerError) => {
           logger.warn('TenantProvider: join request listener error', listenerError);
+          authService.flagReloginRequired?.('TenantProvider.joinRequests', listenerError);
           setError(listenerError?.message || 'Failed to load join requests');
         },
       );
@@ -175,6 +176,7 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
         });
       } catch (loadError) {
         logger.error('TenantProvider: failed to load tenant metadata', loadError);
+        authService.flagReloginRequired?.('TenantProvider.loadTenants', loadError);
         setError(loadError instanceof Error ? loadError.message : 'Failed to load coaching centers');
       } finally {
         setLoadingTenants(false);
@@ -208,43 +210,67 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     bootstrapFromCache();
   }, [bootstrapFromCache]);
 
-  useEffect(() => {
-    if (!user?.uid) {
+  const attachMembershipListener = useCallback(
+    (context?: string) => {
+      if (!user?.uid) {
+        membershipUnsubscribe.current?.();
+        setMemberships([]);
+        setTenantMap({});
+        setSelectedTenantId(null);
+        setInitializing(false);
+        clearJoinRequestListener();
+        return;
+      }
+
+      setInitializing(true);
+      setError(null);
+
       membershipUnsubscribe.current?.();
-      setMemberships([]);
-      setTenantMap({});
-      setSelectedTenantId(null);
-      setInitializing(false);
-      clearJoinRequestListener();
-      return;
-    }
+      membershipUnsubscribe.current = tenantService.listenToMembershipsForUser(
+        user.uid,
+        (list) => {
+          const normalizedList = normalizeMembershipList(list);
+          setMemberships(normalizedList);
+          setInitializing(false);
+          void tenantService.cacheMemberships(normalizedList).catch((cacheError) => {
+            logger.warn('TenantProvider: cache memberships failed', cacheError);
+          });
+          void loadTenantsFor(normalizedList);
+        },
+        (listenError) => {
+          authService.flagReloginRequired?.('TenantProvider.memberships', listenError);
+          setError(listenError?.message || 'Failed to load coaching centers');
+          setInitializing(false);
+        },
+      );
 
-    setInitializing(true);
-    setError(null);
+      if (selectedTenantId) {
+        attachJoinRequestListener(selectedTenantId);
+      }
 
-    membershipUnsubscribe.current?.();
-    membershipUnsubscribe.current = tenantService.listenToMembershipsForUser(
-      user.uid,
-      (list) => {
-        const normalizedList = normalizeMembershipList(list);
-        setMemberships(normalizedList);
-        setInitializing(false);
-        void tenantService.cacheMemberships(normalizedList).catch((cacheError) => {
-          logger.warn('TenantProvider: cache memberships failed', cacheError);
-        });
-        void loadTenantsFor(normalizedList);
-      },
-      (listenError) => {
-        setError(listenError?.message || 'Failed to load coaching centers');
-        setInitializing(false);
-      },
-    );
+      if (context) {
+        logger.debug('TenantProvider: reattached membership listener', { context });
+      }
+    },
+    [user?.uid, loadTenantsFor, selectedTenantId, attachJoinRequestListener],
+  );
 
+  useEffect(() => {
+    attachMembershipListener('initial');
     return () => {
       membershipUnsubscribe.current?.();
       membershipUnsubscribe.current = null;
     };
-  }, [user?.uid, loadTenantsFor]);
+  }, [attachMembershipListener]);
+
+  useEffect(() => {
+    const unsubscribe = authService.registerFirestoreReinit?.(attachMembershipListener);
+    return () => {
+      try {
+        unsubscribe?.();
+      } catch {}
+    };
+  }, [attachMembershipListener]);
 
   useEffect(() => {
     if (!memberships.length) {

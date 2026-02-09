@@ -793,7 +793,7 @@ export function StickerGifPickerMobile({
               value={searchQuery}
               onChangeText={setSearchQuery}
             />
-            <View pointerEvents="none" style={styles.searchIconContainer}>
+            <View style={[styles.searchIconContainer, { pointerEvents: 'none' }]}>
               <Search size={20} color={theme.textSecondary} />
             </View>
           </View>

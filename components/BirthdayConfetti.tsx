@@ -70,7 +70,7 @@ export default function BirthdayConfetti() {
   if (particles.length === 0) return null;
 
   return (
-    <View pointerEvents="none" style={{ display: visible ? 'flex' : 'none', position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, zIndex: 10001 }}>
+    <View style={{ display: visible ? 'flex' : 'none', position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, zIndex: 10001, pointerEvents: 'none' }}>
       {particles.map((p, i) => (
         <ConfettiPiece key={`burst-${i}`} p={p} progress={progress} />
       ))}

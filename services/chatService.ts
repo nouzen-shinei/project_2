@@ -6,7 +6,16 @@ import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import { ref, push, set, get, onValue, onChildAdded, onChildChanged, off, query, orderByChild, child, update, endAt, limitToLast, runTransaction, equalTo } from 'firebase/database';
 import { ref as storageRef, deleteObject } from 'firebase/storage';
-import { authService } from '../hooks/useAuthUnified';
+type AuthServiceType = typeof import('../hooks/useAuthUnified').authService;
+let __authService: AuthServiceType | null = null;
+function getAuthService(): AuthServiceType {
+  if (!__authService) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require('../hooks/useAuthUnified');
+    __authService = mod.authService as AuthServiceType;
+  }
+  return __authService;
+}
 import { internalTokenManager } from './internalTokenManager';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 import { maybeShowStorageLimitReachedAlert } from './storageLimitAlert';
@@ -307,7 +316,7 @@ class ChatService {
   }
 
   private requireCurrentUserEmail(): string {
-    const candidate = this.normalizeEmail(auth.currentUser?.email || authService.getCurrentUser()?.email);
+    const candidate = this.normalizeEmail(auth.currentUser?.email || getAuthService().getCurrentUser()?.email);
     if (!candidate) {
       throw new Error('User not authenticated');
     }
@@ -595,7 +604,7 @@ class ChatService {
       throw new Error('Sender email is unavailable.');
     }
 
-    const currentUser = authService.getCurrentUser();
+    const currentUser = getAuthService().getCurrentUser();
     if (!currentUser?.uid) {
       throw new Error('Sign in again to continue chatting.');
     }
@@ -1785,7 +1794,7 @@ class ChatService {
 
       if (isTyping) {
         try {
-          await authService.updateTypingStatus(normalizedUserEmail, normalizedRecipientEmail);
+          await getAuthService().updateTypingStatus(normalizedUserEmail, normalizedRecipientEmail);
         } catch (profileError) {
           logger.warn('Failed to update user profile typing status:', profileError);
         }
@@ -1796,7 +1805,7 @@ class ChatService {
         }, 3000);
       } else {
         try {
-          await authService.updateTypingStatus(normalizedUserEmail, null);
+          await getAuthService().updateTypingStatus(normalizedUserEmail, null);
         } catch (profileError) {
           logger.warn('Failed to clear user profile typing status:', profileError);
         }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { authService } from './useAuthUnified';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { firestore } from '../config/firebase';
 
@@ -26,6 +27,18 @@ export function useMaintenanceMode(): MaintenanceModeState {
     enabled: false,
     message: DEFAULT_MESSAGE,
   });
+  const [reinitKey, setReinitKey] = useState(0);
+
+  useEffect(() => {
+    const unsubscribe = authService.registerFirestoreReinit?.(() => {
+      setReinitKey((prev) => prev + 1);
+    });
+    return () => {
+      try {
+        unsubscribe?.();
+      } catch {}
+    };
+  }, []);
 
   useEffect(() => {
     const unsubscribe = onSnapshot(
@@ -49,7 +62,7 @@ export function useMaintenanceMode(): MaintenanceModeState {
     );
 
     return unsubscribe;
-  }, [ref]);
+  }, [ref, reinitKey]);
 
   return state;
 }
