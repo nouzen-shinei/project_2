@@ -15,7 +15,7 @@ import {
   where
 } from 'firebase/firestore';
 import { firestore as db } from '../config/firebase';
-import { useAuth } from './useAuthUnified';
+import { useAuth, authService } from './useAuthUnified';
 import { Notice, NoticeFormData } from '../types/notice';
 import { noticeService } from '../services/noticeService';
 import { useTenant } from './useTenantContext';
@@ -27,6 +27,18 @@ export const useNotices = () => {
   const [loading, setLoading] = useState(true);
   const { user } = useAuth();
   const { activeTenant, activeMembership } = useTenant();
+  const [reinitKey, setReinitKey] = useState(0);
+
+  useEffect(() => {
+    const unsubscribe = authService.registerFirestoreReinit?.(() => {
+      setReinitKey((prev) => prev + 1);
+    });
+    return () => {
+      try {
+        unsubscribe?.();
+      } catch {}
+    };
+  }, []);
 
   const isNoticeVisibleForRole = (notice: Notice, role: TenantMembershipRole | null | undefined): boolean => {
     const targets = (notice as any)?.targetTenantRoles;
@@ -74,7 +86,7 @@ export const useNotices = () => {
     });
 
     return () => unsubscribe();
-  }, [user, activeTenant?.id, activeMembership?.role]);
+  }, [user, activeTenant?.id, activeMembership?.role, reinitKey]);
 
   const addNotice = async (noticeData: NoticeFormData): Promise<string> => {
     if (!user) throw new Error('User not authenticated');

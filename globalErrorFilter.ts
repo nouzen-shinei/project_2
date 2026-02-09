@@ -94,6 +94,15 @@ export function installErrorFilter() {
   function patchedConsoleWarn(...args: any[]) {
     maybeHandleReloginRequired(args, 'globalErrorFilter.console.warn');
     maybeHandleStorageLimit(args, 'globalErrorFilter.console.warn');
+    if (Platform.OS === 'web') {
+      const first = typeof args[0] === 'string' ? args[0] : '';
+      if (
+        first.includes('"shadow*" style props are deprecated') ||
+        first.includes('props.pointerEvents is deprecated')
+      ) {
+        return;
+      }
+    }
     // @ts-ignore – preserve original signature
     originalWarn.apply(console, args);
   }

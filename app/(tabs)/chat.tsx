@@ -5234,10 +5234,9 @@ export default function Chat() {
       : editingMessageInfo?.id === normalizeMessageId(msg.id);
     const pendingOverlay = actionPending ? (
       <View
-        pointerEvents="none"
         style={[
           styles.messagePendingOverlay,
-          { backgroundColor: isOwnMessage ? 'rgba(0, 0, 0, 0.35)' : 'rgba(0, 0, 0, 0.25)' },
+          { backgroundColor: isOwnMessage ? 'rgba(0, 0, 0, 0.35)' : 'rgba(0, 0, 0, 0.25)', pointerEvents: 'none' },
         ]}
       >
         <ActivityIndicator size="small" color="#ffffff" />
@@ -7962,7 +7961,7 @@ export default function Chat() {
           />
         </View>
         {!isInitialAnchorSettled && (
-          <View style={[styles.loadingOverlay, { backgroundColor: theme.background }]} pointerEvents="auto">
+          <View style={[styles.loadingOverlay, { backgroundColor: theme.background, pointerEvents: 'auto' }]}>
             <ActivityIndicator size="large" color={theme.primary} />
           </View>
         )}

@@ -1737,7 +1737,7 @@ export default function AdminPanel() {
       )}
 
       {needsInvitePortal && (
-        <View pointerEvents="none" style={styles.hiddenInviteManagerHost}>
+        <View style={[styles.hiddenInviteManagerHost, { pointerEvents: 'none' }]}>
           <TenantInviteManager ref={inviteManagerRef} />
         </View>
       )}

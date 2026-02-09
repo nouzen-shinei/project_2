@@ -19,6 +19,7 @@ import firebaseAuthService from './firebaseAuthService';
 import { tenantService } from './tenantService';
 import { runtimeEndpoints } from './runtimeEndpoints';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
+import { authService } from '@/hooks/useAuthUnified';
 
 export interface Student {
   id: string;
@@ -104,28 +105,49 @@ class StudentService {
     onError?: (error: Error) => void,
   ): () => void {
     const q = query(this.studentsRef, where('tenantId', '==', tenantId), orderBy('createdAt', 'desc'));
-    return onSnapshot(
-      q,
-      (snapshot) => {
-        const students = snapshot.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        })) as Student[];
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
 
-        // Sort by order field on the client side
-        students.sort((a, b) => {
-          const orderA = a.order ?? 999999;
-          const orderB = b.order ?? 999999;
-          return orderA - orderB;
-        });
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const students = snapshot.docs.map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          })) as Student[];
 
-        onSuccess(students);
-      },
-      (error) => {
-        logger.error('📚 StudentService: subscribeToStudents failed', error);
-        onError?.(error as Error);
-      },
-    );
+          students.sort((a, b) => {
+            const orderA = a.order ?? 999999;
+            const orderB = b.order ?? 999999;
+            return orderA - orderB;
+          });
+
+          onSuccess(students);
+        },
+        (error) => {
+          logger.error('📚 StudentService: subscribeToStudents failed', error);
+          onError?.(error as Error);
+        },
+      );
+
+      if (context) {
+        logger.debug('StudentService: subscribeToStudents reattached', { context, tenantId });
+      }
+    };
+
+    attach('initial');
+    const unregister = authService.registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   }
 
   /**

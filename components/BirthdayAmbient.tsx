@@ -69,9 +69,9 @@ export default function BirthdayAmbient() {
   if (!shouldShowAmbient) return null;
 
   return (
-    <View pointerEvents="none" style={{ position: 'absolute', left: 0, top: 0, right: 0, bottom: 0 }}>
+    <View style={{ position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, pointerEvents: 'none' }}>
       {particles.map((p, idx) => (
-        <View pointerEvents="none" key={`bday-fx-${idx}`}>
+        <View style={{ pointerEvents: 'none' }} key={`bday-fx-${idx}`}>
           <Floater p={p} />
         </View>
       ))}

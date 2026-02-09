@@ -4,6 +4,16 @@ import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { logger } from '@/lib/logger';
 import { firestore } from '../config/firebase';
 import { internalTokenManager } from './internalTokenManager';
+type AuthServiceType = typeof import('../hooks/useAuthUnified').authService;
+let __authService: AuthServiceType | null = null;
+function getAuthService(): AuthServiceType {
+  if (!__authService) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require('../hooks/useAuthUnified');
+    __authService = mod.authService as AuthServiceType;
+  }
+  return __authService;
+}
 
 export type RuntimeEndpoints = {
   apiBaseUrl?: string;
@@ -47,10 +57,17 @@ class RuntimeEndpointsService {
   private started = false;
   private unsub?: () => void;
   private refreshInFlight: Promise<void> | null = null;
+  private reinitUnsubscribe: (() => void) | null = null;
 
   async init(): Promise<void> {
     if (this.started) return;
     this.started = true;
+
+    if (!this.reinitUnsubscribe) {
+      this.reinitUnsubscribe = getAuthService().registerFirestoreReinit?.((context) => {
+        this.handleReinit(context || 'reinit');
+      }) || null;
+    }
 
     await this.loadFromStorage();
     await this.refreshFromFirestoreOnce();
@@ -106,6 +123,15 @@ class RuntimeEndpointsService {
       this.unsub = undefined;
       this.started = false;
     }
+  }
+
+  private handleReinit(context: string): void {
+    if (!this.started) return;
+    this.unsub?.();
+    this.unsub = undefined;
+    void this.refreshFromFirestoreOnce();
+    this.startListener();
+    logger.debug('runtimeEndpoints reinit', { context });
   }
 
   getSnapshot(): RuntimeEndpoints {

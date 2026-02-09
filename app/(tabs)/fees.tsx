@@ -277,8 +277,8 @@ export default function Fees() {
   const isSmallScreen = width < 600; // threshold for small screens
   const isNativePlatform = Platform.OS !== 'web';
   const isFocused = useIsFocused();
-  const recordsScrollRef = useRef<GHScrollView | null>(null);
-  const filtersScrollRef = useRef<GHScrollView | null>(null);
+  const recordsScrollRef = useRef<any>(null);
+  const filtersScrollRef = useRef<any>(null);
   const [recordsScrollEnabled, setRecordsScrollEnabled] = useState(true);
 
   const router = useRouter();
@@ -6398,7 +6398,7 @@ export default function Fees() {
 
   {/* Summary & Records */}
   <GHScrollView
-    ref={recordsScrollRef}
+          ref={recordsScrollRef as any}
     style={styles.recordsList}
     contentContainerStyle={[styles.recordsContent, { paddingBottom: 120 }]}
     showsVerticalScrollIndicator={false}
@@ -6451,7 +6451,7 @@ export default function Fees() {
         {/* Filter Tabs Row */}
         <View style={{ width: '100%', marginBottom: 6 }}>
           <GHScrollView
-            ref={filtersScrollRef}
+            ref={filtersScrollRef as any}
             horizontal
             showsHorizontalScrollIndicator={false}
             style={{ 
@@ -6477,26 +6477,26 @@ export default function Fees() {
             onMoveShouldSetResponder={() => true}
             onTouchStart={() => {
               setRecordsScrollEnabled(false);
-              recordsScrollRef.current?.setNativeProps({ scrollEnabled: false });
+              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: false });
             }}
             onTouchEnd={() => {
-              recordsScrollRef.current?.setNativeProps({ scrollEnabled: true });
+              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
               setRecordsScrollEnabled(true);
             }}
             onTouchCancel={() => {
-              recordsScrollRef.current?.setNativeProps({ scrollEnabled: true });
+              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
               setRecordsScrollEnabled(true);
             }}
             onScrollBeginDrag={() => {
               setRecordsScrollEnabled(false);
-              recordsScrollRef.current?.setNativeProps({ scrollEnabled: false });
+              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: false });
             }}
             onScrollEndDrag={() => {
-              recordsScrollRef.current?.setNativeProps({ scrollEnabled: true });
+              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
               setRecordsScrollEnabled(true);
             }}
             onMomentumScrollEnd={() => {
-              recordsScrollRef.current?.setNativeProps({ scrollEnabled: true });
+              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
               setRecordsScrollEnabled(true);
             }}
           >
@@ -6993,8 +6993,8 @@ export default function Fees() {
 
             <View style={styles.inputGroup}>
               <Text style={[styles.inputLabel, { color: theme.text }]}>Due Month *</Text>
-              <View style={[styles.pickerContainer, { borderColor: theme.border, backgroundColor: theme.surface }]}
-                pointerEvents="box-none"
+              <View
+                style={[styles.pickerContainer, { borderColor: theme.border, backgroundColor: theme.surface, pointerEvents: 'box-none' }]}
               >
                 <TouchableOpacity
                   style={[

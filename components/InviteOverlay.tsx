@@ -375,7 +375,7 @@ const InviteOverlay = ({ token }: InviteOverlayProps) => {
   const disablePrimary = displayState !== 'ready' || accepting;
 
   return (
-    <View style={styles.overlay} pointerEvents="auto">
+    <View style={[styles.overlay, { pointerEvents: 'auto' }]}>
       <View
         style={[
           styles.backdrop,

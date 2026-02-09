@@ -653,12 +653,11 @@ const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router, on
             {inviteToken && <InviteOverlay token={inviteToken} />}
 
             {shouldShowTenantAccess && (
-              <View pointerEvents="box-none" style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}>
+              <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'box-none' }}>
                 <TenantAccessScreen visible={tenantModalVisible} onClose={() => setTenantModalVisible(false)} />
                 {!tenantModalVisible && !hintDismissed && (
                   <View
-                    pointerEvents="box-none"
-                    style={{ position: 'absolute', bottom: 120, left: 0, right: 0, alignItems: 'center' }}
+                    style={{ position: 'absolute', bottom: 120, left: 0, right: 0, alignItems: 'center', pointerEvents: 'box-none' }}
                   >
                     <View
                       style={{

@@ -1,6 +1,6 @@
 import { logger } from '@/lib/logger';
 import { useState, useEffect } from 'react';
-import { useAuth } from './useAuthUnified';
+import { useAuth, authService } from './useAuthUnified';
 import { useTenant } from './useTenantContext';
 import type { FeeRecord, TenantAuditLogEntry } from '../types';
 import {
@@ -72,6 +72,18 @@ function useFees() {
   // Get authentication status
   const { user, isAuthenticated, isInitialized } = useAuth();
   const { activeTenant, loading: tenantLoading } = useTenant();
+  const [reinitKey, setReinitKey] = useState(0);
+
+  useEffect(() => {
+    const unsubscribe = authService.registerFirestoreReinit?.(() => {
+      setReinitKey((prev) => prev + 1);
+    });
+    return () => {
+      try {
+        unsubscribe?.();
+      } catch {}
+    };
+  }, []);
 
   const requireTenantId = () => {
     if (!activeTenant?.id) {
@@ -172,7 +184,7 @@ function useFees() {
         unsubscribe();
       }
     };
-  }, [isAuthenticated, isInitialized, user, activeTenant?.id, tenantLoading]);
+  }, [isAuthenticated, isInitialized, user, activeTenant?.id, tenantLoading, reinitKey]);
 
   const addFeeRecord = async (
     feeData: Omit<FeeRecord, 'id' | 'tenantId'>,

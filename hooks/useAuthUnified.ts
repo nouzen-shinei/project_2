@@ -8,6 +8,7 @@ import { ref as storageRef, deleteObject } from 'firebase/storage';
 import { 
   signOut as firebaseSignOut,
   onAuthStateChanged,
+  onIdTokenChanged,
   User,
   GoogleAuthProvider,
   signInWithPopup,
@@ -144,21 +145,64 @@ initializeGoogleSignIn();
 
 let authListeners: Set<(state: typeof globalAuthState) => void> = new Set();
 let firebaseUnsubscribe: (() => void) | null = null;
+let idTokenUnsubscribe: (() => void) | null = null;
 let authorizedEmails: string[] = [];
 let teamMembersListeners: Set<(members: TeamMember[]) => void> = new Set();
 let teamMembersUnsubscribe: Unsubscribe | null = null;
+let teamMembersReinitUnsub: (() => void) | null = null;
 let presenceInterval: ReturnType<typeof setInterval> | null = null;
 let isAppInBackground = false; // Track app state
 let roleListenerUnsubscribe: Unsubscribe | null = null;
 let lastRoleHeartbeatCheckAt = 0;
 let roleBaselineEstablished = false;
 let lastSyncedRole: 'user' | 'admin' | null = null;
+let tokenRefreshInterval: ReturnType<typeof setInterval> | null = null;
 // Track how authorized emails were last loaded: from Firestore (authoritative), from cache, or error
 // Prevent concurrent revalidation attempts
 let revalidationInProgress = false;
 let permissionDeniedCounter = 0;
 let lastPermissionDeniedAt = 0;
 let permissionRecoveryInFlight: Promise<void> | null = null;
+
+const firestoreReinitHandlers = new Set<(context?: string) => void>();
+function registerFirestoreReinit(handler: (context?: string) => void): () => void {
+  firestoreReinitHandlers.add(handler);
+  return () => {
+    firestoreReinitHandlers.delete(handler);
+  };
+}
+
+function reinitFirestoreListeners(context?: string): void {
+  firestoreReinitHandlers.forEach((handler) => {
+    try {
+      handler(context);
+    } catch (error) {
+      logger.warn('Failed to reinit Firestore listeners', { context, error });
+    }
+  });
+}
+
+function stopTokenRefreshTimer(): void {
+  if (tokenRefreshInterval) {
+    clearInterval(tokenRefreshInterval);
+    tokenRefreshInterval = null;
+  }
+}
+
+function startTokenRefreshTimer(user: User): void {
+  stopTokenRefreshTimer();
+  tokenRefreshInterval = setInterval(async () => {
+    try {
+      if (globalAuthState.isOffline) return;
+      await user.getIdToken(true);
+      reinitFirestoreListeners('periodic-token-refresh');
+      await revalidateAuthorizationOnReconnect(2, 300);
+      logger.debug('🔁 Periodic token refresh completed');
+    } catch (error) {
+      logger.warn('Periodic token refresh failed', error);
+    }
+  }, 30 * 60 * 1000);
+}
 
 // Global variable to track current presence user (for debugging)
 let currentPresenceUser: string | null = null;
@@ -195,6 +239,7 @@ async function attemptPermissionRecovery(reason?: string): Promise<void> {
     try {
       logger.debug('🔄 Attempting permission recovery via token refresh', { reason });
       await user.getIdToken(true);
+      reinitFirestoreListeners('permission-recovery');
       await revalidateAuthorizationOnReconnect(2, 400);
       clearReloginRequired();
       logger.debug('✅ Permission recovery attempt completed');
@@ -209,7 +254,8 @@ async function attemptPermissionRecovery(reason?: string): Promise<void> {
 
 function flagReloginRequired(reason?: string, error?: unknown): void {
   if (globalAuthState.reloginRequired) return;
-  if (!globalAuthState.user) return;
+  const hasAuthUser = Boolean(globalAuthState.user || auth.currentUser);
+  if (!hasAuthUser) return;
   if (globalAuthState.isOffline) return;
   if (!isPermissionDeniedError(error)) return;
   const now = Date.now();
@@ -229,6 +275,28 @@ function flagReloginRequired(reason?: string, error?: unknown): void {
   notifyListeners();
 }
 
+function forceReloginRequired(reason?: string): void {
+  if (globalAuthState.reloginRequired) return;
+  const hasAuthUser = Boolean(globalAuthState.user || auth.currentUser);
+  if (!hasAuthUser) return;
+  if (globalAuthState.isOffline) return;
+  globalAuthState.reloginRequired = true;
+  globalAuthState.reloginReason = reason || null;
+  notifyListeners();
+}
+
+let reloginErrorInterceptorInstalled = false;
+function installReloginErrorInterceptor(): void {
+  if (reloginErrorInterceptorInstalled) return;
+  reloginErrorInterceptorInstalled = true;
+  logger.setErrorInterceptor?.((level, args) => {
+    if (level !== 'warn' && level !== 'error') return;
+    for (const arg of args) {
+      flagReloginRequired(`logger.${level}`, arg);
+    }
+  });
+}
+
 function clearReloginRequired(): void {
   const hadState = Boolean(globalAuthState.reloginRequired || globalAuthState.reloginReason);
   globalAuthState.reloginRequired = false;
@@ -239,6 +307,8 @@ function clearReloginRequired(): void {
     notifyListeners();
   }
 }
+
+installReloginErrorInterceptor();
 
 async function clearUserScopedStorage(): Promise<void> {
   const explicitKeys: string[] = [
@@ -597,6 +667,9 @@ async function updateUserProfileSafe(email: string, profileData: {
                                errorCode === 'permission-denied';
       const isMissingAuthDoc = errorMessage === 'AUTH_DOC_MISSING';
       
+      if (isPermissionError) {
+        flagReloginRequired('updateUserProfileSafe.authorizedEmails', authError);
+      }
       if (!isPermissionError && !isMissingAuthDoc && shouldLog) {
         logger.warn('⚠️ AuthorizedEmails update failed, trying users collection:', authError);
       }
@@ -652,6 +725,9 @@ async function updateUserProfileSafe(email: string, profileData: {
                                      usersErrorCode === 'permission-denied';
         
         // Only log non-permission errors and only when shouldLog is true
+        if (isUsersPermissionError) {
+          flagReloginRequired('updateUserProfileSafe.usersCollection', firestoreError);
+        }
         if (!isUsersPermissionError && shouldLog) {
           logger.warn('⚠️ Users collection update also failed:', firestoreError);
         }
@@ -680,6 +756,9 @@ async function updateUserProfileSafe(email: string, profileData: {
                                errorMessage.includes('insufficient permissions') ||
                                errorMessage.includes('permission-denied');
       
+      if (isPermissionError) {
+        flagReloginRequired('updateUserProfileSafe.outer', error);
+      }
       if (!isPermissionError) {
         logger.warn('⚠️ Unexpected error in safe profile update:', error);
       }
@@ -825,6 +904,9 @@ async function setUserOnline(email: string, isOnline: boolean = true) {
                              errorMessage.includes('insufficient permissions') ||
                              errorCode === 'permission-denied';
     
+    if (isPermissionError) {
+      flagReloginRequired('setUserOnline', error);
+    }
     if (!isPermissionError) {
       logger.warn('Non-permission error setting user online status:', error);
     }
@@ -1374,16 +1456,15 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
 
         // Sign in to Google
         const userInfo = await GoogleSignin.signIn();
-        
-        if (!userInfo || !userInfo.data?.idToken) {
+
+        if (!userInfo || !userInfo.idToken) {
           throw new Error('No user data or ID token received from Google');
         }
 
-        const googleUser = userInfo.data;
-        logger.debug('📱 Google Sign-In successful:', googleUser.user.email);
+        logger.debug('📱 Google Sign-In successful:', userInfo.user.email);
 
         // Create Firebase credential and sign in
-        const credential = GoogleAuthProvider.credential(googleUser.idToken);
+        const credential = GoogleAuthProvider.credential(userInfo.idToken);
         const firebaseResult = await signInWithCredential(auth, credential);
         const user = firebaseResult.user;
 
@@ -1532,6 +1613,7 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
 async function signOut(): Promise<void> {
   try {
     logger.debug('Starting sign out...');
+    stopTokenRefreshTimer();
     
     // Log user logout before signing out
     if (globalAuthState.user?.email) {
@@ -1726,6 +1808,17 @@ function initializeAuth() {
     
     if (user) {
       try {
+        if (!user.email) {
+          logger.warn('Auth state change missing email; forcing relogin');
+          forceReloginRequired('auth.missing-email');
+          return;
+        }
+        try {
+          await user.getIdToken(true);
+        } catch (tokenError) {
+          logger.warn('Failed to force token refresh on auth state change', tokenError);
+        }
+        startTokenRefreshTimer(user);
         logger.debug('🔐 Multi-tenant auth state change - granting access to authenticated user:', user.email);
         try {
           await loadAuthorizedEmails();
@@ -1918,6 +2011,7 @@ function initializeAuth() {
     } else {
       // User signed out or auth state is null
       logger.debug('ℹ️ Firebase auth state is null');
+      stopTokenRefreshTimer();
       // Cleanup role listener
       if (roleListenerUnsubscribe) {
         try { roleListenerUnsubscribe(); } catch {}
@@ -1935,6 +2029,13 @@ function initializeAuth() {
       logger.debug('ℹ️ Keeping cached user if present for offline support');
       return;
     }
+  });
+
+  idTokenUnsubscribe = onIdTokenChanged(auth, async (user) => {
+    if (!user) return;
+    logger.debug('🔄 Firebase ID token refreshed');
+    reinitFirestoreListeners('id-token-changed');
+    await revalidateAuthorizationOnReconnect(2, 300);
   });
 
   // Set initialization timeout - shorter for faster offline detection
@@ -1994,96 +2095,109 @@ function onTeamMembersChange(callback: (members: TeamMember[]) => void): () => v
   // Set up Firestore listener if not already set up
   if (!teamMembersUnsubscribe) {
     const authorizedRef = collection(firestore, 'authorizedEmails');
-    teamMembersUnsubscribe = onSnapshot(authorizedRef, async (snapshot) => {
-      try {
-        const members: TeamMember[] = [];
-        snapshot.forEach((docSnap) => {
-          const data = docSnap.data();
-          if (data && data.email) {
-            const name = data.displayName || data.email.split('@')[0]
-              .replace(/[._-]/g, ' ')
-              .replace(/\b\w/g, (l: string) => l.toUpperCase());
-            
-            // Presence derivation: by env mode (last_seen vs flag)
-            const lastSeen = data.lastSeen;
-            const FIRESTORE_ONLINE_THRESHOLD_MIN = getPresenceThresholdMin();
+    const attach = (context?: string) => {
+      teamMembersUnsubscribe?.();
+      teamMembersUnsubscribe = onSnapshot(authorizedRef, async (snapshot) => {
+        try {
+          const members: TeamMember[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            if (data && data.email) {
+              const name = data.displayName || data.email.split('@')[0]
+                .replace(/[._-]/g, ' ')
+                .replace(/\b\w/g, (l: string) => l.toUpperCase());
+              
+              // Presence derivation: by env mode (last_seen vs flag)
+              const lastSeen = data.lastSeen;
+              const FIRESTORE_ONLINE_THRESHOLD_MIN = getPresenceThresholdMin();
 
-            // Robust timestamp parsing (supports ISO string, number, Date, Firestore Timestamp-like objects)
-            const parseAnyTimestamp = (val: any): Date | null => {
-              try {
-                if (!val) return null;
-                // Firestore server timestamp sentinel (unresolved) – treat as now
-                if (val && typeof val === 'object' && val._methodName === 'serverTimestamp')
-                  return new Date();
-                // Firestore Timestamp shape { seconds, nanoseconds }
-                if (val && typeof val === 'object' && typeof val.seconds === 'number')
-                  return new Date(val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6));
-                // Actual Timestamp with toDate()
-                if (val && typeof val.toDate === 'function') return val.toDate();
-                if (val instanceof Date) return val;
-                if (typeof val === 'number' || typeof val === 'string') return new Date(val);
-                return null;
-              } catch {
-                return null;
-              }
-            };
-
-            // Compute online status based on configured mode
-            let isOnline = false;
-            if (PRESENCE_MODE === 'flag') {
-              isOnline = data.isOnline === true;
-            } else {
-              const parsedLastSeen = parseAnyTimestamp(lastSeen);
-              if (parsedLastSeen) {
-                const now = new Date();
-                const timeDiffMinutes = (now.getTime() - parsedLastSeen.getTime()) / (1000 * 60);
-                isOnline = timeDiffMinutes <= FIRESTORE_ONLINE_THRESHOLD_MIN;
-                if (!isOnline && (data.isOnline === true)) {
-                  // (Removed verbose derived offline discrepancy debug log)
+              // Robust timestamp parsing (supports ISO string, number, Date, Firestore Timestamp-like objects)
+              const parseAnyTimestamp = (val: any): Date | null => {
+                try {
+                  if (!val) return null;
+                  // Firestore server timestamp sentinel (unresolved) – treat as now
+                  if (val && typeof val === 'object' && val._methodName === 'serverTimestamp')
+                    return new Date();
+                  // Firestore Timestamp shape { seconds, nanoseconds }
+                  if (val && typeof val === 'object' && typeof val.seconds === 'number')
+                    return new Date(val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6));
+                  // Actual Timestamp with toDate()
+                  if (val && typeof val.toDate === 'function') return val.toDate();
+                  if (val instanceof Date) return val;
+                  if (typeof val === 'number' || typeof val === 'string') return new Date(val);
+                  return null;
+                } catch {
+                  return null;
                 }
+              };
+
+              // Compute online status based on configured mode
+              let isOnline = false;
+              if (PRESENCE_MODE === 'flag') {
+                isOnline = data.isOnline === true;
               } else {
-                // No usable lastSeen; trust stored flag as a fallback
-                isOnline = data.isOnline ?? false;
+                const parsedLastSeen = parseAnyTimestamp(lastSeen);
+                if (parsedLastSeen) {
+                  const now = new Date();
+                  const timeDiffMinutes = (now.getTime() - parsedLastSeen.getTime()) / (1000 * 60);
+                  isOnline = timeDiffMinutes <= FIRESTORE_ONLINE_THRESHOLD_MIN;
+                  if (!isOnline && (data.isOnline === true)) {
+                    // (Removed verbose derived offline discrepancy debug log)
+                  }
+                } else {
+                  // No usable lastSeen; trust stored flag as a fallback
+                  isOnline = data.isOnline ?? false;
+                }
               }
+              
+              // (Removed admin user presence debug log)
+              
+              members.push({
+                id: data.email.toLowerCase(),
+                name,
+                email: data.email.toLowerCase(),
+                avatar: data.email.charAt(0).toUpperCase(),
+                photoURL: data.photoURL,
+                customImageURL: data.customImageURL,
+                role: data.role || 'user',
+                isOnline: isOnline,
+                lastSeen: lastSeen,
+                typingTo: data.typingTo?.toLowerCase() || data.typingTo,
+                school: data.school,
+                bio: data.bio,
+                phone: data.phone,
+                dateOfBirth: data.dateOfBirth,
+                salutation: data.salutation,
+                subjects: Array.isArray(data.subjects) ? data.subjects : undefined,
+              });
             }
-            
-            // (Removed admin user presence debug log)
-            
-            members.push({
-              id: data.email.toLowerCase(),
-              name,
-              email: data.email.toLowerCase(),
-              avatar: data.email.charAt(0).toUpperCase(),
-              photoURL: data.photoURL,
-              customImageURL: data.customImageURL,
-              role: data.role || 'user',
-              isOnline: isOnline,
-              lastSeen: lastSeen,
-              typingTo: data.typingTo?.toLowerCase() || data.typingTo,
-              school: data.school,
-              bio: data.bio,
-              phone: data.phone,
-              dateOfBirth: data.dateOfBirth,
-              salutation: data.salutation,
-              subjects: Array.isArray(data.subjects) ? data.subjects : undefined,
-            });
-          }
-        });
-        
-        members.sort((a, b) => {
-          if (a.isOnline !== b.isOnline) {
-            return a.isOnline ? -1 : 1;
-          }
-          return a.name.localeCompare(b.name);
-        });
-        
-        teamMembersListeners.forEach((listener) => {
-          listener(members);
-        });
-      } catch (error) {
-        logger.error('Error in team members listener:', error);
+          });
+          
+          members.sort((a, b) => {
+            if (a.isOnline !== b.isOnline) {
+              return a.isOnline ? -1 : 1;
+            }
+            return a.name.localeCompare(b.name);
+          });
+          
+          teamMembersListeners.forEach((listener) => {
+            listener(members);
+          });
+        } catch (error) {
+          logger.error('Error in team members listener:', error);
+        }
+      });
+
+      if (context) {
+        logger.debug('Team members listener reattached', { context });
       }
-    });
+    };
+
+    attach('initial');
+
+    if (!teamMembersReinitUnsub) {
+      teamMembersReinitUnsub = registerFirestoreReinit?.(() => attach('reinit')) || null;
+    }
   }
   
   // Return unsubscribe function
@@ -2093,6 +2207,12 @@ function onTeamMembersChange(callback: (members: TeamMember[]) => void): () => v
     if (teamMembersListeners.size === 0 && teamMembersUnsubscribe) {
       teamMembersUnsubscribe();
       teamMembersUnsubscribe = null;
+      if (teamMembersReinitUnsub) {
+        try {
+          teamMembersReinitUnsub();
+        } catch {}
+        teamMembersReinitUnsub = null;
+      }
     }
   };
 }
@@ -2601,6 +2721,9 @@ async function updateUserProfile(email: string, profileData: {
                              errorMessage.includes('insufficient permissions') ||
                              errorCode === 'permission-denied';
     
+    if (isPermissionError) {
+      flagReloginRequired('updateUserProfile', error);
+    }
     if (!isPermissionError) {
       // Only log 10% of non-permission errors to reduce noise
       if (Math.random() < 0.1) {
@@ -2784,6 +2907,13 @@ export function useAuth() {
                     firebaseUnsubscribe();
                     firebaseUnsubscribe = null;
                   }
+                  if (idTokenUnsubscribe) {
+                    try {
+                      idTokenUnsubscribe();
+                    } catch {}
+                    idTokenUnsubscribe = null;
+                  }
+                  stopTokenRefreshTimer();
                   globalAuthState.isInitialized = false;
                   initializeAuth();
                   
@@ -2822,6 +2952,12 @@ export function useAuth() {
       if (isSubscribed.current) {
         authListeners.delete(setState);
         isSubscribed.current = false;
+        if (idTokenUnsubscribe) {
+          try {
+            idTokenUnsubscribe();
+          } catch {}
+          idTokenUnsubscribe = null;
+        }
       }
     };
   }, []);
@@ -2871,4 +3007,5 @@ export const authService = {
   isDeviceBanError,
   flagReloginRequired,
   clearReloginRequired,
+  registerFirestoreReinit,
 };

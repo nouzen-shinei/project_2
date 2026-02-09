@@ -293,6 +293,7 @@ export interface AuthorizedUser {
 
 class DeviceTrackingService {
   private currentDeviceId: string | null = null;
+  private pushTokenRefreshReinitUnsub: (() => void) | null = null;
   private currentUserEmail: string | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private unsubscribeListeners: (() => void)[] = [];
@@ -1434,9 +1435,29 @@ class DeviceTrackingService {
 
       this.unsubscribeListeners.push(unsubscribe);
       this.hasPushTokenRefreshMonitor = true;
+      if (!this.pushTokenRefreshReinitUnsub) {
+        this.pushTokenRefreshReinitUnsub = authService.registerFirestoreReinit?.(() => {
+          if (this.currentUserEmail && this.currentDeviceId) {
+            this.restartPushTokenRefreshMonitor('reinit');
+          }
+        }) || null;
+      }
       logger.debug('Push token refresh monitor activated for device:', deviceId);
     } catch (error) {
       logger.error('Failed to start push token refresh monitor:', error);
+    }
+  }
+
+  private async restartPushTokenRefreshMonitor(context?: string): Promise<void> {
+    if (!this.currentUserEmail || !this.currentDeviceId || Platform.OS === 'web') {
+      return;
+    }
+    this.unsubscribeListeners.forEach((unsubscribe) => unsubscribe());
+    this.unsubscribeListeners = [];
+    this.hasPushTokenRefreshMonitor = false;
+    await this.startPushTokenRefreshMonitor(this.currentUserEmail, this.currentDeviceId);
+    if (context) {
+      logger.debug('Push token refresh monitor reattached', { context });
     }
   }
 

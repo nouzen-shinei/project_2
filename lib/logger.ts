@@ -36,6 +36,9 @@ let dynamicConfig: LoggerConfig = {
   level: activeLevel,
 };
 
+type ErrorInterceptor = (level: LogLevel, args: any[]) => void;
+let errorInterceptor: ErrorInterceptor | null = null;
+
 let context: Record<string, unknown> = {};
 
 function shouldLog(level: LogLevel) {
@@ -86,6 +89,11 @@ const COLOR: Record<LogLevel, string> = {
 };
 
 function baseEmit(level: LogLevel, args: any[]) {
+  if (errorInterceptor && (level === 'warn' || level === 'error')) {
+    try {
+      errorInterceptor(level, args);
+    } catch {}
+  }
   if (!shouldLog(level)) return;
   const processed = dynamicConfig.redactKeys
     ? args.map(a => redact(a, dynamicConfig.redactKeys))
@@ -125,6 +133,9 @@ export const logger = {
   },
   configure(partial: Partial<LoggerConfig>) {
     dynamicConfig = { ...dynamicConfig, ...partial };
+  },
+  setErrorInterceptor(handler: ErrorInterceptor | null) {
+    errorInterceptor = handler;
   },
   time(label: string) {
     return performanceNow(label);

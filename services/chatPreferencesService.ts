@@ -1,6 +1,7 @@
 import { logger } from '@/lib/logger';
 import { doc, getDoc, onSnapshot, setDoc, updateDoc, deleteField, runTransaction } from 'firebase/firestore';
 import { firestore } from '@/config/firebase';
+import { authService } from '@/hooks/useAuthUnified';
 
 export type PinnedChatsMap = Record<string, number>; // key = sanitized email ([@,.] -> _), value = serial
 
@@ -24,10 +25,32 @@ export const chatPreferencesService = {
 
   onPinnedChatsChange(userEmail: string, cb: (map: PinnedChatsMap) => void) {
     const ref = userDocRef(userEmail);
-    return onSnapshot(ref, (snap) => {
-      const data = snap.exists() ? (snap.data() as any) : {};
-      cb((data.pinnedChats as PinnedChatsMap) || {});
-    });
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
+
+    const attach = (context?: string) => {
+      if (disposed) return;
+      unsubscribe?.();
+      unsubscribe = onSnapshot(ref, (snap) => {
+        const data = snap.exists() ? (snap.data() as any) : {};
+        cb((data.pinnedChats as PinnedChatsMap) || {});
+      });
+
+      if (context) {
+        logger.debug('chatPreferencesService.onPinnedChatsChange reattached', { context });
+      }
+    };
+
+    attach('initial');
+    const unregister = authService.registerFirestoreReinit?.(() => attach('reinit'));
+
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      try {
+        unregister?.();
+      } catch {}
+    };
   },
 
   async pinChat(userEmail: string, otherEmail: string): Promise<PinnedChatsMap> {
