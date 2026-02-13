@@ -1433,12 +1433,28 @@ export async function startBillingCheckout(payload: BillingCheckoutPayload) {
   try {
     return await apiRequest<BillingCheckoutResponse>('/billing/checkout', { method: 'POST', body: payload });
   } catch (error) {
-    if (error instanceof ApiError && error.status === 404) {
-      return {
-        checkoutUrl: '#',
-        provider: payload.provider ?? 'stripe',
-        sessionId: 'preview-only',
-      } satisfies BillingCheckoutResponse;
+    if (error instanceof ApiError) {
+      if (error.status === 404) {
+        return {
+          checkoutUrl: '#',
+          provider: payload.provider ?? 'stripe',
+          sessionId: 'preview-only',
+        } satisfies BillingCheckoutResponse;
+      }
+
+      if (error.status === 409 && error.data && typeof error.data === 'object') {
+        const data = error.data as { checkoutUrl?: unknown; provider?: unknown; sessionId?: unknown };
+        const checkoutUrl = typeof data.checkoutUrl === 'string' ? data.checkoutUrl : '';
+        if (checkoutUrl) {
+          const provider = typeof data.provider === 'string' ? data.provider : payload.provider ?? 'razorpay';
+          const sessionId = typeof data.sessionId === 'string' ? data.sessionId : undefined;
+          return {
+            checkoutUrl,
+            provider,
+            ...(sessionId ? { sessionId } : {}),
+          } satisfies BillingCheckoutResponse;
+        }
+      }
     }
     throw error;
   }

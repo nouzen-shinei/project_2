@@ -13,6 +13,7 @@ export default function LoginScreen() {
   const { isSlow, label: qualityLabel } = useNetworkQuality();
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
+  const [displayError, setDisplayError] = useState<string | null>(null);
 
   // Debug logging (only in development)
   const isDev = __DEV__;
@@ -29,14 +30,12 @@ export default function LoginScreen() {
     }
   }, [user, loading]);
 
-  // Clear only device-ban errors on mount; everything else resets automatically
+  // Hold onto the latest auth error until the user retries sign-in
   useEffect(() => {
     if (!error) return;
-    const isDeviceBan = error.includes('DEVICE_BAN_ERROR:');
-    if (!isDeviceBan) {
-      clearError();
-    }
-  }, []);
+    if (error === 'Authentication timeout - slow connection') return;
+    setDisplayError(error);
+  }, [error]);
 
   // Clear success message when an error comes in or on unmount
   useEffect(() => {
@@ -71,10 +70,9 @@ export default function LoginScreen() {
 
   const handleGoogleSignIn = async () => {
     setIsSigningIn(true);
-    // Only clear non-device-ban errors before signing in
-    if (error && !error.includes('DEVICE_BAN_ERROR:')) {
-      clearError();
-    }
+    setDisplayError(null);
+    setSuccess(null);
+    clearError();
     
     try {
       const result = await signInWithGoogle();
@@ -123,7 +121,7 @@ export default function LoginScreen() {
       <SignInCard 
         onGoogleSignIn={handleGoogleSignIn}
         loading={loading || isSigningIn}
-        error={error}
+        error={displayError}
         success={success}
       />
     </View>

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityIndicator, Animated, Platform, RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { RefreshCw, X } from 'lucide-react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 
 import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
@@ -18,7 +18,7 @@ export default function UsageScreen() {
   const { theme } = useTheme();
   const { activeTenant, loading: tenantLoading } = useTenant();
   const { activeMembership } = useTenant();
-  const insets = useSafeAreaInsets();
+  const sharedTopPadding = useSharedTopPadding({ minPadding: 0, extraPadding: HEADER_VERTICAL_PADDING });
   const tenantId = activeTenant?.id ?? null;
 
   const canViewUsage = activeMembership?.role !== 'member';
@@ -147,7 +147,7 @@ export default function UsageScreen() {
           {
             backgroundColor: theme.surface,
             borderBottomColor: theme.border,
-            paddingTop: insets.top + HEADER_VERTICAL_PADDING,
+            paddingTop: sharedTopPadding,
             paddingBottom: HEADER_VERTICAL_PADDING,
           },
         ]}

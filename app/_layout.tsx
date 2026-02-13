@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Stack , useRouter, useSegments } from 'expo-router';
 import { enforceClientSafety } from '../lib/runtimeEnv';
 import { injectCSP } from '../lib/security/csp';
@@ -37,6 +37,7 @@ import BirthdayMusic from '../components/BirthdayMusic';
 import BirthdayFab from '../components/BirthdayFab';
 import { Platform, Image, ActivityIndicator, View, Text, useColorScheme, Modal, TouchableOpacity, Alert } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaInsetsContext, SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import AuthGate from '../components/AuthGate';
 import MaintenanceGate from '../components/MaintenanceGate';
 import { NoticeProvider } from '../components/NoticeProvider';
@@ -182,6 +183,35 @@ export default function RootLayout() {
   const segments = useSegments();
   const segmentsRef = useRef(segments);
   const [hasRedirected, setHasRedirected] = useState(false);
+
+  const webSafeAreaOverride = useMemo(() => {
+    if (Platform.OS !== 'web') {
+      return false;
+    }
+
+    const segs = segments as unknown as string[] | undefined;
+    let first = Array.isArray(segs) && segs.length ? segs[0] : '';
+
+    if (!first && typeof window !== 'undefined') {
+      const path = window.location.pathname.toLowerCase();
+      first = path.split('/').filter(Boolean)[0] ?? '';
+    }
+
+    const allow = new Set([
+      '(tabs)',
+      'student-profile',
+      'checkout',
+      'checkout-result',
+      'billing',
+      'invite',
+      'shared',
+      'auth',
+      'l',
+      's',
+    ]);
+
+    return allow.has(first);
+  }, [segments]);
 
   const isPublicRoute = (() => {
     if (Array.isArray(segments) && segments.length > 0) {
@@ -424,34 +454,38 @@ export default function RootLayout() {
   if (loading || !isInitialized) {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
-        <MaintenanceGate>
-          <ThemeProvider>
-            <ModalAlertProvider>
-              <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colorScheme === 'dark' ? '#0f172a' : '#fff' }}>
-                <Image
-                  source={require('../assets/images/icon.png')}
-                  style={{ width: 120, height: 120, marginBottom: 32, borderRadius: 24 }}
-                  resizeMode="contain"
-                />
-                <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#aaa' : '#888'} />
-                <Text
-                  style={{
-                    position: 'absolute',
-                    bottom: 24,
-                    textAlign: 'center',
-                    color: colorScheme === 'dark' ? '#9CA3AF' : '#6B7280',
-                    fontSize: 16,
-                  }}
-                >
-                  © vipika.in
-                </Text>
-              </View>
-              <ReloginRequiredModal />
-              <StatusBar style="auto" />
-              <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-            </ModalAlertProvider>
-          </ThemeProvider>
-        </MaintenanceGate>
+        <SafeAreaProvider>
+          <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
+            <MaintenanceGate>
+              <ThemeProvider>
+                <ModalAlertProvider>
+                  <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colorScheme === 'dark' ? '#0f172a' : '#fff' }}>
+                    <Image
+                      source={require('../assets/images/icon.png')}
+                      style={{ width: 120, height: 120, marginBottom: 32, borderRadius: 24 }}
+                      resizeMode="contain"
+                    />
+                    <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#aaa' : '#888'} />
+                    <Text
+                      style={{
+                        position: 'absolute',
+                        bottom: 24,
+                        textAlign: 'center',
+                        color: colorScheme === 'dark' ? '#9CA3AF' : '#6B7280',
+                        fontSize: 16,
+                      }}
+                    >
+                      © vipika.in
+                    </Text>
+                  </View>
+                  <ReloginRequiredModal />
+                  <StatusBar style="auto" />
+                  <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                </ModalAlertProvider>
+              </ThemeProvider>
+            </MaintenanceGate>
+          </SafeAreaWebTopOverride>
+        </SafeAreaProvider>
       </GestureHandlerRootView>
     );
   }
@@ -460,24 +494,28 @@ export default function RootLayout() {
   if (!user && !isOffline && isPublicRoute) {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
-        <MaintenanceGate>
-          <ThemeProvider>
-            <ModalAlertProvider>
-              <Stack screenOptions={{ headerShown: false }}>
-                <Stack.Screen name="l" options={{ headerShown: false }} />
-                <Stack.Screen name="s/index" options={{ headerShown: false }} />
-                <Stack.Screen name="s/[token]" options={{ headerShown: false }} />
-                <Stack.Screen name="shared/index" options={{ headerShown: false }} />
-                <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
-                <Stack.Screen name="invite/[token]" options={{ headerShown: false }} />
-                <Stack.Screen name="+not-found" options={{ headerShown: false }} />
-              </Stack>
-              <ReloginRequiredModal />
-              <StatusBar style="auto" />
-              <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-            </ModalAlertProvider>
-          </ThemeProvider>
-        </MaintenanceGate>
+        <SafeAreaProvider>
+          <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
+            <MaintenanceGate>
+              <ThemeProvider>
+                <ModalAlertProvider>
+                  <Stack screenOptions={{ headerShown: false }}>
+                    <Stack.Screen name="l" options={{ headerShown: false }} />
+                    <Stack.Screen name="s/index" options={{ headerShown: false }} />
+                    <Stack.Screen name="s/[token]" options={{ headerShown: false }} />
+                    <Stack.Screen name="shared/index" options={{ headerShown: false }} />
+                    <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
+                    <Stack.Screen name="invite/[token]" options={{ headerShown: false }} />
+                    <Stack.Screen name="+not-found" options={{ headerShown: false }} />
+                  </Stack>
+                  <ReloginRequiredModal />
+                  <StatusBar style="auto" />
+                  <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                </ModalAlertProvider>
+              </ThemeProvider>
+            </MaintenanceGate>
+          </SafeAreaWebTopOverride>
+        </SafeAreaProvider>
       </GestureHandlerRootView>
     );
   }
@@ -486,16 +524,20 @@ export default function RootLayout() {
     const LoginScreen = require('./auth/login').default;
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
-        <MaintenanceGate>
-          <ThemeProvider>
-            <ModalAlertProvider>
-              <LoginScreen />
-              <ReloginRequiredModal />
-              <StatusBar style="auto" />
-              <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-            </ModalAlertProvider>
-          </ThemeProvider>
-        </MaintenanceGate>
+        <SafeAreaProvider>
+          <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
+            <MaintenanceGate>
+              <ThemeProvider>
+                <ModalAlertProvider>
+                  <LoginScreen />
+                  <ReloginRequiredModal />
+                  <StatusBar style="auto" />
+                  <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                </ModalAlertProvider>
+              </ThemeProvider>
+            </MaintenanceGate>
+          </SafeAreaWebTopOverride>
+        </SafeAreaProvider>
       </GestureHandlerRootView>
     );
   }
@@ -503,28 +545,57 @@ export default function RootLayout() {
   // Otherwise, show main app shell (user exists, or offline with cached user)
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <MaintenanceGate>
-        <AuthGate>
-          <TenantProvider>
-            <ThemeProvider>
-              <ModalAlertProvider>
-                <TenantAwareShell
-                  colorScheme={colorScheme}
-                  isOffline={isOffline}
-                  roleChangeNotice={roleChangeNotice}
-                  router={router}
-                  onTenantBootstrapped={() => setTenantBootstrapped(true)}
-                />
-                <ReloginRequiredModal />
-                <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-              </ModalAlertProvider>
-            </ThemeProvider>
-          </TenantProvider>
-        </AuthGate>
-      </MaintenanceGate>
+      <SafeAreaProvider>
+        <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
+          <MaintenanceGate>
+            <AuthGate>
+              <TenantProvider>
+                <ThemeProvider>
+                  <ModalAlertProvider>
+                    <TenantAwareShell
+                      colorScheme={colorScheme}
+                      isOffline={isOffline}
+                      roleChangeNotice={roleChangeNotice}
+                      router={router}
+                      onTenantBootstrapped={() => setTenantBootstrapped(true)}
+                    />
+                    <ReloginRequiredModal />
+                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                  </ModalAlertProvider>
+                </ThemeProvider>
+              </TenantProvider>
+            </AuthGate>
+          </MaintenanceGate>
+        </SafeAreaWebTopOverride>
+      </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }
+
+const SafeAreaWebTopOverride = ({
+  children,
+  shouldOverride,
+}: {
+  children: React.ReactNode;
+  shouldOverride: boolean;
+}) => {
+  const insets = useSafeAreaInsets();
+
+  if (!shouldOverride) {
+    return <>{children}</>;
+  }
+
+  const adjustedInsets = useMemo(
+    () => ({ ...insets, top: 0, bottom: 0, left: 0, right: 0 }),
+    [insets]
+  );
+
+  return (
+    <SafeAreaInsetsContext.Provider value={adjustedInsets}>
+      {children}
+    </SafeAreaInsetsContext.Provider>
+  );
+};
 
 interface TenantAwareShellProps {
   colorScheme: ReturnType<typeof useColorScheme>;
@@ -653,7 +724,7 @@ const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router, on
             {inviteToken && <InviteOverlay token={inviteToken} />}
 
             {shouldShowTenantAccess && (
-              <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'box-none' }}>
+              <>
                 <TenantAccessScreen visible={tenantModalVisible} onClose={() => setTenantModalVisible(false)} />
                 {!tenantModalVisible && !hintDismissed && (
                   <View
@@ -716,7 +787,7 @@ const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router, on
                     </View>
                   </View>
                 )}
-              </View>
+              </>
             )}
 
             {/* Role Change Modal (online only) */}

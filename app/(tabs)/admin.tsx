@@ -16,6 +16,7 @@ import Toast from 'react-native-toast-message';
 import { Plus, Trash2, RefreshCw, Shield, User, Bell, Settings, Search, X, PieChart, KeyRound } from 'lucide-react-native';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth } from '../../hooks/useAuthUnified';
@@ -53,6 +54,7 @@ const USAGE_HISTORY_MONTHS = 6;
 export default function AdminPanel() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const sharedTopPadding = useSharedTopPadding();
   const { theme } = useTheme();
   const skeletonBaseColor = `${theme.textSecondary}15`;
   const skeletonHighlightColor = `${theme.textSecondary}35`;
@@ -1137,6 +1139,7 @@ export default function AdminPanel() {
             loading={seatUsageAlertLoading}
             error={seatUsageAlertError}
             monthLabel={seatUsageMonthId}
+            horizontalInset={0}
             onPress={() => setShowQuotaModal(true)}
             onRefresh={refreshSeatUsageAlerts}
           />
@@ -1629,7 +1632,7 @@ export default function AdminPanel() {
     <View style={[styles.container, { backgroundColor: theme.background }]}>
       {/* Header */}
   {/* Header */}
-  <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+  <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
   <Text allowFontScaling={false} style={[styles.headerTitle, { color: theme.text }]}>Admin Panel</Text>
         <View style={styles.headerActions}>
           {inviteButtonVisible && (
@@ -1912,7 +1915,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
+    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
     paddingTop: 60,
     paddingBottom: 20,
     borderBottomWidth: 1,
@@ -1936,7 +1939,7 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
-    paddingHorizontal: 20,
+    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
   },
   hiddenInviteManagerHost: {
     height: 0,
@@ -2153,7 +2156,7 @@ const styles = StyleSheet.create({
     fontFamily: 'Inter-Regular',
     textAlign: 'center',
     marginTop: 8,
-    marginHorizontal: 20,
+    marginHorizontal: Platform.select({ web: 10, default: 20 }),
   },
   modalMessage: {
     fontSize: 16,
@@ -2182,7 +2185,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     backgroundColor: 'transparent',
     borderBottomWidth: 1,
-    paddingHorizontal: 20,
+    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
   },
   tabButton: {
     flexDirection: 'row',

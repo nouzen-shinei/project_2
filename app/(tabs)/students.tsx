@@ -15,6 +15,7 @@ import {
   ActivityIndicator,
   FlatList,
 } from 'react-native';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { Plus, Search, MoveVertical as MoreVertical, User, Phone, Mail, MessageCircle, Calendar, BookOpen, TrendingUp, Clock, Camera, Upload, ChevronUp, ChevronDown, Users, Trash2, Download, Edit3 } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
@@ -78,6 +79,8 @@ export default function Students() {
   const { theme } = useTheme();
   const { user } = useAuth();
   const router = useRouter();
+  const sharedTopPadding = useSharedTopPadding();
+  const modalTopPadding = 16;
   const { activeTenant, loading: tenantLoading } = useTenant();
   const { students: studentList, loading, error, addStudent, updateStudent, deleteStudent, moveStudentUp, moveStudentDown } = useStudents();
   const students = studentList as Student[];
@@ -1049,7 +1052,7 @@ export default function Students() {
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
       {/* Header */}
-  <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+  <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
   <Text allowFontScaling={false} style={[styles.title, { color: theme.text }]}>Students</Text>
         <View style={styles.headerButtons}>
           {Platform.OS === 'web' && (
@@ -1395,7 +1398,7 @@ export default function Students() {
         }}
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity 
               onPress={() => {
                 if (!isAddingStudent) {

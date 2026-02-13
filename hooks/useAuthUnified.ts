@@ -1451,20 +1451,34 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
       logger.debug('📱 Starting mobile Google Sign-In...');
 
       try {
+        const webClientId = (process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID || '').trim();
+        if (!webClientId) {
+          throw new Error('Missing EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID for native Google Sign-In');
+        }
         // Check if Google Play Services are available
         await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
 
         // Sign in to Google
         const userInfo = await GoogleSignin.signIn();
+        let idToken = userInfo?.idToken;
+        if (!idToken) {
+          try {
+            const tokens = await GoogleSignin.getTokens();
+            idToken = tokens?.idToken;
+          } catch (tokenError) {
+            logger.warn('Google Sign-In tokens unavailable:', tokenError);
+          }
+        }
 
-        if (!userInfo || !userInfo.idToken) {
+        if (!userInfo || !idToken) {
           throw new Error('No user data or ID token received from Google');
         }
 
-        logger.debug('📱 Google Sign-In successful:', userInfo.user.email);
+        const userEmail = userInfo?.user?.email || null;
+        logger.debug('📱 Google Sign-In successful:', userEmail || '(no email)');
 
         // Create Firebase credential and sign in
-        const credential = GoogleAuthProvider.credential(userInfo.idToken);
+        const credential = GoogleAuthProvider.credential(idToken);
         const firebaseResult = await signInWithCredential(auth, credential);
         const user = firebaseResult.user;
 

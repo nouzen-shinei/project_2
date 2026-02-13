@@ -1,4 +1,5 @@
 import { logger } from '@/lib/logger';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
@@ -76,6 +77,7 @@ export default function SendReminders() {
   const router = useRouter();
   const { headerCompensation } = useBirthdays();
   const effectiveHeaderComp = Math.max(0, Math.min(headerCompensation || 0, 60) * 0.5);
+  const sharedTopPadding = useSharedTopPadding();
   const { students, loading: studentsLoading } = useStudents();
   const { fees } = useFees();
   const { user } = useAuth();
@@ -2318,8 +2320,8 @@ export default function SendReminders() {
 
   return (
     <View style={styles.container} onTouchStart={(e) => e.stopPropagation()}>
-      {/* Header */}
-  <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+        {/* Header */}
+        <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
         <View style={styles.headerContent}>
           <View>
             <Text allowFontScaling={false} style={styles.title}>Send Reminders</Text>

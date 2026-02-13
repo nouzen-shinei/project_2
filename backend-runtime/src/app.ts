@@ -3847,6 +3847,7 @@ async function loadTenantCurrentBilling(
     const renewalDate = toIsoTimestamp(data.renewalDate ?? data.renewsAt ?? data.renewalAt) ?? undefined;
     const planVariantId = typeof data.planVariantId === 'string' && data.planVariantId.trim() ? data.planVariantId.trim() : undefined;
     const couponCode = typeof data.couponCode === 'string' && data.couponCode.trim() ? data.couponCode.trim() : undefined;
+    const planLockedByOrg = (data as any).planLockedByOrg === true;
     const storedCheckoutRequired = typeof (data as any).checkoutRequired === 'boolean' ? (data as any).checkoutRequired : undefined;
     const storedCheckoutRequiredProvider =
       typeof (data as any).checkoutRequiredProvider === 'string' && (data as any).checkoutRequiredProvider.trim()
@@ -3861,7 +3862,7 @@ async function loadTenantCurrentBilling(
     let invoiceCheckoutRequiredProvider: string | undefined;
     try {
       // If the tenant is on Free, do not surface any lingering open invoices as "payment pending".
-      if (planId !== 'free') {
+      if (planId !== 'free' && !planLockedByOrg) {
         const invoiceSnap = await db
           .collection('billingInvoices')
           .doc(tenantId)
@@ -3899,13 +3900,17 @@ async function loadTenantCurrentBilling(
       console.warn('[billing] failed to check open invoices for', tenantId, error);
     }
 
-    const checkoutRequired = planId === 'free'
+    const checkoutRequired = planId === 'free' || planLockedByOrg
       ? false
       : invoiceCheckoutRequired || storedCheckoutRequired === true
         ? true
         : storedCheckoutRequired;
-    const checkoutRequiredSince = planId === 'free' ? undefined : invoiceCheckoutRequiredSince ?? storedCheckoutRequiredSince;
-    const checkoutRequiredProvider = planId === 'free' ? undefined : invoiceCheckoutRequiredProvider ?? storedCheckoutRequiredProvider;
+    const checkoutRequiredSince = planId === 'free' || planLockedByOrg
+      ? undefined
+      : invoiceCheckoutRequiredSince ?? storedCheckoutRequiredSince;
+    const checkoutRequiredProvider = planId === 'free' || planLockedByOrg
+      ? undefined
+      : invoiceCheckoutRequiredProvider ?? storedCheckoutRequiredProvider;
     const cancelAtCycleEnd = typeof (data as any).cancelAtCycleEnd === 'boolean' ? (data as any).cancelAtCycleEnd : undefined;
     const scheduledDowngradePlanIdRaw =
       typeof (data as any).scheduledDowngradePlanId === 'string' ? (data as any).scheduledDowngradePlanId.trim().toLowerCase() : '';
@@ -6894,6 +6899,11 @@ export function createApp(options: CreateAppOptions = {}){
             planVariantId: variant.id,
             status: nextStatus,
             checkoutRequired: false,
+            checkoutRequiredProvider: admin.firestore.FieldValue.delete(),
+            checkoutRequiredSinceIso: admin.firestore.FieldValue.delete(),
+            checkoutRequiredSince: admin.firestore.FieldValue.delete(),
+            checkoutRequiredAtIso: admin.firestore.FieldValue.delete(),
+            billingAttemptId: admin.firestore.FieldValue.delete(),
             // When an operator assigns a plan in the admin console, treat the plan as organization-managed.
             // Tenant users should not be able to self-downgrade from the app without org approval.
             planLockedByOrg: nextPlanId === 'free' ? admin.firestore.FieldValue.delete() : true,
