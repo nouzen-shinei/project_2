@@ -1,4 +1,5 @@
 import { logger } from '@/lib/logger';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   View,
@@ -273,6 +274,7 @@ const buildReceiptDownloadFileName = (receipt: any) => {
 
 export default function Fees() {
   const { theme } = useTheme();
+  const sharedTopPadding = useSharedTopPadding();
   const { width } = useWindowDimensions(); // get screen width
   const isSmallScreen = width < 600; // threshold for small screens
   const isNativePlatform = Platform.OS !== 'web';
@@ -6322,8 +6324,8 @@ export default function Fees() {
 
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
-      {/* Header */}
-  <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+        {/* Header */}
+        <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
         <Text allowFontScaling={false} style={[styles.title, { color: theme.text }]}>  
           {isSmallScreen ? 'Fee' : 'Fee Management'}
         </Text>
@@ -10840,7 +10842,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 20,
-    paddingTop: 60,
+    paddingTop: 16,
     paddingBottom: 20,
     borderBottomWidth: 1,
   },

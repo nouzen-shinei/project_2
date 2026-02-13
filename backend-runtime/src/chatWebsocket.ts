@@ -4,6 +4,12 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { ensureFirebase } from './firebaseAdmin';
 import { decodeInternalToken, getConversationKey, normalizeEmail, watchConversationRealtime } from './chatRealtime';
 
+function parseRequestQueryParams(requestUrl?: string): URLSearchParams {
+  const queryIndex = (requestUrl ?? '').indexOf('?');
+  const query = queryIndex >= 0 ? (requestUrl ?? '').slice(queryIndex + 1) : '';
+  return new URLSearchParams(query);
+}
+
 async function isTenantEmailActiveMember(tenantId: string, email: string): Promise<boolean> {
   const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
   const normalizedEmail = normalizeEmail(email);
@@ -27,18 +33,12 @@ export function setupChatWebsocket(server: Server): void {
   const wss = new WebSocketServer({ server, path: '/chat/ws' });
 
   wss.on('connection', async (socket: WebSocket, request: IncomingMessage) => {
-    const url = (() => {
-      try {
-        return new URL(request.url || '', 'http://localhost');
-      } catch {
-        return null;
-      }
-    })();
+    const searchParams = parseRequestQueryParams(request.url);
 
-    const token = url?.searchParams.get('token') ?? undefined;
-    const tenantId = url?.searchParams.get('tenantId') ?? '';
-    const userEmail = url?.searchParams.get('user') ?? '';
-    const partnerEmail = url?.searchParams.get('partner') ?? '';
+    const token = searchParams.get('token') ?? undefined;
+    const tenantId = searchParams.get('tenantId') ?? '';
+    const userEmail = searchParams.get('user') ?? '';
+    const partnerEmail = searchParams.get('partner') ?? '';
 
     const tokenPayload = decodeInternalToken(token);
     if (!token || !tokenPayload) {

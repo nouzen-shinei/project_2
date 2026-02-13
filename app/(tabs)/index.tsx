@@ -31,12 +31,14 @@ import SkeletonBar, { SkeletonCircle, SkeletonRow, SkeletonCard } from '../../co
 import { reminderHistoryService } from '../../services/reminderHistoryService';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { useTenant } from '../../hooks/useTenantContext';
 import UsageAlertInlineBanner from '@/components/UsageAlertInlineBanner';
 import { useActiveUsageAlerts } from '@/hooks/useActiveUsageAlerts';
 
 export default function Dashboard() {
   const insets = useSafeAreaInsets();
+  const sharedTopPadding = useSharedTopPadding();
   const { theme } = useTheme();
   const { hasCelebration, celebrants, isMusicPlaying, toggleMusic, headerCompensation } = useBirthdays();
   const { user } = useAuth();
@@ -1022,7 +1024,7 @@ export default function Dashboard() {
 
   <View style={[
     styles.header,
-    { backgroundColor: theme.surface, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }
+    { backgroundColor: theme.surface, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }
   ]}>
         <View>
           <Text allowFontScaling={false} style={[styles.greeting, { color: theme.text }]}>{getGreeting()}</Text>

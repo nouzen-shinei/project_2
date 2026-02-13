@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -9,6 +10,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { AlertTriangle, CheckCircle2, Clock3, LogIn, MailPlus, Shield, Sparkles, UserPlus, X } from 'lucide-react-native';
 import { useRouter } from 'expo-router';
 import Toast from 'react-native-toast-message';
@@ -157,6 +159,11 @@ const InviteOverlay = ({ token }: InviteOverlayProps) => {
   const { refreshTenants } = useTenant();
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const modalWebPadding = 20;
+  const sharedTopPadding = useSharedTopPadding({ minPadding: 60, extraPadding: 24, webPadding: modalWebPadding });
+  const sharedBottomPadding = Platform.OS === 'web'
+    ? modalWebPadding
+    : Math.max(insets.bottom + 24, 60);
   const { width } = useWindowDimensions();
   const isNarrow = width < 490;
 
@@ -380,8 +387,8 @@ const InviteOverlay = ({ token }: InviteOverlayProps) => {
         style={[
           styles.backdrop,
           {
-            paddingTop: Math.max(insets.top + 24, 60),
-            paddingBottom: Math.max(insets.bottom + 24, 60),
+            paddingTop: sharedTopPadding,
+            paddingBottom: sharedBottomPadding,
           },
         ]}
       >

@@ -12,6 +12,7 @@ interface UsageAlertInlineBannerProps {
   monthLabel?: string | null;
   onPress?: () => void;
   onRefresh?: () => void;
+  horizontalInset?: number;
 }
 
 const metricLabelByKey: Record<UsageMetricKey, string> = {
@@ -77,12 +78,14 @@ export const UsageAlertInlineBanner: React.FC<UsageAlertInlineBannerProps> = ({
   monthLabel,
   onPress,
   onRefresh,
+  horizontalInset,
 }) => {
   const { theme } = useTheme();
+  const resolvedInset = horizontalInset ?? 20;
 
   if (loading && !alert && !error) {
     return (
-      <View style={[styles.banner, { borderColor: theme.border, backgroundColor: `${theme.border}30` }]}> 
+      <View style={[styles.banner, { borderColor: theme.border, backgroundColor: `${theme.border}30`, marginHorizontal: resolvedInset }]}> 
         <View style={styles.loadingRow}>
           <ActivityIndicator size="small" color={theme.primary} />
           <Text style={[styles.bannerMeta, { color: theme.textSecondary }]}>Loading usage alerts…</Text>
@@ -94,7 +97,7 @@ export const UsageAlertInlineBanner: React.FC<UsageAlertInlineBannerProps> = ({
   if (!alert) {
     if (error) {
       return (
-        <View style={[styles.banner, { borderColor: theme.border, backgroundColor: `${theme.border}20` }]}> 
+        <View style={[styles.banner, { borderColor: theme.border, backgroundColor: `${theme.border}20`, marginHorizontal: resolvedInset }]}> 
           <Text style={[styles.bannerErrorTitle, { color: theme.error }]}>Usage alerts unavailable</Text>
           <Text style={[styles.bannerMeta, { color: theme.textSecondary }]}>{error}</Text>
           {onRefresh && (
@@ -127,6 +130,7 @@ export const UsageAlertInlineBanner: React.FC<UsageAlertInlineBannerProps> = ({
         {
           borderColor: severityColor,
           backgroundColor: `${severityColor}15`,
+          marginHorizontal: resolvedInset,
         },
       ]}
     >
@@ -167,7 +171,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 14,
     padding: 12,
-    marginHorizontal: 20,
     marginTop: 20,
     gap: 6,
   },

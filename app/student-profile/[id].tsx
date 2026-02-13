@@ -44,12 +44,14 @@ import { tryExtractStorageLimitReachedInfo } from '../../services/storageLimitAl
 import { formatDateToString } from '../../lib/utils';
 import { chatService } from '../../services/chatService';
 import { useTenant } from '../../hooks/useTenantContext';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 
 export default function StudentProfile() {
   const { id, edit } = useLocalSearchParams<{ id: string; edit?: string }>();
   const router = useRouter();
   const navigation = useNavigation();
   const { theme } = useTheme();
+  const sharedTopPadding = useSharedTopPadding();
   const { fees, loading: feesLoading } = useFees();
   const { activeTenant } = useTenant();
   
@@ -492,7 +494,7 @@ export default function StudentProfile() {
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
       {/* Header */}
-      <View style={[styles.header, { backgroundColor: theme.surface }]}>
+      <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: sharedTopPadding }]}>
         <TouchableOpacity 
           style={styles.headerButton} 
           onPress={isEditing ? handleCancelEdit : handleGoBack}

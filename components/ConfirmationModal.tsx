@@ -483,7 +483,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   nativeButtonContainer: {
-    paddingBottom: Platform.OS === 'web' ? 42 : 20,
+    paddingBottom: Platform.OS === 'web' ? 42 : 40,
   },
   buttonContainerColumn: {
     flexDirection: 'column',

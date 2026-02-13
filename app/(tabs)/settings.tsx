@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import {
   View,
   Text,
@@ -128,6 +129,8 @@ export default function Settings() {
   } = useSettings();
   const { headerCompensation } = useBirthdays();
   const effectiveHeaderComp = Math.max(0, Math.min(headerCompensation || 0, 60) * 0.5);
+  const sharedTopPadding = useSharedTopPadding();
+  const modalTopPadding = 16;
 
   const tenantUnavailable = !tenantLoading && !activeTenant?.id;
 
@@ -1752,8 +1755,8 @@ export default function Settings() {
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
       {/* Header */}
-  <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
-  <Text allowFontScaling={false} style={[styles.title, { color: theme.text }]}>Settings</Text>
+      <View style={[styles.header, { backgroundColor: theme.surface, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
+        <Text allowFontScaling={false} style={[styles.title, { color: theme.text }]}>Settings</Text>
       </View>
 
       {/* Settings Content */}
@@ -1863,7 +1866,7 @@ export default function Settings() {
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={async () => {
               if (editingProfile) {
                 await cancelEditProfile();
@@ -2424,7 +2427,7 @@ export default function Settings() {
           <View
             style={[
               styles.modalHeader,
-              { backgroundColor: theme.surface, borderBottomColor: theme.border },
+              { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding },
             ]}
           >
             <TouchableOpacity
@@ -2496,7 +2499,7 @@ export default function Settings() {
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={() => setShowEmailModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>
@@ -2666,7 +2669,7 @@ export default function Settings() {
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={() => setShowHelpModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>
@@ -2984,7 +2987,7 @@ export default function Settings() {
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={() => setShowAppInfoModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>
@@ -3277,7 +3280,7 @@ export default function Settings() {
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={() => setShowBugReportModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>
@@ -3607,7 +3610,7 @@ Additional Notes:
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={() => setShowBackupModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>
@@ -3714,7 +3717,7 @@ Additional Notes:
         presentationStyle="pageSheet"
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
-          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <TouchableOpacity onPress={() => setShowThemeModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>

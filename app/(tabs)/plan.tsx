@@ -21,6 +21,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
 import { useTenantUsageSummary } from '@/hooks/useTenantUsageSummary';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import PlanTierCard from '@/components/PlanTierCard';
 import ConfirmationModal from '@/components/ConfirmationModal';
@@ -180,6 +181,7 @@ function limitsToPlanTierDisplay(options: {
 export default function PlanAndBillingScreen() {
   const router = useRouter();
   const { theme } = useTheme();
+  const sharedTopPadding = useSharedTopPadding();
   const { activeTenant, activeMembership, loading: tenantLoading } = useTenant();
   const {
     usageSummary,
@@ -973,7 +975,7 @@ export default function PlanAndBillingScreen() {
     };
     return (
       <Animated.View style={[styles.container, { backgroundColor: theme.background }, openStyle]}>
-        <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+        <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: sharedTopPadding }]}>
           <TouchableOpacity onPress={handleClose} style={styles.backButton}>
             <X size={22} color={theme.text} />
           </TouchableOpacity>
@@ -1012,7 +1014,7 @@ export default function PlanAndBillingScreen() {
 
   return (
     <Animated.View style={[styles.container, { backgroundColor: theme.background }, openStyle]}>
-      <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+      <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: sharedTopPadding }]}>
         <TouchableOpacity onPress={handleClose} style={styles.backButton}>
           <X size={22} color={theme.text} />
         </TouchableOpacity>

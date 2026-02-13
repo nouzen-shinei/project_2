@@ -1,6 +1,7 @@
 import React from 'react';
-import { Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { X } from 'lucide-react-native';
 import { useAuth } from '@/hooks/useAuthUnified';
 import { useTenant } from '@/hooks/useTenantContext';
@@ -15,6 +16,11 @@ interface TenantAccessScreenProps {
 
 const TenantAccessScreen = ({ visible, onClose }: TenantAccessScreenProps) => {
   const insets = useSafeAreaInsets();
+  const modalWebPadding = 20;
+  const sharedTopPadding = useSharedTopPadding({ minPadding: 60, extraPadding: 24, webPadding: modalWebPadding });
+  const sharedBottomPadding = Platform.OS === 'web'
+    ? modalWebPadding
+    : Math.max(insets.bottom + 24, 60);
   const { theme } = useTheme();
   const { user } = useAuth();
   const { memberships, pendingMemberships } = useTenant();
@@ -40,8 +46,8 @@ const TenantAccessScreen = ({ visible, onClose }: TenantAccessScreenProps) => {
         style={[
           styles.backdrop,
           {
-            paddingTop: Math.max(insets.top + 24, 60),
-            paddingBottom: Math.max(insets.bottom + 24, 60),
+            paddingTop: sharedTopPadding,
+            paddingBottom: sharedBottomPadding,
           },
         ]}
       >

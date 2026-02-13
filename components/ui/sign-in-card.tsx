@@ -13,6 +13,7 @@ import {
   ScrollView,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -35,6 +36,7 @@ const AnimatedTouchableOpacity = Animated.createAnimatedComponent(TouchableOpaci
 const AnimatedView = Animated.createAnimatedComponent(View);
 
 export default function SignInCard({ onGoogleSignIn, loading, error, success }: SignInCardProps) {
+  const sharedTopPadding = useSharedTopPadding();
   // Debug logging for error
   if (__DEV__ && error) {
     logger.debug('📱 SignInCard: Received error:', error);
@@ -150,7 +152,7 @@ export default function SignInCard({ onGoogleSignIn, loading, error, success }: 
 
       <ScrollView
         style={styles.scrollView}
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[styles.scrollContent, { paddingTop: sharedTopPadding }]}
         bounces={false}
         showsVerticalScrollIndicator={false}
       >
@@ -175,7 +177,6 @@ export default function SignInCard({ onGoogleSignIn, loading, error, success }: 
           </View>
         </View>
 
-        {/* Glass morphism card with beautiful animations */}
         <AnimatedView style={[styles.glassContainer, cardAnimatedStyle]}>
           {/* Card glow effect */}
           <AnimatedView style={[styles.cardGlow, glowAnimatedStyle]} />

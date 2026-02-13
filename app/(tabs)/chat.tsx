@@ -30,6 +30,7 @@ import Toast from 'react-native-toast-message';
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth, authService } from '../../hooks/useAuthUnified';
 import { useBirthdays } from '../../components/BirthdayProvider';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import type { TeamMember } from '../../hooks/useAuthUnified';
 import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useChat } from '../../hooks/useChat';
@@ -82,6 +83,7 @@ export default function Chat() {
   const CHAT_SCROLL_DEBUG = false;
   const { headerCompensation, setSuppressFab } = useBirthdays();
   const effectiveHeaderComp = Math.max(0, Math.min(headerCompensation || 0, 60) * 0.5);
+  const sharedTopPadding = useSharedTopPadding();
   const isFocused = useIsFocused();
   const router = useRouter();
   const { user, loading: authLoading } = useAuth();
@@ -7308,7 +7310,7 @@ export default function Chat() {
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}> 
         {/* Header */}
-        <View style={[styles.header, { backgroundColor: theme.background, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}> 
+        <View style={[styles.header, { backgroundColor: theme.background, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}> 
           <Text allowFontScaling={false} style={[styles.headerTitle, { color: theme.text }]}>Messages</Text>
         </View>
         <View style={[styles.container, styles.centered]}> 
@@ -7329,7 +7331,7 @@ export default function Chat() {
       return (
         <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
           {/* Header */}
-          <View style={[styles.header, { backgroundColor: theme.background, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+          <View style={[styles.header, { backgroundColor: theme.background, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
             <Text allowFontScaling={false} style={[styles.headerTitle, { color: theme.text }]}>Messages</Text>
           </View>
           
@@ -7347,7 +7349,7 @@ export default function Chat() {
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
         {/* Header */}
-  <View style={[styles.header, { backgroundColor: theme.background, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+  <View style={[styles.header, { backgroundColor: theme.background, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
           <Text allowFontScaling={false} style={[styles.headerTitle, { color: theme.text }]}>Messages</Text>
         </View>
 
@@ -7604,7 +7606,7 @@ export default function Chat() {
       keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
     >
   {/* Header with User Selection */}
-  <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, 60 - effectiveHeaderComp) }]}>
+  <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
         <TouchableOpacity 
           onPress={() => {
             Keyboard.dismiss(); // Manually hide keyboard when going back

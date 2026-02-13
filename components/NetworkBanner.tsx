@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, Animated, TouchableOpacity, Platform } from 'react-native';
 import { Wifi, WifiOff, X, AlertTriangle } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
+import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 
 interface NetworkBannerProps {
   isOnline: boolean;
@@ -22,6 +23,7 @@ export default function NetworkBanner({
   isSlow
 }: NetworkBannerProps) {
   const { theme } = useTheme();
+  const sharedTopPadding = useSharedTopPadding({ minPadding: 0, extraPadding: 12, webPadding: 20 });
   const [visible, setVisible] = useState(false);
   const [slideAnim] = useState(new Animated.Value(-100));
   const [autoHideTimer, setAutoHideTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
@@ -165,6 +167,7 @@ export default function NetworkBanner({
         { 
           backgroundColor,
           transform: [{ translateY: slideAnim }],
+          paddingTop: sharedTopPadding,
           pointerEvents: 'auto',
         },
       ]}
@@ -195,7 +198,6 @@ const styles = StyleSheet.create({
     right: 0,
     paddingHorizontal: 16,
     paddingVertical: 12,
-    paddingTop: 50, // Account for status bar
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',

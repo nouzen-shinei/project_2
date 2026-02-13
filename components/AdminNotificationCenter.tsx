@@ -75,6 +75,7 @@ interface AdminNotificationCenterProps {
 
 export default function AdminNotificationCenter({ adminEmail, adminName, authorizedEmails = [] }: AdminNotificationCenterProps) {
   const { theme } = useTheme();
+  const modalTopPadding = 16;
   const { user } = useAuth();
   const { width } = useWindowDimensions();
   const { activeTenant } = useTenant();
@@ -1543,7 +1544,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
           {/* Modal Header */}
-          <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Send Notification</Text>
             <TouchableOpacity
               style={styles.closeButton}
@@ -1803,7 +1804,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
           {/* Modal Header */}
-          <View style={[styles.modalHeader, { borderBottomColor: theme.border }]}>
+          <View style={[styles.modalHeader, { borderBottomColor: theme.border, paddingTop: modalTopPadding }]}>
             <View style={styles.headerContent}>
               <Ban size={24} color={theme.error} />
               <Text style={[styles.modalTitle, { color: theme.text }]}>Hard Ban Device</Text>
