@@ -280,6 +280,34 @@ export default function SignInCard({ onGoogleSignIn, loading, error, success }: 
               website
             </Text>
             </Text>
+            <Text style={styles.footerText}>
+              {' '}•{' '}
+              <Text
+                style={[styles.footerText, { textDecorationLine: 'underline', color: '#a855f7' }]}
+                onPress={() => {
+                  if (Platform.OS === 'web') {
+                    window.open('/privacy-policy.html', '_blank');
+                  } else {
+                    Linking.openURL('https://tuitionmanager.app/privacy-policy.html');
+                  }
+                }}
+              >
+                Privacy Policy
+              </Text>
+              {' '}•{' '}
+              <Text
+                style={[styles.footerText, { textDecorationLine: 'underline', color: '#a855f7' }]}
+                onPress={() => {
+                  if (Platform.OS === 'web') {
+                    window.open('/terms-of-service.html', '_blank');
+                  } else {
+                    Linking.openURL('https://tuitionmanager.app/terms-of-service.html');
+                  }
+                }}
+              >
+                Terms of Service
+              </Text>
+            </Text>
         </View>
       </ScrollView>
     </View>

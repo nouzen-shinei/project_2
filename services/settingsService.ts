@@ -251,13 +251,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   },
   
   legal: {
-    privacyPolicyUrl: 'https://tution.42web.io/privacy-policy.html',
-    termsOfServiceUrl: 'https://tution.42web.io/terms-of-service.html',
+    privacyPolicyUrl: 'https://tuitionmanager.app/privacy-policy.html',
+    termsOfServiceUrl: 'https://tuitionmanager.app/terms-of-service.html',
     licensingInfo: 'MIT License - Open Source'
   },
   
   social: {
-    website: 'https://tution.42web.io',
+    website: 'https://tuitionmanager.app',
     linkedin: 'https://www.linkedin.com/in/nouzen-shinei',
     twitter: 'https://x.com/nouzen_shinei_',
     github: 'https://github.com/nouzen-shinei'
