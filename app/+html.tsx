@@ -14,6 +14,7 @@ export default function Root({ children }: { children: React.ReactNode }) {
         />
         <meta name="application-name" content="Tuition Manager" />
         <meta name="description" content="Complete tuition and coaching class management solution" />
+        <meta name="google-site-verification" content="FnTndAGX4rzdc8f6zvpaV_4ich9qLQTzH_zfI8nF9I4" />
         <meta name="theme-color" content="#4f46e5" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-capable" content="yes" />
