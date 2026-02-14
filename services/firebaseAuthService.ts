@@ -5,6 +5,8 @@ import { logger } from '@/lib/logger';
 import { auth, firestore } from '@/config/firebase';
 import { 
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   signOut as firebaseSignOut,
   onAuthStateChanged,
@@ -12,6 +14,7 @@ import {
 import { doc, getDoc, setDoc, collection, getDocs, deleteDoc } from 'firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router } from 'expo-router';
+import { Platform } from 'react-native';
 
 export interface AuthUser {
   uid: string;
@@ -30,6 +33,34 @@ class FirebaseAuthService {
     // Don't load authorized emails immediately - wait for authentication
     // this.loadAuthorizedEmails(); // Commented out to prevent permission errors
     this.initializeAuthListener();
+    void this.handlePendingWebRedirectResult();
+  }
+
+  private shouldFallbackToRedirect(error: unknown): boolean {
+    const code = String((error as any)?.code || '').toLowerCase();
+    return (
+      code === 'auth/popup-blocked' ||
+      code === 'auth/operation-not-supported-in-this-environment'
+    );
+  }
+
+  private isWebRedirectPreferred(): boolean {
+    return (process.env.EXPO_PUBLIC_WEB_GOOGLE_AUTH_MODE || '').toLowerCase() === 'redirect';
+  }
+
+  private isLocalWebHost(): boolean {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return false;
+    const host = window.location.hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  }
+
+  private async handlePendingWebRedirectResult(): Promise<void> {
+    if (Platform.OS !== 'web') return;
+    try {
+      await getRedirectResult(auth);
+    } catch (error) {
+      logger.error('FirebaseAuthService: failed to process pending redirect result', error);
+    }
   }
 
   private async loadAuthorizedEmails(): Promise<void> {
@@ -147,10 +178,34 @@ class FirebaseAuthService {
       const provider = new GoogleAuthProvider();
       provider.addScope('profile');
       provider.addScope('email');
+
+      if (Platform.OS === 'web' && this.isWebRedirectPreferred() && !this.isLocalWebHost()) {
+        logger.debug('FirebaseAuthService: web auth mode=redirect, starting redirect flow');
+        await signInWithRedirect(auth, provider);
+        return {
+          success: true,
+        };
+      } else if (Platform.OS === 'web' && this.isWebRedirectPreferred() && this.isLocalWebHost()) {
+        logger.warn('FirebaseAuthService: redirect mode requested on localhost; using popup flow for local stability');
+      }
       
       // Use Firebase's built-in popup sign-in (handles OAuth complexity)
-      const result = await signInWithPopup(auth, provider);
-      const firebaseUser = result.user;
+      let firebaseUser;
+      try {
+        const result = await signInWithPopup(auth, provider);
+        firebaseUser = result.user;
+      } catch (error) {
+        if (Platform.OS === 'web' && this.shouldFallbackToRedirect(error)) {
+          logger.warn('FirebaseAuthService: popup unavailable, falling back to redirect', {
+            code: (error as any)?.code,
+          });
+          await signInWithRedirect(auth, provider);
+          return {
+            success: true,
+          };
+        }
+        throw error;
+      }
       
       logger.debug('Firebase sign-in successful:', firebaseUser.email);
       

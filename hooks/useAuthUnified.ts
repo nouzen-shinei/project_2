@@ -12,6 +12,8 @@ import {
   User,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signInWithCredential,
 } from 'firebase/auth';
 import { 
@@ -507,16 +509,12 @@ async function revalidateAuthorizationOnReconnect(_: number = 3, __: number = 50
 
 async function checkNetworkStatus(): Promise<boolean> {
   try {
-    // For web, check navigator.onLine first for immediate response
+    // For web, trust navigator.onLine to avoid false negatives from NetInfo
+    // during OAuth redirect return.
     if (Platform.OS === 'web') {
       const navigatorOnline = navigator.onLine;
       logger.debug('🌐 Navigator.onLine:', navigatorOnline);
-      
-      // If navigator says offline, double-check with a small test
-      if (!navigatorOnline) {
-        logger.debug('🌐 Navigator says offline, double-checking...');
-        return false;
-      }
+      return navigatorOnline;
     }
     
     // Use NetInfo for more detailed check, but with timeout
@@ -1338,6 +1336,37 @@ function isDeviceBanError(error: string): boolean {
   return error.startsWith('DEVICE_BAN_ERROR:');
 }
 
+function shouldFallbackToRedirect(error: unknown): boolean {
+  const code = String((error as any)?.code || '').toLowerCase();
+  return (
+    code === 'auth/popup-blocked' ||
+    code === 'auth/operation-not-supported-in-this-environment'
+  );
+}
+
+function isWebRedirectPreferred(): boolean {
+  return (process.env.EXPO_PUBLIC_WEB_GOOGLE_AUTH_MODE || '').toLowerCase() === 'redirect';
+}
+
+function isLocalWebHost(): boolean {
+  if (Platform.OS !== 'web' || typeof window === 'undefined') return false;
+  const host = window.location.hostname.toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+function setAuthRedirectPending(pending: boolean): void {
+  if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+  try {
+    if (pending) {
+      window.sessionStorage.setItem('auth_redirect_in_flight', '1');
+    } else {
+      window.sessionStorage.removeItem('auth_redirect_in_flight');
+    }
+  } catch {
+    // ignore storage failures
+  }
+}
+
 // Sign in with Google
 async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; error?: string }> {
   try {
@@ -1353,8 +1382,34 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
       provider.addScope('email');
       provider.addScope('profile');
 
-      const result = await signInWithPopup(auth, provider);
-      const user = result.user;
+      if (isWebRedirectPreferred() && !isLocalWebHost()) {
+        logger.debug('Web Google auth mode=redirect, starting redirect flow');
+        setAuthRedirectPending(true);
+        await signInWithRedirect(auth, provider);
+        return {
+          success: true,
+        };
+      } else if (isWebRedirectPreferred() && isLocalWebHost()) {
+        logger.warn('Web Google auth mode=redirect requested on localhost; using popup flow for local stability');
+      }
+
+      let user: User;
+      try {
+        const result = await signInWithPopup(auth, provider);
+        user = result.user;
+      } catch (webSignInError) {
+        if (shouldFallbackToRedirect(webSignInError)) {
+          logger.warn('Popup sign-in unavailable on web; falling back to redirect', {
+            code: (webSignInError as any)?.code,
+          });
+          setAuthRedirectPending(true);
+          await signInWithRedirect(auth, provider);
+          return {
+            success: true,
+          };
+        }
+        throw webSignInError;
+      }
 
       if (!user || !user.email) {
         throw new Error('No user data received from Google');
@@ -1698,6 +1753,29 @@ function initializeAuth() {
 
   logger.debug('🚀 Initializing unified auth system...');
 
+  if (Platform.OS === 'web') {
+    void getRedirectResult(auth).catch((error) => {
+      logger.error('Failed to process pending Google redirect result:', error);
+      globalAuthState.error = error?.message || 'Google sign in failed';
+      setAuthRedirectPending(false);
+      notifyListeners();
+    });
+
+    // Fail-safe: clear pending redirect marker after a short delay if auth is still empty.
+    try {
+      const pending = window.sessionStorage.getItem('auth_redirect_in_flight') === '1';
+      if (pending) {
+        setTimeout(() => {
+          if (!auth.currentUser) {
+            setAuthRedirectPending(false);
+          }
+        }, 10_000);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   // 1. Always load cached user immediately on startup
   (async () => {
     const cachedUser = await getCachedUserData();
@@ -1813,14 +1891,16 @@ function initializeAuth() {
   firebaseUnsubscribe = onAuthStateChanged(auth, async (user) => {
     logger.debug('🔥 Firebase auth state changed:', user ? user.email : 'null');
     
-    // Skip processing if we're offline
+    // Skip processing when offline only if there is no authenticated user.
+    // During redirect return, transient offline detection can occur while user is valid.
     const isCurrentlyOnline = await checkNetworkStatus();
-    if (!isCurrentlyOnline) {
+    if (!isCurrentlyOnline && !user) {
       logger.debug('🚫 Skipping auth state change processing - device is offline');
       return;
     }
     
     if (user) {
+      setAuthRedirectPending(false);
       try {
         if (!user.email) {
           logger.warn('Auth state change missing email; forcing relogin');

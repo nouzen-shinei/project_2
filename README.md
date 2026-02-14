@@ -191,6 +191,29 @@ EXPO_PUBLIC_API_BASE_URL=https://your-backend.example.com
 EXPO_PUBLIC_EMAIL_API_BASE_URL=https://your-email-backend.example.com
 ```
 
+### Firebase Auth on Vercel (production web)
+
+If your web app is hosted on a custom domain (for example `https://tuitionmanager.app`), configure Firebase Auth to use that same domain in production.
+
+Required setup:
+
+- In Firebase Console -> Authentication -> Settings -> Authorized domains, add your custom domain (and `www` variant if applicable).
+- In Vercel project environment variables (Production), set:
+
+```env
+EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN=tuitionmanager.app
+```
+
+- Ensure `vercel.json` includes rewrites for Firebase helper routes before the SPA catch-all:
+  - `/__/auth/(.*)` -> `https://<your-firebase-project>.firebaseapp.com/__/auth/$1`
+  - `/__/firebase/(.*)` -> `https://<your-firebase-project>.firebaseapp.com/__/firebase/$1`
+
+Why this is needed:
+
+- Firebase Auth web flows rely on `/__/auth/*` helper endpoints.
+- Without these rewrites, sign-in may jump to the default `*.firebaseapp.com` domain and then back to your app domain.
+- With matching `authDomain` + rewrites, the user-visible auth flow stays on your custom domain.
+
 ### Server-only secrets (never in Expo bundle)
 
 - Internal auth: `INTERNAL_API_KEY`

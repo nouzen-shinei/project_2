@@ -13,6 +13,14 @@
   ],
   "rewrites": [
     {
+      "source": "/__/auth/(.*)",
+      "destination": "https://tution-app-6c0c3.firebaseapp.com/__/auth/$1"
+    },
+    {
+      "source": "/__/firebase/(.*)",
+      "destination": "https://tution-app-6c0c3.firebaseapp.com/__/firebase/$1"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
