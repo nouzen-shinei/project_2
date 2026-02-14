@@ -65,6 +65,24 @@ installErrorFilter();
 if (typeof document !== 'undefined') {
   try { enforceClientSafety(); } catch {}
   try {
+    const rawAuthDomain = (process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN || '').trim();
+    const normalizedAuthDomain = rawAuthDomain.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    const authDomainOrigin = normalizedAuthDomain ? `https://${normalizedAuthDomain}` : null;
+    const expandedAuthFrameOrigins = (() => {
+      if (!authDomainOrigin) return [] as string[];
+      try {
+        const url = new URL(authDomainOrigin);
+        const host = url.hostname.toLowerCase();
+        if (host === 'tuitionmanager.app') {
+          return [authDomainOrigin, `${url.protocol}//www.tuitionmanager.app`];
+        }
+        if (host === 'www.tuitionmanager.app') {
+          return [authDomainOrigin, `${url.protocol}//tuitionmanager.app`];
+        }
+      } catch {}
+      return [authDomainOrigin];
+    })();
+
     injectCSP({
       extraConnect: [],
       extraScript: [
@@ -77,6 +95,7 @@ if (typeof document !== 'undefined') {
       extraFrame: [
         'https://*.firebasedatabase.app',
         'https://tution-app-6c0c3.firebaseapp.com',
+        ...expandedAuthFrameOrigins,
         'https://checkout.razorpay.com',
         'https://api.razorpay.com',
         'https://firebasestorage.googleapis.com'
@@ -159,6 +178,7 @@ export default function RootLayout() {
 
   const [tenantBootstrapped, setTenantBootstrapped] = useState(false);
   const [splashHidden, setSplashHidden] = useState(false);
+  const [authRedirectPending, setAuthRedirectPending] = useState(false);
 
   // Safety net: never keep the native splash up forever.
   useEffect(() => {
@@ -179,6 +199,42 @@ export default function RootLayout() {
   
   // Initialize notifications system
   useNotifications();
+    useEffect(() => {
+      if (Platform.OS !== 'web' || typeof window === 'undefined') {
+        return;
+      }
+
+      const readPending = () => {
+        try {
+          return window.sessionStorage.getItem('auth_redirect_in_flight') === '1';
+        } catch {
+          return false;
+        }
+      };
+
+      const pending = readPending();
+      setAuthRedirectPending(pending);
+
+      if (pending && user?.isAuthorized && tenantBootstrapped) {
+        setAuthRedirectPending(false);
+        try {
+          window.sessionStorage.removeItem('auth_redirect_in_flight');
+        } catch {}
+        return undefined;
+      }
+
+      if (pending) {
+        const timeout = setTimeout(() => {
+          setAuthRedirectPending(false);
+          try {
+            window.sessionStorage.removeItem('auth_redirect_in_flight');
+          } catch {}
+        }, 10_000);
+        return () => clearTimeout(timeout);
+      }
+
+      return undefined;
+    }, [user?.isAuthorized, tenantBootstrapped]);
   const router = useRouter();
   const segments = useSegments();
   const segmentsRef = useRef(segments);
@@ -451,7 +507,7 @@ export default function RootLayout() {
   }
 
   // Show splash/loading while auth is initializing
-  if (loading || !isInitialized) {
+  if (loading || !isInitialized || authRedirectPending) {
     return (
       <GestureHandlerRootView style={{ flex: 1 }}>
         <SafeAreaProvider>
