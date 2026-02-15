@@ -22,7 +22,7 @@
 <body>
   <main class="container">
   <h1>Privacy Policy</h1>
-  <p class="muted small">Last updated: August 21, 2025</p>
+  <p class="muted small">Last updated: February 14, 2026</p>
 
     <p>
       This Privacy Policy explains how Tuition Manager (the “App”, “we”, “our”, or “us”) collects, uses, and shares information
@@ -31,26 +31,36 @@
 
     <h2>Information we collect</h2>
     <ul>
-      <li><strong>Account information:</strong> name, email address, and profile details you provide during sign-in (Google Sign-In).</li>
-      <li><strong>Content you add:</strong> chat messages, attachments (images, PDFs, videos, documents), student and fee-related information, and any materials you upload or share.</li>
-      <li><strong>Device and app info:</strong> device type/brand/model, OS version, app version, language/locale, timezone, browser/user agent (web), hardware concurrency (web), and network type/state.</li>
-      <li><strong>Identifiers:</strong> app-generated device identifier, Firebase/Expo push notification tokens, and session identifiers.</li>
-      <li><strong>IP address & region:</strong> IP is used for security and diagnostics; we may derive an approximate region (no precise GPS location).</li>
-      <li><strong>Permission statuses:</strong> whether you granted camera, microphone, media/library, and notification permissions. We do not collect microphone or camera recordings by default—only what you explicitly upload.</li>
+      <li><strong>Account information:</strong> name, email address, phone number (when provided for reminders), and profile details you provide during sign-in (Google Sign-In).</li>
+      <li><strong>Content you add:</strong> chat messages, attachments (images, PDFs, videos, documents), student and fee-related information, attendance and billing records, and any materials you upload or share.</li>
+      <li><strong>Communications data:</strong> message content and metadata for in-app chat, email, WhatsApp, SMS, and voice reminders (timestamps, delivery status, and destination). Voice calls may include call metadata such as time and duration.</li>
+      <li><strong>Device and app info:</strong> device type/brand/model, OS version, app version, language/locale, timezone, screen metrics, storage stats, orientation/motion support, browser/user agent (web), web capability flags (e.g., WebGL/WebRTC/support signals), and network type/state.</li>
+      <li><strong>Identifiers:</strong> app-generated device identifier, app-scoped device fingerprint for security and anti-abuse, session identifiers, and Firebase/Expo push notification tokens.</li>
+      <li><strong>Network and web context:</strong> IP address, connection type/downlink, and (on web) current URL, referrer, and source/medium data for security and diagnostics.</li>
+      <li><strong>Payment and transaction info:</strong> purchase metadata and transaction identifiers from Apple App Store (iOS), Google Play Billing (Android), and Razorpay (web). We do not store full payment card details.</li>
+      <li><strong>Permission statuses:</strong> whether you granted location, camera, microphone, and notification permissions. We do not collect microphone or camera recordings by default—only what you explicitly upload or share.</li>
     </ul>
 
     <div class="box small">
-      <p><strong>No precise location:</strong> The App does not collect precise location. We only infer an approximate region from IP for security and diagnostics. We also sample whether location/camera/microphone/notifications permissions are granted, not the underlying data unless you explicitly share it.</p>
+      <p><strong>No precise location:</strong> The App does not collect precise GPS location. We only infer an approximate region from IP for security and diagnostics. We also sample whether location/camera/microphone/notifications permissions are granted, not the underlying data unless you explicitly share it.</p>
     </div>
 
     <h2>How we use information</h2>
     <ul>
       <li>Provide core App functionality (students/fees, messaging, file upload/viewing, reminders).</li>
-      <li>Send notifications you enable (e.g., payment reminders, updates).</li>
+      <li>Send communications you enable (email, push, WhatsApp, SMS, and voice reminders).</li>
+      <li>Process payments and manage billing, subscriptions, and receipts.</li>
       <li>Maintain safety and security, including device ban checks, abuse prevention, and fraud detection.</li>
       <li>Support, troubleshooting, and to improve performance and reliability.</li>
       <li>Comply with legal obligations.</li>
     </ul>
+    <p class="small muted">We do not currently use third‑party analytics or crash reporting tools. If this changes, we will update this policy.</p>
+
+    <h2>Payments</h2>
+    <p>
+      Payments are processed by Apple App Store (iOS), Google Play Billing (Android), or Razorpay (web). We receive transaction
+      identifiers and purchase status to fulfill your order, but we do not store full payment card details.
+    </p>
 
     <h2>File uploads and shared links</h2>
     <p>
@@ -62,7 +72,7 @@
     <h2>How we share information</h2>
     <ul>
       <li><strong>At your direction:</strong> Information and links you share are accessible to recipients you choose.</li>
-  <li><strong>Service providers:</strong> We use trusted vendors to run the App. These include Firebase/Google Cloud (Auth, Firestore, Realtime Database, Storage, Hosting), Expo services (push notifications), Twilio (SMS/voice for reminders), and our email delivery backend (which may use SES and/or Resend). Providers access data only to perform services for us and under appropriate safeguards.</li>
+  <li><strong>Service providers:</strong> We use trusted vendors to run the App. These include Firebase/Google Cloud (Auth, Firestore, Realtime Database, Storage, Hosting), Expo services (push notifications), Apple and Google for in-app billing, Razorpay for web payments, WhatsApp/SMS/voice providers (such as Twilio or carrier partners), and our email delivery backend (which may use SES and/or Resend). Providers access data only to perform services for us and under appropriate safeguards.</li>
       <li><strong>Legal:</strong> We may disclose information to comply with law, protect rights, or respond to valid legal requests.</li>
     </ul>
     <p>We do not sell personal information. We do not share data for advertising purposes.</p>
@@ -88,6 +98,7 @@
       <li><strong>Chat messages and files:</strong> kept until you delete them or your account is deleted.</li>
       <li><strong>Uploaded receipts and attachments:</strong> kept until you delete the file; public token links stop working when files are deleted.</li>
       <li><strong>Device records:</strong> offline devices may be cleaned up after a period of inactivity (e.g., ~14 days). Logout signals are transient.</li>
+      <li><strong>Communications metadata:</strong> email/SMS/WhatsApp/voice delivery logs retained for troubleshooting and compliance.</li>
       <li><strong>Device bans:</strong> retained while active or until expiration/removal.</li>
     </ul>
     </p>
@@ -95,10 +106,11 @@
     <h2>Your choices & rights</h2>
     <ul>
       <li>Update your profile and settings in the App.</li>
-      <li>Control permissions for notifications, camera, microphone, and media in your device settings.</li>
+      <li>Control permissions for notifications, location, camera, and microphone in your device settings.</li>
       <li>Delete files you previously shared to revoke access to tokenized links.</li>
-  <li>Request account deletion in-app: Help & FAQ → “Request account deletion” (a confirmation modal will guide you). You can also email <a href="mailto:vipulkr250@gmail.com">vipulkr250@gmail.com</a> from your signed-in email.</li>
-  <li>Opt out of WhatsApp/SMS: reply STOP to the message thread, or email <a href="mailto:vipulkr250@gmail.com">vipulkr250@gmail.com</a>.</li>
+  <li>Request account deletion in-app: Help & FAQ → “Request account deletion” (a confirmation modal will guide you). You can also email <a href="mailto:krvikrantsingh51@gmail.com">krvikrantsingh51@gmail.com</a> from your signed-in email.</li>
+  <li>Opt out of WhatsApp/SMS/voice: reply STOP to the message thread, or email <a href="mailto:krvikrantsingh51@gmail.com">krvikrantsingh51@gmail.com</a>.</li>
+      <li>Manage email and push notification preferences in the App settings.</li>
       <li>Access, correct, or delete your personal information by contacting us.</li>
     </ul>
 
@@ -110,7 +122,7 @@
   <h2>Reporting and content removal</h2>
     <p>
       If you believe content shared via the App is illegal, infringing, or violates our policies, please report it to
-      <a href="mailto:vipulkr250@gmail.com?subject=Content%20Report">vipulkr250@gmail.com</a> with details and relevant links.
+      <a href="mailto:krvikrantsingh51@gmail.com?subject=Content%20Report">krvikrantsingh51@gmail.com</a> with details and relevant links.
       We will review and, where appropriate, remove or restrict access to the content.
     </p>
     <p class="small muted">
@@ -130,12 +142,12 @@
     <h2>Contact us</h2>
     <p>
   If you have questions about this Privacy Policy or our practices, contact us at
-  <a href="mailto:vipulkr250@gmail.com">vipulkr250@gmail.com</a> or call +91 7667857972.
+  <a href="mailto:krvikrantsingh51@gmail.com">krvikrantsingh51@gmail.com</a> or call +91 7667857972.
   Postal: VIPIKA, Parsawan, Bodhgaya Block, Magadh University Road, Gaya, Bihar 824234, India.
     </p>
 
     <div class="box small">
-  <p><strong>Data Safety summary:</strong> We collect account info, content you upload, device/app info, app-generated identifiers, push token, IP (for security and approximate region), and permission statuses. Used to provide features and security. No ads, no sale of data. Shared only with recipients you choose and service providers (Firebase/Google, Expo, Twilio, email delivery backend). Tokenized file links can be accessed by anyone with the link until you delete the file. WhatsApp messages are sent only with opt‑in and you can opt out by replying STOP.</p>
+  <p><strong>Data Safety summary:</strong> We collect account info, communications data, content you upload, device/app info, app-generated identifiers, push tokens, IP and web context (for security and diagnostics), payment transaction metadata, and permission statuses. Used to provide features, payments, and security. No ads, no sale of data. Shared only with recipients you choose and service providers (Firebase/Google, Expo, Apple/Google billing, Razorpay, WhatsApp/SMS/voice providers, and the email delivery backend). Tokenized file links can be accessed by anyone with the link until you delete the file. WhatsApp/SMS/voice messages are sent only with opt‑in and you can opt out by replying STOP.</p>
     </div>
   </main>
   

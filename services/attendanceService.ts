@@ -14,7 +14,7 @@ import {
 } from 'firebase/firestore';
 import { firestore as db } from '../config/firebase';
 import type { AttendanceRecord, TenantAuditLogEntry } from '../types';
-import firebaseAuthService from './firebaseAuthService';
+import { authService } from '@/hooks/useAuthUnified';
 import { tenantService } from './tenantService';
 
 class AttendanceService {
@@ -28,7 +28,7 @@ class AttendanceService {
       'attendance_record_saved' | 'attendance_records_batch_saved' | 'attendance_record_deleted'>,
     details: { targetId?: string; metadata?: Record<string, unknown> } = {},
   ): Promise<void> {
-    const actor = firebaseAuthService.getCurrentUser();
+    const actor = authService.getCurrentUser();
     if (!actor) {
       return;
     }
