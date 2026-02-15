@@ -2,7 +2,7 @@ import { logger } from '@/lib/logger';
 import type { Tenant, TenantMembership } from '@/types';
 // TODO: Fix studentService import issue - temporarily using dynamic import
 // import { studentService } from './studentService';
-import { firebaseAuthService } from './firebaseAuthService';
+import { authService } from '@/hooks/useAuthUnified';
 import { internalTokenManager } from './internalTokenManager';
 import { runtimeEndpoints } from './runtimeEndpoints';
 import { tenantService } from './tenantService';
@@ -533,7 +533,7 @@ class DataManagementService {
       // Import authorized emails (only for admin)
       if (importData.authorizedEmails && Array.isArray(importData.authorizedEmails)) {
         try {
-          await firebaseAuthService.updateAuthorizedEmails(importData.authorizedEmails);
+          await authService.updateAuthorizedEmails(importData.authorizedEmails);
           result.imported.authorizedEmails = importData.authorizedEmails.length;
           logger.debug(`Imported ${result.imported.authorizedEmails} authorized emails`);
         } catch (error) {
@@ -584,7 +584,7 @@ class DataManagementService {
     if (!options.tenantId || options.importedCount <= 0) {
       return;
     }
-    const actor = firebaseAuthService.getCurrentUser();
+    const actor = authService.getCurrentUser();
     const sortedDates = options.dates.filter(Boolean).sort();
     const metadata: Record<string, unknown> = {
       source: options.source ?? 'data_import',

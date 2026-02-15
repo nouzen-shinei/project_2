@@ -52,8 +52,11 @@ import * as Localization from 'expo-localization';
 import * as Location from 'expo-location';
 import * as ImagePicker from 'expo-image-picker';
 import { getRecordingPermissionsAsync as getAudioRecordingPermissionsAsync } from 'expo-audio';
+import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import DeviceInfo from 'react-native-device-info';
+import SHA256 from 'crypto-js/sha256';
 
 export interface DeviceAction {
   id: string;
@@ -112,6 +115,9 @@ type DevicePingType = 'register' | 'heartbeat' | 'full';
 export interface UserDevice {
   // Basic device identification
   deviceId: string;
+  deviceIdSource?: 'stable_seed' | 'fingerprint_fallback' | 'unknown';
+  deviceSeedHash?: string;
+  fallbackFingerprintHash?: string;
   deviceType: 'mobile' | 'web' | 'tablet';
   deviceName: string;
   
@@ -248,17 +254,34 @@ export interface UserDevice {
   freeStorage?: number; // Available storage space in bytes
   totalStorage?: number; // Total storage capacity in bytes
   usedStorage?: number; // Used storage space in bytes
+  storagePercentageUsed?: number; // 0-100
   
   // Device Orientation & Motion
   currentOrientation?: string; // Current device orientation
   orientationLocked?: boolean; // Whether orientation is locked
+  orientationAngle?: number; // Screen orientation angle (web)
+  orientationChangeSupported?: boolean; // Orientation change support (web)
   motionSupport?: boolean; // Device motion API support
   
   // Enhanced Web Capabilities
   webGLSupport?: boolean; // WebGL support status
+  webGL2Support?: boolean; // WebGL2 support status
   webRTCSupport?: boolean; // WebRTC support status
+  webAssemblySupport?: boolean; // WebAssembly support status
   serviceWorkerSupport?: boolean; // Service worker support
   localStorageSupport?: boolean; // Local storage support
+  sessionStorageSupport?: boolean; // Session storage support
+  indexedDBSupport?: boolean; // IndexedDB support
+  webSocketsSupport?: boolean; // WebSocket support
+  geolocationSupport?: boolean; // Geolocation API support
+  deviceMotionSupport?: boolean; // DeviceMotionEvent support
+  deviceOrientationSupport?: boolean; // DeviceOrientationEvent support
+  pushNotificationsSupport?: boolean; // Push API support
+  webShareSupport?: boolean; // Web Share API support
+  mediaDevicesSupport?: boolean; // MediaDevices/getUserMedia support
+  webBluetoothSupport?: boolean; // Web Bluetooth API support
+  webUSBSupport?: boolean; // WebUSB API support
+  webNFCSupport?: boolean; // Web NFC API support
   
   // Device Permissions
   locationPermission?: string; // Location permission status
@@ -293,11 +316,15 @@ export interface AuthorizedUser {
 
 class DeviceTrackingService {
   private currentDeviceId: string | null = null;
+  private currentDeviceIdSource: 'stable_seed' | 'fingerprint_fallback' | 'unknown' = 'unknown';
+  private currentDeviceSeedHash: string | null = null;
   private pushTokenRefreshReinitUnsub: (() => void) | null = null;
   private currentUserEmail: string | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private unsubscribeListeners: (() => void)[] = [];
   private readonly DEVICE_ID_KEY_PREFIX = 'device_id_'; // Will be suffixed with user hash
+  private readonly DEVICE_SEED_KEY = 'device_seed_v1';
+  private readonly DEVICE_ID_SOURCE_KEY_SUFFIX = '_source';
   private readonly HEARTBEAT_INTERVAL = 30000; // 30 seconds
   private readonly OFFLINE_THRESHOLD = 120000; // 2 minutes
   private lastKnownExpoPushToken: string | null = null;
@@ -1268,6 +1295,22 @@ class DeviceTrackingService {
       const deviceInfo: UserDevice = {
         // Basic identification
         deviceId,
+        deviceIdSource: this.currentDeviceIdSource,
+        deviceSeedHash: this.currentDeviceSeedHash ?? undefined,
+        fallbackFingerprintHash: this.computeFallbackFingerprintHash({
+          userAgent: browserInfo.userAgent,
+          manufacturer: hardwareInfo.manufacturer,
+          modelName: hardwareInfo.modelName,
+          modelId: hardwareInfo.modelId,
+          hardwareConcurrency: browserInfo.hardwareConcurrency || hardwareInfo.hardwareConcurrency,
+          totalMemory: hardwareInfo.totalMemory,
+          screenWidth: screenInfo.screenWidth,
+          screenHeight: screenInfo.screenHeight,
+          supportedCpuArchitectures: hardwareInfo.supportedCpuArchitectures,
+          jsHeapSizeLimit: browserInfo.jsHeapSizeLimit,
+          platform: browserInfo.platform || systemInfo.osName,
+          vendor: browserInfo.vendor,
+        }) || undefined,
         deviceType: basicInfo.deviceType,
         deviceName: basicInfo.deviceName,
         
@@ -1543,6 +1586,9 @@ class DeviceTrackingService {
         updatedAt: this.createResolvedTimestamp(),
         lastActivityType: 'full_update',
         sessionId,
+        deviceIdSource: this.currentDeviceIdSource,
+        deviceSeedHash: this.currentDeviceSeedHash ?? undefined,
+        fallbackFingerprintHash: undefined,
       };
 
       // Update network info
@@ -1598,6 +1644,21 @@ class DeviceTrackingService {
         if (browserInfo.viewportHeight) {
           updates.viewportHeight = browserInfo.viewportHeight;
         }
+      }
+
+      if (!updates.fallbackFingerprintHash) {
+        const existingSnap = await getDoc(deviceDoc);
+        if (existingSnap.exists()) {
+          const existingData = existingSnap.data() as UserDevice;
+          if (existingData.fallbackFingerprintHash) {
+            updates.fallbackFingerprintHash = existingData.fallbackFingerprintHash;
+          }
+        }
+      }
+
+      if (!updates.fallbackFingerprintHash) {
+        const fallbackBase = await this.getFingerprintBaseForCurrentDevice();
+        updates.fallbackFingerprintHash = this.computeFallbackFingerprintHash(fallbackBase) || undefined;
       }
 
       // Clean undefined values before updating
@@ -3089,6 +3150,9 @@ class DeviceTrackingService {
           storageInfo.freeStorage = freeStorage;
           storageInfo.totalStorage = totalStorage;
           storageInfo.usedStorage = totalStorage - freeStorage;
+          if (totalStorage > 0) {
+            storageInfo.storagePercentageUsed = (storageInfo.usedStorage / totalStorage) * 100;
+          }
         } catch (error) {
           logger.warn('Failed to get storage info:', error);
         }
@@ -3101,6 +3165,9 @@ class DeviceTrackingService {
               storageInfo.totalStorage = estimate.quota;
               storageInfo.usedStorage = estimate.usage;
               storageInfo.freeStorage = estimate.quota - estimate.usage;
+              if (estimate.quota > 0) {
+                storageInfo.storagePercentageUsed = (estimate.usage / estimate.quota) * 100;
+              }
             }
           }
         } catch (error) {
@@ -3127,6 +3194,7 @@ class DeviceTrackingService {
         const { width, height } = Dimensions.get('window');
         orientationInfo.currentOrientation = width > height ? 'landscape' : 'portrait';
         orientationInfo.orientationLocked = false; // Would need additional packages to detect lock
+        orientationInfo.orientationChangeSupported = true;
         orientationInfo.motionSupport = true; // Most mobile devices support motion
       } else {
         // Web: Use screen orientation API
@@ -3134,10 +3202,13 @@ class DeviceTrackingService {
           if (screen.orientation) {
             orientationInfo.currentOrientation = screen.orientation.type;
             orientationInfo.orientationLocked = screen.orientation.angle !== undefined;
+            orientationInfo.orientationAngle = screen.orientation.angle;
+            orientationInfo.orientationChangeSupported = true;
           } else {
             // Fallback for older browsers
             const { innerWidth, innerHeight } = window;
             orientationInfo.currentOrientation = innerWidth > innerHeight ? 'landscape' : 'portrait';
+            orientationInfo.orientationChangeSupported = 'onorientationchange' in window;
           }
           
           // Check for DeviceMotionEvent support
@@ -3167,8 +3238,10 @@ class DeviceTrackingService {
       try {
         const canvas = document.createElement('canvas');
         capabilities.webGLSupport = !!(canvas.getContext('webgl') || canvas.getContext('experimental-webgl'));
+        capabilities.webGL2Support = !!canvas.getContext('webgl2');
       } catch (error) {
         capabilities.webGLSupport = false;
+        capabilities.webGL2Support = false;
       }
 
       // WebRTC support
@@ -3177,6 +3250,21 @@ class DeviceTrackingService {
         typeof navigator.mediaDevices.getUserMedia === 'function' &&
         window.RTCPeerConnection
       );
+
+      capabilities.webAssemblySupport = typeof WebAssembly === 'object';
+
+      capabilities.sessionStorageSupport = typeof window.sessionStorage !== 'undefined';
+      capabilities.indexedDBSupport = !!window.indexedDB;
+      capabilities.webSocketsSupport = !!window.WebSocket;
+      capabilities.geolocationSupport = 'geolocation' in navigator;
+      capabilities.deviceMotionSupport = 'DeviceMotionEvent' in window;
+      capabilities.deviceOrientationSupport = 'DeviceOrientationEvent' in window;
+      capabilities.pushNotificationsSupport = 'PushManager' in window;
+      capabilities.webShareSupport = 'share' in navigator;
+      capabilities.mediaDevicesSupport = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+      capabilities.webBluetoothSupport = 'bluetooth' in navigator;
+      capabilities.webUSBSupport = 'usb' in navigator;
+      capabilities.webNFCSupport = 'nfc' in navigator;
 
       // Service Worker support
       capabilities.serviceWorkerSupport = 'serviceWorker' in navigator;
@@ -3288,38 +3376,84 @@ class DeviceTrackingService {
         // Fallback to timestamp-based ID if no user email
         const timestamp = Date.now();
         const random = Math.random().toString(36).substring(2, 8);
+        this.currentDeviceIdSource = 'unknown';
         return `${Platform.OS}_unknown_${timestamp}_${random}`;
       }
 
       // Create user-specific storage key
       const userDeviceIdKey = `${this.DEVICE_ID_KEY_PREFIX}${this.hashEmail(userEmail)}`;
+      const userDeviceIdSourceKey = `${userDeviceIdKey}${this.DEVICE_ID_SOURCE_KEY_SUFFIX}`;
       
       // First check if we have a cached device ID in AsyncStorage
       let deviceId = await AsyncStorage.getItem(userDeviceIdKey);
+      const deviceIdSource = await AsyncStorage.getItem(userDeviceIdSourceKey);
       if (deviceId) {
         // Verify that cached device ID matches the expected format for this user
         const expectedPrefix = `${Platform.OS}_${this.hashEmail(userEmail)}_`;
         if (deviceId.startsWith(expectedPrefix)) {
+          if (deviceIdSource === 'stable_seed' || deviceIdSource === 'fingerprint_fallback') {
+            this.currentDeviceIdSource = deviceIdSource;
+            this.currentDeviceSeedHash = deviceIdSource === 'stable_seed'
+              ? await this.getDeviceSeedHash()
+              : null;
+          } else {
+            let detectedSource: 'stable_seed' | 'fingerprint_fallback' = 'fingerprint_fallback';
+            const cachedHash = deviceId.split('_').slice(2).join('_');
+            const existingSeed = await this.readDeviceSeed();
+            if (existingSeed) {
+              const stableHash = this.hashFingerprintData(existingSeed);
+              if (cachedHash === stableHash) {
+                detectedSource = 'stable_seed';
+              }
+            }
+            this.currentDeviceIdSource = detectedSource;
+            this.currentDeviceSeedHash = detectedSource === 'stable_seed'
+              ? await this.getDeviceSeedHash()
+              : null;
+            await AsyncStorage.setItem(userDeviceIdSourceKey, detectedSource);
+          }
           return deviceId;
         }
         // If cached ID doesn't match current user, generate new one
         logger.debug('Cached device ID format mismatch, generating new one');
       }
 
+      const existingRecord = await this.findExistingDeviceRecordByFallback(userEmail);
+      if (existingRecord) {
+        this.currentDeviceIdSource = existingRecord.source;
+        this.currentDeviceSeedHash = existingRecord.deviceSeedHash ?? null;
+        deviceId = existingRecord.deviceId;
+        await AsyncStorage.setItem(userDeviceIdKey, deviceId);
+        await AsyncStorage.setItem(userDeviceIdSourceKey, this.currentDeviceIdSource);
+        return deviceId;
+      }
+
       // Generate new device ID based on user + device fingerprint
-      deviceId = await this.generateConsistentDeviceId(userEmail);
+      const generated = await this.generateConsistentDeviceId(userEmail);
+      deviceId = generated.deviceId;
+      this.currentDeviceIdSource = generated.source;
+      this.currentDeviceSeedHash = generated.source === 'stable_seed'
+        ? await this.getDeviceSeedHash()
+        : null;
       
       // Cache the generated ID for faster access
       await AsyncStorage.setItem(userDeviceIdKey, deviceId);
+      await AsyncStorage.setItem(userDeviceIdSourceKey, this.currentDeviceIdSource);
       return deviceId;
     } catch (error) {
       logger.warn('AsyncStorage not available, generating consistent device ID without caching');
       if (!userEmail) {
         const timestamp = Date.now();
         const random = Math.random().toString(36).substring(2, 8);
+        this.currentDeviceIdSource = 'unknown';
         return `${Platform.OS}_unknown_${timestamp}_${random}`;
       }
-      return await this.generateConsistentDeviceId(userEmail);
+      const generated = await this.generateConsistentDeviceId(userEmail);
+      this.currentDeviceIdSource = generated.source;
+      this.currentDeviceSeedHash = generated.source === 'stable_seed'
+        ? await this.getDeviceSeedHash()
+        : null;
+      return generated.deviceId;
     }
   }
 
@@ -3341,67 +3475,31 @@ class DeviceTrackingService {
    * This ensures the same physical device gets the same ID for the same user
    * Format: platform_userhash_devicefingerprint
    */
-  private async generateConsistentDeviceId(userEmail: string): Promise<string> {
+  private async generateConsistentDeviceId(
+    userEmail: string
+  ): Promise<{ deviceId: string; source: 'stable_seed' | 'fingerprint_fallback' }> {
     try {
-      // Collect the same device characteristics used for fingerprinting
-      const basicInfo = await this.getBasicDeviceInfo();
-      const hardwareInfo = await this.getHardwareInfo();
-      const systemInfo = await this.getSystemInfo();
-      const screenInfo = this.getScreenInfo();
-      const browserInfo = this.getBrowserInfo();
-
-      // Create a minimal device object for fingerprinting
-      const deviceForId: Partial<UserDevice> = {
-        userAgent: browserInfo.userAgent || '',
-        manufacturer: hardwareInfo.manufacturer || '',
-        modelName: hardwareInfo.modelName || '',
-        modelId: hardwareInfo.modelId || '',
-        hardwareConcurrency: browserInfo.hardwareConcurrency || hardwareInfo.hardwareConcurrency,
-        totalMemory: hardwareInfo.totalMemory,
-        screenWidth: screenInfo.screenWidth,
-        screenHeight: screenInfo.screenHeight,
-        supportedCpuArchitectures: hardwareInfo.supportedCpuArchitectures,
-        jsHeapSizeLimit: browserInfo.jsHeapSizeLimit,
-        platform: browserInfo.platform || systemInfo.osName,
-        vendor: browserInfo.vendor || ''
-      };
-
-      // Generate fingerprint hash
-      const fingerprintData = [
-        deviceForId.userAgent || '',
-        deviceForId.manufacturer || '',
-        deviceForId.modelName || '',
-        deviceForId.modelId || '',
-        deviceForId.hardwareConcurrency?.toString() || '',
-        deviceForId.totalMemory?.toString() || '',
-        deviceForId.screenWidth?.toString() || '',
-        deviceForId.screenHeight?.toString() || '',
-        deviceForId.supportedCpuArchitectures?.join(',') || '',
-        deviceForId.jsHeapSizeLimit?.toString() || '',
-        deviceForId.platform || '',
-        deviceForId.vendor || ''
-      ].filter(Boolean).join('|');
-
-      // Create a simple hash of the fingerprint data
-      let hash = 0;
-      for (let i = 0; i < fingerprintData.length; i++) {
-        const char = fingerprintData.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-      }
-      
-      const fingerprintHash = Math.abs(hash).toString(36);
       const userHash = this.hashEmail(userEmail);
+      const stableSeed = await this.getOrCreateDeviceSeed();
+      if (stableSeed) {
+        const stableHash = this.hashFingerprintData(stableSeed);
+        logger.debug('Device ID source: stable seed', { platform: Platform.OS, userHash });
+        return { deviceId: `${Platform.OS}_${userHash}_${stableHash}`, source: 'stable_seed' };
+      }
+
+      const deviceForId = await this.getFingerprintBaseForCurrentDevice();
+      const fingerprintHash = this.computeFallbackFingerprintHash(deviceForId);
+      logger.debug('Device ID source: fingerprint fallback', { platform: Platform.OS, userHash });
       
       // Create a readable device ID: platform_userhash_devicefingerprint
-      return `${Platform.OS}_${userHash}_${fingerprintHash}`;
+      return { deviceId: `${Platform.OS}_${userHash}_${fingerprintHash}`, source: 'fingerprint_fallback' };
     } catch (error) {
       logger.error('Error generating consistent device ID, falling back to timestamp-based ID:', error);
       // Fallback to timestamp-based ID if fingerprinting fails
       const timestamp = Date.now();
       const random = Math.random().toString(36).substring(2, 8);
       const userHash = this.hashEmail(userEmail);
-      return `${Platform.OS}_${userHash}_${timestamp}_${random}`;
+      return { deviceId: `${Platform.OS}_${userHash}_${timestamp}_${random}`, source: 'fingerprint_fallback' };
     }
   }
 
@@ -3455,6 +3553,158 @@ class DeviceTrackingService {
       .split(/[._-]/)
       .map(part => part.charAt(0).toUpperCase() + part.slice(1))
       .join(' ');
+  }
+
+  private normalizeFingerprintValue(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value.toString() : '';
+    }
+    return String(value).trim().toLowerCase();
+  }
+
+  private hashFingerprintData(input: string): string {
+    return SHA256(input).toString().slice(0, 20);
+  }
+
+  private computeFallbackFingerprintHash(device: Partial<UserDevice>): string {
+    const fingerprintData = [
+      device.userAgent,
+      device.manufacturer,
+      device.modelName,
+      device.modelId,
+      device.hardwareConcurrency,
+      device.totalMemory,
+      device.screenWidth,
+      device.screenHeight,
+      device.supportedCpuArchitectures?.join(',') || '',
+      device.jsHeapSizeLimit,
+      device.platform,
+      device.vendor
+    ]
+      .map((value) => this.normalizeFingerprintValue(value))
+      .filter(Boolean)
+      .join('|');
+
+    return this.hashFingerprintData(fingerprintData);
+  }
+
+  private async generateRandomSeed(): Promise<string> {
+    try {
+      const bytes = await Crypto.getRandomBytesAsync(16);
+      return Array.from(bytes)
+        .map((byte) => byte.toString(16).padStart(2, '0'))
+        .join('');
+    } catch (error) {
+      logger.warn('Failed to generate cryptographic seed, using fallback', error);
+      return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    }
+  }
+
+  private async readDeviceSeed(): Promise<string | null> {
+    try {
+      if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+        return window.localStorage.getItem(this.DEVICE_SEED_KEY);
+      }
+
+      if (Platform.OS !== 'web' && typeof SecureStore?.getItemAsync === 'function') {
+        return await SecureStore.getItemAsync(this.DEVICE_SEED_KEY);
+      }
+
+      return await AsyncStorage.getItem(this.DEVICE_SEED_KEY);
+    } catch (error) {
+      logger.warn('Failed to read device seed', error);
+      return null;
+    }
+  }
+
+  private async writeDeviceSeed(seed: string): Promise<void> {
+    try {
+      if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(this.DEVICE_SEED_KEY, seed);
+        return;
+      }
+
+      if (Platform.OS !== 'web' && typeof SecureStore?.setItemAsync === 'function') {
+        await SecureStore.setItemAsync(this.DEVICE_SEED_KEY, seed);
+        return;
+      }
+
+      await AsyncStorage.setItem(this.DEVICE_SEED_KEY, seed);
+    } catch (error) {
+      logger.warn('Failed to persist device seed', error);
+    }
+  }
+
+  private async getOrCreateDeviceSeed(): Promise<string | null> {
+    let seed = await this.readDeviceSeed();
+    if (seed) return seed;
+
+    seed = await this.generateRandomSeed();
+    await this.writeDeviceSeed(seed);
+    return seed;
+  }
+
+  private async getDeviceSeedHash(): Promise<string | null> {
+    const seed = await this.readDeviceSeed();
+    if (!seed) return null;
+    return this.hashFingerprintData(seed);
+  }
+
+  private async getFingerprintBaseForCurrentDevice(): Promise<Partial<UserDevice>> {
+    const hardwareInfo = await this.getHardwareInfo();
+    const systemInfo = await this.getSystemInfo();
+    const screenInfo = this.getScreenInfo();
+    const browserInfo = this.getBrowserInfo();
+
+    return {
+      userAgent: browserInfo.userAgent || '',
+      manufacturer: hardwareInfo.manufacturer || '',
+      modelName: hardwareInfo.modelName || '',
+      modelId: hardwareInfo.modelId || '',
+      hardwareConcurrency: browserInfo.hardwareConcurrency || hardwareInfo.hardwareConcurrency,
+      totalMemory: hardwareInfo.totalMemory,
+      screenWidth: screenInfo.screenWidth,
+      screenHeight: screenInfo.screenHeight,
+      supportedCpuArchitectures: hardwareInfo.supportedCpuArchitectures,
+      jsHeapSizeLimit: browserInfo.jsHeapSizeLimit,
+      platform: browserInfo.platform || systemInfo.osName,
+      vendor: browserInfo.vendor || ''
+    };
+  }
+
+  private async findExistingDeviceRecordByFallback(
+    userEmail: string
+  ): Promise<{ deviceId: string; deviceSeedHash?: string; source: 'stable_seed' | 'fingerprint_fallback' } | null> {
+    try {
+      const fingerprintBase = await this.getFingerprintBaseForCurrentDevice();
+      const fallbackHash = this.computeFallbackFingerprintHash(fingerprintBase);
+      if (!fallbackHash) {
+        return null;
+      }
+
+      const devicesCollection = collection(firestore, 'user_devices', userEmail, 'devices');
+      const fallbackQuery = query(
+        devicesCollection,
+        where('fallbackFingerprintHash', '==', fallbackHash),
+        limit(1)
+      );
+      const devicesSnap = await getDocs(fallbackQuery);
+      if (!devicesSnap.empty) {
+        const deviceDoc = devicesSnap.docs[0];
+        const device = deviceDoc.data() as UserDevice;
+        const deviceSeedHash = device.deviceSeedHash;
+        const source = device.deviceIdSource === 'stable_seed' || deviceSeedHash
+          ? 'stable_seed'
+          : 'fingerprint_fallback';
+        return { deviceId: deviceDoc.id, deviceSeedHash, source };
+      }
+
+      return null;
+    } catch (error) {
+      logger.warn('Failed to resolve existing device record by fallback fingerprint', error);
+      return null;
+    }
   }
 
 
@@ -3845,7 +4095,7 @@ class DeviceTrackingService {
       }
 
       const device = deviceSnapshot.data() as UserDevice;
-      const deviceFingerprint = this.generateDeviceFingerprint(device);
+      const deviceFingerprint = await this.generateDeviceFingerprint(device);
 
       // Find and delete active bans for this user+device combination
       const bansQuery = query(
@@ -3937,7 +4187,7 @@ class DeviceTrackingService {
       }
 
       const device = deviceSnapshot.data() as UserDevice;
-      const deviceFingerprint = this.generateDeviceFingerprint(device);
+      const deviceFingerprint = await this.generateDeviceFingerprint(device);
       
       logger.debug(`📱 Device fingerprint: ${deviceFingerprint}`);
       
@@ -4426,30 +4676,14 @@ class DeviceTrackingService {
    * Generate a unique device fingerprint based on unchanging characteristics
    * Note: This uses the same logic as generateConsistentDeviceId() to ensure consistency
    */
-  private generateDeviceFingerprint(device: UserDevice): string {
-    const fingerprintData = [
-      device.userAgent || '',
-      device.manufacturer || '',
-      device.modelName || '',
-      device.modelId || '',
-      device.hardwareConcurrency?.toString() || '',
-      device.totalMemory?.toString() || '',
-      device.screenWidth?.toString() || '',
-      device.screenHeight?.toString() || '',
-      device.supportedCpuArchitectures?.join(',') || '',
-      device.jsHeapSizeLimit?.toString() || '',
-      device.platform || '',
-      device.vendor || ''
-    ].filter(Boolean).join('|');
-
-    // Create a simple hash of the fingerprint data (same as generateConsistentDeviceId)
-    let hash = 0;
-    for (let i = 0; i < fingerprintData.length; i++) {
-      const char = fingerprintData.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash; // Convert to 32bit integer
+  private async generateDeviceFingerprint(device: UserDevice): Promise<string> {
+    if (typeof device.deviceSeedHash === 'string' && device.deviceSeedHash.trim()) {
+      logger.debug('Device fingerprint source: stored seed hash', { platform: Platform.OS });
+      return device.deviceSeedHash.trim();
     }
-    return Math.abs(hash).toString(36);
+
+    logger.debug('Device fingerprint source: fingerprint fallback', { platform: Platform.OS });
+    return this.computeFallbackFingerprintHash(device);
   }
 
   /**
@@ -4464,7 +4698,7 @@ class DeviceTrackingService {
     expiresAt?: Date
   ): Promise<void> {
     try {
-      const deviceFingerprint = this.generateDeviceFingerprint(device);
+      const deviceFingerprint = await this.generateDeviceFingerprint(device);
       
       const banData = {
         banType: 'hard' as const,
@@ -4522,7 +4756,7 @@ class DeviceTrackingService {
    */
   async isDeviceBanned(device: UserDevice): Promise<DeviceBan | null> {
     try {
-      const deviceFingerprint = this.generateDeviceFingerprint(device);
+      const deviceFingerprint = await this.generateDeviceFingerprint(device);
       
       // Query for active bans with matching fingerprint
       const bansQuery = query(
@@ -4569,7 +4803,7 @@ class DeviceTrackingService {
    */
   async isDeviceBannedForUser(device: UserDevice, userEmail: string): Promise<DeviceBan | null> {
     try {
-      const deviceFingerprint = this.generateDeviceFingerprint(device);
+      const deviceFingerprint = await this.generateDeviceFingerprint(device);
       
       // Query for active bans with matching fingerprint AND target user email
       const bansQuery = query(

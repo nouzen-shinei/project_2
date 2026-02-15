@@ -322,12 +322,16 @@ const DeviceDetailsModal: React.FC<DeviceDetailsModalProps> = ({
     const freeStorage = getGenericNumberProperty('freeStorage');
     const totalStorage = getGenericNumberProperty('totalStorage');
     const usedStorage = getGenericNumberProperty('usedStorage');
+    const storagePercentageUsed = getGenericNumberProperty('storagePercentageUsed');
+    const computedUsage = totalStorage > 0 && usedStorage > 0
+      ? Math.round((usedStorage / totalStorage) * 100)
+      : 0;
     
     return {
       total: totalStorage > 0 ? `${Math.round(totalStorage / (1024 * 1024 * 1024))} GB` : 'Unknown',
       used: usedStorage > 0 ? `${Math.round(usedStorage / (1024 * 1024 * 1024))} GB` : 'Unknown',
       free: freeStorage > 0 ? `${Math.round(freeStorage / (1024 * 1024 * 1024))} GB` : 'Unknown',
-      usagePercent: totalStorage > 0 && usedStorage > 0 ? Math.round((usedStorage / totalStorage) * 100) : 0
+      usagePercent: storagePercentageUsed > 0 ? Math.round(storagePercentageUsed) : computedUsage
     };
   }, [getGenericNumberProperty]);
 
@@ -336,6 +340,8 @@ const DeviceDetailsModal: React.FC<DeviceDetailsModalProps> = ({
     const orientation = getDeviceProperty('currentOrientation');
     const orientationLocked = getBooleanProperty('orientationLocked');
     const motionSupport = getBooleanProperty('motionSupport');
+    const orientationAngle = getGenericNumberProperty('orientationAngle');
+    const orientationChangeSupported = getBooleanProperty('orientationChangeSupported');
     
     // Permissions
     const locationPermission = getDeviceProperty('locationPermission');
@@ -347,12 +353,25 @@ const DeviceDetailsModal: React.FC<DeviceDetailsModalProps> = ({
       orientation: orientation !== 'N/A' ? orientation : 'Unknown',
       orientationLocked,
       motionSupport,
+      orientationAngle,
+      orientationChangeSupported,
       locationPermission: locationPermission !== 'N/A' ? locationPermission : 'Unknown',
       notificationPermission: notificationPermission !== 'N/A' ? notificationPermission : 'Unknown',
       cameraPermission: cameraPermission !== 'N/A' ? cameraPermission : 'Unknown',
       micPermission: micPermission !== 'N/A' ? micPermission : 'Unknown'
     };
-  }, [getDeviceProperty, getBooleanProperty]);
+  }, [getDeviceProperty, getBooleanProperty, getGenericNumberProperty]);
+
+  const idSourceInfo = useMemo(() => {
+    const raw = getDeviceProperty('deviceIdSource');
+    if (raw === 'stable_seed') {
+      return { label: 'Stable seed', tone: 'stable' as const };
+    }
+    if (raw === 'fingerprint_fallback') {
+      return { label: 'Fallback', tone: 'fallback' as const };
+    }
+    return { label: 'Unknown', tone: 'unknown' as const };
+  }, [getDeviceProperty]);
 
   // Copy to clipboard
   const copyToClipboard = useCallback(async (text: string, label: string) => {
@@ -564,6 +583,48 @@ const DeviceDetailsModal: React.FC<DeviceDetailsModalProps> = ({
               value={getDeviceProperty('deviceId')}
               copyable
             />
+
+            <View style={styles.detailRow}>
+              <View style={styles.detailLabel}>
+                <Shield size={16} color={theme.primary} />
+                <Text style={[styles.labelText, { color: theme.textSecondary }]}>ID Source</Text>
+              </View>
+              <View
+                style={[
+                  styles.idSourceBadge,
+                  {
+                    backgroundColor:
+                      idSourceInfo.tone === 'stable'
+                        ? theme.success + '20'
+                        : idSourceInfo.tone === 'fallback'
+                          ? theme.warning + '20'
+                          : theme.textSecondary + '20',
+                    borderColor:
+                      idSourceInfo.tone === 'stable'
+                        ? theme.success
+                        : idSourceInfo.tone === 'fallback'
+                          ? theme.warning
+                          : theme.textSecondary
+                  }
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.idSourceText,
+                    {
+                      color:
+                        idSourceInfo.tone === 'stable'
+                          ? theme.success
+                          : idSourceInfo.tone === 'fallback'
+                            ? theme.warning
+                            : theme.textSecondary
+                    }
+                  ]}
+                >
+                  {idSourceInfo.label}
+                </Text>
+              </View>
+            </View>
             
             <DetailRow
               icon={<Info size={16} color={theme.primary} />}
@@ -1040,6 +1101,20 @@ const DeviceDetailsModal: React.FC<DeviceDetailsModalProps> = ({
               label="Motion Support"
               value={deviceCapabilities.motionSupport ? 'Yes' : 'No'}
             />
+
+            {deviceCapabilities.orientationAngle > 0 && (
+              <DetailRow
+                icon={<Activity size={16} color={theme.primary} />}
+                label="Orientation Angle"
+                value={`${deviceCapabilities.orientationAngle}°`}
+              />
+            )}
+
+            <DetailRow
+              icon={<RotateCcw size={16} color={theme.primary} />}
+              label="Orientation Change"
+              value={deviceCapabilities.orientationChangeSupported ? 'Yes' : 'No'}
+            />
           </View>
 
           {/* Permissions */}
@@ -1376,6 +1451,16 @@ const styles = StyleSheet.create({
   actionBtnTextWhite: {
     color: 'white',
     fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+  },
+  idSourceBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  idSourceText: {
+    fontSize: 12,
     fontFamily: 'Inter-SemiBold',
   },
 });

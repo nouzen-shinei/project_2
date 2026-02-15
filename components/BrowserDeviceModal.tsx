@@ -38,7 +38,11 @@ import {
   Video,
   Bell,
   Camera,
-  Mic
+  Mic,
+  Share2,
+  Bluetooth,
+  Usb,
+  Nfc
 } from 'lucide-react-native';
 import * as Clipboard from 'expo-clipboard';
 import Toast from 'react-native-toast-message';
@@ -366,23 +370,64 @@ function BrowserDeviceModal({
   // Web capabilities and storage
   const webCapabilities = useMemo(() => {
     const webGLSupport = getBooleanProperty('webGLSupport');
+    const webGL2Support = getBooleanProperty('webGL2Support');
     const webRTCSupport = getBooleanProperty('webRTCSupport');
+    const webAssemblySupport = getBooleanProperty('webAssemblySupport');
     const serviceWorkerSupport = getBooleanProperty('serviceWorkerSupport');
     const localStorageSupport = getBooleanProperty('localStorageSupport');
+    const sessionStorageSupport = getBooleanProperty('sessionStorageSupport');
+    const indexedDBSupport = getBooleanProperty('indexedDBSupport');
+    const webSocketsSupport = getBooleanProperty('webSocketsSupport');
+    const geolocationSupport = getBooleanProperty('geolocationSupport');
+    const deviceMotionSupport = getBooleanProperty('deviceMotionSupport');
+    const deviceOrientationSupport = getBooleanProperty('deviceOrientationSupport');
+    const pushNotificationsSupport = getBooleanProperty('pushNotificationsSupport');
+    const webShareSupport = getBooleanProperty('webShareSupport');
+    const mediaDevicesSupport = getBooleanProperty('mediaDevicesSupport');
+    const webBluetoothSupport = getBooleanProperty('webBluetoothSupport');
+    const webUSBSupport = getBooleanProperty('webUSBSupport');
+    const webNFCSupport = getBooleanProperty('webNFCSupport');
     const freeStorage = getGenericNumberProperty('freeStorage');
     const totalStorage = getGenericNumberProperty('totalStorage');
     const usedStorage = getGenericNumberProperty('usedStorage');
+    const storagePercentageUsed = getGenericNumberProperty('storagePercentageUsed');
     
     return {
       webGLSupport,
+      webGL2Support,
       webRTCSupport,
+      webAssemblySupport,
       serviceWorkerSupport,
       localStorageSupport,
+      sessionStorageSupport,
+      indexedDBSupport,
+      webSocketsSupport,
+      geolocationSupport,
+      deviceMotionSupport,
+      deviceOrientationSupport,
+      pushNotificationsSupport,
+      webShareSupport,
+      mediaDevicesSupport,
+      webBluetoothSupport,
+      webUSBSupport,
+      webNFCSupport,
       totalStorage: totalStorage > 0 ? `${Math.round(totalStorage / (1024 * 1024 * 1024))} GB` : 'Unknown',
       usedStorage: usedStorage > 0 ? `${Math.round(usedStorage / (1024 * 1024 * 1024))} GB` : 'Unknown',
-      freeStorage: freeStorage > 0 ? `${Math.round(freeStorage / (1024 * 1024 * 1024))} GB` : 'Unknown'
+      freeStorage: freeStorage > 0 ? `${Math.round(freeStorage / (1024 * 1024 * 1024))} GB` : 'Unknown',
+      storagePercentageUsed: storagePercentageUsed > 0 ? Math.round(storagePercentageUsed) : 0
     };
   }, [getBooleanProperty, getGenericNumberProperty]);
+
+  const idSourceInfo = useMemo(() => {
+    const raw = getGenericProperty('deviceIdSource');
+    if (raw === 'stable_seed') {
+      return { label: 'Stable seed', tone: 'stable' as const };
+    }
+    if (raw === 'fingerprint_fallback') {
+      return { label: 'Fallback', tone: 'fallback' as const };
+    }
+    return { label: 'Unknown', tone: 'unknown' as const };
+  }, [getGenericProperty]);
 
   // Device permissions for web
   const webPermissions = useMemo(() => {
@@ -605,6 +650,48 @@ function BrowserDeviceModal({
               value={getDeviceProperty('deviceId')}
               copyable
             />
+
+            <View style={styles.detailRow}>
+              <View style={styles.detailLabel}>
+                <Shield size={16} color={theme.primary} />
+                <Text style={[styles.labelText, { color: theme.textSecondary }]}>ID Source</Text>
+              </View>
+              <View
+                style={[
+                  styles.idSourceBadge,
+                  {
+                    backgroundColor:
+                      idSourceInfo.tone === 'stable'
+                        ? theme.success + '20'
+                        : idSourceInfo.tone === 'fallback'
+                          ? theme.warning + '20'
+                          : theme.textSecondary + '20',
+                    borderColor:
+                      idSourceInfo.tone === 'stable'
+                        ? theme.success
+                        : idSourceInfo.tone === 'fallback'
+                          ? theme.warning
+                          : theme.textSecondary
+                  }
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.idSourceText,
+                    {
+                      color:
+                        idSourceInfo.tone === 'stable'
+                          ? theme.success
+                          : idSourceInfo.tone === 'fallback'
+                            ? theme.warning
+                            : theme.textSecondary
+                    }
+                  ]}
+                >
+                  {idSourceInfo.label}
+                </Text>
+              </View>
+            </View>
             
             <DetailRow
               icon={<Globe size={16} color={theme.primary} />}
@@ -1038,11 +1125,23 @@ function BrowserDeviceModal({
               label="WebGL Support"
               value={webCapabilities.webGLSupport ? 'Yes' : 'No'}
             />
+
+            <DetailRow
+              icon={<Monitor size={16} color={theme.primary} />}
+              label="WebGL2 Support"
+              value={webCapabilities.webGL2Support ? 'Yes' : 'No'}
+            />
             
             <DetailRow
               icon={<Video size={16} color={theme.primary} />}
               label="WebRTC Support"
               value={webCapabilities.webRTCSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Settings size={16} color={theme.primary} />}
+              label="WebAssembly"
+              value={webCapabilities.webAssemblySupport ? 'Yes' : 'No'}
             />
             
             <DetailRow
@@ -1055,6 +1154,78 @@ function BrowserDeviceModal({
               icon={<HardDrive size={16} color={theme.primary} />}
               label="Local Storage"
               value={webCapabilities.localStorageSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<HardDrive size={16} color={theme.primary} />}
+              label="Session Storage"
+              value={webCapabilities.sessionStorageSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<HardDrive size={16} color={theme.primary} />}
+              label="IndexedDB"
+              value={webCapabilities.indexedDBSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Activity size={16} color={theme.primary} />}
+              label="WebSockets"
+              value={webCapabilities.webSocketsSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<MapPin size={16} color={theme.primary} />}
+              label="Geolocation API"
+              value={webCapabilities.geolocationSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Activity size={16} color={theme.primary} />}
+              label="Device Motion"
+              value={webCapabilities.deviceMotionSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Activity size={16} color={theme.primary} />}
+              label="Device Orientation"
+              value={webCapabilities.deviceOrientationSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Bell size={16} color={theme.primary} />}
+              label="Push Notifications"
+              value={webCapabilities.pushNotificationsSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Share2 size={16} color={theme.primary} />}
+              label="Web Share"
+              value={webCapabilities.webShareSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Video size={16} color={theme.primary} />}
+              label="Media Devices"
+              value={webCapabilities.mediaDevicesSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Bluetooth size={16} color={theme.primary} />}
+              label="Web Bluetooth"
+              value={webCapabilities.webBluetoothSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Usb size={16} color={theme.primary} />}
+              label="WebUSB"
+              value={webCapabilities.webUSBSupport ? 'Yes' : 'No'}
+            />
+
+            <DetailRow
+              icon={<Nfc size={16} color={theme.primary} />}
+              label="Web NFC"
+              value={webCapabilities.webNFCSupport ? 'Yes' : 'No'}
             />
           </View>
 
@@ -1079,6 +1250,14 @@ function BrowserDeviceModal({
               label="Free Storage"
               value={webCapabilities.freeStorage}
             />
+
+            {webCapabilities.storagePercentageUsed > 0 && (
+              <DetailRow
+                icon={<Activity size={16} color={webCapabilities.storagePercentageUsed > 80 ? theme.error : theme.warning} />}
+                label="Usage"
+                value={`${webCapabilities.storagePercentageUsed}%`}
+              />
+            )}
           </View>
 
           {/* Web Permissions */}
@@ -1419,6 +1598,16 @@ const styles = StyleSheet.create({
   actionBtnTextWhite: {
     color: 'white',
     fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+  },
+  idSourceBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  idSourceText: {
+    fontSize: 12,
     fontFamily: 'Inter-SemiBold',
   },
 });

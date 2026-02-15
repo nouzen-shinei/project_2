@@ -15,7 +15,6 @@ import {
 import { firestore } from '../config/firebase';
 import { internalTokenManager } from './internalTokenManager';
 import type { FeeHistoryEntry, TenantAuditLogEntry } from '../types';
-import firebaseAuthService from './firebaseAuthService';
 import { tenantService } from './tenantService';
 import { runtimeEndpoints } from './runtimeEndpoints';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
@@ -77,7 +76,7 @@ class StudentService {
     action: Extract<TenantAuditLogEntry['action'], 'fee_payment_updated' | 'fee_due_dates_updated'>,
     details: { targetId?: string; metadata?: Record<string, unknown> } = {},
   ): Promise<void> {
-    const actor = firebaseAuthService.getCurrentUser();
+    const actor = authService.getCurrentUser();
     if (!actor) {
       return;
     }
