@@ -3222,6 +3222,10 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
 
 const styles = StyleSheet.create({
   container: {
+    width: '100%',
+    maxWidth: 360,
+    minWidth: 220,
+    alignSelf: 'stretch',
     borderRadius: 8,
     overflow: 'hidden',
     marginVertical: 2,

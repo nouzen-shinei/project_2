@@ -442,7 +442,10 @@ export default function Fees() {
   const [uploadingReceipt, setUploadingReceipt] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [selectedFiles, setSelectedFiles] = useState<any[]>([]);
-  const [duplicateFileError, setDuplicateFileError] = useState<string | null>(null);
+  const selectedReceiptFilesRef = useRef<any[]>([]);
+  const [isReceiptDropActive, setIsReceiptDropActive] = useState(false);
+  const [skippedReceiptFiles, setSkippedReceiptFiles] = useState<string[]>([]);
+  const MAX_SKIPPED_RECEIPT_ITEMS = 30;
   const [receiptModalError, setReceiptModalError] = useState<string | null>(null);
   const [showDeleteReceiptModal, setShowDeleteReceiptModal] = useState(false);
   const [receiptToDelete, setReceiptToDelete] = useState<{index: number, receipt: any} | null>(null);
@@ -501,6 +504,46 @@ export default function Fees() {
 
     return sortedGroups;
   }, [selectedFee?.receipts]);
+
+  const resetReceiptUploadModalState = useCallback(() => {
+    setSelectedFiles([]);
+    selectedReceiptFilesRef.current = [];
+    setSkippedReceiptFiles([]);
+    setIsReceiptDropActive(false);
+  }, []);
+
+  const getReceiptFileIdentity = useCallback((file: any) => {
+    const fileName = String(file?.name || file?.fileName || '').trim().toLowerCase();
+    const fileSize = Number(file?.size || file?.fileSize || 0);
+    const lastModified = Number(file?.lastModified || 0);
+    return `${fileName}|${fileSize}|${lastModified}`;
+  }, []);
+
+  const groupedSkippedReceiptFiles = useMemo(() => {
+    const groups: Record<'folder' | 'duplicate' | 'tooLarge' | 'unsupported' | 'other', string[]> = {
+      folder: [],
+      duplicate: [],
+      tooLarge: [],
+      unsupported: [],
+      other: [],
+    };
+
+    for (const rawEntry of skippedReceiptFiles) {
+      const entry = String(rawEntry || '').trim();
+      if (!entry) continue;
+      const match = entry.match(/^\[(.*?)\]\s*(.*)$/);
+      const label = (match?.[1] || '').toLowerCase();
+      const value = (match?.[2] || entry).trim();
+
+      if (label === 'folder') groups.folder.push(value);
+      else if (label === 'duplicate') groups.duplicate.push(value);
+      else if (label === 'too large') groups.tooLarge.push(value);
+      else if (label === 'unsupported') groups.unsupported.push(value);
+      else groups.other.push(entry);
+    }
+
+    return groups;
+  }, [skippedReceiptFiles]);
   
   // Payment deletion states
   const [showDeletePaymentModal, setShowDeletePaymentModal] = useState(false);
@@ -3892,6 +3935,273 @@ export default function Fees() {
     }
   };
 
+  const addFilesToReceiptSelection = useCallback((incomingFiles: any[], initialSkipped: string[] = []) => {
+    if (!Array.isArray(incomingFiles) || incomingFiles.length === 0) {
+      const normalized = Array.from(new Set((initialSkipped || []).filter(Boolean))).slice(0, MAX_SKIPPED_RECEIPT_ITEMS);
+      setSkippedReceiptFiles(normalized);
+      return;
+    }
+
+    const newFiles = incomingFiles
+      .map((asset: any) => ({
+        uri: asset?.uri,
+        name: asset?.fileName || asset?.name || `receipt_${Date.now()}.jpg`,
+        type: asset?.type || asset?.mimeType || 'image/jpeg',
+        size: asset?.fileSize || asset?.size,
+        lastModified: Number(asset?.lastModified || 0) || undefined,
+      }))
+      .filter((file: any) => typeof file?.uri === 'string' && file.uri.length > 0);
+
+    if (newFiles.length === 0) {
+      const normalized = Array.from(new Set((initialSkipped || []).filter(Boolean))).slice(0, MAX_SKIPPED_RECEIPT_ITEMS);
+      setSkippedReceiptFiles(normalized);
+      return;
+    }
+
+    const allowedMimeTypes = new Set([
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ]);
+    const allowedExtensions = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx']);
+    const skippedEntries: string[] = [...(initialSkipped || [])];
+    const unsupportedNames: string[] = [];
+    const supportedFiles = newFiles.filter((file: any) => {
+      const mime = String(file?.type || '').toLowerCase();
+      const fileName = String(file?.name || 'Unknown file');
+      if (mime.startsWith('image/')) {
+        return true;
+      }
+      if (allowedMimeTypes.has(mime)) {
+        return true;
+      }
+      const name = fileName.toLowerCase();
+      const ext = name.includes('.') ? name.split('.').pop() || '' : '';
+      const supported = allowedExtensions.has(ext);
+      if (!supported) {
+        unsupportedNames.push(fileName);
+      }
+      return supported;
+    });
+
+    if (unsupportedNames.length > 0) {
+      skippedEntries.push(...unsupportedNames.map((name) => `[Unsupported] ${name}`));
+    }
+
+    if (supportedFiles.length === 0) {
+      const normalized = Array.from(new Set(skippedEntries.filter(Boolean))).slice(0, MAX_SKIPPED_RECEIPT_ITEMS);
+      setSkippedReceiptFiles(normalized);
+      return;
+    }
+
+    const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
+    const oversizedFiles = supportedFiles.filter((file: any) => {
+      const fileSize = file.size || 0;
+      return fileSize > MAX_FILE_SIZE;
+    });
+
+    if (oversizedFiles.length > 0) {
+      const fileNames = oversizedFiles.map((file: any) => file.name).join(', ');
+      skippedEntries.push(...oversizedFiles.map((file: any) => `[Too large] ${file.name || 'Unknown file'}`));
+      Alert.alert(
+        'File Too Large',
+        `The following file(s) exceed the 20 MB limit: ${fileNames}`,
+        [{ text: 'OK' }]
+      );
+    }
+
+    const allowedFiles = supportedFiles.filter((file: any) => {
+      const fileSize = file.size || 0;
+      return fileSize <= MAX_FILE_SIZE;
+    });
+
+    const currentSelected = selectedReceiptFilesRef.current || [];
+    const existing = new Set(currentSelected.map((file: any) => getReceiptFileIdentity(file)));
+    const duplicateNames: string[] = [];
+    const toAdd: any[] = [];
+
+    for (const file of allowedFiles) {
+      const dedupeKey = getReceiptFileIdentity(file);
+      if (existing.has(dedupeKey)) {
+        duplicateNames.push(String(file?.name || 'Unknown file'));
+        continue;
+      }
+      existing.add(dedupeKey);
+      toAdd.push(file);
+    }
+
+    if (duplicateNames.length > 0) {
+      skippedEntries.push(...duplicateNames.map((name) => `[Duplicate] ${name}`));
+    }
+
+    const nextSelected = toAdd.length > 0 ? [...currentSelected, ...toAdd] : currentSelected;
+    setSelectedFiles(nextSelected);
+    selectedReceiptFilesRef.current = nextSelected;
+    logger.debug('Updated selected files:', nextSelected);
+
+    const normalizedSkipped = Array.from(new Set(skippedEntries.filter(Boolean))).slice(0, MAX_SKIPPED_RECEIPT_ITEMS);
+    setSkippedReceiptFiles(normalizedSkipped);
+  }, [MAX_SKIPPED_RECEIPT_ITEMS, getReceiptFileIdentity]);
+
+  const handleReceiptDropAreaDragOver = useCallback((event: any) => {
+    if (Platform.OS !== 'web' || !showReceiptUpload || uploadingReceipt) {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!isReceiptDropActive) {
+      setIsReceiptDropActive(true);
+    }
+  }, [isReceiptDropActive, showReceiptUpload, uploadingReceipt]);
+
+  const handleReceiptDropAreaDragEnter = useCallback((event: any) => {
+    if (Platform.OS !== 'web' || !showReceiptUpload || uploadingReceipt) {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!isReceiptDropActive) {
+      setIsReceiptDropActive(true);
+    }
+  }, [isReceiptDropActive, showReceiptUpload, uploadingReceipt]);
+
+  const handleReceiptDropAreaDragLeave = useCallback((event: any) => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setIsReceiptDropActive(false);
+  }, []);
+
+  const handleReceiptDropAreaDrop = useCallback((event: any) => {
+    if (Platform.OS !== 'web' || !showReceiptUpload || uploadingReceipt) {
+      return;
+    }
+
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setIsReceiptDropActive(false);
+
+    const droppedItems = event?.nativeEvent?.dataTransfer?.items || event?.dataTransfer?.items;
+    const folderNames = Array.from(droppedItems || [])
+      .map((item: any) => item?.webkitGetAsEntry?.())
+      .filter((entry: any) => Boolean(entry?.isDirectory))
+      .map((entry: any) => String(entry?.name || 'Folder'));
+
+    if (folderNames.length > 0) {
+      const folderMessage = 'Folder upload is not supported. Please drop files directly.';
+      if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+        window.alert(folderMessage);
+      } else {
+        Alert.alert('Folder Not Supported', folderMessage);
+      }
+      addFilesToReceiptSelection([], folderNames.map((name) => `[Folder] ${name}`));
+      return;
+    }
+
+    const droppedFiles = event?.nativeEvent?.dataTransfer?.files || event?.dataTransfer?.files;
+    if (!droppedFiles || droppedFiles.length === 0) {
+      return;
+    }
+
+    const normalized = Array.from(droppedFiles).map((file: any) => {
+      const objectUrl =
+        typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+          ? URL.createObjectURL(file)
+          : null;
+      return {
+        uri: objectUrl,
+        name: file?.name,
+        fileName: file?.name,
+        type: file?.type,
+        mimeType: file?.type,
+        fileSize: file?.size,
+        size: file?.size,
+      };
+    });
+
+    addFilesToReceiptSelection(normalized);
+  }, [addFilesToReceiptSelection, showReceiptUpload, uploadingReceipt]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !showReceiptUpload) {
+      return;
+    }
+
+    const blockAndMarkDrag = (event: DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setIsReceiptDropActive(true);
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'copy';
+      }
+    };
+
+    const blockDragLeave = (event: DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setIsReceiptDropActive(false);
+    };
+
+    const handleWindowDrop = (event: DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setIsReceiptDropActive(false);
+
+      const folderNames = Array.from(event.dataTransfer?.items || [])
+        .map((item: any) => item?.webkitGetAsEntry?.())
+        .filter((entry: any) => Boolean(entry?.isDirectory))
+        .map((entry: any) => String(entry?.name || 'Folder'));
+
+      if (folderNames.length > 0) {
+        const folderMessage = 'Folder upload is not supported. Please drop files directly.';
+        if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+          window.alert(folderMessage);
+        } else {
+          Alert.alert('Folder Not Supported', folderMessage);
+        }
+        addFilesToReceiptSelection([], folderNames.map((name) => `[Folder] ${name}`));
+        return;
+      }
+
+      const droppedFiles = event.dataTransfer?.files;
+      if (!droppedFiles || droppedFiles.length === 0) {
+        return;
+      }
+      const normalized = Array.from(droppedFiles).map((file: any) => {
+        const objectUrl =
+          typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+            ? URL.createObjectURL(file)
+            : null;
+        return {
+          uri: objectUrl,
+          name: file?.name,
+          fileName: file?.name,
+          type: file?.type,
+          mimeType: file?.type,
+          fileSize: file?.size,
+          size: file?.size,
+        };
+      });
+      addFilesToReceiptSelection(normalized);
+    };
+
+    window.addEventListener('dragenter', blockAndMarkDrag);
+    window.addEventListener('dragover', blockAndMarkDrag);
+    window.addEventListener('dragleave', blockDragLeave);
+    window.addEventListener('drop', handleWindowDrop);
+
+    return () => {
+      window.removeEventListener('dragenter', blockAndMarkDrag);
+      window.removeEventListener('dragover', blockAndMarkDrag);
+      window.removeEventListener('dragleave', blockDragLeave);
+      window.removeEventListener('drop', handleWindowDrop);
+    };
+  }, [addFilesToReceiptSelection, showReceiptUpload]);
+
   const selectFiles = async (source: 'gallery' | 'documents') => {
     try {
       let result: any;
@@ -3932,60 +4242,8 @@ export default function Fees() {
       logger.debug('File picker result:', result); // Debug log
 
       if (!result.canceled && result.assets) {
-        const newFiles = result.assets.map((asset: any) => ({
-          uri: asset.uri,
-          name: asset.fileName || asset.name || `receipt_${Date.now()}.jpg`,
-          type: asset.type || asset.mimeType || 'image/jpeg',
-          size: asset.fileSize || asset.size
-        }));
-        
-        logger.debug('Processed new files:', newFiles); // Debug log
-        
-        // Check file size limit (20 MB = 20 * 1024 * 1024 bytes)
-        const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
-        const oversizedFiles = newFiles.filter((file: any) => {
-          const fileSize = file.size || 0;
-          return fileSize > MAX_FILE_SIZE;
-        });
-
-        if (oversizedFiles.length > 0) {
-          const fileNames = oversizedFiles.map((file: any) => file.name).join(', ');
-          Alert.alert(
-            'File Too Large',
-            `The following file(s) exceed the 20 MB limit: ${fileNames}`,
-            [{ text: 'OK' }]
-          );
-          return;
-        }
-        
-        // Add new files to existing selection, filtering out duplicates
-        setSelectedFiles(prevFiles => {
-          // Filter out files that are already selected
-          const filteredNewFiles = newFiles.filter((newFile: any) => {
-            return !prevFiles.some((existingFile: any) => 
-              existingFile.uri === newFile.uri || 
-              (existingFile.name === newFile.name && existingFile.size === newFile.size)
-            );
-          });
-          
-          const updatedFiles = [...prevFiles, ...filteredNewFiles];
-          logger.debug('Updated selected files:', updatedFiles); // Debug log
-          
-          // Show error message if some files were filtered out
-          if (filteredNewFiles.length < newFiles.length) {
-            const duplicateCount = newFiles.length - filteredNewFiles.length;
-            setDuplicateFileError(
-              `${duplicateCount} file(s) were already selected and have been skipped.`
-            );
-            // Auto-clear the error after 5 seconds
-            setTimeout(() => setDuplicateFileError(null), 9000);
-          } else {
-            // Clear any existing error if all files were added successfully
-            setDuplicateFileError(null);
-          }
-          
-          return updatedFiles;
-        });
+        logger.debug('Processed new files from picker:', result.assets); // Debug log
+        addFilesToReceiptSelection(result.assets);
       } else {
         logger.debug('File selection was canceled or no assets found');
       }
@@ -4104,8 +4362,7 @@ export default function Fees() {
         visibilityTime: 3000,
       });
 
-      setSelectedFiles([]);
-      setDuplicateFileError(null); // Clear any duplicate file errors
+      resetReceiptUploadModalState();
       setShowReceiptUpload(false); // Close the upload modal after successful upload
     } catch (error) {
       logger.error('Error uploading receipts:', error);
@@ -9513,8 +9770,7 @@ export default function Fees() {
         presentationStyle="pageSheet"
         onRequestClose={() => {
           setShowReceiptUpload(false);
-          setSelectedFiles([]); // Clear selected files when closing
-          setDuplicateFileError(null); // Clear duplicate file error when closing
+          resetReceiptUploadModalState();
         }}
       >
         <View style={[styles.modalContainer, { backgroundColor: theme.background }]}>
@@ -9524,8 +9780,7 @@ export default function Fees() {
               style={styles.closeButton}
               onPress={() => {
                 setShowReceiptUpload(false);
-                setSelectedFiles([]); // Clear selected files when closing
-                setDuplicateFileError(null); // Clear duplicate file error when closing
+                resetReceiptUploadModalState();
               }}
             >
               <X size={24} color={theme.textSecondary} />
@@ -9537,55 +9792,131 @@ export default function Fees() {
             contentContainerStyle={{
               paddingBottom: Platform.select({ web: 0, default: 30 }),
             }}
+            {...(Platform.OS === 'web'
+              ? ({
+                  onDragOver: handleReceiptDropAreaDragOver,
+                  onDragEnter: handleReceiptDropAreaDragEnter,
+                  onDrop: handleReceiptDropAreaDrop,
+                } as any)
+              : {})}
           >
             <Text style={[styles.modalText, { color: theme.textSecondary }]}>
               {`Upload payment receipt(s) for ${(selectedFee?.studentName ?? 'this student')}’s fee`}
             </Text>
 
-            {/* Duplicate File Error Message */}
-            {duplicateFileError && (
-              <View style={{ backgroundColor: '#FEF2F2', borderColor: '#EF4444', borderWidth: 1, borderRadius: 8, padding: 12, marginVertical: 8 }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
-                    <AlertCircle size={16} color="#EF4444" />
-                    <Text style={{ color: '#EF4444', fontWeight: '600', marginLeft: 8, fontSize: 14 }}>
-                      Duplicate Files Detected
-                    </Text>
-                  </View>
-                  <TouchableOpacity
-                    onPress={() => setDuplicateFileError(null)}
-                    style={{ padding: 4 }}
-                  >
-                    <X size={16} color="#EF4444" />
-                  </TouchableOpacity>
-                </View>
-                <Text style={{ color: '#DC2626', marginTop: 4, fontSize: 13 }}>
-                  {duplicateFileError}
+            {skippedReceiptFiles.length > 0 && (
+              <View style={{ backgroundColor: '#FFFBEB', borderColor: '#F59E0B', borderWidth: 1, borderRadius: 8, padding: 10, marginTop: 10 }}>
+                <Text style={{ color: '#92400E', fontWeight: '600', fontSize: 13, marginBottom: 4 }}>
+                  Skipped while adding files ({skippedReceiptFiles.length})
                 </Text>
+                <ScrollView style={{ maxHeight: 140 }} nestedScrollEnabled>
+                  {groupedSkippedReceiptFiles.folder.length > 0 && (
+                    <>
+                      <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 2, marginBottom: 2 }}>
+                        Folders ({groupedSkippedReceiptFiles.folder.length})
+                      </Text>
+                      {groupedSkippedReceiptFiles.folder.map((entry, idx) => (
+                        <Text key={`receipt_folder_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                          • {entry}
+                        </Text>
+                      ))}
+                    </>
+                  )}
+                  {groupedSkippedReceiptFiles.duplicate.length > 0 && (
+                    <>
+                      <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                        Duplicates ({groupedSkippedReceiptFiles.duplicate.length})
+                      </Text>
+                      {groupedSkippedReceiptFiles.duplicate.map((entry, idx) => (
+                        <Text key={`receipt_duplicate_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                          • {entry}
+                        </Text>
+                      ))}
+                    </>
+                  )}
+                  {groupedSkippedReceiptFiles.tooLarge.length > 0 && (
+                    <>
+                      <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                        Too Large ({groupedSkippedReceiptFiles.tooLarge.length})
+                      </Text>
+                      {groupedSkippedReceiptFiles.tooLarge.map((entry, idx) => (
+                        <Text key={`receipt_too_large_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                          • {entry}
+                        </Text>
+                      ))}
+                    </>
+                  )}
+                  {groupedSkippedReceiptFiles.unsupported.length > 0 && (
+                    <>
+                      <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                        Unsupported ({groupedSkippedReceiptFiles.unsupported.length})
+                      </Text>
+                      {groupedSkippedReceiptFiles.unsupported.map((entry, idx) => (
+                        <Text key={`receipt_unsupported_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                          • {entry}
+                        </Text>
+                      ))}
+                    </>
+                  )}
+                  {groupedSkippedReceiptFiles.other.length > 0 && (
+                    <>
+                      <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                        Other ({groupedSkippedReceiptFiles.other.length})
+                      </Text>
+                      {groupedSkippedReceiptFiles.other.map((entry, idx) => (
+                        <Text key={`receipt_other_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                          • {entry}
+                        </Text>
+                      ))}
+                    </>
+                  )}
+                </ScrollView>
               </View>
             )}
 
-            {selectedFiles.length === 0 ? (
-              // Show file selection option when no files are selected
-              <View style={styles.uploadOptions}>
-                <TouchableOpacity
-                  style={[styles.uploadOption, { backgroundColor: theme.surface, borderColor: theme.border }]}
-                  onPress={() => handleUploadReceipt('unified')}
-                  disabled={uploadingReceipt}
-                >
-                  <Upload size={32} color={theme.primary} />
-                  <Text style={[styles.uploadOptionTitle, { color: theme.text }]}>Select Files</Text>
-                  <Text style={[styles.uploadOptionSubtitle, { color: theme.textSecondary }]}>
-                    Choose from camera, gallery, or documents
-                  </Text>
-                  <Text style={[styles.uploadOptionHint, { color: theme.textSecondary }]}>
-                    Supported: Images, PDFs, Word, Excel · Max 20 MB each
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            ) : (
-              // Show selected files when files are selected
-              <View>
+            <View
+              style={[
+                styles.receiptDropZone,
+                Platform.OS === 'web' && isReceiptDropActive
+                  ? [styles.receiptDropZoneActive, { borderColor: theme.primary, backgroundColor: `${theme.primary}12` }]
+                  : null,
+              ]}
+              {...(Platform.OS === 'web'
+                ? ({
+                    onDragEnter: handleReceiptDropAreaDragEnter,
+                    onDragOver: handleReceiptDropAreaDragOver,
+                    onDragLeave: handleReceiptDropAreaDragLeave,
+                    onDrop: handleReceiptDropAreaDrop,
+                  } as any)
+                : {})}
+            >
+              {Platform.OS === 'web' && (
+                <Text style={[styles.receiptDropHint, { color: isReceiptDropActive ? theme.primary : theme.textSecondary }]}> 
+                  {isReceiptDropActive ? 'Drop files to attach receipts' : 'Tip: Drag and drop files here'}
+                </Text>
+              )}
+
+              {selectedFiles.length === 0 ? (
+                // Show file selection option when no files are selected
+                <View style={styles.uploadOptions}>
+                  <TouchableOpacity
+                    style={[styles.uploadOption, { backgroundColor: theme.surface, borderColor: theme.border }]}
+                    onPress={() => handleUploadReceipt('unified')}
+                    disabled={uploadingReceipt}
+                  >
+                    <Upload size={32} color={theme.primary} />
+                    <Text style={[styles.uploadOptionTitle, { color: theme.text }]}>Select Files</Text>
+                    <Text style={[styles.uploadOptionSubtitle, { color: theme.textSecondary }]}> 
+                      Choose from camera, gallery, or documents
+                    </Text>
+                    <Text style={[styles.uploadOptionHint, { color: theme.textSecondary }]}> 
+                      Supported: Images, PDFs, Word, Excel · Max 20 MB each
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                // Show selected files when files are selected
+                <View>
                 <View style={styles.selectedFilesHeader}>
                   <Text style={[styles.selectedFilesTitle, { color: theme.text }]}>
                     Selected Files ({selectedFiles.length})
@@ -9625,7 +9956,7 @@ export default function Fees() {
                   <TouchableOpacity
                     style={[styles.previewButton, styles.previewCancelButton, { borderColor: theme.border }]}
                     onPress={() => {
-                      setSelectedFiles([]);
+                      resetReceiptUploadModalState();
                     }}
                   >
                     <Text style={[styles.previewButtonText, { color: theme.textSecondary }]}>Clear All</Text>
@@ -9642,8 +9973,9 @@ export default function Fees() {
                     </Text>
                   </TouchableOpacity>
                 </View>
-              </View>
-            )}
+                </View>
+              )}
+            </View>
 
             {uploadingReceipt && (
               <View style={[styles.uploadingContainer, { backgroundColor: theme.surface }]}>
@@ -11673,6 +12005,23 @@ const styles = StyleSheet.create({
     fontFamily: 'Inter-Regular',
     marginTop: 6,
     textAlign: 'center',
+  },
+  receiptDropZone: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: 'transparent',
+    padding: 10,
+    marginTop: 8,
+  },
+  receiptDropZoneActive: {
+    borderWidth: 2,
+  },
+  receiptDropHint: {
+    fontSize: 12,
+    fontFamily: 'Inter-Medium',
+    textAlign: 'center',
+    marginTop: 2,
   },
   uploadingContainer: {
     marginTop: 16,
