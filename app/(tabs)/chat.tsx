@@ -831,6 +831,10 @@ export default function Chat() {
 
   // sendMessageNotification is defined after effectiveUser to avoid TDZ
   const [selectedFiles, setSelectedFiles] = useState<any[]>([]);
+  const selectedFilesRef = useRef<any[]>([]);
+  const [isChatDropActive, setIsChatDropActive] = useState(false);
+  const [skippedPreviewFiles, setSkippedPreviewFiles] = useState<string[]>([]);
+  const MAX_SKIPPED_PREVIEW_ITEMS = 30;
   
   // Media prefetch cache
   const prefetchedUrisRef = useRef<Set<string>>(new Set());
@@ -4185,6 +4189,14 @@ export default function Chat() {
     setShowSpecialCommand(false);
     setIsComposingSpecial(true);
   }, []);
+
+  const resetFilePreviewModal = useCallback(() => {
+    setFilePreviewVisible(false);
+    setSelectedFiles([]);
+    selectedFilesRef.current = [];
+    setSkippedPreviewFiles([]);
+  }, []);
+
   // Android hardware back handling: close overlays first, otherwise go from chat detail back to chat list
   useFocusEffect(
     useCallback(() => {
@@ -4193,7 +4205,7 @@ export default function Chat() {
         if (stickerGifPickerVisible) { closeStickerGifPicker(); return true; }
         if (attachmentModalVisible) { closeAttachmentModal(); return true; }
         if (imageViewerVisible) { setImageViewerVisible(false); return true; }
-        if (filePreviewVisible) { setFilePreviewVisible(false); return true; }
+        if (filePreviewVisible) { resetFilePreviewModal(); return true; }
         if (chatProfileModalVisible) { setChatProfileModalVisible(false); return true; }
         if (selectedTeamMember) { Keyboard.dismiss(); setSelectedTeamMember(null); return true; }
         return false;
@@ -4211,6 +4223,7 @@ export default function Chat() {
       closeStickerGifPicker,
       closeAttachmentModal,
       closeEmojiPicker,
+      resetFilePreviewModal,
     ])
   );
 
@@ -4230,6 +4243,351 @@ export default function Chat() {
     }
   };
 
+  const buildWebDroppedFiles = useCallback(async (droppedFiles: any): Promise<any[]> => {
+    const items = Array.from(droppedFiles || []);
+    const mapped = await Promise.all(
+      items.map(async (file: any) => {
+        if (!file) {
+          return null;
+        }
+
+        const fileName = String(file?.name || 'file');
+        const mimeType = String(file?.type || '');
+        const isLikelyImage =
+          mimeType.toLowerCase().startsWith('image/') ||
+          /\.(jpg|jpeg|png|gif|webp|bmp|svg|heic|heif|tif|tiff|ico)$/i.test(fileName);
+
+        const objectUrl =
+          typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+            ? URL.createObjectURL(file)
+            : null;
+
+        let previewUri: string | null = null;
+        if (isLikelyImage && typeof FileReader !== 'undefined') {
+          try {
+            previewUri = await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result || ''));
+              reader.onerror = () => reject(reader.error);
+              reader.readAsDataURL(file);
+            });
+          } catch {
+            previewUri = null;
+          }
+        }
+
+        const uri = objectUrl || previewUri;
+        if (typeof uri !== 'string' || uri.length === 0) {
+          return null;
+        }
+
+        return {
+          uri,
+          previewUri: previewUri || undefined,
+          name: fileName,
+          fileName,
+          type: mimeType,
+          mimeType,
+          fileSize: file?.size,
+          size: file?.size,
+          lastModified: Number(file?.lastModified || 0) || undefined,
+        };
+      })
+    );
+
+    return mapped.filter((entry): entry is any => Boolean(entry));
+  }, []);
+
+  const getPreviewFileIdentity = useCallback((file: any) => {
+    const fileName = String(file?.fileName || file?.name || '').trim().toLowerCase();
+    const fileSize = Number(file?.fileSize || file?.size || 0);
+    const lastModified = Number(file?.lastModified || 0);
+    return `${fileName}|${fileSize}|${lastModified}`;
+  }, []);
+
+  const previewSelectedFiles = useCallback((files: any[], initialSkipped: string[] = []) => {
+    if (!Array.isArray(files) || files.length === 0) {
+      const normalizedInitial = Array.from(new Set((initialSkipped || []).filter(Boolean))).slice(0, MAX_SKIPPED_PREVIEW_ITEMS);
+      setSkippedPreviewFiles(normalizedInitial);
+      if (normalizedInitial.length > 0) {
+        setFilePreviewVisible(true);
+      }
+      return;
+    }
+
+    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+    const oversizedFiles = files.filter((file) => {
+      const fileSize = file?.fileSize || file?.size || 0;
+      return fileSize > MAX_FILE_SIZE;
+    });
+
+    const allowedFiles = files.filter((file) => {
+      const fileSize = file?.fileSize || file?.size || 0;
+      return fileSize <= MAX_FILE_SIZE;
+    });
+
+    const skippedEntries: string[] = [...(initialSkipped || [])];
+
+    if (oversizedFiles.length > 0) {
+      const fileNames = oversizedFiles
+        .map((file) => file?.fileName || file?.name || 'Unknown file')
+        .join(', ');
+      skippedEntries.push(
+        ...oversizedFiles.map((file) => `[Too large] ${file?.fileName || file?.name || 'Unknown file'}`)
+      );
+      Toast.show({
+        type: 'error',
+        text1: 'File Too Large',
+        text2: `The following file(s) exceed the 50 MB limit: ${fileNames}`,
+        position: 'top',
+      });
+    }
+
+    const currentSelected = selectedFilesRef.current || [];
+    const existing = new Set(currentSelected.map((file: any) => getPreviewFileIdentity(file)));
+    const skippedNames: string[] = [];
+    const toAdd: any[] = [];
+
+    for (const file of allowedFiles) {
+      const fileName = String(file?.fileName || file?.name || 'Unknown file');
+      const dedupeKey = getPreviewFileIdentity(file);
+      if (existing.has(dedupeKey)) {
+        skippedNames.push(fileName);
+        continue;
+      }
+      existing.add(dedupeKey);
+      toAdd.push(file);
+    }
+
+    const addedCount = toAdd.length;
+    const nextSelected = addedCount > 0 ? [...currentSelected, ...toAdd] : currentSelected;
+    setSelectedFiles(nextSelected);
+    selectedFilesRef.current = nextSelected;
+
+    skippedEntries.push(...skippedNames.map((name) => `[Duplicate] ${name}`));
+    const normalizedSkipped = Array.from(new Set(skippedEntries.filter(Boolean))).slice(0, MAX_SKIPPED_PREVIEW_ITEMS);
+    setSkippedPreviewFiles(normalizedSkipped);
+
+    if (addedCount > 0 || normalizedSkipped.length > 0) {
+      setFilePreviewVisible(true);
+    }
+  }, [MAX_SKIPPED_PREVIEW_ITEMS, getPreviewFileIdentity]);
+
+  const groupedSkippedPreviewFiles = useMemo(() => {
+    const groups: Record<'folder' | 'duplicate' | 'tooLarge' | 'other', string[]> = {
+      folder: [],
+      duplicate: [],
+      tooLarge: [],
+      other: [],
+    };
+
+    for (const rawEntry of skippedPreviewFiles) {
+      const entry = String(rawEntry || '').trim();
+      if (!entry) {
+        continue;
+      }
+      const match = entry.match(/^\[(.*?)\]\s*(.*)$/);
+      const label = (match?.[1] || '').toLowerCase();
+      const value = (match?.[2] || entry).trim();
+
+      if (label === 'folder') {
+        groups.folder.push(value);
+      } else if (label === 'duplicate') {
+        groups.duplicate.push(value);
+      } else if (label === 'too large') {
+        groups.tooLarge.push(value);
+      } else {
+        groups.other.push(entry);
+      }
+    }
+
+    return groups;
+  }, [skippedPreviewFiles]);
+
+  const handleChatPageDragOver = useCallback((event: any) => {
+    if (Platform.OS !== 'web' || !selectedTeamMember) {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!isChatDropActive) {
+      setIsChatDropActive(true);
+    }
+  }, [isChatDropActive, selectedTeamMember]);
+
+  const handleChatPageDragLeave = useCallback((event: any) => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setIsChatDropActive(false);
+  }, []);
+
+  const handleChatPageDrop = useCallback(async (event: any) => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setIsChatDropActive(false);
+
+    if (!selectedTeamMember) {
+      Toast.show({
+        type: 'info',
+        text1: 'Select a Chat',
+        text2: 'Choose a team member before dropping files.',
+        position: 'top',
+      });
+      return;
+    }
+
+    if (isOffline) {
+      Toast.show({
+        type: 'info',
+        text1: 'Offline',
+        text2: 'You cannot send files while offline. Please reconnect to the internet and try again.',
+        position: 'top',
+      });
+      return;
+    }
+
+    const folderNames = Array.from(event?.nativeEvent?.dataTransfer?.items || event?.dataTransfer?.items || [])
+      .map((item: any) => item?.webkitGetAsEntry?.())
+      .filter((entry: any) => Boolean(entry?.isDirectory))
+      .map((entry: any) => String(entry?.name || 'Folder'));
+
+    if (folderNames.length > 0) {
+      const message = 'Folder upload is not supported in chat. Please drop files directly.';
+      if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+        window.alert(message);
+      } else {
+        Alert.alert('Folder Not Supported', message);
+      }
+      Toast.show({
+        type: 'error',
+        text1: 'Folder Not Supported',
+        text2: message,
+        position: 'top',
+      });
+      const skippedFolders = folderNames.map((name) => `[Folder] ${name}`);
+      previewSelectedFiles([], skippedFolders);
+      return;
+    }
+
+    const droppedFiles = event?.nativeEvent?.dataTransfer?.files || event?.dataTransfer?.files;
+    if (!droppedFiles || droppedFiles.length === 0) {
+      return;
+    }
+
+    const files = await buildWebDroppedFiles(droppedFiles);
+
+    previewSelectedFiles(files);
+  }, [buildWebDroppedFiles, isOffline, previewSelectedFiles, selectedTeamMember]);
+
+  useEffect(() => {
+    if (!selectedTeamMember) {
+      setIsChatDropActive(false);
+    }
+  }, [selectedTeamMember]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !isFocused) {
+      return;
+    }
+
+    const markDragging = (event: any) => {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      if (!selectedTeamMember) {
+        return;
+      }
+      setIsChatDropActive(true);
+      if (event?.dataTransfer) {
+        event.dataTransfer.dropEffect = 'copy';
+      }
+    };
+
+    const clearDragging = (event: any) => {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      if (!selectedTeamMember) {
+        return;
+      }
+      setIsChatDropActive(false);
+    };
+
+    const handleWindowDrop = async (event: any) => {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      if (!selectedTeamMember) {
+        Toast.show({
+          type: 'info',
+          text1: 'Select a Chat',
+          text2: 'Choose a team member before dropping files.',
+          position: 'top',
+        });
+        return;
+      }
+      setIsChatDropActive(false);
+
+      const folderNames = Array.from(event?.dataTransfer?.items || [])
+        .map((item: any) => item?.webkitGetAsEntry?.())
+        .filter((entry: any) => Boolean(entry?.isDirectory))
+        .map((entry: any) => String(entry?.name || 'Folder'));
+
+      if (folderNames.length > 0) {
+        const message = 'Folder upload is not supported in chat. Please drop files directly.';
+        if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+          window.alert(message);
+        } else {
+          Alert.alert('Folder Not Supported', message);
+        }
+        Toast.show({
+          type: 'error',
+          text1: 'Folder Not Supported',
+          text2: message,
+          position: 'top',
+        });
+        const skippedFolders = folderNames.map((name) => `[Folder] ${name}`);
+        previewSelectedFiles([], skippedFolders);
+        return;
+      }
+
+      if (isOffline) {
+        Toast.show({
+          type: 'info',
+          text1: 'Offline',
+          text2: 'You cannot send files while offline. Please reconnect to the internet and try again.',
+          position: 'top',
+        });
+        return;
+      }
+
+      const droppedFiles = event?.dataTransfer?.files;
+      if (!droppedFiles || droppedFiles.length === 0) {
+        return;
+      }
+
+      const files = await buildWebDroppedFiles(droppedFiles);
+
+      previewSelectedFiles(files);
+    };
+
+    window.addEventListener('dragenter', markDragging);
+    window.addEventListener('dragover', markDragging);
+    window.addEventListener('dragleave', clearDragging);
+    window.addEventListener('drop', handleWindowDrop);
+
+    return () => {
+      window.removeEventListener('dragenter', markDragging);
+      window.removeEventListener('dragover', markDragging);
+      window.removeEventListener('dragleave', clearDragging);
+      window.removeEventListener('drop', handleWindowDrop);
+    };
+  }, [buildWebDroppedFiles, isFocused, isOffline, previewSelectedFiles, selectedTeamMember]);
+
   const handleFileSelection = async (type: 'image' | 'camera' | 'document' | 'video' | 'videoCamera') => {
   closeAttachmentModal();
     
@@ -4243,7 +4601,7 @@ export default function Chat() {
       });
       return;
     }
-    
+
     try {
       let result = null;
       
@@ -4290,26 +4648,7 @@ export default function Chat() {
         }
         
         if (files.length > 0) {
-          // Check file size limit (50 MB = 50 * 1024 * 1024 bytes)
-          const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
-          const oversizedFiles = files.filter(file => {
-            const fileSize = file.fileSize || file.size || 0;
-            return fileSize > MAX_FILE_SIZE;
-          });
-
-          if (oversizedFiles.length > 0) {
-            const fileNames = oversizedFiles.map(file => file.fileName || file.name || 'Unknown file').join(', ');
-            Toast.show({
-              type: 'error',
-              text1: 'File Too Large',
-              text2: `The following file(s) exceed the 50 MB limit: ${fileNames}`,
-              position: 'top',
-            });
-            return;
-          }
-
-          setSelectedFiles(files);
-          setFilePreviewVisible(true);
+          previewSelectedFiles(files);
         }
       }
     } catch (error: any) {
@@ -4419,8 +4758,7 @@ export default function Chat() {
       
       // Clear message and files after sending
       clearInputField(); // Use helper function to clear input
-      setSelectedFiles([]);
-      setFilePreviewVisible(false);
+      resetFilePreviewModal();
       attachmentUploadCancelMap.current.delete(tempId);
       setPendingAttachments(prev => {
         const next = new Map(prev);
@@ -5115,8 +5453,9 @@ export default function Chat() {
   const removeSelectedFile = (index: number) => {
     const newFiles = selectedFiles.filter((_, i) => i !== index);
     setSelectedFiles(newFiles);
+    selectedFilesRef.current = newFiles;
     if (newFiles.length === 0) {
-      setFilePreviewVisible(false);
+      resetFilePreviewModal();
     }
   };
 
@@ -5867,7 +6206,11 @@ export default function Chat() {
                     {Array.isArray(msg.attachments) && msg.attachments.length > 0 && (msg.attachments as HydratedAttachment[]).map((attachment, index: number) => (
                       <View
                         key={index}
-                        style={{ marginBottom: index < msg.attachments.length - 1 ? 8 : 0, alignItems: 'center' }}
+                        style={{
+                          marginBottom: index < msg.attachments.length - 1 ? 8 : 0,
+                          width: '100%',
+                          alignItems: 'stretch',
+                        }}
                       >
                         {brokenFileUrls.has(attachment.url) ? (
                           // Show placeholder for deleted/missing files
@@ -6586,7 +6929,7 @@ export default function Chat() {
       visible={filePreviewVisible}
       transparent
       animationType="slide"
-      onRequestClose={() => setFilePreviewVisible(false)}
+      onRequestClose={resetFilePreviewModal}
     >
       <View style={styles.filePreviewOverlay}>
         <SafeAreaView style={styles.filePreviewContainer}>
@@ -6595,12 +6938,70 @@ export default function Chat() {
               Preview Files ({selectedFiles.length})
             </Text>
             <TouchableOpacity
-              onPress={() => setFilePreviewVisible(false)}
+              onPress={resetFilePreviewModal}
               style={styles.closeButton}
             >
               <X size={24} color={theme.text} />
             </TouchableOpacity>
           </View>
+
+          {skippedPreviewFiles.length > 0 && (
+            <View style={{ marginHorizontal: 20, marginTop: 10, backgroundColor: '#FFFBEB', borderColor: '#F59E0B', borderWidth: 1, borderRadius: 8, padding: 10 }}>
+              <Text style={{ color: '#92400E', fontWeight: '600', fontSize: 13, marginBottom: 4 }}>
+                Skipped while adding files ({skippedPreviewFiles.length})
+              </Text>
+              <ScrollView style={{ maxHeight: 140 }} nestedScrollEnabled>
+                {groupedSkippedPreviewFiles.folder.length > 0 && (
+                  <>
+                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 2, marginBottom: 2 }}>
+                      Folders ({groupedSkippedPreviewFiles.folder.length})
+                    </Text>
+                    {groupedSkippedPreviewFiles.folder.map((entry, idx) => (
+                      <Text key={`folder_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                        • {entry}
+                      </Text>
+                    ))}
+                  </>
+                )}
+                {groupedSkippedPreviewFiles.duplicate.length > 0 && (
+                  <>
+                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                      Duplicates ({groupedSkippedPreviewFiles.duplicate.length})
+                    </Text>
+                    {groupedSkippedPreviewFiles.duplicate.map((entry, idx) => (
+                      <Text key={`duplicate_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                        • {entry}
+                      </Text>
+                    ))}
+                  </>
+                )}
+                {groupedSkippedPreviewFiles.tooLarge.length > 0 && (
+                  <>
+                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                      Too Large ({groupedSkippedPreviewFiles.tooLarge.length})
+                    </Text>
+                    {groupedSkippedPreviewFiles.tooLarge.map((entry, idx) => (
+                      <Text key={`too_large_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                        • {entry}
+                      </Text>
+                    ))}
+                  </>
+                )}
+                {groupedSkippedPreviewFiles.other.length > 0 && (
+                  <>
+                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
+                      Other ({groupedSkippedPreviewFiles.other.length})
+                    </Text>
+                    {groupedSkippedPreviewFiles.other.map((entry, idx) => (
+                      <Text key={`other_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
+                        • {entry}
+                      </Text>
+                    ))}
+                  </>
+                )}
+              </ScrollView>
+            </View>
+          )}
 
           <ScrollView
             style={styles.filePreviewContent}
@@ -6616,15 +7017,16 @@ export default function Chat() {
                 return candidate;
               })();
               const fileSizeValue = file.fileSize || file.size;
-              const isImage = mimeType ? isImageFile(mimeType, safePreviewName) : false;
-              const isVideo = mimeType ? isVideoFile(mimeType, safePreviewName) : false;
+              const isImage = isImageFile(mimeType, safePreviewName);
+              const isVideo = isVideoFile(mimeType, safePreviewName);
+              const previewImageUri = String(file.previewUri || file.uri || '');
               const thumbnailUri = file.thumbnail || file.preview || file.poster || null;
 
               return (
                 <View key={index} style={[styles.filePreviewItem, { backgroundColor: theme.background }]}>
                   <View style={[styles.filePreviewInfo, isVideo ? styles.filePreviewInfoVideo : null]}>
-                    {isImage ? (
-                      <Image source={{ uri: file.uri }} style={styles.previewImage} />
+                    {isImage && previewImageUri ? (
+                      <Image source={{ uri: previewImageUri }} style={styles.previewImage} />
                     ) : isVideo ? (
                       <View style={styles.videoPreviewContainer}>
                         <VideoPlayer
@@ -7604,6 +8006,13 @@ export default function Chat() {
       style={[styles.container, { backgroundColor: theme.background }]}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+      {...(Platform.OS === 'web'
+        ? ({
+            onDragOver: handleChatPageDragOver,
+            onDragLeave: handleChatPageDragLeave,
+            onDrop: handleChatPageDrop,
+          } as any)
+        : {})}
     >
   {/* Header with User Selection */}
   <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
@@ -8372,6 +8781,16 @@ export default function Chat() {
           isSendingMessage={isSendingMessage}
           canSend={canAttemptSend}
         />
+      )}
+
+      {Platform.OS === 'web' && isChatDropActive && selectedTeamMember && (
+        <View pointerEvents="none" style={styles.chatDropOverlay}>
+          <View style={[styles.chatDropCard, { backgroundColor: theme.surface, borderColor: theme.primary }]}> 
+            <FileIcon size={26} color={theme.primary} />
+            <Text style={[styles.chatDropTitle, { color: theme.text }]}>Drop files to send</Text>
+            <Text style={[styles.chatDropSubtitle, { color: theme.textSecondary }]}>Files will open in preview before sending</Text>
+          </View>
+        </View>
       )}
 
       {/* Modals */}
@@ -9552,6 +9971,36 @@ const styles = StyleSheet.create({
   messagesWrapper: {
     flex: 1,
     position: 'relative',
+  },
+  chatDropOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2000,
+    backgroundColor: 'rgba(0, 0, 0, 0.12)',
+  },
+  chatDropCard: {
+    borderWidth: 2,
+    borderStyle: 'dashed',
+    borderRadius: 14,
+    paddingHorizontal: 22,
+    paddingVertical: 16,
+    minWidth: 260,
+    alignItems: 'center',
+  },
+  chatDropTitle: {
+    fontSize: 16,
+    fontFamily: 'Poppins-SemiBold',
+    marginTop: 8,
+  },
+  chatDropSubtitle: {
+    fontSize: 13,
+    fontFamily: 'Inter-Regular',
+    marginTop: 4,
   },
   
   // Sticky date header styles
