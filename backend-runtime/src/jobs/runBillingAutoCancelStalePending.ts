@@ -98,11 +98,13 @@ async function main(): Promise<void> {
     candidatesFound: stats.candidatesFound,
     tenantsProcessed: stats.tenantsProcessed,
     tenantsSkippedLocked: (stats as any).tenantsSkippedLocked ?? 0,
+    tenantsSkippedPlanLocked: (stats as any).tenantsSkippedPlanLocked ?? 0,
     tenantsCancelled: stats.tenantsCancelled,
     invoicesFailed: stats.invoicesFailed,
     invoicesCreated: stats.invoicesCreated,
     providerCancelsAttempted: stats.providerCancelsAttempted,
     providerCancelsFailed: stats.providerCancelsFailed,
+    terminal_non_cancellable: (stats as any).terminalNonCancellable ?? 0,
     errors: stats.errors.length,
     fatalError: (stats as any).fatalError ?? null,
   });

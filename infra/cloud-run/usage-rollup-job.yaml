@@ -15,7 +15,7 @@ spec:
           maxRetries: 1
           timeoutSeconds: 1800
           containers:
-            - image: gcr.io/tution-app-6c0c3/backend-runtime:latest
+            - image: gcr.io/tution-app-6c0c3/backend-runtime:20260304-usage-alert-push-v1
               command: ["npm"]
               args: ["run", "usage:rollup:scheduled"]
               resources:
@@ -49,3 +49,11 @@ spec:
                   value: "0"
                 - name: USAGE_ROLLUP_SKIP_STORAGE
                   value: "0"
+
+                - name: EMAIL_BACKEND_BASE_URL
+                  value: "https://my-email-backend.fly.dev"
+                - name: EMAIL_BACKEND_INTERNAL_KEY
+                  valueSource:
+                    secretKeyRef:
+                      secret: email-backend-internal-key
+                      version: latest

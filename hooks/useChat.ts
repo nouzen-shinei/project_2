@@ -76,6 +76,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
   const [messages, setMessages] = useState<HydratedMessageState[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reloadVersion, setReloadVersion] = useState(0);
   const [hasMore, setHasMore] = useState<boolean>(true);
   const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const oldestCursorRef = useRef<string | null>(null);
@@ -703,6 +704,12 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     prefetchNextPage,
   ]);
 
+  const reconnect = useCallback(() => {
+    setError(null);
+    setLoading(true);
+    setReloadVersion((prev) => prev + 1);
+  }, []);
+
   // Initial page and live tail
   useEffect(() => {
     let cancelled = false;
@@ -750,6 +757,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
   }, [
     user?.email,
     recipientId,
+    reloadVersion,
     hydrateCachedWindow,
     syncLatestFromNetwork,
     applyMessagesUpdate,
@@ -1671,6 +1679,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     messages,
     loading,
     error,
+    reconnect,
     hasMore,
     loadingMore,
     loadMore,

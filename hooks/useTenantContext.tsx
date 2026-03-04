@@ -7,7 +7,7 @@ import type {
   TenantMembershipStatusEvent,
   TenantNotificationPreferences,
 } from '@/types';
-import { tenantService } from '@/services/tenantService';
+import { tenantService, normalizeTenantNotificationPreferences } from '@/services/tenantService';
 import { useAuth, authService } from './useAuthUnified';
 import { logger } from '@/lib/logger';
 
@@ -112,6 +112,23 @@ const normalizeMembershipList = (list: TenantMembership[]): TenantMembership[] =
     return list;
   }
   return list.map((membership) => normalizeMembershipHistory(membership));
+};
+
+const buildEffectiveTenantNotificationPreferences = (
+  tenantPrefs: TenantNotificationPreferences | undefined,
+  membership: TenantMembership | null,
+): TenantNotificationPreferences => {
+  const normalizedTenant = normalizeTenantNotificationPreferences(tenantPrefs);
+  const memberPrefsRaw = (membership?.notificationPreferences || {}) as Partial<TenantNotificationPreferences>;
+
+  const effective: TenantNotificationPreferences = { ...normalizedTenant };
+  if (typeof memberPrefsRaw.usageAlertEmail === 'boolean') {
+    effective.usageAlertEmail = memberPrefsRaw.usageAlertEmail;
+  }
+  if (typeof memberPrefsRaw.usageAlertPush === 'boolean') {
+    effective.usageAlertPush = memberPrefsRaw.usageAlertPush;
+  }
+  return effective;
 };
 
 const TenantContext = createContext<TenantContextValue | undefined>(undefined);
@@ -372,8 +389,19 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     if (!selectedTenantId) {
       return null;
     }
-    return tenantMap[selectedTenantId] || null;
-  }, [selectedTenantId, tenantMap]);
+    const tenant = tenantMap[selectedTenantId] || null;
+    if (!tenant) {
+      return null;
+    }
+    const effectiveNotificationPreferences = buildEffectiveTenantNotificationPreferences(
+      tenant.notificationPreferences,
+      activeMembership,
+    );
+    return {
+      ...tenant,
+      notificationPreferences: effectiveNotificationPreferences,
+    };
+  }, [selectedTenantId, tenantMap, activeMembership]);
 
   const pendingMemberships = useMemo(
     () =>

@@ -104,16 +104,8 @@ export function ensureFirebase(): void {
     serviceAccountRaw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   }
 
-  if (firebaseInited && serviceAccountRaw && !firebaseUsedServiceAccount) {
-    try {
-      admin.app().delete().catch(() => undefined);
-      firebaseInited = false;
-    } catch {
-      // ignore delete errors; we'll attempt re-init below
-    }
-  }
-
-  if (firebaseInited) {
+  if (firebaseInited || admin.apps.length > 0) {
+    firebaseInited = true;
     applyFirestoreSettings();
     return;
   }
