@@ -604,6 +604,7 @@ const notificationPreferenceKeys = [
   'joinRequestEmail',
   'joinRequestPush',
   'usageAlertEmail',
+  'usageAlertPush',
   'usageAlertWhatsApp',
   'usageAlertSlack',
 ] as const;
@@ -656,6 +657,7 @@ const tenantNotificationPreferencesSchema = z
     joinRequestEmail: z.boolean().optional(),
     joinRequestPush: z.boolean().optional(),
     usageAlertEmail: z.boolean().optional(),
+    usageAlertPush: z.boolean().optional(),
     usageAlertWhatsApp: z.boolean().optional(),
     usageAlertSlack: z.boolean().optional(),
   })
@@ -697,6 +699,7 @@ const defaultTenantNotificationPreferences: Record<NotificationPreferenceKey, bo
   joinRequestEmail: true,
   joinRequestPush: true,
   usageAlertEmail: true,
+  usageAlertPush: true,
   usageAlertWhatsApp: true,
   usageAlertSlack: true,
 };

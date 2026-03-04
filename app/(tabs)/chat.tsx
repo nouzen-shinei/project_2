@@ -364,6 +364,7 @@ export default function Chat() {
     messages = [],
     loading = false,
     error = null,
+    reconnect: reconnectChat,
     hasMore = false,
     loadingMore = false,
     loadMore,
@@ -376,6 +377,32 @@ export default function Chat() {
     editMessage: editChatMessage,
     deleteMessage: deleteChatMessage,
   } = useChat(selectedTeamMember?.id, { live: isFocused && isAppActive });
+
+  const CHAT_RECONNECT_TIMEOUT_MS = 8000;
+  const [showReconnectFallback, setShowReconnectFallback] = useState(false);
+  const shouldTrackReconnectFallback =
+    Boolean(selectedTeamMember) &&
+    Boolean(error) &&
+    !loading &&
+    messages.length === 0;
+
+  useEffect(() => {
+    if (!shouldTrackReconnectFallback) {
+      setShowReconnectFallback(false);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setShowReconnectFallback(true);
+    }, CHAT_RECONNECT_TIMEOUT_MS);
+
+    return () => clearTimeout(timer);
+  }, [shouldTrackReconnectFallback]);
+
+  const handleManualReconnect = useCallback(() => {
+    setShowReconnectFallback(false);
+    reconnectChat();
+  }, [reconnectChat]);
 
   const [animatedMessages, setAnimatedMessages] = useState<Set<string>>(new Set());
   const [previousMessageIds, setPreviousMessageIds] = useState<Set<string>>(new Set());
@@ -8322,13 +8349,44 @@ export default function Chat() {
                 (pendingMedia && pendingMedia.size > 0) ||
                 (pendingMessages && pendingMessages.size > 0) ||
                 (pendingAttachments && pendingAttachments.size > 0);
+              const hasLoadError = Boolean(error);
               const shouldDeferEmptyState =
                 loading ||
                 loadingMore ||
                 !selectedTeamMember ||
-                hasMore;
+                hasMore ||
+                hasLoadError;
 
               if (hasPending || shouldDeferEmptyState) {
+                if (selectedTeamMember && hasLoadError) {
+                  if (showReconnectFallback) {
+                    return (
+                      <View style={styles.emptyState}>
+                        <View style={[styles.reconnectCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+                          <Text style={[styles.reconnectTitle, { color: theme.text }]}>Couldn't load messages</Text>
+                          <Text style={[styles.reconnectSubtext, { color: theme.textSecondary }]}>
+                            {isOffline
+                              ? "You're offline right now. Reconnect to the internet, then try again."
+                              : 'Please check your connection and try reconnecting.'}
+                          </Text>
+                          <TouchableOpacity
+                            onPress={handleManualReconnect}
+                            activeOpacity={0.85}
+                            style={[styles.reconnectButton, { backgroundColor: theme.primary }]}
+                          >
+                            <Text style={styles.reconnectButtonText}>Reconnect</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    );
+                  }
+                  return (
+                    <View style={styles.emptyState}>
+                      <ActivityIndicator color={theme.primary} size="small" />
+                      <Text style={[styles.reconnectHintText, { color: theme.textSecondary }]}>Trying to reconnect…</Text>
+                    </View>
+                  );
+                }
                 return null;
               }
               return (
@@ -9490,6 +9548,45 @@ const styles = StyleSheet.create({
   emptyState: {
     alignItems: 'center',
     paddingVertical: 64,
+  },
+  reconnectHintText: {
+    marginTop: 10,
+    fontSize: 13,
+    fontFamily: 'Inter-Regular',
+  },
+  reconnectCard: {
+    width: '100%',
+    maxWidth: 360,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  reconnectTitle: {
+    fontSize: 16,
+    fontFamily: 'Poppins-SemiBold',
+    marginBottom: 6,
+    textAlign: 'center',
+  },
+  reconnectSubtext: {
+    fontSize: 13,
+    fontFamily: 'Inter-Regular',
+    textAlign: 'center',
+    lineHeight: 18,
+    marginBottom: 12,
+  },
+  reconnectButton: {
+    minHeight: 38,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  reconnectButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontFamily: 'Poppins-SemiBold',
   },
   emptyStateText: {
     fontSize: 18,

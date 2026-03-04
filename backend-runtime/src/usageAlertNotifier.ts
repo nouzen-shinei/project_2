@@ -3,6 +3,12 @@ import fetch from 'node-fetch';
 import { enqueueCustomMessage } from './queueProvider';
 import { ensureFirebase, getFirestore } from './firebaseAdmin';
 import {
+  markPushTokensInvalid,
+  sendExpoMessages,
+  type ExpoPushMessage,
+  type PushTokenRecord,
+} from './pushUtils';
+import {
   sendUsageAlertEmails,
   type TenantNotificationEmailResult,
 } from './tenantNotificationEmail';
@@ -14,6 +20,7 @@ const DEFAULT_SENDER = process.env.USAGE_ALERT_SENDER_NAME?.trim() || 'Usage Mon
 const DEFAULT_COACHING_FALLBACK = process.env.USAGE_ALERT_BRAND_NAME?.trim() || 'Tuition Manager';
 const DEFAULT_USAGE_ALERT_PREFS = {
   usageAlertEmail: true,
+  usageAlertPush: true,
   usageAlertWhatsApp: true,
   usageAlertSlack: true,
 };
@@ -28,6 +35,13 @@ const CRITICAL_ACK_ESCALATION_HOURS = coerceEscalationHours(
 
 export interface UsageAlertNotificationSummary {
   email?: (TenantNotificationEmailResult & { recipients: number }) | null;
+  push?: {
+    recipients: number;
+    attempted: number;
+    sent: number;
+    failed: number;
+    skipped?: number;
+  } | null;
   whatsapp?: {
     recipients: number;
     attempted: number;
@@ -65,11 +79,13 @@ export interface UsageAlertNotificationSummary {
     pending: boolean;
     deliveredChannels: {
       email: number;
+      push: number;
       whatsapp: number;
       slack: boolean;
     };
     channelPreferences: {
       email: boolean;
+      push: boolean;
       whatsapp: boolean;
       slack: boolean;
     };
@@ -89,9 +105,28 @@ interface NotifyUsageAlertParams {
   alertId: string;
 }
 
+interface TenantAdminContact {
+  email: string;
+  phone?: string;
+  usageAlertEmailEnabled: boolean;
+  usageAlertPushEnabled: boolean;
+}
+
 interface TenantAdminContacts {
-  emails: string[];
+  admins: TenantAdminContact[];
   phones: string[];
+}
+
+interface UsageAlertDeviceRecord {
+  token: string;
+  deviceDocPath: string;
+  deviceId?: string;
+  ownerEmail: string;
+  notificationsEnabled?: boolean;
+  noticeNotificationsEnabled?: boolean;
+  usageAlertNotificationsEnabled?: boolean;
+  isDeleted?: boolean;
+  isOnline?: boolean;
 }
 
 export async function notifyUsageAlert(params: NotifyUsageAlertParams): Promise<UsageAlertNotificationSummary | null> {
@@ -102,15 +137,19 @@ export async function notifyUsageAlert(params: NotifyUsageAlertParams): Promise<
   const contacts = await loadTenantAdminContacts(db, params.tenantId);
   const slackWebhook = (process.env.USAGE_ALERT_SLACK_WEBHOOK_URL || '').trim();
 
-  const allowEmail = tenantContext.preferences.usageAlertEmail !== false;
   const allowWhatsApp = tenantContext.preferences.usageAlertWhatsApp !== false;
   const allowSlack = tenantContext.preferences.usageAlertSlack !== false;
 
-  const emailRecipients = allowEmail ? contacts.emails : [];
+  const emailRecipients = contacts.admins
+    .filter((contact) => contact.usageAlertEmailEnabled !== false)
+    .map((contact) => contact.email);
   const whatsappRecipients = allowWhatsApp ? contacts.phones : [];
   const slackTargetWebhook = allowSlack ? slackWebhook : '';
+  const pushRecipients = contacts.admins
+    .filter((contact) => contact.usageAlertPushEnabled !== false)
+    .map((contact) => contact.email);
 
-  if (!emailRecipients.length && !whatsappRecipients.length && !slackTargetWebhook) {
+  if (!emailRecipients.length && !pushRecipients.length && !whatsappRecipients.length && !slackTargetWebhook) {
     return null;
   }
 
@@ -145,16 +184,37 @@ export async function notifyUsageAlert(params: NotifyUsageAlertParams): Promise<
       pending: true,
       deliveredChannels: {
         email: emailRecipients.length,
+        push: pushRecipients.length,
         whatsapp: whatsappRecipients.length,
         slack: Boolean(slackTargetWebhook),
       },
       channelPreferences: {
-        email: allowEmail,
+        email: emailRecipients.length > 0,
+        push: pushRecipients.length > 0,
         whatsapp: allowWhatsApp,
         slack: allowSlack,
       },
     },
   };
+
+  if (pushRecipients.length) {
+    summary.push = await sendUsagePushNotifications({
+      db,
+      tenantId: params.tenantId,
+      tenantName,
+      recipients: pushRecipients,
+      severityLabel,
+      metric: params.metric,
+      metricLabel: params.metricLabel,
+      threshold: params.threshold,
+      percentage,
+      valueLabel: metricsCopy.valueLabel,
+      limitLabel: metricsCopy.limitLabel,
+      monthId: params.monthId,
+      ackUrl,
+      alertId: params.alertId,
+    });
+  }
 
   if (emailRecipients.length) {
     try {
@@ -219,14 +279,186 @@ export async function notifyUsageAlert(params: NotifyUsageAlertParams): Promise<
   }
 
   const hasEmail = Boolean(summary.email && summary.email.recipients > 0);
+  const hasPush = Boolean(summary.push && summary.push.recipients > 0);
   const hasWhatsApp = Boolean(summary.whatsapp && summary.whatsapp.recipients > 0);
   const hasSlack = Boolean(summary.slack);
 
-  if (!hasEmail && !hasWhatsApp && !hasSlack) {
+  if (!hasEmail && !hasPush && !hasWhatsApp && !hasSlack) {
     return null;
   }
 
   return summary;
+}
+
+async function getDevicesForUser(
+  db: admin.firestore.Firestore,
+  email: string
+): Promise<UsageAlertDeviceRecord[]> {
+  const normalized = email.trim().toLowerCase();
+  if (!normalized) return [];
+
+  const devicesSnap = await db
+    .collection('user_devices')
+    .doc(normalized)
+    .collection('devices')
+    .select(
+      'expoPushToken',
+      'notificationsEnabled',
+      'noticeNotificationsEnabled',
+      'usageAlertNotificationsEnabled',
+      'isDeleted',
+      'isOnline',
+      'deviceId'
+    )
+    .get();
+
+  return devicesSnap.docs
+    .map((doc) => {
+      const data = doc.data();
+      const token = typeof data?.expoPushToken === 'string' ? data.expoPushToken.trim() : '';
+      return {
+        token,
+        deviceDocPath: doc.ref.path,
+        deviceId: data?.deviceId,
+        ownerEmail: normalized,
+        notificationsEnabled: data?.notificationsEnabled,
+        noticeNotificationsEnabled: data?.noticeNotificationsEnabled,
+        usageAlertNotificationsEnabled: data?.usageAlertNotificationsEnabled,
+        isDeleted: data?.isDeleted,
+        isOnline: data?.isOnline,
+      } satisfies UsageAlertDeviceRecord;
+    })
+    .filter((record) => Boolean(record.token));
+}
+
+function shouldDeliverPushToDevice(device: UsageAlertDeviceRecord): boolean {
+  if (!device.token) return false;
+  if (device.isDeleted) return false;
+  if (device.isOnline !== true) return false;
+  if (device.notificationsEnabled === false) return false;
+  if (device.noticeNotificationsEnabled === false) return false;
+  if (device.usageAlertNotificationsEnabled === false) return false;
+  return true;
+}
+
+async function collectDeliverableUsageAlertDevices(
+  db: admin.firestore.Firestore,
+  recipients: string[]
+): Promise<Map<string, UsageAlertDeviceRecord>> {
+  const tokenToDevice = new Map<string, UsageAlertDeviceRecord>();
+  const blockedTokens = new Set<string>();
+
+  for (const recipient of recipients) {
+    const devices = await getDevicesForUser(db, recipient);
+    for (const device of devices) {
+      if (!shouldDeliverPushToDevice(device)) {
+        if (device.token && (device.noticeNotificationsEnabled === false || device.usageAlertNotificationsEnabled === false)) {
+          blockedTokens.add(device.token);
+          tokenToDevice.delete(device.token);
+        }
+        continue;
+      }
+
+      if (device.token && !blockedTokens.has(device.token) && !tokenToDevice.has(device.token)) {
+        tokenToDevice.set(device.token, device);
+      }
+    }
+  }
+
+  for (const token of blockedTokens) {
+    tokenToDevice.delete(token);
+  }
+
+  return tokenToDevice;
+}
+
+async function sendUsagePushNotifications(options: {
+  db: admin.firestore.Firestore;
+  tenantId: string;
+  tenantName?: string;
+  recipients: string[];
+  severityLabel: string;
+  metric: UsageMetricKey;
+  metricLabel: string;
+  threshold: 'warning' | 'critical';
+  percentage: number;
+  valueLabel: string;
+  limitLabel: string;
+  monthId: string;
+  ackUrl?: string;
+  alertId: string;
+}): Promise<UsageAlertNotificationSummary['push']> {
+  const tokenToDevice = await collectDeliverableUsageAlertDevices(options.db, options.recipients);
+  if (!tokenToDevice.size) {
+    return {
+      recipients: 0,
+      attempted: 0,
+      sent: 0,
+      failed: 0,
+      skipped: options.recipients.length,
+    };
+  }
+
+  const title = options.threshold === 'critical'
+    ? `Usage limit hit: ${options.metricLabel}`
+    : `Usage warning: ${options.metricLabel}`;
+  const body = `${options.metricLabel} is at ${options.percentage}% (${options.valueLabel} of ${options.limitLabel}) for ${options.monthId}.`;
+  const timestamp = new Date().toISOString();
+
+  const messages: ExpoPushMessage[] = [];
+  for (const device of tokenToDevice.values()) {
+    messages.push({
+      to: device.token,
+      title,
+      body,
+      sound: 'default',
+      priority: options.threshold === 'critical' ? 'high' : 'default',
+      data: {
+        type: 'usage_alert',
+        priority: options.threshold === 'critical' ? 'high' : 'medium',
+        tenantId: options.tenantId,
+        tenantName: options.tenantName || null,
+        metric: options.metric,
+        metricLabel: options.metricLabel,
+        threshold: options.threshold,
+        monthId: options.monthId,
+        percentage: options.percentage,
+        valueLabel: options.valueLabel,
+        limitLabel: options.limitLabel,
+        alertId: options.alertId,
+        ackUrl: options.ackUrl || null,
+        timestamp,
+      },
+    });
+  }
+
+  const result = await sendExpoMessages(messages, { context: 'usage_alert' });
+
+  if (result.invalidTokens.length) {
+    const invalidRecords: PushTokenRecord[] = [];
+    for (const token of result.invalidTokens) {
+      const device = tokenToDevice.get(token);
+      if (device) {
+        invalidRecords.push({
+          token,
+          deviceDocPath: device.deviceDocPath,
+          deviceId: device.deviceId,
+          ownerEmail: device.ownerEmail,
+        });
+      }
+    }
+    if (invalidRecords.length) {
+      await markPushTokensInvalid(invalidRecords, { context: 'usage_alert' });
+    }
+  }
+
+  return {
+    recipients: tokenToDevice.size,
+    attempted: messages.length,
+    sent: result.sent,
+    failed: result.failed,
+    skipped: Math.max(0, options.recipients.length - tokenToDevice.size),
+  };
 }
 
 function formatBytes(value: number): string {
@@ -313,6 +545,9 @@ function normalizeUsageAlertPreferences(raw?: Record<string, unknown>): typeof D
   if (typeof raw.usageAlertEmail === 'boolean') {
     normalized.usageAlertEmail = raw.usageAlertEmail;
   }
+  if (typeof raw.usageAlertPush === 'boolean') {
+    normalized.usageAlertPush = raw.usageAlertPush;
+  }
   if (typeof raw.usageAlertWhatsApp === 'boolean') {
     normalized.usageAlertWhatsApp = raw.usageAlertWhatsApp;
   }
@@ -332,7 +567,7 @@ async function loadTenantAdminContacts(
     .where('status', '==', 'active')
     .get();
 
-  const emails = new Set<string>();
+  const adminsByEmail = new Map<string, TenantAdminContact>();
   const phones = new Set<string>();
 
   snapshot.forEach((docSnap) => {
@@ -343,16 +578,39 @@ async function loadTenantAdminContacts(
     }
     const email = typeof data.email === 'string' ? data.email.trim().toLowerCase() : '';
     if (email) {
-      emails.add(email);
+      const membershipPrefs =
+        (data.notificationPreferences && typeof data.notificationPreferences === 'object'
+          ? (data.notificationPreferences as Record<string, unknown>)
+          : {}) || {};
+      const existing = adminsByEmail.get(email);
+      const usageAlertEmailEnabled =
+        typeof membershipPrefs.usageAlertEmail === 'boolean' ? membershipPrefs.usageAlertEmail : true;
+      const usageAlertPushEnabled =
+        typeof membershipPrefs.usageAlertPush === 'boolean' ? membershipPrefs.usageAlertPush : true;
+
+      if (!existing) {
+        adminsByEmail.set(email, {
+          email,
+          usageAlertEmailEnabled,
+          usageAlertPushEnabled,
+        });
+      }
     }
     const phone = extractPhoneNumber(data);
     if (phone) {
       phones.add(phone);
+      if (email) {
+        const existing = adminsByEmail.get(email);
+        if (existing && !existing.phone) {
+          existing.phone = phone;
+          adminsByEmail.set(email, existing);
+        }
+      }
     }
   });
 
   return {
-    emails: Array.from(emails),
+    admins: Array.from(adminsByEmail.values()),
     phones: Array.from(phones),
   };
 }

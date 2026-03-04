@@ -59,6 +59,7 @@ export interface TenantNotificationPreferences {
   joinRequestEmail: boolean;
   joinRequestPush: boolean;
   usageAlertEmail: boolean;
+  usageAlertPush: boolean;
   usageAlertWhatsApp: boolean;
   usageAlertSlack: boolean;
 }
@@ -107,6 +108,7 @@ export interface TenantMembership {
   displayName?: string;
   role: TenantMembershipRole;
   status: TenantMembershipStatus;
+  notificationPreferences?: Partial<TenantNotificationPreferences>;
   inviteToken?: string;
   inviteExpiresAt?: string | Timestamp;
   invitedBy?: string;

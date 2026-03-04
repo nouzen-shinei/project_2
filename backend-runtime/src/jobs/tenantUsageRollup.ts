@@ -17,8 +17,8 @@ const METRIC_LABELS: Record<UsageMetricKey, string> = {
   storage: 'Storage',
 };
 
-const ALERT_THROTTLE_HOURS = Math.max(1, Number(process.env.USAGE_ALERT_THROTTLE_HOURS ?? '24'));
-const ALERT_THROTTLE_MS = ALERT_THROTTLE_HOURS * 60 * 60 * 1000;
+const ALERT_UNCHANGED_REMINDER_DAYS = Math.max(1, Number(process.env.USAGE_ALERT_UNCHANGED_REMINDER_DAYS ?? '7'));
+const ALERT_UNCHANGED_REMINDER_MS = ALERT_UNCHANGED_REMINDER_DAYS * 24 * 60 * 60 * 1000;
 
 function parseBoolean(value?: string | null): boolean {
   if (!value) return false;
@@ -437,6 +437,25 @@ async function estimateStorageBytes(
   bucket: StorageBucket | null,
   tenantId: string
 ): Promise<StorageEstimationResult> {
+  try {
+    const usageSnap = await db.collection('tenantStorageUsage').doc(tenantId).get();
+    if (usageSnap.exists) {
+      const usageData = usageSnap.data() || {};
+      const bytes = Number((usageData as any).bytes ?? 0);
+      if (Number.isFinite(bytes) && bytes >= 0) {
+        return {
+          totalBytes: bytes,
+          sources: [{ label: 'tenant-storage-usage', bytes }],
+        };
+      }
+    }
+  } catch (error) {
+    console.warn('[rollup] failed to read tenantStorageUsage bytes', {
+      tenantId,
+      error,
+    });
+  }
+
   const sources: Array<{ label: string; bytes: number }> = [];
 
   const prefixConfigs = resolveStoragePrefixConfigs();
@@ -451,11 +470,6 @@ async function estimateStorageBytes(
         sources.push({ label: config.label, bytes });
       }
     }
-  }
-
-  const noticeAudioBytes = await sumNoticeAudioBytes(db, tenantId);
-  if (noticeAudioBytes > 0) {
-    sources.push({ label: 'notice-audio-files', bytes: noticeAudioBytes });
   }
 
   const externalCollection = (process.env.USAGE_STORAGE_STATS_COLLECTION || '').trim();
@@ -503,22 +517,6 @@ async function sumStoragePrefixBytes(bucket: StorageBucket, prefix: string): Pro
     console.warn(`[rollup] storage listing failed for prefix ${prefix}`, error);
     return 0;
   }
-}
-
-async function sumNoticeAudioBytes(db: Firestore, tenantId: string): Promise<number> {
-  const snapshot = await db.collection('notices').where('tenantId', '==', tenantId).get();
-  if (snapshot.empty) {
-    return 0;
-  }
-  let total = 0;
-  snapshot.forEach((doc) => {
-    const data = doc.data() || {};
-    const size = Number(data.audioFileSize ?? data.audioSize ?? 0);
-    if (Number.isFinite(size) && size > 0) {
-      total += size;
-    }
-  });
-  return total;
 }
 
 function resolveStoragePrefixConfigs(): Array<{ label: string; template: string }> {
@@ -786,12 +784,8 @@ async function collectMetrics(
     : await withFallback(() => estimateStorageBytes(db, bucket, tenant.id), storageFallback);
   if (storageWarning) warnings.push(`[storage] ${storageWarning}`);
 
-  let storageBytes = storageEstimate.totalBytes;
+  const storageBytes = storageEstimate.totalBytes;
   const storageSources = [...storageEstimate.sources];
-  if (chatActivity.attachmentBytes > 0) {
-    storageBytes += chatActivity.attachmentBytes;
-    storageSources.push({ label: 'chat-attachments', bytes: chatActivity.attachmentBytes });
-  }
 
   const data: AggregatedMetrics = {
     studentsAdded,
@@ -891,7 +885,30 @@ function hasActiveAlertThrottle(state: AlertThrottleState, key: string): boolean
   if (!Number.isFinite(issuedAt)) {
     return false;
   }
-  return Date.now() - issuedAt < ALERT_THROTTLE_MS;
+  return Date.now() - issuedAt < ALERT_UNCHANGED_REMINDER_MS;
+}
+
+function parseIsoFromUnknown(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const ms = Date.parse(trimmed);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+  if (value && typeof value === 'object') {
+    const asAny = value as any;
+    if (typeof asAny.toDate === 'function') {
+      try {
+        const date = asAny.toDate();
+        if (date instanceof Date && Number.isFinite(date.getTime())) {
+          return date.toISOString();
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return null;
 }
 
 async function recordAlertThrottleTimestamp(
@@ -949,7 +966,7 @@ async function createUsageNoticeForAlert(
 
   const firestore = usageDocRef.firestore;
   const noticesRef = firestore.collection('notices');
-  await noticesRef.add(stripUndefinedDeep({
+  const noticeRef = await noticesRef.add(stripUndefinedDeep({
     tenantId,
     title,
     content,
@@ -972,6 +989,9 @@ async function createUsageNoticeForAlert(
       threshold,
     },
   } as Record<string, unknown>));
+  console.log(
+    `[rollup] notice created tenant=${tenantId} metric=${metric} threshold=${threshold} noticeId=${noticeRef.id}`
+  );
 }
 
 async function evaluateAlerts(
@@ -1021,84 +1041,141 @@ async function evaluateAlerts(
       const alertKey = `${String(entry.metric)}:${String(threshold)}`;
       const docId = `${String(entry.metric)}_${String(threshold)}`;
       const existing = existingByKey.get(alertKey) ?? null;
+      const alertDocId = existing?.id || docId;
+      const alertDoc = usageDocRef.collection('alerts').doc(alertDocId);
+      const nowIso = new Date().toISOString();
+      const currentFingerprint = `${entry.metric}|${threshold}|${entry.value}|${entry.limit}`;
 
-      // If there's already an open alert, refresh its values so the UI stays current.
-      if (existing && !existing.acknowledgedAt) {
-        if (!dryRun) {
-          await usageDocRef
-            .collection('alerts')
-            .doc(docId)
-            .set(
-              stripUndefinedDeep({
-                metric: entry.metric,
-                type: threshold,
-                value: entry.value,
-                limit: entry.limit,
-                ratio,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                updatedAtIso: new Date().toISOString(),
-              }),
-              { merge: true }
-            );
+      let existingData: Record<string, unknown> | null = null;
+      if (existing && !dryRun) {
+        try {
+          const existingSnap = await alertDoc.get();
+          existingData = existingSnap.exists ? ((existingSnap.data() || {}) as Record<string, unknown>) : null;
+        } catch {
+          existingData = null;
         }
-        return;
       }
+
+      const previousFingerprint =
+        existingData && typeof existingData.notificationFingerprint === 'string'
+          ? String(existingData.notificationFingerprint)
+          : existingData
+            ? `${entry.metric}|${String((existingData as any).type || threshold)}|${Number((existingData as any).value || 0)}|${Number((existingData as any).limit || 0)}`
+            : '';
 
       const throttleKey = getAlertThrottleKey(entry.metric, threshold);
-      if (hasActiveAlertThrottle(throttleState, throttleKey)) {
-        if (dryRun) {
-          console.warn(
-            `[rollup][dry-run] would skip ${threshold} alert for ${entry.metric} due to throttle ${ALERT_THROTTLE_HOURS}h`
+      const throttledAtIso = throttleState[throttleKey] ?? null;
+      const lastNotifiedAtIso =
+        (existingData &&
+          (parseIsoFromUnknown((existingData as any).lastNotifiedAtIso) || parseIsoFromUnknown((existingData as any).lastNotifiedAt))) ||
+        parseIsoFromUnknown(throttledAtIso);
+
+      const hasMeaningfulChange = !existing || previousFingerprint !== currentFingerprint;
+      const unchangedReminderDue = (() => {
+        if (hasMeaningfulChange) return false;
+        if (!lastNotifiedAtIso) return true;
+        const notifiedMs = Date.parse(lastNotifiedAtIso);
+        if (!Number.isFinite(notifiedMs)) return true;
+        return Date.now() - notifiedMs >= ALERT_UNCHANGED_REMINDER_MS;
+      })();
+      const shouldNotify = hasMeaningfulChange || unchangedReminderDue;
+      const notificationDecision: 'changed' | 'unchanged_reminder_due' | 'unchanged_skipped' = hasMeaningfulChange
+        ? 'changed'
+        : unchangedReminderDue
+          ? 'unchanged_reminder_due'
+          : 'unchanged_skipped';
+
+      // If there's already an alert, refresh its values so the UI stays current.
+      if (existing) {
+        if (!dryRun) {
+          await alertDoc.set(
+            stripUndefinedDeep({
+              metric: entry.metric,
+              type: threshold,
+              value: entry.value,
+              limit: entry.limit,
+              ratio,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAtIso: new Date().toISOString(),
+            }),
+            { merge: true }
           );
-        } else if (process.env.USAGE_ALERT_DEBUG === '1') {
-          console.log('[rollup] throttling usage alert', {
-            tenantId,
-            monthId,
-            metric: entry.metric,
-            threshold,
-            throttleKey,
-          });
         }
+      }
+
+      if (!shouldNotify) {
+        console.log('[rollup] usage alert decision', {
+          tenantId,
+          monthId,
+          metric: entry.metric,
+          threshold,
+          notificationDecision,
+          lastNotifiedAtIso,
+          reminderDays: ALERT_UNCHANGED_REMINDER_DAYS,
+        });
         return;
       }
+
+      console.log('[rollup] usage alert decision', {
+        tenantId,
+        monthId,
+        metric: entry.metric,
+        threshold,
+        notificationDecision,
+        lastNotifiedAtIso,
+        reminderDays: ALERT_UNCHANGED_REMINDER_DAYS,
+      });
+
       if (dryRun) {
         console.warn(
-          `[rollup][dry-run] would create ${threshold} alert for ${entry.metric}: value=${entry.value} limit=${entry.limit}`
+          `[rollup][dry-run] would notify ${threshold} alert for ${entry.metric}: value=${entry.value} limit=${entry.limit} changed=${String(hasMeaningfulChange)}`
         );
         return;
       }
 
-      const createdAtIso = new Date().toISOString();
-      const alertDoc = usageDocRef.collection('alerts').doc(docId);
-      await alertDoc.set(
-        stripUndefinedDeep({
-          metric: entry.metric,
-          type: threshold,
-          value: entry.value,
-          limit: entry.limit,
+      const createdAtIso = nowIso;
+      if (!existing) {
+        await alertDoc.set(
+          stripUndefinedDeep({
+            metric: entry.metric,
+            type: threshold,
+            value: entry.value,
+            limit: entry.limit,
+            ratio,
+            createdAt: createdAtIso,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAtIso: createdAtIso,
+          }),
+          { merge: true }
+        );
+        console.log(
+          `[rollup] alert created ${usageDocRef.path} metric=${entry.metric} type=${threshold} ratio=${(ratio * 100).toFixed(2)}%`
+        );
+      }
+      let noticeCreated = false;
+      try {
+        await createUsageNoticeForAlert(
+          usageDocRef,
+          tenantId,
+          monthId,
+          entry.metric,
           ratio,
-          createdAt: createdAtIso,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAtIso: createdAtIso,
-        }),
-        { merge: true }
-      );
-      console.log(
-        `[rollup] alert created ${usageDocRef.path} metric=${entry.metric} type=${threshold} ratio=${(ratio * 100).toFixed(2)}%`
-      );
-      const throttleTimestamp = new Date().toISOString();
-      await recordAlertThrottleTimestamp(usageDocRef, throttleKey, throttleTimestamp);
-      await createUsageNoticeForAlert(
-        usageDocRef,
-        tenantId,
-        monthId,
-        entry.metric,
-        ratio,
-        entry.value,
-        entry.limit,
-        threshold,
-        dryRun
-      );
+          entry.value,
+          entry.limit,
+          threshold,
+          dryRun
+        );
+        noticeCreated = true;
+      } catch (noticeError) {
+        console.error('[rollup] usage alert notice creation failed', {
+          tenantId,
+          monthId,
+          metric: entry.metric,
+          error: noticeError,
+        });
+      }
+
+      let notificationSummaryPersisted = false;
       if (!dryRun) {
         try {
           const notificationSummary = await notifyUsageAlert({
@@ -1111,16 +1188,26 @@ async function evaluateAlerts(
             ratio,
             value: entry.value,
             limit: entry.limit,
-            alertId: alertDoc.id,
+            alertId: alertDocId,
           });
           if (notificationSummary) {
-            await alertDoc.set(
-              stripUndefinedDeep({
-                notifications: notificationSummary,
-                lastNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-              }),
-              { merge: true }
-            );
+            const notificationUpdate = stripUndefinedDeep({
+              notifications: notificationSummary,
+              lastNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+              lastNotifiedAtIso: nowIso,
+              notificationFingerprint: currentFingerprint,
+              notificationMode: hasMeaningfulChange ? 'changed' : 'unchanged_reminder',
+            }) as Record<string, unknown>;
+            await alertDoc.set(notificationUpdate, { merge: true });
+            notificationSummaryPersisted = true;
+
+            if (notificationSummary.email && notificationSummary.email.disabled !== true) {
+              await alertDoc
+                .update({
+                  'notifications.email.disabled': admin.firestore.FieldValue.delete(),
+                })
+                .catch(() => undefined);
+            }
           }
         } catch (notifyError) {
           console.error('[rollup] usage alert notification failed', {
@@ -1130,6 +1217,17 @@ async function evaluateAlerts(
             error: notifyError,
           });
         }
+      }
+
+      if (noticeCreated || notificationSummaryPersisted) {
+        await recordAlertThrottleTimestamp(usageDocRef, throttleKey, nowIso);
+      } else {
+        console.warn('[rollup] usage alert not throttled due to failed delivery paths', {
+          tenantId,
+          monthId,
+          metric: entry.metric,
+          threshold,
+        });
       }
     })
   );

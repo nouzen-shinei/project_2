@@ -51,6 +51,8 @@ type Stats = {
   invoicesCreated: number;
   providerCancelsAttempted: number;
   providerCancelsFailed: number;
+  terminalNonCancellable: number;
+  tenantsSkippedPlanLocked: number;
   fatalError?: { tenantId: string; message: string };
   errors: Array<{ tenantId: string; message: string }>;
 };
@@ -79,6 +81,13 @@ function addHoursIso(iso: string, hours: number): string {
   const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) return iso;
   return new Date(ms + hours * 60 * 60 * 1000).toISOString();
+}
+
+function isRazorpayTerminalNonCancellableError(message: string): boolean {
+  const normalized = (message || '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes('not cancellable in expired status')) return true;
+  return normalized.includes('not cancellable') && normalized.includes('expired');
 }
 
 function computeAttemptKey(input: { attemptId?: string; provider: string; subscriptionId: string; sinceIso: string }): string {
@@ -588,15 +597,15 @@ async function downgradeTenantToFree(options: {
   expectedProvider?: string;
   expectedSubscriptionId?: string;
   dryRun: boolean;
-}): Promise<void> {
+}): Promise<boolean> {
   const { db, tenantId, nowIso, reasonCode, reasonDescription, provider, subscriptionId, expectedBillingAttemptId, expectedProvider, expectedSubscriptionId, dryRun } = options;
-  if (dryRun) return;
+  if (dryRun) return true;
 
   const billingRef = db.collection('tenantBilling').doc(tenantId);
   const tenantRef = db.collection('tenants').doc(tenantId);
   const auditRef = db.collection('tenantAuditLogs').doc();
 
-  await db.runTransaction(async (tx) => {
+  const downgraded = await db.runTransaction(async (tx) => {
     const billingSnap = await tx.get(billingRef);
     const tenantSnap = await tx.get(tenantRef);
     if (!tenantSnap.exists) {
@@ -604,6 +613,11 @@ async function downgradeTenantToFree(options: {
     }
 
     const billing = billingSnap.exists ? billingSnap.data() || {} : {};
+
+    // Guard: org-locked plans must never be auto-downgraded.
+    if ((billing as any).planLockedByOrg === true) {
+      return false;
+    }
 
     // Guard: only downgrade if this attempt still appears to be current.
     // This prevents an older attempt cancellation from downgrading a tenant that has started a newer autopay.
@@ -616,13 +630,13 @@ async function downgradeTenantToFree(options: {
     const expectedProv = typeof expectedProvider === 'string' ? expectedProvider.trim().toLowerCase() : '';
 
     if (expectedProv && currentProvider && expectedProv !== currentProvider) {
-      return;
+      return false;
     }
     if (expectedAttemptId && currentAttemptId && expectedAttemptId !== currentAttemptId) {
-      return;
+      return false;
     }
     if (expectedSubId && currentSubId && expectedSubId !== currentSubId) {
-      return;
+      return false;
     }
 
     // Switch to Free and clear pending/subscription fields.
@@ -690,7 +704,11 @@ async function downgradeTenantToFree(options: {
       }),
       { merge: false }
     );
+
+    return true;
   });
+
+  return Boolean(downgraded);
 }
 
 async function listInvoiceCandidates(
@@ -843,6 +861,8 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
     invoicesCreated: 0,
     providerCancelsAttempted: 0,
     providerCancelsFailed: 0,
+    terminalNonCancellable: 0,
+    tenantsSkippedPlanLocked: 0,
     errors: [],
   };
 
@@ -950,6 +970,13 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
         const planId = typeof (billing as any).planId === 'string' ? String((billing as any).planId).toLowerCase() : 'free';
         const pendingPlanId = typeof (billing as any).pendingPlanId === 'string' ? String((billing as any).pendingPlanId).toLowerCase() : '';
         const planIdForHistory = pendingPlanId || planId;
+        const planLockedByOrg = (billing as any).planLockedByOrg === true;
+
+        if (planLockedByOrg) {
+          log(options.verbose, 'skipping tenant (plan locked by org)', { tenantId });
+          stats.tenantsSkippedPlanLocked += 1;
+          continue;
+        }
 
         const provider = typeof (billing as any).billingProvider === 'string' ? String((billing as any).billingProvider).toLowerCase() : '';
         const subscriptionId = typeof (billing as any).subscriptionId === 'string' ? String((billing as any).subscriptionId).trim() : '';
@@ -1085,6 +1112,7 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
         }
 
         let cancelledCurrentAttempt = false;
+        let pendingSyntheticInvoiceForCurrentAttempt: AttemptToCancel | null = null;
 
         for (const attempt of attempts) {
           const isRazorpayAutopayAuthenticatedAttempt = (() => {
@@ -1184,16 +1212,29 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
                 log(options.verbose, 'cancelling razorpay subscription', { tenantId, subscriptionId: attempt.subscriptionId });
                 await cancelRazorpaySubscription({ subscriptionId: attempt.subscriptionId, cancelAtCycleEnd: false });
               } catch (error) {
-                stats.providerCancelsFailed += 1;
                 const message = error instanceof Error ? error.message : String(error);
-                log(options.verbose, 'razorpay cancel failed (fatal)', {
-                  tenantId,
-                  error: message,
-                });
-                if (message.startsWith('razorpay_')) {
-                  throw new Error(message);
+                if (isRazorpayTerminalNonCancellableError(message)) {
+                  stats.terminalNonCancellable += 1;
+                  log(options.verbose, 'razorpay subscription already terminal; continuing', {
+                    tenantId,
+                    subscriptionId: attempt.subscriptionId,
+                    message,
+                    terminal_non_cancellable: true,
+                  });
+                  // Skip all side effects in this case: no invoice mutation, no synthetic invoice,
+                  // no downgrade, and no tenant notification.
+                  continue;
+                } else {
+                  stats.providerCancelsFailed += 1;
+                  log(options.verbose, 'razorpay cancel failed (fatal)', {
+                    tenantId,
+                    error: message,
+                  });
+                  if (message.startsWith('razorpay_')) {
+                    throw new Error(message);
+                  }
+                  throw new Error(`razorpay_cancel_failed: ${message}`);
                 }
-                throw new Error(`razorpay_cancel_failed: ${message}`);
               }
             }
 
@@ -1243,27 +1284,10 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
           }
           stats.invoicesFailed += failedInvoices;
 
-          // If there were no open invoices, create a synthetic failed invoice so history shows a reason.
-          if (failedInvoices === 0) {
-            const created = await createFailedInvoiceIfMissing({
-              db,
-              tenantId,
-              nowIso,
-              sinceIso: attempt.sinceIso,
-              provider: attempt.provider,
-              providerSubscriptionId: attempt.subscriptionId,
-              subscriptionId: attempt.subscriptionId,
-              planId: planIdForHistory,
-              planVariantId: typeof (billing as any).planVariantId === 'string' ? String((billing as any).planVariantId) : null,
-              attemptKey: attempt.attemptKey,
-              billingAttemptId: attempt.billingAttemptId,
-              reasonCode,
-              reasonDescription,
-              dryRun: options.dryRun,
-            });
-            if (created) {
-              stats.invoicesCreated += 1;
-            }
+          // Only consider synthetic failed invoice creation for the current attempt.
+          // Never create synthetic invoices for stale non-current attempts.
+          if (failedInvoices === 0 && isAttemptCurrent) {
+            pendingSyntheticInvoiceForCurrentAttempt = attempt;
           }
 
           if (isAttemptCurrent) {
@@ -1280,7 +1304,7 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
 
         // Downgrade + notify only if the cancelled attempt is still the tenant's current attempt.
         if (cancelledCurrentAttempt) {
-          await downgradeTenantToFree({
+          const downgraded = await downgradeTenantToFree({
             db,
             tenantId,
             nowIso,
@@ -1294,7 +1318,38 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
             dryRun: options.dryRun,
           });
 
-          if (!options.dryRun) {
+          if (!downgraded) {
+            log(options.verbose, 'skip downgrade/notify (attempt no longer current or org-locked)', {
+              tenantId,
+              expectedProvider: attemptProvider || null,
+              expectedSubscriptionId: attemptSubscriptionId || null,
+              expectedBillingAttemptId: attemptBillingAttemptId || null,
+            });
+          }
+
+          if (downgraded && pendingSyntheticInvoiceForCurrentAttempt) {
+            const created = await createFailedInvoiceIfMissing({
+              db,
+              tenantId,
+              nowIso,
+              sinceIso: pendingSyntheticInvoiceForCurrentAttempt.sinceIso,
+              provider: pendingSyntheticInvoiceForCurrentAttempt.provider,
+              providerSubscriptionId: pendingSyntheticInvoiceForCurrentAttempt.subscriptionId,
+              subscriptionId: pendingSyntheticInvoiceForCurrentAttempt.subscriptionId,
+              planId: planIdForHistory,
+              planVariantId: typeof (billing as any).planVariantId === 'string' ? String((billing as any).planVariantId) : null,
+              attemptKey: pendingSyntheticInvoiceForCurrentAttempt.attemptKey,
+              billingAttemptId: pendingSyntheticInvoiceForCurrentAttempt.billingAttemptId,
+              reasonCode,
+              reasonDescription,
+              dryRun: options.dryRun,
+            });
+            if (created) {
+              stats.invoicesCreated += 1;
+            }
+          }
+
+          if (downgraded && !options.dryRun) {
             try {
               const res = await sendTenantBillingEventNotification({
                 tenantId,
@@ -1326,9 +1381,11 @@ export async function runBillingAutoCancelStalePending(db: Firestore, options: A
               });
             }
           }
-        }
 
-        stats.tenantsCancelled += 1;
+          if (downgraded) {
+            stats.tenantsCancelled += 1;
+          }
+        }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       stats.errors.push({ tenantId, message });

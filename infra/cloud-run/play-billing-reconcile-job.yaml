@@ -1,0 +1,62 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: play-billing-reconcile-job
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: billing-stale-pending-job@tution-app-6c0c3.iam.gserviceaccount.com
+          maxRetries: 1
+          timeoutSeconds: 1800
+          containers:
+            - image: gcr.io/tution-app-6c0c3/backend-runtime:20260304-billing-terminal-guard-fix
+              command: ["npm"]
+              args: ["run", "billing:play-reconcile"]
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
+              env:
+                - name: FIREBASE_PROJECT_ID
+                  value: tution-app-6c0c3
+                - name: FIREBASE_DATABASE_URL
+                  value: https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app
+                - name: FIREBASE_STORAGE_BUCKET
+                  value: tution-app-6c0c3.firebasestorage.app
+
+                - name: GOOGLE_PLAY_PACKAGE_NAME
+                  value: com.sneha.tution
+                - name: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
+                  valueSource:
+                    secretKeyRef:
+                      secret: play-billing-service-account-json
+                      version: latest
+
+                - name: PLAY_BILLING_RECONCILE_DRY_RUN
+                  value: "0"
+                - name: PLAY_BILLING_RECONCILE_VERBOSE
+                  value: "1"
+                - name: PLAY_BILLING_RECONCILE_MAX_TENANTS
+                  value: "200"
+                - name: PLAY_BILLING_RECONCILE_TENANT_IDS
+                  value: ""
+                - name: PLAY_BILLING_RECONCILE_LOCK_ENABLED
+                  value: "1"
+                - name: PLAY_BILLING_RECONCILE_LOCK_DOC
+                  value: billingLocks/play_billing_reconcile
+                - name: PLAY_BILLING_RECONCILE_LOCK_LEASE_MS
+                  value: "900000"
+
+                - name: EMAIL_BACKEND_BASE_URL
+                  value: "https://my-email-backend.fly.dev"
+                - name: EMAIL_BACKEND_INTERNAL_KEY
+                  valueSource:
+                    secretKeyRef:
+                      secret: email-backend-internal-key
+                      version: latest

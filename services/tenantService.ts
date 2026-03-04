@@ -141,6 +141,7 @@ export const TENANT_NOTIFICATION_PREFERENCE_KEYS: TenantNotificationPreferenceKe
   'joinRequestEmail',
   'joinRequestPush',
   'usageAlertEmail',
+  'usageAlertPush',
   'usageAlertWhatsApp',
   'usageAlertSlack',
 ];
@@ -151,6 +152,7 @@ export const DEFAULT_TENANT_NOTIFICATION_PREFERENCES: TenantNotificationPreferen
   joinRequestEmail: true,
   joinRequestPush: true,
   usageAlertEmail: true,
+  usageAlertPush: true,
   usageAlertWhatsApp: true,
   usageAlertSlack: true,
 };

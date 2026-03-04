@@ -17,12 +17,14 @@ import {
 import { Play, Pause, Volume2, Download, Share, ChevronLeft, ChevronRight } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
 import { formatFileSize } from '../lib/fileUtils';
+import { FileDownloadUtil } from '../lib/fileDownloadUtil';
 import { ShareModal } from './ShareModal';
 import { chatCacheService } from '../services/chatCacheService';
 import * as FileSystem from 'expo-file-system';
 import { useEvent } from 'expo';
 import { useVideoPlayer, VideoView, type VideoSource } from 'expo-video';
 import { useDownloadState } from '@/hooks/useDownloadState';
+import { setDownloadState } from '@/lib/downloadStateStore';
 
 interface AudioPlayerProps {
   fileUrl: string;
@@ -819,9 +821,8 @@ function AudioPlayerInner(props: AudioPlayerProps) {
   const { theme } = useTheme();
   const [resolvedUrl, setResolvedUrl] = useState(props.fileUrl);
   const [resolving, setResolving] = useState(false);
-  const downloadState = useDownloadState(
-    props.downloadKey || props.shareUrl || resolvedUrl || props.fileUrl
-  );
+  const resolvedDownloadKey = props.downloadKey || props.shareUrl || resolvedUrl || props.fileUrl;
+  const downloadState = useDownloadState(resolvedDownloadKey);
   const effectiveIsDownloading = props.isDownloading ?? downloadState.isDownloading;
   const effectiveProgress = props.downloadProgress ?? downloadState.progress;
 
@@ -834,19 +835,23 @@ function AudioPlayerInner(props: AudioPlayerProps) {
 
     if (Platform.OS === 'web') {
       try {
-        const anchor = document.createElement('a');
-        anchor.href = candidateUrl;
-        anchor.download = props.fileName || 'audio';
-        anchor.target = '_blank';
-        anchor.rel = 'noreferrer';
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
+        setDownloadState(resolvedDownloadKey, { isDownloading: true, progress: 0 });
+        await FileDownloadUtil.downloadFileWithProgress(
+          candidateUrl,
+          props.fileName || 'audio',
+          (percent) => {
+            const bounded = Math.max(0, Math.min(100, Math.round(percent)));
+            setDownloadState(resolvedDownloadKey, {
+              isDownloading: bounded < 100,
+              progress: bounded,
+            });
+          }
+        );
       } catch (error) {
-        logger.debug('AudioPlayer: web download fallback', error);
-        try {
-          window.open(candidateUrl, '_blank', 'noopener,noreferrer');
-        } catch {}
+        logger.error('AudioPlayer: web download failed', error);
+        Alert.alert('Download', 'Failed to download audio. Please try again.');
+      } finally {
+        setDownloadState(resolvedDownloadKey, { isDownloading: false, progress: 0 });
       }
       return;
     }
@@ -878,7 +883,7 @@ function AudioPlayerInner(props: AudioPlayerProps) {
       logger.error('AudioPlayer: download failed', error);
       Alert.alert('Download', 'Failed to download audio. Please try again.');
     }
-  }, [props.fileName, props.fileUrl, props.shareUrl, resolvedUrl]);
+  }, [props.fileName, props.fileUrl, props.shareUrl, resolvedDownloadKey, resolvedUrl]);
 
   useEffect(() => {
     let cancelled = false;

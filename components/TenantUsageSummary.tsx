@@ -1,14 +1,17 @@
-import React, { useMemo, useState, useCallback } from 'react';
+import React, { useMemo, useState, useCallback, useEffect } from 'react';
 import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import { RefreshCw } from 'lucide-react-native';
 import Toast from 'react-native-toast-message';
+import { doc, updateDoc } from 'firebase/firestore';
 
+import { firestore } from '@/config/firebase';
 import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
 import useStudents from '@/hooks/useStudents';
 import { useTenantUsageSummary } from '@/hooks/useTenantUsageSummary';
 import { usageAnalyticsService } from '@/services/usageAnalyticsService';
+import { normalizeTenantNotificationPreferences } from '@/services/tenantService';
 import { logger } from '@/lib/logger';
 import type { ThemeColors } from '@/types/theme';
 import type { UsageAlertRecord, UsageMetricKey, UsageSummaryResponse } from '@/types/usage';
@@ -158,7 +161,7 @@ const TenantUsageSummary = ({
 }: TenantUsageSummaryProps) => {
   const { theme } = useTheme();
   const router = useRouter();
-  const { activeTenant, activeMembership, memberships } = useTenant();
+  const { activeTenant, activeMembership, memberships, applyTenantNotificationPreferencesSnapshot } = useTenant();
   const { students, loading: studentsLoading } = useStudents();
   const [alertsExpanded, setAlertsExpanded] = useState(false);
 
@@ -333,6 +336,15 @@ const TenantUsageSummary = ({
   }, [activeMembership?.role]);
 
   const [acknowledgingAlertId, setAcknowledgingAlertId] = useState<string | null>(null);
+  const [usageAlertEmailEnabled, setUsageAlertEmailEnabled] = useState(true);
+  const [usageAlertPushEnabled, setUsageAlertPushEnabled] = useState(true);
+  const [updatingPreferenceKey, setUpdatingPreferenceKey] = useState<'usageAlertEmail' | 'usageAlertPush' | null>(null);
+
+  useEffect(() => {
+    const normalized = normalizeTenantNotificationPreferences(activeTenant?.notificationPreferences);
+    setUsageAlertEmailEnabled(normalized.usageAlertEmail);
+    setUsageAlertPushEnabled(normalized.usageAlertPush);
+  }, [activeTenant?.id, activeTenant?.notificationPreferences]);
 
   const handleAcknowledgeAlert = useCallback(async (alertIdRaw?: string | null) => {
     const alertId = alertIdRaw?.trim();
@@ -358,6 +370,65 @@ const TenantUsageSummary = ({
     }
   }, [activeTenant?.id, acknowledgingAlertId, canManagePlan, refreshUsageSummary]);
 
+  const handleToggleUsageAlertPreference = useCallback(async (
+    key: 'usageAlertEmail' | 'usageAlertPush',
+    nextValue: boolean,
+  ) => {
+    const tenantId = activeTenant?.id?.trim();
+    if (!canManagePlan || !tenantId) {
+      return;
+    }
+    if (updatingPreferenceKey === key) {
+      return;
+    }
+
+    setUpdatingPreferenceKey(key);
+    const previousEmail = usageAlertEmailEnabled;
+    const previousPush = usageAlertPushEnabled;
+    if (key === 'usageAlertEmail') {
+      setUsageAlertEmailEnabled(nextValue);
+    } else {
+      setUsageAlertPushEnabled(nextValue);
+    }
+
+    try {
+      const membershipId = activeMembership?.id?.trim();
+      if (!membershipId) {
+        throw new Error('Membership not found for current user.');
+      }
+
+      const membershipRef = doc(firestore, 'tenantMemberships', membershipId);
+      await updateDoc(membershipRef, {
+        [`notificationPreferences.${key}`]: nextValue,
+        updatedAt: new Date().toISOString(),
+      });
+
+      const normalized = normalizeTenantNotificationPreferences(activeTenant?.notificationPreferences);
+      const nextPrefs = {
+        ...normalized,
+        [key]: nextValue,
+      };
+      applyTenantNotificationPreferencesSnapshot(tenantId, nextPrefs);
+    } catch (error) {
+      setUsageAlertEmailEnabled(previousEmail);
+      setUsageAlertPushEnabled(previousPush);
+      const message = error instanceof Error ? error.message : 'Unable to update preference.';
+      logger.warn('TenantUsageSummary: failed to update usage alert preference', error);
+      Toast.show({ type: 'error', text1: 'Preference update failed', text2: message });
+    } finally {
+      setUpdatingPreferenceKey(null);
+    }
+  }, [
+    activeTenant?.id,
+    activeTenant?.notificationPreferences,
+    activeMembership?.id,
+    applyTenantNotificationPreferencesSnapshot,
+    canManagePlan,
+    updatingPreferenceKey,
+    usageAlertEmailEnabled,
+    usageAlertPushEnabled,
+  ]);
+
   const showUpgradeCta = canManagePlan && (studentPercent >= 90 || staffPercent >= 90 || reminderPercent >= 90);
 
   if (!activeTenant || !canView) {
@@ -373,6 +444,72 @@ const TenantUsageSummary = ({
           <Text style={[styles.errorText, { color: theme.error }]}>{usageSummaryError}</Text>
         ) : null}
       </View>
+      {canManagePlan ? (
+        <View style={[styles.preferenceCard, { borderColor: theme.border }]}> 
+          <Text style={[styles.preferenceTitle, { color: theme.text }]}>Your usage alert channels</Text>
+          <View style={styles.preferenceRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.preferenceLabel, { color: theme.text }]}>Email alerts</Text>
+              <Text style={[styles.preferenceHelper, { color: theme.textSecondary }]}>Receive usage limit alerts by email for your account</Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => {
+                void handleToggleUsageAlertPreference('usageAlertEmail', !usageAlertEmailEnabled);
+              }}
+              style={[
+                styles.preferenceToggle,
+                {
+                  borderColor: usageAlertEmailEnabled ? theme.primary : theme.border,
+                  backgroundColor: usageAlertEmailEnabled ? `${theme.primary}1A` : theme.surface,
+                  opacity: updatingPreferenceKey === 'usageAlertEmail' ? 0.7 : 1,
+                },
+              ]}
+              disabled={updatingPreferenceKey === 'usageAlertEmail'}
+              accessibilityRole="button"
+              accessibilityLabel="Toggle usage alert email notifications"
+            >
+              {updatingPreferenceKey === 'usageAlertEmail' ? (
+                <ActivityIndicator size="small" color={theme.primary} />
+              ) : (
+                <Text style={[styles.preferenceToggleText, { color: usageAlertEmailEnabled ? theme.primary : theme.textSecondary }]}> 
+                  {usageAlertEmailEnabled ? 'On' : 'Off'}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          <View style={[styles.preferenceRow, { borderTopColor: `${theme.border}70` }]}> 
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.preferenceLabel, { color: theme.text }]}>Push alerts</Text>
+              <Text style={[styles.preferenceHelper, { color: theme.textSecondary }]}>Receive usage limit alerts as push notifications on your devices</Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => {
+                void handleToggleUsageAlertPreference('usageAlertPush', !usageAlertPushEnabled);
+              }}
+              style={[
+                styles.preferenceToggle,
+                {
+                  borderColor: usageAlertPushEnabled ? theme.primary : theme.border,
+                  backgroundColor: usageAlertPushEnabled ? `${theme.primary}1A` : theme.surface,
+                  opacity: updatingPreferenceKey === 'usageAlertPush' ? 0.7 : 1,
+                },
+              ]}
+              disabled={updatingPreferenceKey === 'usageAlertPush'}
+              accessibilityRole="button"
+              accessibilityLabel="Toggle usage alert push notifications"
+            >
+              {updatingPreferenceKey === 'usageAlertPush' ? (
+                <ActivityIndicator size="small" color={theme.primary} />
+              ) : (
+                <Text style={[styles.preferenceToggleText, { color: usageAlertPushEnabled ? theme.primary : theme.textSecondary }]}> 
+                  {usageAlertPushEnabled ? 'On' : 'Off'}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : null}
       {highlightedAlert && (
         <View
           style={[
@@ -591,6 +728,44 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 12,
+  },
+  preferenceCard: {
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 8,
+  },
+  preferenceTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  preferenceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingTop: 8,
+    borderTopWidth: 1,
+  },
+  preferenceLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  preferenceHelper: {
+    fontSize: 12,
+  },
+  preferenceToggle: {
+    minWidth: 64,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  preferenceToggleText: {
+    fontSize: 12,
+    fontWeight: '700',
   },
   alertBanner: {
     borderWidth: 1,
