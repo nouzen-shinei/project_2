@@ -55,7 +55,7 @@ Use `gcloud scheduler jobs update http usage-rollup-nightly …` to tweak schedu
 ```bash
 gcloud scheduler jobs create http usage-refresh-queue \
   --project=$PROJECT_ID --location=$REGION \
-  --schedule="0 * * * *" \
+  --schedule="*/5 * * * *" \
   --http-method=POST \
   --uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/usage-refresh-job:run" \
   --oauth-service-account-email=$SCHEDULER_SA \

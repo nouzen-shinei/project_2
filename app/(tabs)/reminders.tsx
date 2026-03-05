@@ -72,6 +72,15 @@ interface SendStatus {
   message?: string;
 }
 
+type SendabilityQuickFilter =
+  | null
+  | 'missing-email'
+  | 'invalid-email'
+  | 'missing-phone'
+  | 'missing-whatsapp'
+  | 'custom-empty'
+  | 'disabled-channel';
+
 export default function SendReminders() {
   const { theme } = useTheme();
   const router = useRouter();
@@ -137,18 +146,47 @@ export default function SendReminders() {
     } as const;
   }, [usageSummary?.reminders]);
 
+  const reminderEffectiveUsedByType = useMemo(() => {
+    const r = usageSummary?.reminders;
+    const sent = {
+      email: typeof r?.email === 'number' ? r.email : 0,
+      sms: typeof r?.sms === 'number' ? r.sms : 0,
+      whatsapp: typeof r?.whatsapp === 'number' ? r.whatsapp : 0,
+      voice: typeof r?.voice === 'number' ? r.voice : 0,
+    };
+    const inFlight = {
+      email: typeof (r as any)?.inFlight?.email === 'number' ? (r as any).inFlight.email : 0,
+      sms: typeof (r as any)?.inFlight?.sms === 'number' ? (r as any).inFlight.sms : 0,
+      whatsapp: typeof (r as any)?.inFlight?.whatsapp === 'number' ? (r as any).inFlight.whatsapp : 0,
+      voice: typeof (r as any)?.inFlight?.voice === 'number' ? (r as any).inFlight.voice : 0,
+    };
+    const reserved = {
+      email: typeof (r as any)?.reserved?.email === 'number' ? (r as any).reserved.email : 0,
+      sms: typeof (r as any)?.reserved?.sms === 'number' ? (r as any).reserved.sms : 0,
+      whatsapp: typeof (r as any)?.reserved?.whatsapp === 'number' ? (r as any).reserved.whatsapp : 0,
+      voice: typeof (r as any)?.reserved?.voice === 'number' ? (r as any).reserved.voice : 0,
+    };
+
+    return {
+      email: sent.email + inFlight.email + reserved.email,
+      sms: sent.sms + inFlight.sms + reserved.sms,
+      whatsapp: sent.whatsapp + inFlight.whatsapp + reserved.whatsapp,
+      voice: sent.voice + inFlight.voice + reserved.voice,
+    } as const;
+  }, [usageSummary?.reminders]);
+
   const reminderTotalUsed = useMemo(() => {
-    const total = (usageSummary as any)?.reminders?.total;
+    const total = (usageSummary as any)?.reminders?.effectiveUsed;
     if (typeof total === 'number' && Number.isFinite(total)) {
       return total;
     }
     return (
-      reminderUsedByType.email +
-      reminderUsedByType.sms +
-      reminderUsedByType.whatsapp +
-      reminderUsedByType.voice
+      reminderEffectiveUsedByType.email +
+      reminderEffectiveUsedByType.sms +
+      reminderEffectiveUsedByType.whatsapp +
+      reminderEffectiveUsedByType.voice
     );
-  }, [usageSummary, reminderUsedByType]);
+  }, [usageSummary, reminderEffectiveUsedByType]);
 
   const reminderTotalRemaining = useMemo(() => {
     if (typeof reminderTotalLimit !== 'number' || !Number.isFinite(reminderTotalLimit) || reminderTotalLimit <= 0) {
@@ -252,6 +290,7 @@ export default function SendReminders() {
   >(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<'all' | 'overdue' | 'unpaid' | 'partial'>('all');
+  const [sendabilityQuickFilter, setSendabilityQuickFilter] = useState<SendabilityQuickFilter>(null);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -529,6 +568,15 @@ export default function SendReminders() {
       logger.warn('Manual refresh error', e);
     }
   }, [sendStatuses, waJobIds, tenantId]);
+
+  useEffect(() => {
+    if (!sendStatuses.length || !tenantId) return;
+    const hasActive = sendStatuses.some((s) => s.status === 'pending' || s.status === 'queued');
+    if (hasActive) return;
+
+    refreshUsageSummary().catch((e) => logger.warn('Usage summary refresh after send completion failed', e));
+    refreshReminderAlerts().catch((e) => logger.warn('Usage alert refresh after send completion failed', e));
+  }, [sendStatuses, tenantId, refreshUsageSummary, refreshReminderAlerts]);
 
   // Helper functions to get appropriate custom messages based on language
   // Note: WhatsApp newline formatting is handled by backend (converts \n to commas)
@@ -883,10 +931,17 @@ export default function SendReminders() {
     return breakdown;
   }, [fees, getCorrectFeeAmount, categorizeFee, theme]);
 
+  const isValidParentEmail = useCallback((value?: string | null) => {
+    const v = (value || '').trim();
+    if (!v) return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+  }, []);
+
   const canSendToStudent = useCallback((student: Student, type: string) => {
+
     switch (type) {
       case 'email':
-        return !!student.parentEmail;
+        return isValidParentEmail(student.parentEmail);
       case 'sms':
       case 'voice':
         return !!(student.parentContact || student.parentPhone);
@@ -895,7 +950,107 @@ export default function SendReminders() {
       default:
         return false;
     }
-  }, []);
+  }, [isValidParentEmail]);
+
+  const displayedStudents = useMemo(() => {
+    if (!sendabilityQuickFilter) {
+      return filteredStudents;
+    }
+
+    // Sendability shortcuts are scoped to planned reminders from selected students.
+    if (selectedStudents.size === 0) {
+      return filteredStudents;
+    }
+
+    const selectedTypes = Array.from(reminderTypes).filter(
+      (t): t is 'email' | 'sms' | 'whatsapp' | 'voice' => t === 'email' || t === 'sms' || t === 'whatsapp' || t === 'voice',
+    );
+    if (!selectedTypes.length) {
+      return filteredStudents;
+    }
+
+    if (sendabilityQuickFilter === 'custom-empty') {
+      const globalCustomEmpty = useCustomMessage
+        ? selectedLanguage === 'both'
+          ? !(customMessageEnglish || '').trim() && !(customMessageHindi || '').trim()
+          : !customMessage.trim()
+        : false;
+      if (!globalCustomEmpty) {
+        return filteredStudents;
+      }
+      return filteredStudents.filter((student) => selectedStudents.has(student.id));
+    }
+
+    if (sendabilityQuickFilter === 'disabled-channel') {
+      const hasDisabledSelectedChannel = selectedTypes.some((type) => {
+        if (type === 'email') return !enabledChannels.email;
+        if (type === 'sms') return !enabledChannels.sms;
+        if (type === 'whatsapp') return !enabledChannels.whatsapp;
+        return !enabledChannels.voice;
+      });
+      if (!hasDisabledSelectedChannel) {
+        return filteredStudents;
+      }
+      return filteredStudents.filter((student) => selectedStudents.has(student.id));
+    }
+
+    if (sendabilityQuickFilter === 'missing-email') {
+      return filteredStudents.filter((student) => {
+        if (!selectedStudents.has(student.id)) return false;
+        const emailSelectedAndEnabled = selectedTypes.includes('email') && enabledChannels.email;
+        if (!emailSelectedAndEnabled) return false;
+        return !(student.parentEmail || '').trim();
+      });
+    }
+
+    if (sendabilityQuickFilter === 'invalid-email') {
+      return filteredStudents.filter((student) => {
+        if (!selectedStudents.has(student.id)) return false;
+        const emailSelectedAndEnabled = selectedTypes.includes('email') && enabledChannels.email;
+        if (!emailSelectedAndEnabled) return false;
+        const trimmedEmail = (student.parentEmail || '').trim();
+        return !!trimmedEmail && !isValidParentEmail(trimmedEmail);
+      });
+    }
+
+    if (sendabilityQuickFilter === 'missing-phone') {
+      return filteredStudents.filter((student) => {
+        if (!selectedStudents.has(student.id)) return false;
+        const phoneChannelSelectedAndEnabled =
+          (selectedTypes.includes('sms') && enabledChannels.sms) ||
+          (selectedTypes.includes('voice') && enabledChannels.voice);
+        if (!phoneChannelSelectedAndEnabled) return false;
+        return !(student.parentContact || student.parentPhone);
+      });
+    }
+
+    if (sendabilityQuickFilter === 'missing-whatsapp') {
+      return filteredStudents.filter((student) => {
+        if (!selectedStudents.has(student.id)) return false;
+        const whatsappSelectedAndEnabled = selectedTypes.includes('whatsapp') && enabledChannels.whatsapp;
+        if (!whatsappSelectedAndEnabled) return false;
+        return !student.parentWhatsApp;
+      });
+    }
+
+    return filteredStudents;
+  }, [
+    sendabilityQuickFilter,
+    filteredStudents,
+    reminderTypes,
+    selectedStudents,
+    useCustomMessage,
+    selectedLanguage,
+    customMessage,
+    customMessageEnglish,
+    customMessageHindi,
+    enabledChannels.email,
+    enabledChannels.sms,
+    enabledChannels.whatsapp,
+    enabledChannels.voice,
+    canSendToStudent,
+    isValidParentEmail,
+  ]);
 
   // Utility function to normalize phone numbers
   const normalizePhoneNumber = useCallback((phone: string): string => {
@@ -1132,12 +1287,12 @@ export default function SendReminders() {
   }, [getStudentFeeInfo, getCustomNotesForLanguage, addGreetings, useCustomGreetings, customGreetingsEnglish, customGreetingsHindi, selectedLanguage, languageOrder, englishVoice, hindiVoice, resolvedTeacherName, resolvedCoachingName, useCustomMessage]);
 
   const handleSelectAll = useCallback(() => {
-    if (selectedStudents.size === filteredStudents.length) {
+    if (displayedStudents.length > 0 && displayedStudents.every((s) => selectedStudents.has(s.id))) {
       setSelectedStudents(new Set());
     } else {
-      setSelectedStudents(new Set(filteredStudents.map(s => s.id)));
+      setSelectedStudents(new Set(displayedStudents.map((s) => s.id)));
     }
-  }, [selectedStudents, filteredStudents]);
+  }, [selectedStudents, displayedStudents]);
 
   const handleSelectStudent = useCallback((studentId: string) => {
     const newSelected = new Set(selectedStudents);
@@ -1198,6 +1353,7 @@ export default function SendReminders() {
     setCustomNotesHindi('');
     setCustomNotesEnglish('');
     setUseCustomNotes(false);
+    setSendabilityQuickFilter(null);
     setSendStatuses([]);
     setPreviewStudentIndex(0);
   }, [selectedStudents.size, reminderTypes, useCustomMessage, customMessage, customMessageHindi, customMessageEnglish, useCustomNotes, customNotes, customNotesHindi, customNotesEnglish]);
@@ -1319,11 +1475,9 @@ export default function SendReminders() {
     const lines = selectedTypes.map((type) => {
       const limitRaw = reminderLimitByType[type];
       const limit = typeof limitRaw === 'number' && Number.isFinite(limitRaw) ? limitRaw : 0;
-      const used = reminderUsedByType[type];
-      const remaining =
-        typeof limit === 'number' && Number.isFinite(limit) && limit > 0
-          ? Math.max(0, limit - used)
-          : 0;
+      const used = reminderEffectiveUsedByType[type];
+      const hasFiniteLimit = typeof limit === 'number' && Number.isFinite(limit) && limit > 0;
+      const remaining = hasFiniteLimit ? Math.max(0, limit - used) : Number.POSITIVE_INFINITY;
       return {
         type,
         label: typeLabels[type],
@@ -1334,7 +1488,7 @@ export default function SendReminders() {
       };
     });
 
-    const insufficient = lines.filter((l) => l.needed > l.remaining);
+    const insufficient = lines.filter((l) => Number.isFinite(l.remaining) && l.needed > l.remaining);
     if (insufficient.length > 0) {
       setQuotaBlockData({
         kind: 'quota',
@@ -1349,7 +1503,243 @@ export default function SendReminders() {
     }
 
     return true;
-  }, [usageSummaryLoading, usageSummaryError, usageSummary, computePlannedReminderNeeds, reminderLimitByType, reminderUsedByType, reminderTypes, selectedStudents.size]);
+  }, [usageSummaryLoading, usageSummaryError, usageSummary, computePlannedReminderNeeds, reminderLimitByType, reminderEffectiveUsedByType, reminderTypes, selectedStudents.size]);
+
+  const sendabilitySummary = useMemo(() => {
+    if (selectedStudents.size === 0 || reminderTypes.size === 0) {
+      return null;
+    }
+
+    const selectedStudentObjects = students.filter((s) => selectedStudents.has(s.id));
+    const selectedTypes = Array.from(reminderTypes);
+
+    const globalCustomEmpty = useCustomMessage
+      ? selectedLanguage === 'both'
+        ? !(customMessageEnglish || '').trim() && !(customMessageHindi || '').trim()
+        : !customMessage.trim()
+      : false;
+
+    let valid = 0;
+    let blockedMissingEmail = 0;
+    let blockedInvalidEmail = 0;
+    let blockedMissingPhone = 0;
+    let blockedMissingWhatsApp = 0;
+    let blockedCustomEmpty = 0;
+    let blockedDisabledChannel = 0;
+    let blockedUnsupported = 0;
+
+    for (const student of selectedStudentObjects) {
+      for (const type of selectedTypes) {
+        const supported = type === 'email' || type === 'sms' || type === 'whatsapp' || type === 'voice';
+        if (!supported) {
+          blockedUnsupported += 1;
+          continue;
+        }
+
+        const channelEnabled =
+          (type === 'email' && enabledChannels.email) ||
+          (type === 'sms' && enabledChannels.sms) ||
+          (type === 'whatsapp' && enabledChannels.whatsapp) ||
+          (type === 'voice' && enabledChannels.voice);
+        if (!channelEnabled) {
+          blockedDisabledChannel += 1;
+          continue;
+        }
+
+        if (type === 'email') {
+          const trimmedEmail = (student.parentEmail || '').trim();
+          if (!trimmedEmail) {
+            blockedMissingEmail += 1;
+            continue;
+          }
+          if (!isValidParentEmail(trimmedEmail)) {
+            blockedInvalidEmail += 1;
+            continue;
+          }
+        }
+
+        if ((type === 'sms' || type === 'voice') && !(student.parentContact || student.parentPhone)) {
+          blockedMissingPhone += 1;
+          continue;
+        }
+
+        if (type === 'whatsapp' && !student.parentWhatsApp) {
+          blockedMissingWhatsApp += 1;
+          continue;
+        }
+
+        if (useCustomMessage && globalCustomEmpty) {
+          blockedCustomEmpty += 1;
+          continue;
+        }
+
+        valid += 1;
+      }
+    }
+
+    const blockedNoContact =
+      blockedMissingEmail + blockedInvalidEmail + blockedMissingPhone + blockedMissingWhatsApp;
+
+    const totalPlanned =
+      valid + blockedNoContact + blockedCustomEmpty + blockedDisabledChannel + blockedUnsupported;
+
+    return {
+      totalPlanned,
+      valid,
+      blockedNoContact,
+      blockedMissingEmail,
+      blockedInvalidEmail,
+      blockedMissingPhone,
+      blockedMissingWhatsApp,
+      blockedCustomEmpty,
+      blockedDisabledChannel,
+      blockedUnsupported,
+    };
+  }, [
+    selectedStudents,
+    reminderTypes,
+    students,
+    useCustomMessage,
+    selectedLanguage,
+    customMessage,
+    customMessageEnglish,
+    customMessageHindi,
+    enabledChannels.email,
+    enabledChannels.sms,
+    enabledChannels.whatsapp,
+    enabledChannels.voice,
+    canSendToStudent,
+    isValidParentEmail,
+  ]);
+
+  useEffect(() => {
+    if (!sendabilityQuickFilter) return;
+
+    if (!sendabilitySummary) {
+      setSendabilityQuickFilter(null);
+      return;
+    }
+
+    if (sendabilityQuickFilter === 'missing-email' && sendabilitySummary.blockedMissingEmail === 0) {
+      setSendabilityQuickFilter(null);
+      return;
+    }
+    if (sendabilityQuickFilter === 'invalid-email' && sendabilitySummary.blockedInvalidEmail === 0) {
+      setSendabilityQuickFilter(null);
+      return;
+    }
+    if (sendabilityQuickFilter === 'missing-phone' && sendabilitySummary.blockedMissingPhone === 0) {
+      setSendabilityQuickFilter(null);
+      return;
+    }
+    if (sendabilityQuickFilter === 'missing-whatsapp' && sendabilitySummary.blockedMissingWhatsApp === 0) {
+      setSendabilityQuickFilter(null);
+      return;
+    }
+    if (sendabilityQuickFilter === 'custom-empty' && sendabilitySummary.blockedCustomEmpty === 0) {
+      setSendabilityQuickFilter(null);
+      return;
+    }
+    if (sendabilityQuickFilter === 'disabled-channel' && sendabilitySummary.blockedDisabledChannel === 0) {
+      setSendabilityQuickFilter(null);
+    }
+  }, [sendabilityQuickFilter, sendabilitySummary]);
+
+  const humanizeSendErrorMessage = useCallback((raw?: string): string => {
+    const code = (raw || '').trim();
+    if (!code) return 'Failed to send';
+
+    const lower = code.toLowerCase();
+    if (lower.includes('twilio') && (lower.includes('credit') || lower.includes('balance') || lower.includes('funds'))) {
+      return 'Insufficient Twilio credits. Please contact support.';
+    }
+    if (lower.includes('insufficient') && (lower.includes('credit') || lower.includes('balance') || lower.includes('funds'))) {
+      return 'Insufficient provider credits. Please contact support.';
+    }
+    if (lower.includes('missing_fields') || lower.includes('validation_failed')) {
+      return 'Some required reminder details are missing. Please review the selected channels and contacts.';
+    }
+    if (lower.includes('reminder_limit_reached')) {
+      return 'Monthly reminder limit reached for one or more selected channels.';
+    }
+    if (lower.includes('reminder_quota_reservation_missing')) {
+      return 'Reminder quota reservation was not found. Please retry the batch.';
+    }
+    if (lower.includes('reminder_quota_reservation_expired')) {
+      return 'Reminder quota reservation expired. Please retry sending.';
+    }
+    if (lower.includes('reminder_quota_reservation_exhausted')) {
+      return 'No reserved reminder quota is left for this batch. Please retry.';
+    }
+    if (lower.includes('email_backend_not_configured')) {
+      return 'Email backend is not configured right now.';
+    }
+    if (lower.includes('email_send_failed')) {
+      return 'Email sending failed. Please try again in a moment.';
+    }
+    if (lower.includes('send_failed')) {
+      return 'Provider send failed. Please try again.';
+    }
+    return code.replace(/_/g, ' ');
+  }, []);
+
+  const getBatchSendErrorUi = useCallback(
+    (error: unknown): { title: string; message: string } => {
+      if (error instanceof ReminderBatchSendError) {
+        if (error.code === 'validation_failed') {
+          const issues = Array.isArray((error as any)?.details?.issues) ? (error as any).details.issues : [];
+          const details = issues
+            .slice(0, 3)
+            .map((issue: any) => {
+              const path = Array.isArray(issue?.path) ? issue.path.join('.') : '';
+              const msg = typeof issue?.message === 'string' ? issue.message : 'Invalid value';
+              if (path.includes('history.parentEmail')) {
+                return 'Parent email is invalid. Update student email or deselect Email channel.';
+              }
+              if (path.includes('email.to_email')) {
+                return 'Recipient email is invalid. Please correct the parent email.';
+              }
+              return path ? `${path}: ${msg}` : msg;
+            })
+            .join('\n');
+
+          return {
+            title: 'Invalid Reminder Payload',
+            message: details
+              ? `Some reminder details were invalid:\n${details}`
+              : 'Some reminder details were invalid. Please review your selected channels and contacts.',
+          };
+        }
+
+        return {
+          title: 'Reminder Send Failed',
+          message: humanizeSendErrorMessage(error.code),
+        };
+      }
+
+      if (error instanceof Error) {
+        const msg = error.message || '';
+        if (msg.includes('At least one reminder item is required')) {
+          return {
+            title: 'Nothing To Send',
+            message:
+              'No valid reminders could be created for the selected students/channels. Check contact details and custom message content.',
+          };
+        }
+
+        return {
+          title: 'Reminder Send Failed',
+          message: humanizeSendErrorMessage(msg),
+        };
+      }
+
+      return {
+        title: 'Reminder Send Failed',
+        message: 'Unable to send reminders due to an unexpected error. Please try again.',
+      };
+    },
+    [humanizeSendErrorMessage],
+  );
 
   const sendReminders = useCallback(async () => {
     logger.debug('sendReminders function called');
@@ -1403,6 +1793,8 @@ export default function SendReminders() {
 
       const buildHistoryPayload = (student: Student, type: string, messageText: string) => {
         const feeInfo = getStudentFeeInfo(student);
+        const rawParentEmail = (student.parentEmail || '').trim();
+        const safeParentEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawParentEmail) ? rawParentEmail : undefined;
         return {
           tenantId,
           userId: user.uid,
@@ -1410,7 +1802,7 @@ export default function SendReminders() {
           studentName: student.name,
           parentName: student.parentName || 'Parent',
           parentContact: getParentContact(student),
-          parentEmail: student.parentEmail,
+          parentEmail: safeParentEmail,
           reminderType: type,
           message: messageText,
           amount: feeInfo.totalDue,
@@ -1457,6 +1849,12 @@ export default function SendReminders() {
           if (type === 'email') {
             const feeInfo = getStudentFeeInfo(student);
             const coachingName = resolvedCoachingName;
+            const validParentEmail = (student.parentEmail || '').trim();
+            const safeParentEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(validParentEmail) ? validParentEmail : '';
+            if (!safeParentEmail) {
+              initialStatuses.push({ studentId: student.id, type, status: 'failed', message: 'Missing or invalid parent email' });
+              continue;
+            }
 
             if (useCustomMessage) {
               const englishFirst = languageOrder === 'english-first';
@@ -1468,7 +1866,7 @@ export default function SendReminders() {
                 history,
                 email: {
                   template: 'custom_message_bilingual',
-                  to_email: student.parentEmail!,
+                  to_email: safeParentEmail,
                   to_name: student.parentName || 'Parent',
                   subject: `Message - ${student.parentName || 'Parent'}`,
                   student_name: student.name,
@@ -1498,7 +1896,7 @@ export default function SendReminders() {
                 history,
                 email: {
                   template: 'fee_reminder',
-                  to_email: student.parentEmail!,
+                  to_email: safeParentEmail,
                   to_name: student.parentName || 'Parent',
                   student_name: student.name,
                   amount: feeInfo.totalDue.toString(),
@@ -1700,6 +2098,20 @@ export default function SendReminders() {
 
       setSendStatuses(initialStatuses);
 
+      if (batchItems.length === 0) {
+        setIsSending(false);
+        const failedCount = initialStatuses.filter((s) => s.status === 'failed').length;
+        const skippedCount = initialStatuses.filter((s) => s.status === 'skipped').length;
+        const reasons = new Set(initialStatuses.map((s) => s.message).filter(Boolean) as string[]);
+        const topReasons = Array.from(reasons).slice(0, 3).map((r) => `- ${humanizeSendErrorMessage(r)}`).join('\n');
+
+        Alert.alert(
+          'Nothing To Send',
+          `${failedCount + skippedCount} reminder attempt(s) were filtered out before sending.${topReasons ? `\n\n${topReasons}` : ''}`,
+        );
+        return;
+      }
+
       try {
         const resp = await usageAnalyticsService.sendReminderBatch(tenantId, batchId, batchItems);
         const byKey = new Map<string, (typeof resp.results)[number]>();
@@ -1714,7 +2126,14 @@ export default function SendReminders() {
             return {
               ...s,
               status: r.status,
-              message: r.message || (r.status === 'success' ? 'Sent successfully' : r.status === 'queued' ? 'Queued for send' : 'Failed to send'),
+              message:
+                r.message
+                  ? humanizeSendErrorMessage(r.message)
+                  : r.status === 'success'
+                    ? 'Sent successfully'
+                    : r.status === 'queued'
+                      ? 'Queued for send'
+                      : 'Failed to send',
             };
           })
         );
@@ -1725,6 +2144,11 @@ export default function SendReminders() {
             setWaJobIds((prev) => new Map(prev).set(`${r.studentId}_whatsapp`, r.jobId!));
           }
         });
+
+        await Promise.all([
+          refreshUsageSummary().catch((e) => logger.warn('Usage summary refresh after batch send failed', e)),
+          refreshReminderAlerts().catch((e) => logger.warn('Usage alert refresh after batch send failed', e)),
+        ]);
       } catch (error) {
         logger.error('Batch send failed', error);
         setIsSending(false);
@@ -1787,11 +2211,9 @@ export default function SendReminders() {
             const lines = selectedTypes.map((type) => {
               const limitRaw = reminderLimitByType[type];
               const limit = typeof limitRaw === 'number' && Number.isFinite(limitRaw) ? limitRaw : 0;
-              const used = reminderUsedByType[type];
-              const remaining =
-                typeof limit === 'number' && Number.isFinite(limit) && limit > 0
-                  ? Math.max(0, limit - used)
-                  : 0;
+              const used = reminderEffectiveUsedByType[type];
+              const hasFiniteLimit = typeof limit === 'number' && Number.isFinite(limit) && limit > 0;
+              const remaining = hasFiniteLimit ? Math.max(0, limit - used) : Number.POSITIVE_INFINITY;
               return { type, label: typeLabels[type], needed: needs[type], remaining, used, limit };
             });
 
@@ -1808,7 +2230,8 @@ export default function SendReminders() {
           }
         }
 
-        Alert.alert('Error', 'Unable to send reminder batch. Please try again.');
+        const ui = getBatchSendErrorUi(error);
+        Alert.alert(ui.title, ui.message);
         return;
       }
 
@@ -1840,7 +2263,11 @@ export default function SendReminders() {
     tenantId,
     computePlannedReminderNeeds,
     reminderLimitByType,
-    reminderUsedByType,
+    reminderEffectiveUsedByType,
+    humanizeSendErrorMessage,
+    getBatchSendErrorUi,
+    refreshUsageSummary,
+    refreshReminderAlerts,
   ]);
 
   const getStatusSummary = () => {
@@ -2054,6 +2481,27 @@ export default function SendReminders() {
       fontSize: 14,
       color: theme.textSecondary,
       marginTop: 4,
+    },
+    studentWarningRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 6,
+      marginTop: 8,
+    },
+    studentWarningChip: {
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: `${theme.error}66`,
+      backgroundColor: `${theme.error}1A`,
+    },
+    studentWarningText: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: theme.error,
+      letterSpacing: 0.2,
+      textTransform: 'uppercase',
     },
     feeInfo: {
       fontSize: 12,
@@ -2378,10 +2826,8 @@ export default function SendReminders() {
 
               const limit = reminderLimitByType[typeId];
               const used = reminderUsedByType[typeId];
-              const remaining =
-                typeof limit === 'number' && Number.isFinite(limit) && limit > 0
-                  ? Math.max(0, limit - used)
-                  : null;
+              const hasFiniteLimit = typeof limit === 'number' && Number.isFinite(limit) && limit > 0;
+              const remaining = hasFiniteLimit ? Math.max(0, limit - used) : null;
 
               return (
                 <TouchableOpacity
@@ -2434,7 +2880,9 @@ export default function SendReminders() {
                           { color: reminderTypes.has(type.id) ? type.color : theme.textSecondary, marginTop: 6 },
                         ]}
                       >
-                        Available: {remaining} / {limit} this month
+                        {hasFiniteLimit
+                          ? `Available: ${remaining} / ${limit} this month`
+                          : `Available: Unlimited this month`}
                       </Text>
                     ) : (
                       <Text
@@ -2680,28 +3128,45 @@ export default function SendReminders() {
             <Text style={styles.sectionTitle}>Select Students</Text>
             <TouchableOpacity onPress={handleSelectAll}>
               <Text style={styles.selectAllText}>
-                {selectedStudents.size === filteredStudents.length ? 'Deselect All' : 'Select All'}
+                {displayedStudents.length > 0 && displayedStudents.every((s) => selectedStudents.has(s.id))
+                  ? 'Deselect All'
+                  : 'Select All'}
               </Text>
             </TouchableOpacity>
           </View>
           
           <Text style={styles.selectedCount}>
-            {selectedStudents.size} of {filteredStudents.length} students selected
+            {selectedStudents.size} selected • {displayedStudents.length} shown
           </Text>
 
           <View style={styles.studentsList}>
-            {filteredStudents.length === 0 ? (
+            {displayedStudents.length === 0 ? (
               <View style={styles.emptyState}>
                 <Users size={48} color={theme.textSecondary} />
                 <Text style={styles.emptyStateText}>
-                  No students found matching your search criteria
+                  {sendabilityQuickFilter
+                    ? 'No students match the current sendability shortcut. Clear it to view all students.'
+                    : 'No students found matching your search criteria'}
                 </Text>
               </View>
             ) : (
-              filteredStudents.map(student => {
+              displayedStudents.map(student => {
                 const feeInfo = getStudentFeeInfo(student);
                 const detailedFeeInfo = getDetailedFeeInfo(student);
                 const isSelected = selectedStudents.has(student.id);
+                const trimmedParentEmail = (student.parentEmail || '').trim();
+                const emailSelected = reminderTypes.has('email');
+                const smsSelected = reminderTypes.has('sms');
+                const voiceSelected = reminderTypes.has('voice');
+                const whatsappSelected = reminderTypes.has('whatsapp');
+                const hasEmail = trimmedParentEmail.length > 0;
+                const hasPhone = !!(student.parentContact || student.parentPhone);
+                const hasWhatsApp = !!student.parentWhatsApp;
+                const hasValidEmail = isValidParentEmail(trimmedParentEmail);
+                const showEmailMissingWarning = emailSelected && !hasEmail;
+                const showInvalidEmailWarning = emailSelected && hasEmail && !hasValidEmail;
+                const showPhoneMissingWarning = (smsSelected || voiceSelected) && !hasPhone;
+                const showWhatsAppMissingWarning = whatsappSelected && !hasWhatsApp;
                 
                 return (
                   <TouchableOpacity
@@ -2736,6 +3201,31 @@ export default function SendReminders() {
                         {student.parentName} • {getParentContact(student)}
                                                   {student.parentEmail ? ` • ${student.parentEmail}` : ''}
                       </Text>
+
+                      {(showEmailMissingWarning || showInvalidEmailWarning || showPhoneMissingWarning || showWhatsAppMissingWarning) && (
+                        <View style={styles.studentWarningRow}>
+                          {showEmailMissingWarning ? (
+                            <View style={styles.studentWarningChip}>
+                              <Text style={styles.studentWarningText}>Email Missing</Text>
+                            </View>
+                          ) : null}
+                          {showInvalidEmailWarning ? (
+                            <View style={styles.studentWarningChip}>
+                              <Text style={styles.studentWarningText}>Invalid Email</Text>
+                            </View>
+                          ) : null}
+                          {showPhoneMissingWarning ? (
+                            <View style={styles.studentWarningChip}>
+                              <Text style={styles.studentWarningText}>Phone Missing</Text>
+                            </View>
+                          ) : null}
+                          {showWhatsAppMissingWarning ? (
+                            <View style={styles.studentWarningChip}>
+                              <Text style={styles.studentWarningText}>WhatsApp Missing</Text>
+                            </View>
+                          ) : null}
+                        </View>
+                      )}
                       
                       {detailedFeeInfo && detailedFeeInfo.length > 0 && (
                         <View style={{ marginTop: 8 }}>
@@ -2796,6 +3286,169 @@ export default function SendReminders() {
       {/* Action Buttons */}
       {selectedStudents.size > 0 && reminderTypes.size > 0 ? (
         <View>
+          {!!sendabilitySummary && (
+            <View
+              style={{
+                marginHorizontal: 20,
+                marginBottom: 10,
+                padding: 12,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: theme.border,
+                backgroundColor: theme.surface,
+              }}
+            >
+              <Text style={{ fontSize: 14, fontWeight: '700', color: theme.text, marginBottom: 6 }}>
+                Sendability Check
+              </Text>
+              <Text style={{ fontSize: 13, color: theme.textSecondary }}>
+                Valid: {sendabilitySummary.valid} of {sendabilitySummary.totalPlanned} planned reminder(s)
+              </Text>
+
+              {sendabilityQuickFilter && (
+                <View
+                  style={{
+                    marginTop: 8,
+                    paddingVertical: 6,
+                    paddingHorizontal: 8,
+                    borderRadius: 8,
+                    backgroundColor: `${theme.primary}18`,
+                    flexDirection: 'row',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <Text style={{ fontSize: 12, color: theme.primary, fontWeight: '600' }}>
+                    Showing students by: {sendabilityQuickFilter === 'missing-email'
+                      ? 'Email Missing'
+                      : sendabilityQuickFilter === 'invalid-email'
+                        ? 'Invalid Email'
+                        : sendabilityQuickFilter === 'missing-phone'
+                          ? 'Phone Missing'
+                          : sendabilityQuickFilter === 'missing-whatsapp'
+                            ? 'WhatsApp Missing'
+                            : sendabilityQuickFilter === 'custom-empty'
+                              ? 'Empty Custom Message'
+                              : 'Disabled Channel'}
+                  </Text>
+                  <TouchableOpacity onPress={() => setSendabilityQuickFilter(null)}>
+                    <Text style={{ fontSize: 12, color: theme.primary, fontWeight: '700' }}>Clear</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+                {sendabilitySummary.blockedInvalidEmail > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setSendabilityQuickFilter('invalid-email')}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: sendabilityQuickFilter === 'invalid-email' ? theme.error : theme.border,
+                      borderRadius: 999,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      backgroundColor: sendabilityQuickFilter === 'invalid-email' ? `${theme.error}18` : 'transparent',
+                    }}
+                  >
+                    <Text style={{ fontSize: 12, color: theme.textSecondary }}>
+                      {sendabilitySummary.blockedInvalidEmail} Invalid Email
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {sendabilitySummary.blockedMissingEmail > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setSendabilityQuickFilter('missing-email')}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: sendabilityQuickFilter === 'missing-email' ? theme.error : theme.border,
+                      borderRadius: 999,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      backgroundColor: sendabilityQuickFilter === 'missing-email' ? `${theme.error}18` : 'transparent',
+                    }}
+                  >
+                    <Text style={{ fontSize: 12, color: theme.textSecondary }}>
+                      {sendabilitySummary.blockedMissingEmail} Email Missing
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {sendabilitySummary.blockedMissingPhone > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setSendabilityQuickFilter('missing-phone')}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: sendabilityQuickFilter === 'missing-phone' ? theme.error : theme.border,
+                      borderRadius: 999,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      backgroundColor: sendabilityQuickFilter === 'missing-phone' ? `${theme.error}18` : 'transparent',
+                    }}
+                  >
+                    <Text style={{ fontSize: 12, color: theme.textSecondary }}>
+                      {sendabilitySummary.blockedMissingPhone} Phone Missing
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {sendabilitySummary.blockedMissingWhatsApp > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setSendabilityQuickFilter('missing-whatsapp')}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: sendabilityQuickFilter === 'missing-whatsapp' ? theme.error : theme.border,
+                      borderRadius: 999,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      backgroundColor: sendabilityQuickFilter === 'missing-whatsapp' ? `${theme.error}18` : 'transparent',
+                    }}
+                  >
+                    <Text style={{ fontSize: 12, color: theme.textSecondary }}>
+                      {sendabilitySummary.blockedMissingWhatsApp} WhatsApp Missing
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {sendabilitySummary.blockedCustomEmpty > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setSendabilityQuickFilter('custom-empty')}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: sendabilityQuickFilter === 'custom-empty' ? theme.warning : theme.border,
+                      borderRadius: 999,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      backgroundColor: sendabilityQuickFilter === 'custom-empty' ? `${theme.warning}18` : 'transparent',
+                    }}
+                  >
+                    <Text style={{ fontSize: 12, color: theme.textSecondary }}>
+                      {sendabilitySummary.blockedCustomEmpty} Custom Empty
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                {sendabilitySummary.blockedDisabledChannel > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setSendabilityQuickFilter('disabled-channel')}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: sendabilityQuickFilter === 'disabled-channel' ? theme.primary : theme.border,
+                      borderRadius: 999,
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      backgroundColor: sendabilityQuickFilter === 'disabled-channel' ? `${theme.primary}18` : 'transparent',
+                    }}
+                  >
+                    <Text style={{ fontSize: 12, color: theme.textSecondary }}>
+                      {sendabilitySummary.blockedDisabledChannel} Channel Disabled
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          )}
+
           {/* Preview and Cancel Buttons Row */}
           <View style={styles.buttonContainer}>
             <TouchableOpacity
@@ -2831,7 +3484,7 @@ export default function SendReminders() {
               
               return false;
             }}
-            disabled={isSending || isProcessing}
+            disabled={isSending || isProcessing || (sendabilitySummary?.valid ?? 0) <= 0}
             activeOpacity={0.8}
           >
             {(isSending || isProcessing) ? (
@@ -2840,7 +3493,11 @@ export default function SendReminders() {
               <Send size={20} color="#ffffff" />
             )}
             <Text style={styles.sendButtonText}>
-              {(isSending || isProcessing) ? 'Sending...' : `Send ${selectedStudents.size} Reminders`}
+              {(isSending || isProcessing)
+                ? 'Sending...'
+                : (sendabilitySummary?.valid ?? 0) <= 0
+                  ? 'No Valid Reminders To Send'
+                  : `Send ${selectedStudents.size} Reminders`}
             </Text>
           </TouchableOpacity>
         </View>
@@ -3192,7 +3849,10 @@ export default function SendReminders() {
                       Required vs Remaining (this month)
                     </Text>
                     {quotaBlockData!.lines.map((l) => {
-                      const over = l.needed > l.remaining;
+                      const finiteRemaining = Number.isFinite(l.remaining);
+                      const over = finiteRemaining && l.needed > l.remaining;
+                      const remainingLabel = finiteRemaining ? String(l.remaining) : 'Unlimited';
+                      const limitLabel = l.limit > 0 ? String(l.limit) : 'Unlimited';
                       return (
                         <View
                           key={l.type}
@@ -3209,7 +3869,7 @@ export default function SendReminders() {
                             {l.label}
                           </Text>
                           <Text style={[styles.statusType, { color: over ? theme.error : theme.textSecondary }]}>
-                            Need {l.needed} • Remaining {l.remaining} (Used {l.used} / Limit {l.limit})
+                            Need {l.needed} • Remaining {remainingLabel} (Used {l.used} / Limit {limitLabel})
                           </Text>
                         </View>
                       );

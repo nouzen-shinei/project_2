@@ -248,11 +248,11 @@ export default function ReminderHistoryViewer({
     setFilter('all');
     setSearchQuery('');
   await loadHistory(limit, studentId, typeFilter, 'all', '', windowDays, scope === 'all');
-    await loadStats(30);
+    await loadStats(windowDays);
     } catch (err) {
       Alert.alert('Error', 'Failed to refresh reminder history');
     }
-  }, [loadHistory, loadStats, limit, studentId, typeFilter, scope]);
+  }, [loadHistory, loadStats, limit, studentId, typeFilter, scope, windowDays]);
 
   // Render individual reminder item
   const renderReminderItem = useCallback(({ item }: { item: ReminderHistoryEntry }) => (
@@ -360,20 +360,6 @@ export default function ReminderHistoryViewer({
   const keyExtractor = useCallback((item: ReminderHistoryEntry, index: number) => {
     return item.id || `reminder-${index}`;
   }, []);
-
-  // Debug logging
-  useEffect(() => {
-    logger.debug('ReminderHistoryViewer - Debug Info:', {
-      historyLength: history.length,
-      filteredLength: filteredHistory.length,
-      filter,
-      typeFilter,
-      searchQuery,
-      statsTotal: stats.totalReminders,
-      loading,
-      error
-    });
-  }, [history, filteredHistory, filter, typeFilter, searchQuery, stats, loading, error]);
 
   const handleRefresh = async () => {
     try {

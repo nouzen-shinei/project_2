@@ -507,8 +507,20 @@ export default function AdminPanel() {
     setRequestingUsageRegeneration(true);
     try {
       const month = usageSummary?.month;
-      await usageAnalyticsService.requestUsageRefresh(tenantId, { month });
-      Toast.show({ type: 'success', text1: 'Rollup regeneration requested' });
+      const result = await usageAnalyticsService.requestUsageRefresh(tenantId, { month });
+      if (result?.alreadyQueued) {
+        Toast.show({
+          type: 'info',
+          text1: 'Already queued',
+          text2: 'A usage regeneration request is already pending for this month.',
+        });
+      } else {
+        Toast.show({ type: 'success', text1: 'Rollup regeneration requested' });
+      }
+      await Promise.all([
+        refreshUsageSummary().catch((e) => logger.warn('AdminPanel: usage summary refresh after regenerate request failed', e)),
+        refreshUsageHistory().catch((e) => logger.warn('AdminPanel: usage history refresh after regenerate request failed', e)),
+      ]);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to request rollup refresh.';
       logger.warn('AdminPanel: usage refresh request failed', error);
@@ -516,7 +528,7 @@ export default function AdminPanel() {
     } finally {
       setRequestingUsageRegeneration(false);
     }
-  }, [tenantId, requestingUsageRegeneration, usageSummary?.month, activeMembership]);
+  }, [tenantId, requestingUsageRegeneration, usageSummary?.month, activeMembership, refreshUsageSummary, refreshUsageHistory]);
 
   const handleLoadMoreJoinRequests = () => {
     setJoinRequestVisibleCount((prev) =>

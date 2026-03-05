@@ -168,11 +168,53 @@ function createFirestoreStub() {
   }
 
   function makeCollectionRef(path) {
+    const buildQuery = (filters = [], queryLimit = null) => ({
+      where(field, op, value) {
+        return buildQuery([...filters, { field, op, value }], queryLimit);
+      },
+      limit(limitValue) {
+        const normalized = Number(limitValue);
+        return buildQuery(filters, Number.isFinite(normalized) && normalized > 0 ? Math.floor(normalized) : null);
+      },
+      async get() {
+        const prefix = `${path}/`;
+        let matched = Array.from(docs.entries())
+          .filter(([key]) => key.startsWith(prefix))
+          .map(([key, value]) => {
+            const id = key.slice(prefix.length);
+            return { id, data: () => ({ ...value }) };
+          });
+
+        for (const filter of filters) {
+          matched = matched.filter((doc) => {
+            const value = doc.data()[filter.field];
+            if (filter.op === '==') {
+              return value === filter.value;
+            }
+            return false;
+          });
+        }
+
+        if (typeof queryLimit === 'number') {
+          matched = matched.slice(0, queryLimit);
+        }
+
+        return {
+          docs: matched,
+          empty: matched.length === 0,
+          size: matched.length,
+        };
+      },
+    });
+
     return {
       path,
       doc(id) {
         const resolvedId = id ?? `doc-${++nextId}`;
         return makeDocRef(`${path}/${resolvedId}`);
+      },
+      where(field, op, value) {
+        return buildQuery([{ field, op, value }], null);
       },
       async get() {
         const prefix = `${path}/`;
@@ -183,6 +225,11 @@ function createFirestoreStub() {
             return { id, data: () => ({ ...value }) };
           });
         return { docs: matched };
+      },
+      async add(payload) {
+        const id = `doc-${++nextId}`;
+        docs.set(`${path}/${id}`, payload);
+        return makeDocRef(`${path}/${id}`);
       },
     };
   }
@@ -359,5 +406,62 @@ describe('usage and billing endpoints', () => {
     assert.match(payload.checkoutUrl, /\?sessionId=/);
     assert.match(payload.checkoutUrl, /tenantId=tenant-usage-billing/);
     assert.equal(fixtures.auditEvents.some((event) => event.action === 'billing_checkout_started'), true);
+  });
+
+  it('creates a usage refresh request and audits it', async () => {
+    const { server, base, fixtures } = await startServer();
+    servers.add(server);
+
+    const response = await fetch(`${base}/usage/refresh?tenantId=${TENANT_ID}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${buildInternalToken()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ month: fixtures.currentMonthId }),
+    });
+
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.ok, true);
+    assert.equal(payload.month, fixtures.currentMonthId);
+    assert.ok(typeof payload.requestId === 'string' && payload.requestId.length > 0);
+    assert.equal(payload.alreadyQueued, undefined);
+    assert.equal(fixtures.auditEvents.some((event) => event.action === 'usage_refresh_requested'), true);
+  });
+
+  it('deduplicates usage refresh requests for the same tenant/month when one is already pending', async () => {
+    const { server, base, fixtures } = await startServer();
+    servers.add(server);
+
+    const first = await fetch(`${base}/usage/refresh?tenantId=${TENANT_ID}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${buildInternalToken()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ month: fixtures.currentMonthId }),
+    });
+    assert.equal(first.status, 200);
+    const firstPayload = await first.json();
+    assert.equal(firstPayload.ok, true);
+
+    const second = await fetch(`${base}/usage/refresh?tenantId=${TENANT_ID}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${buildInternalToken()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ month: fixtures.currentMonthId }),
+    });
+    assert.equal(second.status, 200);
+    const secondPayload = await second.json();
+    assert.equal(secondPayload.ok, true);
+    assert.equal(secondPayload.alreadyQueued, true);
+    assert.equal(secondPayload.status, 'pending');
+    assert.equal(secondPayload.requestId, firstPayload.requestId);
+
+    const refreshEvents = fixtures.auditEvents.filter((event) => event.action === 'usage_refresh_requested');
+    assert.equal(refreshEvents.length, 1);
   });
 });

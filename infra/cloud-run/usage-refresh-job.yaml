@@ -13,28 +13,34 @@ spec:
         spec:
           serviceAccountName: usage-refresh-job@tution-app-6c0c3.iam.gserviceaccount.com
           maxRetries: 1
-          timeoutSeconds: 900
+          timeoutSeconds: 1800
           containers:
-            - image: gcr.io/tution-app-6c0c3/backend-runtime:20260304-usage-alert-push-v1
+            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
               command: ["npm"]
               args: ["run", "usage:refresh-worker"]
               resources:
                 limits:
                   cpu: "1"
-                  memory: "512Mi"
+                  memory: "1Gi"
               env:
+                - name: NODE_ENV
+                  value: production
                 - name: FIREBASE_PROJECT_ID
                   value: tution-app-6c0c3
                 - name: FIREBASE_DATABASE_URL
                   value: https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app
                 - name: FIREBASE_STORAGE_BUCKET
                   value: tution-app-6c0c3.firebasestorage.app
+                - name: ROLLUP_RUNNER_ID
+                  value: cloud-run-usage-refresh-job
                 - name: USAGE_REFRESH_BATCH_LIMIT
-                  value: "1"
+                  value: "3"
                 - name: USAGE_REFRESH_DRY_RUN
                   value: "0"
                 - name: USAGE_REFRESH_VERBOSE
                   value: "0"
+                - name: USAGE_ALERT_UNCHANGED_REMINDER_DAYS
+                  value: "7"
                 - name: USAGE_ROLLUP_SKIP_REMINDERS
                   value: "0"
                 - name: USAGE_ROLLUP_SKIP_PAYMENTS
@@ -47,7 +53,7 @@ spec:
                 - name: EMAIL_BACKEND_BASE_URL
                   value: "https://my-email-backend.fly.dev"
                 - name: EMAIL_BACKEND_INTERNAL_KEY
-                  valueSource:
+                  valueFrom:
                     secretKeyRef:
-                      secret: email-backend-internal-key
-                      version: latest
+                      name: email-backend-internal-key
+                      key: latest
