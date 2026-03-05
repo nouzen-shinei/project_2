@@ -422,6 +422,92 @@ describe('reminders batch send endpoint', () => {
     assert.equal(body.results.length, 1);
     assert.equal(body.results[0].status, 'success');
 
+    const reservationSnap = await firestore
+      .collection('tenantReminderReservations')
+      .doc(TEST_TENANT_ID)
+      .collection('months')
+      .doc(body.monthId)
+      .collection('batches')
+      .doc('batch-2')
+      .get();
+    assert.equal(reservationSnap.exists, true);
+    const reservation = reservationSnap.data() || {};
+    assert.equal(reservation.totalRemaining, 0);
+    assert.equal((reservation.remaining || {}).sms, 0);
+
+    assert.equal(sendSmsCalls, 1);
+  });
+
+  it('skips send for existing history even when reservation is expired', async () => {
+    const now = new Date();
+    const monthId = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+
+    await firestore
+      .collection('tenantReminderReservations')
+      .doc(TEST_TENANT_ID)
+      .collection('months')
+      .doc(monthId)
+      .collection('batches')
+      .doc('batch-expired-skip')
+      .set(
+        {
+          tenantId: TEST_TENANT_ID,
+          month: monthId,
+          batchId: 'batch-expired-skip',
+          requested: { email: 0, sms: 1, whatsapp: 0, voice: 0 },
+          remaining: { email: 0, sms: 1, whatsapp: 0, voice: 0 },
+          totalRequested: 1,
+          totalRemaining: 1,
+          expiresAt: new Date(Date.now() - 60_000),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        { merge: false },
+      );
+
+    await firestore
+      .collection('reminderHistory')
+      .doc('hist-skip-expired-1')
+      .set({ tenantId: TEST_TENANT_ID, reminderType: 'sms', status: 'success', updatedAt: new Date() }, { merge: false });
+
+    const r = await fetch(base + '/reminders/batch/send', {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({
+        tenantId: TEST_TENANT_ID,
+        batchId: 'batch-expired-skip',
+        items: [
+          {
+            type: 'sms',
+            studentId: 's11',
+            to: '+15551238888',
+            message: 'Should not send (expired reservation + existing history)',
+            historyId: 'hist-skip-expired-1',
+          },
+        ],
+      }),
+    });
+
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.results.length, 1);
+    assert.equal(body.results[0].status, 'success');
+
+    const reservationSnap = await firestore
+      .collection('tenantReminderReservations')
+      .doc(TEST_TENANT_ID)
+      .collection('months')
+      .doc(monthId)
+      .collection('batches')
+      .doc('batch-expired-skip')
+      .get();
+    assert.equal(reservationSnap.exists, true);
+    const reservation = reservationSnap.data() || {};
+    assert.equal(reservation.totalRemaining, 0);
+    assert.equal((reservation.remaining || {}).sms, 0);
+
+    // No new SMS should be sent because history was already finalized.
     assert.equal(sendSmsCalls, 1);
   });
 });

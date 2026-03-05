@@ -163,13 +163,13 @@ class UsageAnalyticsService {
   async requestUsageRefresh(
     tenantId: string,
     options?: { month?: string | null }
-  ): Promise<{ requestId: string; month: string }> {
+  ): Promise<{ requestId: string; month: string; alreadyQueued?: boolean; status?: 'pending' | 'processing' }> {
     const normalizedTenantId = tenantId?.trim();
     if (!normalizedTenantId) {
       throw new Error('Tenant id is required to refresh usage.');
     }
     const month = options?.month?.trim();
-    return await this.post<{ requestId: string; month: string }>(
+    return await this.post<{ requestId: string; month: string; alreadyQueued?: boolean; status?: 'pending' | 'processing' }>(
       '/usage/refresh',
       {
         query: { tenantId: normalizedTenantId },

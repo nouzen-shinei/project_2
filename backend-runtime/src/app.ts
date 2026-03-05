@@ -1161,7 +1161,18 @@ async function reconcileTenantReminderUsageToBillableOnly(
     return;
   }
 
-  const usageRef = db.collection('tenantReminderUsage').doc(tenantId).collection('months').doc(monthId);
+  let usageRef: any = null;
+  try {
+    const tenantUsageCollection = (db as any)?.collection?.('tenantReminderUsage');
+    const tenantUsageDoc = tenantUsageCollection?.doc?.(tenantId);
+    const monthsCollection = tenantUsageDoc?.collection?.('months');
+    usageRef = monthsCollection?.doc?.(monthId) ?? null;
+    if (!usageRef || typeof usageRef.get !== 'function') {
+      return;
+    }
+  } catch {
+    return;
+  }
   const existingSnap = await usageRef.get();
   const existing = existingSnap.exists ? existingSnap.data() || {} : {};
   if ((existing as any).countingMode === 'billable_success_only_v2') {
@@ -1312,6 +1323,24 @@ async function assertTenantReminderQuotaAvailable(
 }
 
 type ReminderChannel = 'email' | 'sms' | 'whatsapp' | 'voice';
+interface ReminderQuotaStateSnapshot {
+  hasUsageDoc: boolean;
+  total: number;
+  email: number;
+  sms: number;
+  whatsapp: number;
+  voice: number;
+  inFlightTotal: number;
+  inFlightEmail: number;
+  inFlightSms: number;
+  inFlightWhatsapp: number;
+  inFlightVoice: number;
+  reservedTotal: number;
+  reservedEmail: number;
+  reservedSms: number;
+  reservedWhatsapp: number;
+  reservedVoice: number;
+}
 
 function normalizeReminderCount(value: unknown): number {
   const n = typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : 0;
@@ -1331,6 +1360,109 @@ function reminderReservationRef(
     .doc(monthId)
     .collection('batches')
     .doc(batchId);
+}
+async function loadTenantReminderQuotaState(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  monthId: string
+): Promise<ReminderQuotaStateSnapshot> {
+  const fallback: ReminderQuotaStateSnapshot = {
+    hasUsageDoc: false,
+    total: 0,
+    email: 0,
+    sms: 0,
+    whatsapp: 0,
+    voice: 0,
+    inFlightTotal: 0,
+    inFlightEmail: 0,
+    inFlightSms: 0,
+    inFlightWhatsapp: 0,
+    inFlightVoice: 0,
+    reservedTotal: 0,
+    reservedEmail: 0,
+    reservedSms: 0,
+    reservedWhatsapp: 0,
+    reservedVoice: 0,
+  };
+
+  let usageRef: any = null;
+  try {
+    const tenantUsageCollection = (db as any)?.collection?.('tenantReminderUsage');
+    const tenantUsageDoc = tenantUsageCollection?.doc?.(tenantId);
+    const monthsCollection = tenantUsageDoc?.collection?.('months');
+    usageRef = monthsCollection?.doc?.(monthId) ?? null;
+    if (!usageRef || typeof usageRef.get !== 'function') {
+      return fallback;
+    }
+  } catch {
+    return fallback;
+  }
+  let usageData: Record<string, any> = {};
+  let hasUsageDoc = false;
+  try {
+    const usageSnap = await usageRef.get();
+    hasUsageDoc = usageSnap.exists;
+    usageData = usageSnap.exists ? usageSnap.data() || {} : {};
+  } catch {
+    hasUsageDoc = false;
+    usageData = {};
+  }
+
+  const state: ReminderQuotaStateSnapshot = {
+    ...fallback,
+    hasUsageDoc,
+    total: safeNumber(usageData.total),
+    email: safeNumber(usageData.email),
+    sms: safeNumber(usageData.sms),
+    whatsapp: safeNumber(usageData.whatsapp),
+    voice: safeNumber(usageData.voice),
+    inFlightTotal: safeNumber(usageData.inFlightTotal),
+    inFlightEmail: safeNumber(usageData.inFlightEmail),
+    inFlightSms: safeNumber(usageData.inFlightSms),
+    inFlightWhatsapp: safeNumber(usageData.inFlightWhatsapp),
+    inFlightVoice: safeNumber(usageData.inFlightVoice),
+  };
+
+  try {
+    const batchesCollection = (db
+      .collection('tenantReminderReservations')
+      .doc(tenantId)
+      .collection('months')
+      .doc(monthId)
+      .collection('batches') as any);
+
+    if (!batchesCollection || typeof batchesCollection.where !== 'function') {
+      return state;
+    }
+
+    const nowTs = admin.firestore.Timestamp.now();
+    const activeQuery = batchesCollection.where('expiresAt', '>', nowTs);
+    if (!activeQuery || typeof activeQuery.get !== 'function') {
+      return state;
+    }
+
+    const activeReservations = await activeQuery.get();
+    activeReservations.forEach((doc: any) => {
+      const data = doc.data() || {};
+      const remaining = data.remaining && typeof data.remaining === 'object' ? data.remaining : {};
+
+      const email = safeNumber(remaining.email);
+      const sms = safeNumber(remaining.sms);
+      const whatsapp = safeNumber(remaining.whatsapp);
+      const voice = safeNumber(remaining.voice);
+      const totalRemaining = safeNumber(data.totalRemaining, email + sms + whatsapp + voice);
+
+      state.reservedEmail += email;
+      state.reservedSms += sms;
+      state.reservedWhatsapp += whatsapp;
+      state.reservedVoice += voice;
+      state.reservedTotal += totalRemaining;
+    });
+  } catch (error) {
+    console.warn('[usage] failed to load active reminder reservations', { tenantId, monthId, error });
+  }
+
+  return state;
 }
 
 async function reserveTenantReminderQuotaForBatch(
@@ -1577,6 +1709,42 @@ async function consumeTenantReminderReservationToken(
         base.createdAt = coerced || admin.firestore.FieldValue.serverTimestamp();
       }
       tx.set(historyRef, stripUndefinedDeep({ ...(historyPayload || {}), ...base }), { merge: true });
+    }
+
+    tx.set(
+      ref,
+      {
+        [`remaining.${channel}`]: admin.firestore.FieldValue.increment(-1),
+        totalRemaining: admin.firestore.FieldValue.increment(-1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+async function releaseTenantReminderReservationTokenIfAvailable(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  batchId: string,
+  channel: ReminderChannel,
+): Promise<void> {
+  const monthId = normalizeMonthId(null);
+  const ref = reminderReservationRef(db, tenantId, monthId, batchId);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return;
+    const data = snap.data() || {};
+    const remaining = (data as any).remaining || {};
+    const remainingByChannel =
+      typeof remaining[channel] === 'number' && Number.isFinite(remaining[channel]) ? Number(remaining[channel]) : 0;
+    const totalRemaining =
+      typeof (data as any).totalRemaining === 'number' && Number.isFinite((data as any).totalRemaining)
+        ? Number((data as any).totalRemaining)
+        : 0;
+
+    if (remainingByChannel <= 0 || totalRemaining <= 0) {
+      return;
     }
 
     tx.set(
@@ -2506,6 +2674,22 @@ interface UsageSummaryResponse {
     email: number;
     voice?: number;
     other?: number;
+    inFlight?: {
+      total: number;
+      whatsapp: number;
+      sms: number;
+      email: number;
+      voice: number;
+    };
+    reserved?: {
+      total: number;
+      whatsapp: number;
+      sms: number;
+      email: number;
+      voice: number;
+    };
+    effectiveUsed?: number;
+    effectiveRemaining?: number | null;
   };
   paymentsReceived?: {
     count: number;
@@ -9774,11 +9958,51 @@ export function createApp(options: CreateAppOptions = {}){
         : actorUid
           ? ({ userId: actorUid } as any)
           : undefined;
+      let quotaTokenConsumed = false;
+      let quotaFinalized = false;
+
+      const finalizeConsumedQuotaAsFailed = async (errorMessage: string) => {
+        if (!historyId || !quotaTokenConsumed || quotaFinalized) {
+          return;
+        }
+        try {
+          await upsertReminderHistoryWithDates(db, historyId, {
+            ...(historyWithActor || {}),
+            tenantId: normalizedTenantId,
+            reminderType: item.type,
+            status: 'failed',
+            metadata: { deliveryStatus: 'failed' },
+            errorMessage,
+          });
+        } catch (e) {
+          console.warn('[reminders_batch_send] reminderHistory failed during quota finalization fallback', e);
+        }
+
+        try {
+          await finalizeReminderQuotaFromHistory(db, {
+            historyId,
+            finalStatus: 'failed',
+            fallbackTenantId: normalizedTenantId,
+            fallbackChannel: item.type,
+            fallbackMonthId: monthId,
+          });
+          quotaFinalized = true;
+        } catch (e) {
+          console.warn('[reminders_batch_send] quota finalize fallback failed', e);
+        }
+      };
 
       try {
         if (historyId) {
           const existing = await db.collection('reminderHistory').doc(historyId).get();
           if (existing.exists) {
+            // This item already has history (idempotent retry path); release one reserved token
+            // if still present so active reservations don't stay inflated until expiry.
+            try {
+              await releaseTenantReminderReservationTokenIfAvailable(db, normalizedTenantId, batchId, item.type);
+            } catch (e) {
+              console.warn('[reminders_batch_send] reservation release failed for existing history', e);
+            }
             const st = deriveStatusFromHistory(existing.data() || {});
             results.push({ studentId, type: item.type, status: st });
             continue;
@@ -9790,6 +10014,7 @@ export function createApp(options: CreateAppOptions = {}){
             historyId: historyId || undefined,
             history: historyWithActor || undefined,
           });
+          quotaTokenConsumed = true;
 
           const sendResult = await sendSMSImpl({ to: item.to, message: item.message });
           if (historyId) {
@@ -9818,6 +10043,7 @@ export function createApp(options: CreateAppOptions = {}){
                 fallbackChannel: 'sms',
                 fallbackMonthId: monthId,
               });
+              quotaFinalized = true;
             } catch (e) {
               console.warn('[reminders_batch_send] sms quota finalize failed', e);
             }
@@ -9837,6 +10063,7 @@ export function createApp(options: CreateAppOptions = {}){
             historyId: historyId || undefined,
             history: historyWithActor || undefined,
           });
+          quotaTokenConsumed = true;
 
           const sendResult = await sendVoiceCallImpl({
             to: item.to,
@@ -9874,6 +10101,7 @@ export function createApp(options: CreateAppOptions = {}){
                 fallbackChannel: 'voice',
                 fallbackMonthId: monthId,
               });
+              quotaFinalized = true;
             } catch (e) {
               console.warn('[reminders_batch_send] voice quota finalize failed', e);
             }
@@ -9893,10 +10121,12 @@ export function createApp(options: CreateAppOptions = {}){
             historyId: historyId || undefined,
             history: historyWithActor || undefined,
           });
+          quotaTokenConsumed = true;
 
           let jobId = '';
           if (item.kind === 'fee') {
             if (!item.studentName || typeof item.amount !== 'number' || !item.dueDate) {
+              await finalizeConsumedQuotaAsFailed('missing_fields');
               results.push({ studentId, type: 'whatsapp', status: 'failed', message: 'missing_fields' });
               continue;
             }
@@ -9920,6 +10150,7 @@ export function createApp(options: CreateAppOptions = {}){
             } as any);
           } else {
             if (!item.message) {
+              await finalizeConsumedQuotaAsFailed('missing_fields');
               results.push({ studentId, type: 'whatsapp', status: 'failed', message: 'missing_fields' });
               continue;
             }
@@ -9998,6 +10229,7 @@ export function createApp(options: CreateAppOptions = {}){
             historyId: historyId || undefined,
             history: historyWithActor || undefined,
           });
+          quotaTokenConsumed = true;
 
           const payload = {
             ...item.email,
@@ -10052,6 +10284,7 @@ export function createApp(options: CreateAppOptions = {}){
                       fallbackChannel: 'email',
                       fallbackMonthId: monthId,
                     });
+                    quotaFinalized = true;
                   } catch (e) {
                     console.warn('[reminders_batch_send] email quota finalize failed', e);
                   }
@@ -10087,6 +10320,7 @@ export function createApp(options: CreateAppOptions = {}){
                     fallbackChannel: 'email',
                     fallbackMonthId: monthId,
                   });
+                  quotaFinalized = true;
                 } catch (e) {
                   console.warn('[reminders_batch_send] email quota finalize failed (non-2xx)', e);
                 }
@@ -10121,6 +10355,7 @@ export function createApp(options: CreateAppOptions = {}){
                   fallbackChannel: 'email',
                   fallbackMonthId: monthId,
                 });
+                quotaFinalized = true;
               } catch (e) {
                 console.warn('[reminders_batch_send] email quota finalize failed (send error)', e);
               }
@@ -10134,6 +10369,7 @@ export function createApp(options: CreateAppOptions = {}){
 
         results.push({ studentId, type: (item as any).type, status: 'failed', message: 'unsupported_type' });
       } catch (error) {
+        await finalizeConsumedQuotaAsFailed('send_failed');
         if (error instanceof TenantAccessError) {
           results.push({
             studentId,
@@ -10769,6 +11005,22 @@ export function createApp(options: CreateAppOptions = {}){
         email: safeNumber(remindersSource.email),
         voice: safeNumber(remindersSource.voice ?? remindersSource.voiceCall),
         other: safeNumber(remindersSource.other),
+        inFlight: {
+          total: 0,
+          whatsapp: 0,
+          sms: 0,
+          email: 0,
+          voice: 0,
+        },
+        reserved: {
+          total: 0,
+          whatsapp: 0,
+          sms: 0,
+          email: 0,
+          voice: 0,
+        },
+        effectiveUsed: 0,
+        effectiveRemaining: null as number | null,
       };
       reminders.total = safeNumber(
         remindersSource.total,
@@ -10788,10 +11040,53 @@ export function createApp(options: CreateAppOptions = {}){
 
       const studentsFallback = safeNumber(tenantSummary.membershipCounts?.total);
       const staffFallback = deriveStaffCount(tenantSummary);
+      const currentMonthId = formatMonthId(new Date());
+
+      if (monthId === currentMonthId) {
+        // Keep reminder usage in sync with live quota enforcement state.
+        try {
+          await reconcileTenantReminderUsageToBillableOnly(db, tenantAccess.tenantId, monthId);
+        } catch (error) {
+          console.warn('[usage_current] reminder reconcile skipped', error);
+        }
+
+        const liveReminderState = await loadTenantReminderQuotaState(db, tenantAccess.tenantId, monthId);
+        const shouldUseLiveReminderCounters =
+          liveReminderState.hasUsageDoc ||
+          safeNumber(liveReminderState.inFlightTotal) > 0 ||
+          safeNumber(liveReminderState.reservedTotal) > 0;
+
+        if (shouldUseLiveReminderCounters) {
+          reminders.total = safeNumber(liveReminderState.total);
+          reminders.email = safeNumber(liveReminderState.email);
+          reminders.sms = safeNumber(liveReminderState.sms);
+          reminders.whatsapp = safeNumber(liveReminderState.whatsapp);
+          reminders.voice = safeNumber(liveReminderState.voice);
+          reminders.other = Math.max(0, reminders.total - (reminders.email + reminders.sms + reminders.whatsapp + reminders.voice));
+        }
+
+        reminders.inFlight = {
+          total: safeNumber(liveReminderState.inFlightTotal),
+          email: safeNumber(liveReminderState.inFlightEmail),
+          sms: safeNumber(liveReminderState.inFlightSms),
+          whatsapp: safeNumber(liveReminderState.inFlightWhatsapp),
+          voice: safeNumber(liveReminderState.inFlightVoice),
+        };
+        reminders.reserved = {
+          total: safeNumber(liveReminderState.reservedTotal),
+          email: safeNumber(liveReminderState.reservedEmail),
+          sms: safeNumber(liveReminderState.reservedSms),
+          whatsapp: safeNumber(liveReminderState.reservedWhatsapp),
+          voice: safeNumber(liveReminderState.reservedVoice),
+        };
+      }
+
+      reminders.effectiveUsed = safeNumber(reminders.total) + safeNumber(reminders.inFlight.total) + safeNumber(reminders.reserved.total);
+      reminders.effectiveRemaining =
+        planLimits.reminders.total > 0 ? Math.max(0, planLimits.reminders.total - reminders.effectiveUsed) : null;
 
       // Seats are a "current state" metric; prefer a live count for the current month
       // so UI doesn't drift when rollups lag or fail.
-      const currentMonthId = formatMonthId(new Date());
       const shouldUseLiveStaffSeats = !monthParam || monthId === currentMonthId;
       const shouldUseLiveStudents = !monthParam || monthId === currentMonthId;
       const shouldUseLiveStorageBytes = !monthParam || monthId === currentMonthId;
@@ -11033,6 +11328,60 @@ export function createApp(options: CreateAppOptions = {}){
     try {
       const db = getFirestoreImpl();
       const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const refreshRequestsRef = db.collection('tenantUsageRefreshRequests');
+
+      const findExistingActiveRequest = async (
+        status: 'pending' | 'processing'
+      ): Promise<{ id: string; status: 'pending' | 'processing' } | null> => {
+        const coll: any = refreshRequestsRef as any;
+        if (!coll || typeof coll.where !== 'function') {
+          return null;
+        }
+        const query = coll
+          .where('tenantId', '==', tenantAccess.tenantId)
+          .where('month', '==', monthId)
+          .where('status', '==', status)
+          .limit(1);
+        if (!query || typeof query.get !== 'function') {
+          return null;
+        }
+        const snap = await query.get();
+        if (!snap || typeof snap.empty !== 'boolean' || snap.empty) {
+          return null;
+        }
+        const doc = Array.isArray((snap as any).docs) ? (snap as any).docs[0] : null;
+        if (!doc || typeof doc.id !== 'string' || !doc.id.trim()) {
+          return null;
+        }
+        return { id: doc.id, status };
+      };
+
+      try {
+        const existingPending = await findExistingActiveRequest('pending');
+        if (existingPending) {
+          return res.json({
+            ok: true,
+            requestId: existingPending.id,
+            month: monthId,
+            alreadyQueued: true,
+            status: existingPending.status,
+          });
+        }
+
+        const existingProcessing = await findExistingActiveRequest('processing');
+        if (existingProcessing) {
+          return res.json({
+            ok: true,
+            requestId: existingProcessing.id,
+            month: monthId,
+            alreadyQueued: true,
+            status: existingProcessing.status,
+          });
+        }
+      } catch (lookupError) {
+        console.warn('[usage_refresh_request] dedupe lookup failed, continuing with enqueue', lookupError);
+      }
+
       const requestRef = await db.collection('tenantUsageRefreshRequests').add({
         tenantId: tenantAccess.tenantId,
         month: monthId,

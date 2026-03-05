@@ -54,6 +54,22 @@ export interface UsageSummaryResponse {
     email: number;
     voice?: number;
     other?: number;
+    inFlight?: {
+      total: number;
+      whatsapp: number;
+      sms: number;
+      email: number;
+      voice: number;
+    };
+    reserved?: {
+      total: number;
+      whatsapp: number;
+      sms: number;
+      email: number;
+      voice: number;
+    };
+    effectiveUsed?: number;
+    effectiveRemaining?: number | null;
   };
   paymentsReceived?: {
     count: number;
