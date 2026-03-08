@@ -23,6 +23,7 @@ Isolated WhatsApp queue backend with optional BullMQ (Redis) for durable process
 - WHATSAPP_QUEUE_CONCURRENCY (default 4 mem / 8 bull)
 - WABA_PHONE_NUMBER_ID / WABA_TOKEN (set to actually send via Meta API; omit for dry-run)
 - WHATSAPP_QUEUE_NAME (BullMQ queue name; default wa-reminders)
+- WEB_PUSH_VAPID_PUBLIC_KEY / WEB_PUSH_VAPID_PRIVATE_KEY / WEB_PUSH_VAPID_SUBJECT (enable production Web Push delivery for browser devices)
  - ALERT_QUEUE_DEPTH (trigger wa_alert_queue_depth_exceeded)
  - ALERT_FAILURE_RATE (0-1 float triggers wa_alert_failure_rate_exceeded)
  - SHUTDOWN_TIMEOUT_MS (graceful shutdown max wait)
@@ -101,6 +102,11 @@ GET /notifications/daily-quotes/status
 POST /notifications/daily-quotes/trigger { timeOfDay?, targetEmails?, dryRun?, reason?, now? }
 POST /notifications/birthday/trigger { email?, emails?, deviceId?, deviceIds?, dryRun?, forceSend?, skipWhatsApp?, suppressStateUpdates?, reason?, now? }
 POST /notifications/birthday/test { email?, emails?, deviceId?, deviceIds? } (defaults: forceSend, skipWhatsApp, suppressStateUpdates)
+GET /notifications/web-push/config?tenantId=...
+POST /notifications/web-push/subscribe { tenantId, deviceId, subscription, notificationPermission?, userAgent? }
+POST /notifications/web-push/unsubscribe { tenantId, deviceId }
+POST /notifications/web-push/send { tenantId, deviceId, title, body, data?, tag?, requireInteraction?, clickUrl?, ttl?, urgency? }
+POST /notifications/web-push/test { tenantId, deviceId, title?, body?, type?, clickUrl?, requireInteraction? }
 
 ## Auth
 Issue a token then use Authorization: Bearer <token>.

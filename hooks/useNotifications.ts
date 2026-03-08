@@ -260,15 +260,6 @@ export const useNotifications = () => {
     }
   }, [user?.email]);
 
-  // Test notification function for debugging
-  const sendTestNotification = useCallback(async () => {
-    try {
-      await notificationService.sendTestNotification();
-    } catch (error) {
-      logger.error('Failed to send test notification:', error);
-    }
-  }, []);
-
   // Function to send payment notifications
   const sendFeePaymentReceived = useCallback(async (
     studentName: string, 
@@ -502,7 +493,6 @@ export const useNotifications = () => {
 
   return {
     sendTeamChatNotification,
-    sendTestNotification,
     sendFeePaymentReceived,
     sendNewStudentEnrolled,
     sendOverdueFeeTeacherAlert,

@@ -32,7 +32,7 @@ interface QuoteScheduleStatus {
   nextEveningTriggerAt: string | null;
   scheduledNotificationCount: number;
   details: QuoteScheduleDetail[];
-  deliveryMode: 'backend' | 'web' | 'local';
+  deliveryMode: 'backend';
   backendStatus?: DailyQuoteBackendStatus | null;
 }
 
@@ -121,7 +121,6 @@ export class QuotesService {
   private apiCallCooldown: number = 60000; // 1 minute cooldown between API calls
   private useApiQuotes: boolean = true;
   private schedulingPromise: Promise<void> | null = null;
-  private webNotificationTimeouts: Partial<Record<'morning' | 'evening', ReturnType<typeof setTimeout>>> = {};
 
   // Quote APIs configuration
   private quoteApis = [
@@ -520,197 +519,26 @@ export class QuotesService {
       return;
     }
 
-    if (Platform.OS !== 'web') {
+    try {
+      await this.cancelQuoteNotifications();
+    } catch (error) {
+      logger.warn('Failed to clear legacy quote notifications before backend scheduling:', error);
+    }
+
+    this.scheduledMorningNotificationId = null;
+    this.scheduledEveningNotificationId = null;
+    this.nextMorningTriggerAt = null;
+    this.nextEveningTriggerAt = null;
+
+    if (this.useApiQuotes) {
       try {
-        await this.cancelQuoteNotifications();
+        await this.prefetchQuotes(Platform.OS === 'web' ? 2 : 3);
       } catch (error) {
-        logger.warn('Failed to clear legacy quote notifications on mobile:', error);
+        logger.debug('Quote prefetch skipped during backend scheduling preparation:', error);
       }
-
-      this.scheduledMorningNotificationId = null;
-      this.scheduledEveningNotificationId = null;
-      this.nextMorningTriggerAt = null;
-      this.nextEveningTriggerAt = null;
-
-      if (this.useApiQuotes) {
-        try {
-          await this.prefetchQuotes(3);
-        } catch (error) {
-          logger.debug('Quote prefetch skipped on mobile backend scheduling:', error);
-        }
-      }
-
-      logger.debug('Daily quote notifications handled by backend runtime for mobile devices.');
-      return;
     }
 
-    if (this.schedulingPromise) {
-      await this.schedulingPromise;
-      return;
-    }
-
-    this.schedulingPromise = (async () => {
-      try {
-        // Cancel existing scheduled quote notifications
-        await this.cancelQuoteNotifications();
-
-        // Prefetch some quotes for better performance (fewer for web)
-        if (this.useApiQuotes) {
-          await this.prefetchQuotes(2);
-        }
-
-        // Schedule morning quote notification (8:00 AM)
-        await this.scheduleMorningQuote();
-
-        // Schedule evening quote notification (8:00 PM)
-        await this.scheduleEveningQuote();
-      } finally {
-        this.schedulingPromise = null;
-      }
-    })();
-
-    try {
-      await this.schedulingPromise;
-    } catch (error) {
-      logger.error('Failed to schedule quote notifications:', error);
-      throw error;
-    }
-  }
-
-  private calculateSecondsUntil(hour: number, minute: number): number {
-    const now = new Date();
-    const target = new Date(now);
-    target.setHours(hour, minute, 0, 0);
-
-    if (target <= now) {
-      target.setDate(target.getDate() + 1);
-    }
-
-    const secondsUntil = Math.ceil((target.getTime() - now.getTime()) / 1000);
-    return Math.max(secondsUntil, 60);
-  }
-
-  /**
-   * Schedule morning quote notification
-   */
-  private async scheduleMorningQuote(): Promise<void> {
-    try {
-      if (Platform.OS === 'web') {
-        // For web, we'll use a different approach since expo notifications don't work the same way
-        const webQuote = await this.getRandomQuote();
-        this.scheduleWebNotification(webQuote, 'morning');
-      } else {
-        this.scheduledMorningNotificationId = null;
-        this.nextMorningTriggerAt = null;
-      }
-    } catch (error) {
-      logger.error('Failed to schedule morning quote:', error);
-    }
-  }
-
-  /**
-   * Schedule evening quote notification
-   */
-  private async scheduleEveningQuote(): Promise<void> {
-    try {
-      if (Platform.OS === 'web') {
-        // For web, we'll use a different approach
-        const webQuote = await this.getRandomQuote();
-        this.scheduleWebNotification(webQuote, 'evening');
-      } else {
-        this.scheduledEveningNotificationId = null;
-        this.nextEveningTriggerAt = null;
-      }
-    } catch (error) {
-      logger.error('Failed to schedule evening quote:', error);
-    }
-  }
-
-  /**
-   * Schedule web notifications using setTimeout and browser notifications
-   */
-  private scheduleWebNotification(quote: Quote, timeOfDay: 'morning' | 'evening'): void {
-    if (typeof window === 'undefined') return;
-
-    const now = new Date();
-    const target = new Date();
-    
-    if (timeOfDay === 'morning') {
-      target.setHours(8, 0, 0, 0);
-    } else {
-      target.setHours(20, 0, 0, 0);
-    }
-
-    // If the target time has already passed today, schedule for tomorrow
-    if (target <= now) {
-      target.setDate(target.getDate() + 1);
-    }
-
-    const timeUntilNotification = target.getTime() - now.getTime();
-
-    if (this.webNotificationTimeouts[timeOfDay]) {
-      clearTimeout(this.webNotificationTimeouts[timeOfDay]!);
-    }
-
-    const timeoutId = setTimeout(async () => {
-      if (!this.isSchedulingEnabled) {
-        return;
-      }
-
-      const quoteForNotification = quote ?? await this.getRandomQuote();
-      this.sendWebQuoteNotification(quoteForNotification, timeOfDay);
-
-      if (!this.isSchedulingEnabled) {
-        return;
-      }
-
-      const nextQuote = await this.getRandomQuote();
-      this.scheduleWebNotification(nextQuote, timeOfDay);
-    }, timeUntilNotification);
-
-    this.webNotificationTimeouts[timeOfDay] = timeoutId;
-
-    if (timeOfDay === 'morning') {
-      this.nextMorningTriggerAt = new Date(Date.now() + timeUntilNotification);
-    } else {
-      this.nextEveningTriggerAt = new Date(Date.now() + timeUntilNotification);
-    }
-  }
-
-  /**
-   * Send web notification using browser notification API
-   */
-  private sendWebQuoteNotification(quote: Quote, timeOfDay: 'morning' | 'evening'): void {
-    if (typeof window === 'undefined' || !('Notification' in window)) return;
-
-    if (Notification.permission === 'granted') {
-      const notification = new Notification('Daily Quote', {
-        body: quote.author ? `"${quote.text}"\n- ${quote.author}` : quote.text,
-        icon: '/favicon.ico',
-        tag: `daily-quote-${timeOfDay}`,
-        badge: '/favicon.ico',
-        requireInteraction: false,
-        silent: false,
-      });
-
-      notification.onclick = () => {
-        window.focus();
-        notification.close();
-      };
-
-      // Auto-close after 10 seconds
-      setTimeout(() => {
-        notification.close();
-      }, 10000);
-    } else if (Notification.permission !== 'denied') {
-      Notification.requestPermission().then((permission) => {
-        if (permission === 'granted') {
-          setTimeout(() => {
-            this.sendWebQuoteNotification(quote, timeOfDay);
-          }, 100);
-        }
-      });
-    }
+    logger.debug('Daily quote notifications handled by backend runtime for all platforms.');
   }
 
   /**
@@ -739,13 +567,6 @@ export class QuotesService {
         for (const id of quoteNotificationIds) {
           await Notifications.cancelScheduledNotificationAsync(id);
         }
-      } else {
-        Object.values(this.webNotificationTimeouts).forEach(timeoutId => {
-          if (timeoutId) {
-            clearTimeout(timeoutId);
-          }
-        });
-        this.webNotificationTimeouts = {};
       }
 
       this.nextMorningTriggerAt = null;
@@ -756,31 +577,23 @@ export class QuotesService {
   }
 
   /**
-   * Send immediate quote notification (for testing)
+   * Trigger immediate backend quote delivery for the active tenant.
    */
   async sendImmediateQuote(category?: string): Promise<void> {
     try {
-      const quote = category ? await this.getRandomQuoteByCategory(category) : await this.getRandomQuote();
-      
-      const sourceEmoji = quote.source === 'local' ? '📚' : '🌐';
-      
-      if (Platform.OS === 'web') {
-        this.sendWebQuoteNotification(quote, 'morning');
-      } else {
-        const tenantId = await tenantService.getCachedSelectedTenant();
-        if (!tenantId) {
-          logger.warn('Cannot trigger backend daily quote without tenant context');
-          return;
-        }
-        const response = await dailyQuoteBackendClient.trigger({
-          tenantId,
-          timeOfDay: 'immediate',
-          reason: category ? `immediate:${category}` : 'immediate',
-        });
+      const tenantId = await tenantService.getCachedSelectedTenant();
+      if (!tenantId) {
+        logger.warn('Cannot trigger backend daily quote without tenant context');
+        return;
+      }
+      const response = await dailyQuoteBackendClient.trigger({
+        tenantId,
+        timeOfDay: 'immediate',
+        reason: category ? `immediate:${category}` : 'immediate',
+      });
 
-        if (!response.ok) {
-          logger.warn('Backend immediate quote trigger failed', response.error);
-        }
+      if (!response.ok) {
+        logger.warn('Backend immediate quote trigger failed', response.error);
       }
     } catch (error) {
       logger.error('Failed to send immediate quote:', error);
@@ -891,43 +704,26 @@ export class QuotesService {
       nextEveningTriggerAt: this.nextEveningTriggerAt ? this.nextEveningTriggerAt.toISOString() : null,
       scheduledNotificationCount: 0,
       details: [],
-      deliveryMode: Platform.OS === 'web' ? 'web' : 'backend',
+      deliveryMode: 'backend',
       backendStatus: undefined,
     };
 
-    if (Platform.OS !== 'web') {
-      try {
-        const backendStatus = await dailyQuoteBackendClient.getStatus();
-        status.backendStatus = backendStatus;
-        if (backendStatus?.lastRunStats) {
-          status.scheduledNotificationCount = backendStatus.lastRunStats.attemptedDeliveries ?? 0;
-          status.details = backendStatus.lastRunStats.recipientsSample.map(rec => ({
-            identifier: `${rec.userEmail}:${rec.deviceId}`,
-            timeOfDay: rec.timeOfDay,
-            hasTimer: true,
-          }));
-        }
-      } catch (error) {
-        logger.warn('Failed to fetch backend daily quote status:', error);
+    try {
+      const backendStatus = await dailyQuoteBackendClient.getStatus();
+      status.backendStatus = backendStatus;
+      if (backendStatus?.lastRunStats) {
+        status.scheduledNotificationCount = backendStatus.lastRunStats.attemptedDeliveries ?? 0;
+        status.details = backendStatus.lastRunStats.recipientsSample.map(rec => ({
+          identifier: `${rec.userEmail}:${rec.deviceId}`,
+          timeOfDay: rec.timeOfDay,
+          hasTimer: true,
+        }));
+        status.nextMorningTriggerAt = backendStatus.nextRunByTimeOfDay?.morning ?? status.nextMorningTriggerAt;
+        status.nextEveningTriggerAt = backendStatus.nextRunByTimeOfDay?.evening ?? status.nextEveningTriggerAt;
       }
-      return status;
+    } catch (error) {
+      logger.warn('Failed to fetch backend daily quote status:', error);
     }
-
-    const morningTimeout = this.webNotificationTimeouts.morning ?? null;
-    const eveningTimeout = this.webNotificationTimeouts.evening ?? null;
-    status.scheduledNotificationCount = [morningTimeout, eveningTimeout].filter(timeout => Boolean(timeout)).length;
-    status.details = [
-      {
-        identifier: null,
-        timeOfDay: 'morning',
-        hasTimer: Boolean(morningTimeout),
-      },
-      {
-        identifier: null,
-        timeOfDay: 'evening',
-        hasTimer: Boolean(eveningTimeout),
-      },
-    ];
 
     return status;
   }

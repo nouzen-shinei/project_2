@@ -69,7 +69,7 @@ import { getChatPaginationProfile } from '@/lib/chatPaginationConfig';
 import { clearDownloadState, setDownloadState } from '@/lib/downloadStateStore';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { tenantService } from '@/services/tenantService';
 import TenantRoleBadge from '@/components/TenantRoleBadge';
 import { normalizeSharedFileName } from '@/services/sharedFileService';
@@ -86,6 +86,7 @@ export default function Chat() {
   const sharedTopPadding = useSharedTopPadding();
   const isFocused = useIsFocused();
   const router = useRouter();
+  const searchParams = useLocalSearchParams<{ senderEmail?: string; chatId?: string; messageId?: string; senderName?: string }>();
   const { user, loading: authLoading } = useAuth();
   const { activeTenant, loading: tenantLoading } = useTenant();
   const tenantUnavailable = !tenantLoading && !activeTenant?.id;
@@ -2060,6 +2061,33 @@ export default function Chat() {
       notificationService.consumePendingChatNavigationTarget();
     }
   }, [isFocused, teamMembers, teamMembersWithChatInfo, effectiveUser?.email]);
+
+  useEffect(() => {
+    if (!isFocused) {
+      return;
+    }
+
+    const targetEmail = typeof searchParams.senderEmail === 'string'
+      ? searchParams.senderEmail.trim().toLowerCase()
+      : '';
+
+    if (!targetEmail) {
+      return;
+    }
+
+    const normalize = (value?: string | null) =>
+      typeof value === 'string' ? value.trim().toLowerCase() : undefined;
+
+    const match = teamMembers.find(member => normalize(member.email) === targetEmail)
+      || teamMembersWithChatInfo.find((member: any) => normalize(member.email) === targetEmail);
+
+    if (!match) {
+      return;
+    }
+
+    setSelectedTeamMember(match as TeamMember);
+    router.replace('/(tabs)/chat');
+  }, [isFocused, router, searchParams.senderEmail, teamMembers, teamMembersWithChatInfo]);
 
   // Wrapper for notifications to keep previous calls working
   const sendMessageNotification = useCallback(

@@ -24,6 +24,7 @@ export interface DailyQuoteJobStats {
     duplicateToken: number;
     outsideWindow: number;
     deletedDevice: number;
+    offlineDevice: number;
   };
   timeOfDayBreakdown: Record<'morning' | 'evening' | 'immediate', { attempted: number; sent: number }>;
   quote: {

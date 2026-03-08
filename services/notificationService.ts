@@ -58,6 +58,7 @@ export interface IDeviceTrackingService {
     noticeNotificationsEnabled?: boolean;
     teamNotificationsEnabled?: boolean;
   }): Promise<void>;
+  syncCurrentWebPushSubscription?(context?: string): Promise<void>;
   updateCurrentDeviceChatState(update: {
     partnerEmail?: string | null;
     partnerId?: string | null;
@@ -75,6 +76,8 @@ type PendingChatNavigationTarget = {
   messageId?: string;
   timestamp?: string | number | Date;
 };
+
+const PENDING_CHAT_STORAGE_KEY = 'tm.pendingChatNavigation';
 
 let __deviceTrackingService: (DeviceTrackingServiceType & IDeviceTrackingService) | null = null;
 function getDeviceTrackingService(): DeviceTrackingServiceType & IDeviceTrackingService {
@@ -785,8 +788,23 @@ class NotificationService {
       });
       
       if (Platform.OS === 'web') {
-        // Use browser notification for web
-        this.sendWebNotification(notification.title, notification.body);
+        const notificationId = typeof notification.data?.notificationId === 'string'
+          ? notification.data.notificationId.trim()
+          : '';
+
+        if (notificationId && this.wasNotificationSent(notificationId)) {
+          logger.debug('Skipping duplicate web notification', {
+            notificationId,
+            type: notification.data?.type,
+          });
+          return;
+        }
+
+        this.sendWebNotification(notification);
+
+        if (notificationId) {
+          this.markNotificationSent(notificationId);
+        }
       } else {
         // Determine appropriate channel for Android
         const channelId =
@@ -817,58 +835,6 @@ class NotificationService {
       }
     } catch (error) {
       logger.error('Error sending local notification:', error);
-    }
-  }
-
-  /**
-   * Test notification function for debugging
-   */
-  async sendTestNotification(): Promise<void> {
-    if (Platform.OS === 'web') {
-      if (typeof window === 'undefined' || !('Notification' in window)) {
-        logger.error('Web notifications are not supported in this browser');
-        return;
-      }
-      
-      if (Notification.permission === 'denied') {
-        logger.error('Notifications are blocked. Please enable them in browser settings.');
-        return;
-      }
-      
-      if (Notification.permission === 'default') {
-        const permission = await Notification.requestPermission();
-        if (permission !== 'granted') {
-          logger.error('Notification permission was denied');
-          return;
-        }
-      }
-      
-      try {
-        const testNotification = new Notification('🔔 Test Notification', {
-          body: 'This is a test notification to verify the system is working! 🎉',
-          icon: '/favicon.ico',
-          tag: 'test-notification',
-          requireInteraction: true,
-        });
-        
-        testNotification.onclick = () => {
-          window.focus();
-          testNotification.close();
-        };
-        
-        setTimeout(() => testNotification.close(), 8000);
-        
-      } catch (error) {
-        logger.error('Error creating test notification:', error);
-      }
-      
-    } else {
-      // Mobile notification test
-      await this.sendLocalNotification({
-        title: 'Test Notification',
-        body: 'This is a test notification to verify the system is working.',
-        data: { type: 'test' }
-      });
     }
   }
 
@@ -2429,25 +2395,60 @@ class NotificationService {
 
   private handleViewMessage(notification: Notifications.Notification): void {
     const data = notification.request.content.data || {};
-    const type = data?.type;
 
     logger.info('View message action triggered:', data);
+    this.handleNotificationNavigation(data);
+  }
+
+  private handleNotificationNavigation(rawData: Record<string, any> | undefined): void {
+    const data = this.normalizeNotificationPayload(rawData);
+    const type = data?.type;
 
     if (type === 'chat_message' || type === 'team_chat_message') {
       this.handleChatNotificationTap(data);
       return;
     }
 
-    const deepLink = typeof data?.deepLink === 'string' ? data.deepLink : undefined;
-    if (deepLink) {
-      try {
-        router.navigate(deepLink as any);
-      } catch (error) {
-        logger.warn('Failed to navigate via notification deep link:', {
-          deepLink,
-          error,
-        });
+    this.navigateToNotificationRoute('/(tabs)');
+  }
+
+  private normalizeNotificationPayload(rawData: Record<string, any> | undefined): Record<string, any> {
+    const data = rawData && typeof rawData === 'object' ? { ...rawData } : {};
+    if (!data.type && typeof rawData?.type === 'string') {
+      data.type = rawData.type;
+    }
+    return data;
+  }
+
+  private resolveNotificationDeepLink(data: Record<string, any> | undefined): string | undefined {
+    if (!data || typeof data !== 'object') {
+      return undefined;
+    }
+
+    if (data.type === 'chat_message' || data.type === 'team_chat_message') {
+      return undefined;
+    }
+
+    return '/(tabs)';
+  }
+
+  private navigateToNotificationRoute(route: string, retryCount = 0): void {
+    try {
+      router.navigate(route as any);
+    } catch (error) {
+      logger.warn('Notification route navigation failed', {
+        route,
+        retryCount,
+        error,
+      });
+
+      if (retryCount >= 5) {
+        return;
       }
+
+      setTimeout(() => {
+        this.navigateToNotificationRoute(route, retryCount + 1);
+      }, Math.min(250 * (retryCount + 1), 1500));
     }
   }
 
@@ -2524,16 +2525,51 @@ class NotificationService {
       timestamp,
     };
 
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      try {
+        window.sessionStorage.setItem(PENDING_CHAT_STORAGE_KEY, JSON.stringify(this.pendingChatNavigation));
+      } catch {
+      }
+    }
+
     this.scheduleChatNavigationAttempt();
   }
 
   getPendingChatNavigationTarget(): PendingChatNavigationTarget | null {
-    return this.pendingChatNavigation;
+    if (this.pendingChatNavigation) {
+      return this.pendingChatNavigation;
+    }
+
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      try {
+        const raw = window.sessionStorage.getItem(PENDING_CHAT_STORAGE_KEY);
+        if (!raw) {
+          return null;
+        }
+
+        const parsed = JSON.parse(raw) as PendingChatNavigationTarget;
+        if (parsed && typeof parsed === 'object') {
+          this.pendingChatNavigation = parsed;
+          return parsed;
+        }
+      } catch {
+      }
+    }
+
+    return null;
   }
 
   consumePendingChatNavigationTarget(): PendingChatNavigationTarget | null {
     const target = this.pendingChatNavigation;
     this.pendingChatNavigation = null;
+
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      try {
+        window.sessionStorage.removeItem(PENDING_CHAT_STORAGE_KEY);
+      } catch {
+      }
+    }
+
     return target;
   }
   private buildTeamChatNotificationContent(message: ChatMessage, senderName?: string): {
@@ -2613,31 +2649,59 @@ class NotificationService {
   /**
    * Send web notification using browser notification API
    */
-  private sendWebNotification(title: string, body: string): void {
+  private sendWebNotification(notification: NotificationData): void {
     try {
       if (typeof window !== 'undefined' && 'Notification' in window) {
+        const data = this.normalizeNotificationPayload(notification.data);
+        const notificationId = typeof data.notificationId === 'string' && data.notificationId.trim()
+          ? data.notificationId.trim()
+          : `web:${data.type || 'general'}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+        data.notificationId = notificationId;
+
+        const deepLink = this.resolveNotificationDeepLink(data);
+        if (deepLink && typeof data.deepLink !== 'string') {
+          data.deepLink = deepLink;
+        }
+
+        const tag = typeof data.noticeId === 'string' && data.noticeId.trim()
+          ? `notice:${data.noticeId.trim()}`
+          : typeof data.messageId === 'string' && data.messageId.trim()
+            ? `message:${data.messageId.trim()}`
+            : notificationId;
+        const keepVisible = data.type === 'daily_quote';
+        const requireInteraction =
+          keepVisible ||
+          data.type === 'chat_message' ||
+          data.type === 'team_chat_message' ||
+          data.type === 'notice_created' ||
+          data.priority === 'high';
+        const autoCloseMs = keepVisible ? null : requireInteraction ? 12_000 : 8_000;
         
         if (Notification.permission === 'granted') {
           logger.debug('✅ Permission granted, creating notification');
-          const notification = new Notification(title, {
-            body,
+          const browserNotification = new Notification(notification.title, {
+            body: notification.body,
             icon: '/favicon.ico',
-            tag: 'team-chat',
+            tag,
             badge: '/favicon.ico',
-            requireInteraction: true,
+            requireInteraction,
             silent: false,
+            data,
           });
           
-          notification.onclick = () => {
+          browserNotification.onclick = () => {
             window.focus();
-            notification.close();
+            this.handleNotificationNavigation(data);
+            browserNotification.close();
           };
-          
-          setTimeout(() => {
-            if (notification) {
-              notification.close();
-            }
-          }, 8000);
+
+          if (typeof autoCloseMs === 'number') {
+            setTimeout(() => {
+              if (browserNotification) {
+                browserNotification.close();
+              }
+            }, autoCloseMs);
+          }
           
         } else if (Notification.permission !== 'denied') {
           logger.debug('🤔 Permission not granted, requesting permission');
@@ -2645,7 +2709,7 @@ class NotificationService {
             logger.debug('📋 Permission request result:', permission);
             if (permission === 'granted') {
               setTimeout(() => {
-                this.sendWebNotification(title, body);
+                this.sendWebNotification(notification);
               }, 100);
             }
           }).catch((error) => {

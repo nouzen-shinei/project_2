@@ -60,7 +60,13 @@ export function registerServiceWorker() {
     // Fallback for environments without __DEV__.
     (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production');
 
-  if (isDev) {
+  const allowServiceWorkerInDev =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1' ||
+      (typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_ENABLE_DEV_SERVICE_WORKER === 'true'));
+
+  if (isDev && !allowServiceWorkerInDev) {
     try {
       void navigator.serviceWorker.getRegistrations().then((registrations) => {
         for (const registration of registrations) {

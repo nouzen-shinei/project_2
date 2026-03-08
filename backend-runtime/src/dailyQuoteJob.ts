@@ -4,6 +4,7 @@ import { ensureFirebase, getFirestore } from './firebaseAdmin';
 import { DAILY_QUOTES_LIBRARY } from './dailyQuotesLibrary';
 import { sendExpoMessages, markPushTokensInvalid, ExpoPushMessage, PushTokenRecord } from './pushUtils';
 import { matchesTenantDevice } from './tenantDeviceFilter';
+import { isWebPushConfigured, sanitizeWebPushSubscription, sendWebPushNotification } from './webPush';
 
 export type DailyQuoteTimeOfDay = 'morning' | 'evening' | 'immediate';
 export interface Quote {
@@ -115,6 +116,30 @@ interface PendingDelivery {
   devicePath: string;
   timeOfDay: DailyQuoteTimeOfDay;
   dateKey: string;
+}
+
+interface WebQueuedNotificationPlan {
+  deviceId: string;
+  userEmail: string;
+  notificationData: Record<string, unknown>;
+  delivery: PendingDelivery;
+  meta: { timeOfDay: DailyQuoteTimeOfDay; userEmail: string; deviceId: string; timezone: string };
+}
+
+interface WebPushNotificationPlan {
+  deviceId: string;
+  userEmail: string;
+  subscription: NonNullable<ReturnType<typeof sanitizeWebPushSubscription>>;
+  payload: {
+    title: string;
+    body: string;
+    tag?: string;
+    requireInteraction?: boolean;
+    clickUrl?: string;
+    data?: Record<string, unknown>;
+  };
+  delivery: PendingDelivery;
+  meta: { timeOfDay: DailyQuoteTimeOfDay; userEmail: string; deviceId: string; timezone: string };
 }
 
 export function startDailyQuoteScheduler(): void {
@@ -426,7 +451,9 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
   };
 
   let messages: ExpoPushMessage[] = [];
-  let pendingDeliveries: PendingDelivery[] = [];
+  let expoPendingDeliveries: PendingDelivery[] = [];
+  const webQueuedNotifications: WebQueuedNotificationPlan[] = [];
+  const webPushNotifications: WebPushNotificationPlan[] = [];
   let tokenRecords: PushTokenRecord[] = [];
   const tokenRecordByToken = new Map<string, PushTokenRecord>();
   const tokensSeen = new Set<string>();
@@ -530,14 +557,6 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
             deviceId,
             token: expoPushTokenRaw,
           });
-        }
-        continue;
-      }
-
-      if ((deviceData.deviceType || '').toLowerCase() === 'web') {
-        stats.skipped.webDevice += 1;
-        if (debugMatch) {
-          console.log('[daily_quote_job] debug skipped webDevice', { userEmail, deviceId, token: expoPushTokenRaw });
         }
         continue;
       }
@@ -689,7 +708,92 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
         author: quote.author,
         source: quote.source ?? 'local',
         quote: quote.text,
+        deepLink: '/(tabs)',
       };
+
+      const devicePath = `user_devices/${userEmail}/devices/${deviceId}`;
+
+      if ((deviceData.deviceType || '').toLowerCase() === 'web') {
+        const notificationId = createDailyQuoteNotificationId(userEmail, deviceId, due.timeOfDay, due.dateKey);
+        const payloadData = {
+          ...dataPayload,
+          notificationId,
+          deviceId,
+          userEmail,
+        };
+        const webPushSubscription = sanitizeWebPushSubscription(deviceData.webPushSubscription);
+
+        if (webPushSubscription && isWebPushConfigured()) {
+          webPushNotifications.push({
+            deviceId,
+            userEmail,
+            subscription: webPushSubscription,
+            payload: {
+              title: 'Daily Quote',
+              body,
+              tag: `daily-quote:${deviceId}:${due.timeOfDay}`,
+              requireInteraction: true,
+              clickUrl: '/(tabs)',
+              data: payloadData,
+            },
+            delivery: {
+              ref: deviceDoc.ref,
+              devicePath,
+              timeOfDay: due.timeOfDay,
+              dateKey: due.dateKey,
+            },
+            meta: { timeOfDay: due.timeOfDay, userEmail, deviceId, timezone },
+          });
+
+          if (debugMatch) {
+            console.log('[daily_quote_job] queued web push daily quote', {
+              userEmail,
+              deviceId,
+              notificationId,
+              timeOfDay: due.timeOfDay,
+              timezone,
+            });
+          }
+
+          continue;
+        }
+
+        webQueuedNotifications.push({
+          deviceId,
+          userEmail,
+          notificationData: {
+            title: 'Daily Quote',
+            body,
+            data: {
+              ...payloadData,
+            },
+            deviceId,
+            userEmail,
+            timestamp: startedAt.toISOString(),
+            id: notificationId,
+            type: 'daily_quote',
+          },
+          delivery: {
+            ref: deviceDoc.ref,
+            devicePath,
+            timeOfDay: due.timeOfDay,
+            dateKey: due.dateKey,
+          },
+          meta: { timeOfDay: due.timeOfDay, userEmail, deviceId, timezone },
+        });
+
+        if (debugMatch) {
+          console.log('[daily_quote_job] queued web daily quote', {
+            userEmail,
+            deviceId,
+            notificationId,
+            timeOfDay: due.timeOfDay,
+            timezone,
+          });
+        }
+
+        continue;
+      }
 
       const message: ExpoPushMessage = {
         to: expoPushTokenRaw,
@@ -706,7 +810,6 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
       messageIndexByToken.set(expoPushTokenRaw, messageIndex);
       messageMeta.push({ timeOfDay: due.timeOfDay, userEmail, deviceId, timezone });
 
-      const devicePath = `user_devices/${userEmail}/devices/${deviceId}`;
       const record: PushTokenRecord = { token: expoPushTokenRaw, deviceDocPath: devicePath };
       tokenRecords.push(record);
       tokenRecordByToken.set(expoPushTokenRaw, record);
@@ -721,7 +824,7 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
         messageIndex,
       });
 
-      pendingDeliveries.push({
+      expoPendingDeliveries.push({
         ref: deviceDoc.ref,
         devicePath,
         timeOfDay: due.timeOfDay,
@@ -760,21 +863,27 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
         return;
       }
       filteredMessages.push(msg);
-      filteredDeliveries.push(pendingDeliveries[idx]);
+      filteredDeliveries.push(expoPendingDeliveries[idx]);
       filteredTokenRecords.push(tokenRecords[idx]);
       filteredMeta.push(messageMeta[idx]);
     });
 
     messages = filteredMessages;
-    pendingDeliveries = filteredDeliveries;
+    expoPendingDeliveries = filteredDeliveries;
     tokenRecords = filteredTokenRecords;
     messageMeta = filteredMeta;
     tokenRecordByToken.clear();
     tokenRecords.forEach(record => tokenRecordByToken.set(record.token, record));
   }
 
-  stats.attemptedDeliveries = messages.length;
-  stats.eligibleDevices = messages.length;
+  const combinedMeta = [
+    ...messageMeta,
+    ...webQueuedNotifications.map(item => item.meta),
+    ...webPushNotifications.map(item => item.meta),
+  ];
+
+  stats.attemptedDeliveries = messages.length + webQueuedNotifications.length + webPushNotifications.length;
+  stats.eligibleDevices = messages.length + webQueuedNotifications.length + webPushNotifications.length;
   stats.timeOfDayBreakdown = {
     morning: { attempted: 0, sent: 0 },
     evening: { attempted: 0, sent: 0 },
@@ -782,7 +891,7 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
   };
 
   const activeDeviceKeys = new Set<string>();
-  messageMeta.forEach(meta => {
+  combinedMeta.forEach(meta => {
     if (!meta) return;
     stats.timeOfDayBreakdown[meta.timeOfDay].attempted += 1;
     activeDeviceKeys.add(`${meta.userEmail}::${meta.deviceId}`);
@@ -794,9 +903,12 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
     );
   }
 
+  const successfulPendingDeliveries: PendingDelivery[] = [];
+
   if (messages.length > 0) {
     if (dryRun) {
       stats.sent = messages.length;
+      successfulPendingDeliveries.push(...expoPendingDeliveries);
       stats.timeOfDayBreakdown.morning.sent += stats.timeOfDayBreakdown.morning.attempted;
       stats.timeOfDayBreakdown.evening.sent += stats.timeOfDayBreakdown.evening.attempted;
       stats.timeOfDayBreakdown.immediate.sent += stats.timeOfDayBreakdown.immediate.attempted;
@@ -804,6 +916,7 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
       const result = await sendExpoMessages(messages, { context: 'daily_quote_job' });
       stats.sent = result.sent;
       stats.failed = result.failed;
+      successfulPendingDeliveries.push(...expoPendingDeliveries);
       if (result.invalidTokens.length > 0) {
         const invalidRecords = result.invalidTokens
           .map(token => tokenRecordByToken.get(token))
@@ -818,8 +931,44 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
     }
   }
 
-  if (!dryRun && pendingDeliveries.length > 0) {
-    await commitPendingUpdates(db, pendingDeliveries, quote);
+  if (webQueuedNotifications.length > 0) {
+    if (dryRun) {
+      stats.sent += webQueuedNotifications.length;
+      successfulPendingDeliveries.push(...webQueuedNotifications.map(item => item.delivery));
+      webQueuedNotifications.forEach(({ meta }) => {
+        stats.timeOfDayBreakdown[meta.timeOfDay].sent += 1;
+      });
+    } else {
+      const webQueueResult = await queueWebDailyQuoteNotifications(webQueuedNotifications);
+      stats.sent += webQueueResult.sent;
+      stats.failed += webQueueResult.failed;
+      successfulPendingDeliveries.push(...webQueueResult.successfulDeliveries);
+      webQueueResult.sentMeta.forEach((meta) => {
+        stats.timeOfDayBreakdown[meta.timeOfDay].sent += 1;
+      });
+    }
+  }
+
+  if (webPushNotifications.length > 0) {
+    if (dryRun) {
+      stats.sent += webPushNotifications.length;
+      successfulPendingDeliveries.push(...webPushNotifications.map(item => item.delivery));
+      webPushNotifications.forEach(({ meta }) => {
+        stats.timeOfDayBreakdown[meta.timeOfDay].sent += 1;
+      });
+    } else {
+      const webPushResult = await sendWebPushDailyQuoteNotifications(webPushNotifications);
+      stats.sent += webPushResult.sent;
+      stats.failed += webPushResult.failed;
+      successfulPendingDeliveries.push(...webPushResult.successfulDeliveries);
+      webPushResult.sentMeta.forEach((meta) => {
+        stats.timeOfDayBreakdown[meta.timeOfDay].sent += 1;
+      });
+    }
+  }
+
+  if (!dryRun && successfulPendingDeliveries.length > 0) {
+    await commitPendingUpdates(db, successfulPendingDeliveries, quote);
   }
 
   stats.runCompletedAt = new Date().toISOString();
@@ -879,6 +1028,130 @@ async function commitPendingUpdates(
   }
 
   await flush();
+}
+
+async function queueWebDailyQuoteNotifications(
+  plans: WebQueuedNotificationPlan[]
+): Promise<{
+  sent: number;
+  failed: number;
+  successfulDeliveries: PendingDelivery[];
+  sentMeta: WebQueuedNotificationPlan['meta'][];
+}> {
+  if (plans.length === 0) {
+    return { sent: 0, failed: 0, successfulDeliveries: [], sentMeta: [] };
+  }
+
+  ensureFirebase();
+
+  let realtimeDb: admin.database.Database;
+  try {
+    realtimeDb = admin.database();
+  } catch (error) {
+    console.warn('[daily_quote_job] realtime database unavailable for web quote delivery', error);
+    return {
+      sent: 0,
+      failed: plans.length,
+      successfulDeliveries: [],
+      sentMeta: [],
+    };
+  }
+
+  let sent = 0;
+  let failed = 0;
+  const successfulDeliveries: PendingDelivery[] = [];
+  const sentMeta: WebQueuedNotificationPlan['meta'][] = [];
+
+  for (const batch of chunkPlans(plans, 25)) {
+    await Promise.all(
+      batch.map(async (plan) => {
+        try {
+          await realtimeDb.ref(`device_notifications/${plan.deviceId}`).push(plan.notificationData);
+          sent += 1;
+          successfulDeliveries.push(plan.delivery);
+          sentMeta.push(plan.meta);
+        } catch (error) {
+          failed += 1;
+          console.warn('[daily_quote_job] failed to queue web daily quote', {
+            userEmail: plan.userEmail,
+            deviceId: plan.deviceId,
+            error: error instanceof Error ? error.message : error,
+          });
+        }
+      })
+    );
+  }
+
+  return { sent, failed, successfulDeliveries, sentMeta };
+}
+
+async function sendWebPushDailyQuoteNotifications(
+  plans: WebPushNotificationPlan[]
+): Promise<{
+  sent: number;
+  failed: number;
+  successfulDeliveries: PendingDelivery[];
+  sentMeta: WebPushNotificationPlan['meta'][];
+}> {
+  let sent = 0;
+  let failed = 0;
+  const successfulDeliveries: PendingDelivery[] = [];
+  const sentMeta: WebPushNotificationPlan['meta'][] = [];
+
+  for (const plan of plans) {
+    const result = await sendWebPushNotification({
+      subscription: plan.subscription,
+      payload: plan.payload,
+      ttl: 60,
+      urgency: 'high',
+    });
+
+    if (result.ok) {
+      sent += 1;
+      successfulDeliveries.push(plan.delivery);
+      sentMeta.push(plan.meta);
+      continue;
+    }
+
+    failed += 1;
+
+    if (result.shouldDeleteSubscription) {
+      await plan.delivery.ref.set({
+        webPushSubscription: admin.firestore.FieldValue.delete(),
+        webPushStatus: 'unsubscribed',
+        webPushLastErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+        webPushLastErrorCode: result.errorCode || 'subscription_gone',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } else {
+      await plan.delivery.ref.set({
+        webPushStatus: 'error',
+        webPushLastErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+        webPushLastErrorCode: result.errorCode || 'web_push_failed',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
+  }
+
+  return { sent, failed, successfulDeliveries, sentMeta };
+}
+
+function chunkPlans<T>(plans: T[], size: number): T[][] {
+  if (size <= 0) return [plans];
+  const chunks: T[][] = [];
+  for (let index = 0; index < plans.length; index += size) {
+    chunks.push(plans.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function createDailyQuoteNotificationId(
+  userEmail: string,
+  deviceId: string,
+  timeOfDay: DailyQuoteTimeOfDay,
+  dateKey: string
+): string {
+  return ['daily_quote', normalizeEmail(userEmail), deviceId, timeOfDay, dateKey].join(':');
 }
 
 function toMillis(input: any): number | null {

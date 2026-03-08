@@ -69,6 +69,12 @@ import {
   resolvePlanLimitsFromCatalog,
   toTenantBillingLimitsSnapshot,
 } from './lib/effectivePlanLimits';
+import {
+  getWebPushPublicKey,
+  isWebPushConfigured,
+  sanitizeWebPushSubscription,
+  sendWebPushNotification,
+} from './webPush';
 
 type TenantMembershipRole = 'owner' | 'admin' | 'staff' | 'member';
 
@@ -384,6 +390,51 @@ const birthdayTriggerSchema = z.object({
 const tenantScopedBirthdayTriggerSchema = birthdayTriggerSchema.and(
   z.object({ tenantId: z.string().min(1) })
 );
+
+const webPushSubscriptionSchema = z.object({
+  endpoint: z.string().url(),
+  expirationTime: z.number().nullable().optional(),
+  keys: z.object({
+    p256dh: z.string().min(1),
+    auth: z.string().min(1),
+  }),
+}).passthrough();
+
+const tenantScopedWebPushSubscribeSchema = z.object({
+  tenantId: z.string().min(1),
+  deviceId: z.string().trim().min(4).max(200),
+  subscription: webPushSubscriptionSchema,
+  notificationPermission: z.enum(['default', 'granted', 'denied']).optional(),
+  userAgent: z.string().max(4000).optional(),
+});
+
+const tenantScopedWebPushUnsubscribeSchema = z.object({
+  tenantId: z.string().min(1),
+  deviceId: z.string().trim().min(4).max(200),
+});
+
+const tenantScopedWebPushSendSchema = z.object({
+  tenantId: z.string().min(1),
+  deviceId: z.string().trim().min(4).max(200),
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(4000),
+  data: z.record(z.any()).optional(),
+  tag: z.string().max(200).optional(),
+  requireInteraction: z.boolean().optional(),
+  clickUrl: z.string().max(1000).optional(),
+  ttl: z.number().int().min(0).max(2419200).optional(),
+  urgency: z.enum(['very-low', 'low', 'normal', 'high']).optional(),
+});
+
+const tenantScopedWebPushTestSchema = z.object({
+  tenantId: z.string().min(1),
+  deviceId: z.string().trim().min(4).max(200),
+  title: z.string().min(1).max(200).optional(),
+  body: z.string().min(1).max(4000).optional(),
+  type: z.string().min(1).max(120).optional(),
+  clickUrl: z.string().max(1000).optional(),
+  requireInteraction: z.boolean().optional(),
+});
 
 const devicePingSchema = z.object({
   tenantId: z.string().trim().min(1),
@@ -15082,6 +15133,311 @@ export function createApp(options: CreateAppOptions = {}){
       const message = e?.name === 'AbortError' ? 'expo_push_timeout' : e?.message || String(e);
       console.warn('[push_proxy] error', message);
       return res.status(502).json({ error: 'expo_push_failed', message });
+    }
+  });
+
+  app.get('/notifications/web-push/config', requireMemberTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess?.tenantId) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    if (!isWebPushConfigured()) {
+      return res.json({ enabled: false });
+    }
+
+    return res.json({
+      enabled: true,
+      publicKey: getWebPushPublicKey(),
+    });
+  });
+
+  app.post('/notifications/web-push/subscribe', requireMemberTenantAccess, async (req, res) => {
+    const parsed = tenantScopedWebPushSubscribeSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const actorEmail = normalizeEmail((await resolveAuthenticatedEmail(req.authContext)) || req.authContext?.email || '');
+    if (!actorEmail) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const sanitized = sanitizeWebPushSubscription(parsed.data.subscription);
+    if (!sanitized) {
+      return res.status(400).json({ error: 'invalid_subscription' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const deviceRef = db.collection('user_devices').doc(actorEmail).collection('devices').doc(parsed.data.deviceId);
+      const userRef = db.collection('user_devices').doc(actorEmail);
+
+      await deviceRef.set({
+        deviceId: parsed.data.deviceId,
+        ownerEmail: actorEmail,
+        tenantIds: admin.firestore.FieldValue.arrayUnion(tenantAccess.tenantId),
+        activeTenantId: tenantAccess.tenantId,
+        webPushSubscription: sanitized,
+        webPushStatus: 'subscribed',
+        webPushVapidPublicKey: getWebPushPublicKey(),
+        webPushSubscribedAt: admin.firestore.FieldValue.serverTimestamp(),
+        webPushLastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+        webPushLastErrorAt: admin.firestore.FieldValue.delete(),
+        webPushLastErrorCode: admin.firestore.FieldValue.delete(),
+        notificationPermission: parsed.data.notificationPermission,
+        userAgent: parsed.data.userAgent,
+        serviceWorkerSupport: true,
+        pushNotificationsSupport: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      await userRef.set({
+        email: actorEmail,
+        tenantIds: admin.firestore.FieldValue.arrayUnion(tenantAccess.tenantId),
+        lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      return res.json({ ok: true, status: 'subscribed' });
+    } catch (error: any) {
+      return res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
+  app.post('/notifications/web-push/unsubscribe', requireMemberTenantAccess, async (req, res) => {
+    const parsed = tenantScopedWebPushUnsubscribeSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    const actorEmail = normalizeEmail((await resolveAuthenticatedEmail(req.authContext)) || req.authContext?.email || '');
+    if (!actorEmail) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const deviceRef = db.collection('user_devices').doc(actorEmail).collection('devices').doc(parsed.data.deviceId);
+      await deviceRef.set({
+        webPushSubscription: admin.firestore.FieldValue.delete(),
+        webPushStatus: 'unsubscribed',
+        webPushLastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      return res.json({ ok: true, status: 'unsubscribed' });
+    } catch (error: any) {
+      return res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
+  app.post('/notifications/web-push/send', pushProxyRL, requireStaffTenantAccess, async (req, res) => {
+    const parsed = tenantScopedWebPushSendSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const usersSnap = await db.collection('user_devices').where('tenantIds', 'array-contains', tenantAccess.tenantId).get();
+      let matchedDevice: { ref: admin.firestore.DocumentReference<admin.firestore.DocumentData>; data: admin.firestore.DocumentData } | null = null;
+
+      for (const userDoc of usersSnap.docs) {
+        const deviceRef = userDoc.ref.collection('devices').doc(parsed.data.deviceId);
+        const deviceSnap = await deviceRef.get();
+        if (deviceSnap.exists) {
+          matchedDevice = { ref: deviceRef, data: deviceSnap.data() || {} };
+          break;
+        }
+      }
+
+      if (!matchedDevice) {
+        return res.status(404).json({ error: 'device_not_found' });
+      }
+
+      const subscription = sanitizeWebPushSubscription(matchedDevice.data.webPushSubscription);
+      if (!subscription) {
+        return res.status(404).json({ error: 'no_web_push_subscription' });
+      }
+
+      const notificationId = typeof parsed.data.data?.notificationId === 'string' && parsed.data.data.notificationId.trim()
+        ? parsed.data.data.notificationId.trim()
+        : `webpush:${parsed.data.deviceId}:${Date.now()}`;
+
+      const result = await sendWebPushNotification({
+        subscription,
+        payload: {
+          title: parsed.data.title,
+          body: parsed.data.body,
+          tag: parsed.data.tag,
+          requireInteraction: parsed.data.requireInteraction,
+          clickUrl: parsed.data.clickUrl,
+          data: {
+            ...(parsed.data.data || {}),
+            notificationId,
+            deviceId: parsed.data.deviceId,
+          },
+        },
+        ttl: parsed.data.ttl,
+        urgency: parsed.data.urgency,
+      });
+
+      if (!result.ok && result.shouldDeleteSubscription) {
+        await matchedDevice.ref.set({
+          webPushSubscription: admin.firestore.FieldValue.delete(),
+          webPushStatus: 'unsubscribed',
+          webPushLastErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+          webPushLastErrorCode: result.errorCode || 'subscription_gone',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } else if (result.ok) {
+        await matchedDevice.ref.set({
+          webPushStatus: 'subscribed',
+          webPushLastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+          webPushLastErrorAt: admin.firestore.FieldValue.delete(),
+          webPushLastErrorCode: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } else {
+        await matchedDevice.ref.set({
+          webPushStatus: 'error',
+          webPushLastErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+          webPushLastErrorCode: result.errorCode || 'web_push_failed',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+
+      if (!result.ok) {
+        return res.status(result.statusCode || 502).json({ ok: false, error: result.errorCode || 'web_push_failed' });
+      }
+
+      return res.json({ ok: true, notificationId });
+    } catch (error: any) {
+      return res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
+  app.post('/notifications/web-push/test', pushProxyRL, requireStaffTenantAccess, async (req, res) => {
+    const parsed = tenantScopedWebPushTestSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const usersSnap = await db.collection('user_devices').where('tenantIds', 'array-contains', tenantAccess.tenantId).get();
+      let matchedDevice: { ref: admin.firestore.DocumentReference<admin.firestore.DocumentData>; data: admin.firestore.DocumentData } | null = null;
+
+      for (const userDoc of usersSnap.docs) {
+        const deviceRef = userDoc.ref.collection('devices').doc(parsed.data.deviceId);
+        const deviceSnap = await deviceRef.get();
+        if (deviceSnap.exists) {
+          matchedDevice = { ref: deviceRef, data: deviceSnap.data() || {} };
+          break;
+        }
+      }
+
+      if (!matchedDevice) {
+        return res.status(404).json({ error: 'device_not_found' });
+      }
+
+      const subscription = sanitizeWebPushSubscription(matchedDevice.data.webPushSubscription);
+      if (!subscription) {
+        return res.status(404).json({ error: 'no_web_push_subscription' });
+      }
+
+      const notificationType = parsed.data.type?.trim() || 'admin_web_push_test';
+      const notificationId = `webpush:test:${parsed.data.deviceId}:${Date.now()}`;
+      const title = parsed.data.title?.trim() || 'Web Push Test';
+      const body = parsed.data.body?.trim() || 'This is a live Web Push test notification from Tuition Manager.';
+      const result = await sendWebPushNotification({
+        subscription,
+        payload: {
+          title,
+          body,
+          requireInteraction: parsed.data.requireInteraction ?? true,
+          clickUrl: parsed.data.clickUrl?.trim() || '/(tabs)',
+          tag: `web-push-test:${parsed.data.deviceId}`,
+          data: {
+            type: notificationType,
+            notificationId,
+            deviceId: parsed.data.deviceId,
+            tenantId: tenantAccess.tenantId,
+            source: 'admin_web_push_test',
+          },
+        },
+        ttl: 300,
+        urgency: 'high',
+      });
+
+      if (!result.ok && result.shouldDeleteSubscription) {
+        await matchedDevice.ref.set({
+          webPushSubscription: admin.firestore.FieldValue.delete(),
+          webPushStatus: 'unsubscribed',
+          webPushLastErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+          webPushLastErrorCode: result.errorCode || 'subscription_gone',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } else if (result.ok) {
+        await matchedDevice.ref.set({
+          webPushStatus: 'subscribed',
+          webPushLastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+          webPushLastErrorAt: admin.firestore.FieldValue.delete(),
+          webPushLastErrorCode: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+
+      if (!result.ok) {
+        return res.status(result.statusCode || 502).json({ ok: false, error: result.errorCode || 'web_push_failed' });
+      }
+
+      return res.json({
+        ok: true,
+        notificationId,
+        deviceId: parsed.data.deviceId,
+        title,
+        body,
+        type: notificationType,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ ok: false, error: error?.message || String(error) });
     }
   });
 

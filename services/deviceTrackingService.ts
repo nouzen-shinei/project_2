@@ -168,6 +168,28 @@ export interface UserDevice {
   lastPushTokenSyncAt?: Timestamp | Date;
   lastPushTokenErrorAt?: Timestamp | Date;
   fcmToken?: string;
+  webPushSubscription?: {
+    endpoint: string;
+    expirationTime?: number | null;
+    keys: {
+      p256dh: string;
+      auth: string;
+    };
+  };
+  webPushStatus?: 'subscribed' | 'unsubscribed' | 'unsupported' | 'permission_denied' | 'sync_required' | 'error';
+  webPushVapidPublicKey?: string;
+  webPushSubscribedAt?: Timestamp | Date;
+  webPushLastSyncedAt?: Timestamp | Date;
+  webPushLastErrorAt?: Timestamp | Date;
+  webPushLastErrorCode?: string;
+  webPushClientLastSubscriptionSyncAt?: Timestamp | Date;
+  webPushClientLastSubscriptionContext?: string;
+  webPushClientLastSubscriptionPermission?: string;
+  webPushClientLastReceiptAt?: Timestamp | Date;
+  webPushClientLastReceiptType?: string;
+  webPushClientLastReceiptNotificationId?: string;
+  webPushClientLastReceiptTag?: string;
+  webPushClientLastReceiptTitle?: string;
 
   // Notification preferences synced from client toggles
   notificationsEnabled?: boolean;
@@ -330,6 +352,9 @@ class DeviceTrackingService {
   private lastKnownExpoPushToken: string | null = null;
   private pushTokenRefreshInFlight = false;
   private hasPushTokenRefreshMonitor = false;
+  private webPushSyncInFlight: Promise<void> | null = null;
+  private lastKnownNotificationsEnabled = true;
+  private webPushDiagnosticsSyncInFlight: Promise<void> | null = null;
   private tenantMetadataCache: {
     userId: string;
     fetchedAt: number;
@@ -606,6 +631,438 @@ class DeviceTrackingService {
     return this.getBackendApiBaseUrl();
   }
 
+  private readonly WEB_PUSH_DIAGNOSTICS_DB_NAME = 'tm-web-push-diagnostics';
+  private readonly WEB_PUSH_DIAGNOSTICS_STORE_NAME = 'kv';
+
+  private openWebPushDiagnosticsDb(): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.WEB_PUSH_DIAGNOSTICS_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(this.WEB_PUSH_DIAGNOSTICS_STORE_NAME)) {
+          db.createObjectStore(this.WEB_PUSH_DIAGNOSTICS_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('indexeddb_open_failed'));
+    });
+  }
+
+  private async readWebPushDiagnostic<T = any>(key: string): Promise<T | null> {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || !('indexedDB' in window)) {
+      return null;
+    }
+
+    try {
+      const db = await this.openWebPushDiagnosticsDb();
+      const result = await new Promise<T | null>((resolve, reject) => {
+        const tx = db.transaction(this.WEB_PUSH_DIAGNOSTICS_STORE_NAME, 'readonly');
+        const request = tx.objectStore(this.WEB_PUSH_DIAGNOSTICS_STORE_NAME).get(key);
+        request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
+        request.onerror = () => reject(request.error || new Error('indexeddb_read_failed'));
+      });
+      db.close();
+      return result;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeWebPushDiagnostic(key: string, value: any): Promise<void> {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || !('indexedDB' in window)) {
+      return;
+    }
+
+    try {
+      const db = await this.openWebPushDiagnosticsDb();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(this.WEB_PUSH_DIAGNOSTICS_STORE_NAME, 'readwrite');
+        tx.objectStore(this.WEB_PUSH_DIAGNOSTICS_STORE_NAME).put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('indexeddb_write_failed'));
+        tx.onabort = () => reject(tx.error || new Error('indexeddb_write_aborted'));
+      });
+      db.close();
+    } catch {
+    }
+  }
+
+  private async syncStoredWebPushDiagnostics(reason: string = 'manual'): Promise<void> {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      return;
+    }
+    if (!this.currentUserEmail || !this.currentDeviceId) {
+      return;
+    }
+    const currentUserEmail = this.currentUserEmail;
+    const currentDeviceId = this.currentDeviceId;
+    if (this.webPushDiagnosticsSyncInFlight) {
+      return this.webPushDiagnosticsSyncInFlight;
+    }
+
+    this.webPushDiagnosticsSyncInFlight = (async () => {
+      const [lastPushReceipt, lastSubscriptionSync] = await Promise.all([
+        this.readWebPushDiagnostic<Record<string, any>>('lastPushReceipt'),
+        this.readWebPushDiagnostic<Record<string, any>>('lastSubscriptionSync'),
+      ]);
+
+      const updates: Record<string, any> = {};
+
+      if (lastPushReceipt?.receivedAt) {
+        updates.webPushClientLastReceiptAt = Timestamp.fromDate(new Date(lastPushReceipt.receivedAt));
+        updates.webPushClientLastReceiptType = typeof lastPushReceipt.type === 'string' ? lastPushReceipt.type : null;
+        updates.webPushClientLastReceiptNotificationId = typeof lastPushReceipt.notificationId === 'string' ? lastPushReceipt.notificationId : null;
+        updates.webPushClientLastReceiptTag = typeof lastPushReceipt.tag === 'string' ? lastPushReceipt.tag : null;
+        updates.webPushClientLastReceiptTitle = typeof lastPushReceipt.title === 'string' ? lastPushReceipt.title : null;
+      }
+
+      if (lastSubscriptionSync?.syncedAt) {
+        updates.webPushClientLastSubscriptionSyncAt = Timestamp.fromDate(new Date(lastSubscriptionSync.syncedAt));
+        updates.webPushClientLastSubscriptionContext = typeof lastSubscriptionSync.context === 'string' ? lastSubscriptionSync.context : reason;
+        updates.webPushClientLastSubscriptionPermission = typeof lastSubscriptionSync.permission === 'string'
+          ? lastSubscriptionSync.permission
+          : (typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : null);
+      }
+
+      const normalized = this.cleanUndefinedValues(updates);
+      if (Object.keys(normalized).length === 0) {
+        return;
+      }
+
+      const deviceRef = doc(firestore, 'user_devices', currentUserEmail, 'devices', currentDeviceId);
+      await updateDoc(deviceRef, {
+        ...normalized,
+        updatedAt: this.createResolvedTimestamp(),
+      });
+    })().finally(() => {
+      this.webPushDiagnosticsSyncInFlight = null;
+    });
+
+    return this.webPushDiagnosticsSyncInFlight;
+  }
+
+  private async sendWebPushViaBackend(payload: {
+    tenantId: string;
+    deviceId: string;
+    title: string;
+    body: string;
+    data?: any;
+    requireInteraction?: boolean;
+    clickUrl?: string;
+    ttl?: number;
+    urgency?: 'very-low' | 'low' | 'normal' | 'high';
+  }): Promise<{ ok: boolean; result?: any }> {
+    const baseUrl = this.getPushProxyBaseUrl();
+    if (!baseUrl) {
+      return { ok: false, result: { error: 'backend_url_missing' } };
+    }
+
+    internalTokenManager.setBaseUrl(baseUrl);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    };
+
+    let token = await internalTokenManager.getToken(baseUrl);
+    if (!token) {
+      token = await internalTokenManager.forceRefresh(baseUrl);
+    }
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    let response = await fetch(`${baseUrl}/notifications/web-push/send`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (response.status === 401) {
+      internalTokenManager.invalidate(baseUrl);
+      const refreshed = await internalTokenManager.forceRefresh(baseUrl);
+      if (refreshed) {
+        headers.Authorization = `Bearer ${refreshed}`;
+      }
+      response = await fetch(`${baseUrl}/notifications/web-push/send`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+    }
+
+    const raw = await response.text();
+    maybeShowMaintenanceAlertFromRaw(response.status, raw);
+    let result: any = {};
+    if (raw) {
+      try {
+        result = JSON.parse(raw);
+      } catch {
+        result = { raw };
+      }
+    }
+
+    return { ok: response.ok, result };
+  }
+
+  private async getWebPushTenantId(): Promise<string | null> {
+    try {
+      const tenantId = await tenantService.getCachedSelectedTenant();
+      return tenantId || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private urlBase64ToArrayBuffer(base64String: string): ArrayBuffer {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const normalized = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = atob(normalized);
+    const output = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; i += 1) {
+      output[i] = rawData.charCodeAt(i);
+    }
+    return output.buffer;
+  }
+
+  private async getWebPushConfig(tenantId: string): Promise<{ baseUrl: string; publicKey: string } | null> {
+    const baseUrl = this.getBackendApiBaseUrl();
+    if (!baseUrl) {
+      return null;
+    }
+
+    internalTokenManager.setBaseUrl(baseUrl);
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    let token = await internalTokenManager.getToken(baseUrl);
+    if (!token) {
+      token = await internalTokenManager.forceRefresh(baseUrl);
+    }
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    const url = `${baseUrl}/notifications/web-push/config?tenantId=${encodeURIComponent(tenantId)}`;
+    let response = await fetch(url, { headers });
+
+    if (response.status === 401) {
+      internalTokenManager.invalidate(baseUrl);
+      const refreshed = await internalTokenManager.forceRefresh(baseUrl);
+      if (refreshed) {
+        headers.Authorization = `Bearer ${refreshed}`;
+      }
+      response = await fetch(url, { headers });
+    }
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const result = await response.json().catch(() => null);
+    if (!result?.enabled || typeof result.publicKey !== 'string' || !result.publicKey.trim()) {
+      return null;
+    }
+
+    return { baseUrl, publicKey: result.publicKey.trim() };
+  }
+
+  private async updateCurrentDeviceWebPushState(updates: Record<string, any>): Promise<void> {
+    if (!this.currentUserEmail || !this.currentDeviceId) {
+      return;
+    }
+
+    const deviceRef = doc(firestore, 'user_devices', this.currentUserEmail, 'devices', this.currentDeviceId);
+    await updateDoc(deviceRef, this.cleanUndefinedValues({
+      ...updates,
+      updatedAt: this.createResolvedTimestamp(),
+      webPushLastSyncedAt: this.createResolvedTimestamp(),
+    }));
+  }
+
+  private async unregisterCurrentWebPushSubscription(reason: string): Promise<void> {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || !this.currentDeviceId) {
+      return;
+    }
+
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        await subscription.unsubscribe().catch(() => undefined);
+      }
+    } catch {
+    }
+
+    const tenantId = await this.getWebPushTenantId();
+    const baseUrl = this.getBackendApiBaseUrl();
+    if (tenantId && baseUrl && this.currentDeviceId) {
+      internalTokenManager.setBaseUrl(baseUrl);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      };
+      let token = await internalTokenManager.getToken(baseUrl);
+      if (!token) {
+        token = await internalTokenManager.forceRefresh(baseUrl);
+      }
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      await fetch(`${baseUrl}/notifications/web-push/unsubscribe`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ tenantId, deviceId: this.currentDeviceId }),
+      }).catch(() => undefined);
+    }
+
+    await this.updateCurrentDeviceWebPushState({
+      webPushSubscription: deleteField(),
+      webPushStatus: reason === 'permission_denied' ? 'permission_denied' : 'unsubscribed',
+      webPushLastErrorCode: reason,
+    }).catch(() => undefined);
+  }
+
+  async syncCurrentWebPushSubscription(context: string = 'manual'): Promise<void> {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      return;
+    }
+    if (!this.currentUserEmail || !this.currentDeviceId) {
+      return;
+    }
+    if (this.webPushSyncInFlight) {
+      return this.webPushSyncInFlight;
+    }
+
+    this.webPushSyncInFlight = (async () => {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+        await this.updateCurrentDeviceWebPushState({
+          webPushStatus: 'unsupported',
+          webPushSubscription: deleteField(),
+          webPushLastErrorCode: 'unsupported',
+        }).catch(() => undefined);
+        return;
+      }
+
+      if (!this.lastKnownNotificationsEnabled) {
+        await this.unregisterCurrentWebPushSubscription('notifications_disabled');
+        return;
+      }
+
+      if (Notification.permission === 'denied') {
+        await this.unregisterCurrentWebPushSubscription('permission_denied');
+        return;
+      }
+
+      if (Notification.permission !== 'granted') {
+        await this.writeWebPushDiagnostic('lastSubscriptionSync', {
+          syncedAt: new Date().toISOString(),
+          context,
+          permission: Notification.permission,
+          status: 'pending_permission',
+        });
+        await this.syncStoredWebPushDiagnostics('permission_pending');
+        await this.updateCurrentDeviceWebPushState({
+          webPushStatus: 'sync_required',
+          webPushLastErrorCode: `permission_${Notification.permission}`,
+        }).catch(() => undefined);
+        return;
+      }
+
+      const tenantId = await this.getWebPushTenantId();
+      if (!tenantId) {
+        return;
+      }
+
+      const config = await this.getWebPushConfig(tenantId);
+      if (!config?.publicKey) {
+        await this.writeWebPushDiagnostic('lastSubscriptionSync', {
+          syncedAt: new Date().toISOString(),
+          context,
+          permission: Notification.permission,
+          status: 'config_unavailable',
+        });
+        await this.syncStoredWebPushDiagnostics('config_unavailable');
+        await this.updateCurrentDeviceWebPushState({
+          webPushStatus: 'error',
+          webPushLastErrorCode: 'config_unavailable',
+        }).catch(() => undefined);
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.ready;
+      const existing = await registration.pushManager.getSubscription();
+      const subscription = existing || await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: this.urlBase64ToArrayBuffer(config.publicKey),
+      });
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      };
+      internalTokenManager.setBaseUrl(config.baseUrl);
+      let token = await internalTokenManager.getToken(config.baseUrl);
+      if (!token) {
+        token = await internalTokenManager.forceRefresh(config.baseUrl);
+      }
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+
+      const response = await fetch(`${config.baseUrl}/notifications/web-push/subscribe`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          tenantId,
+          deviceId: this.currentDeviceId,
+          subscription: subscription.toJSON(),
+          notificationPermission: Notification.permission,
+          userAgent: navigator.userAgent,
+        }),
+      });
+
+      const raw = await response.text().catch(() => '');
+      maybeShowMaintenanceAlertFromRaw(response.status, raw);
+      if (!response.ok) {
+        await this.writeWebPushDiagnostic('lastSubscriptionSync', {
+          syncedAt: new Date().toISOString(),
+          context,
+          permission: Notification.permission,
+          status: 'subscribe_failed',
+          errorCode: `subscribe_failed:${response.status}`,
+        });
+        await this.syncStoredWebPushDiagnostics('subscribe_failed');
+        await this.updateCurrentDeviceWebPushState({
+          webPushStatus: 'error',
+          webPushLastErrorCode: `subscribe_failed:${response.status}`,
+        }).catch(() => undefined);
+        return;
+      }
+
+      await this.writeWebPushDiagnostic('lastSubscriptionSync', {
+        syncedAt: new Date().toISOString(),
+        context,
+        permission: Notification.permission,
+        status: 'subscribed',
+      });
+      await this.syncStoredWebPushDiagnostics('subscribed');
+
+      await this.updateCurrentDeviceWebPushState({
+        webPushSubscription: subscription.toJSON(),
+        webPushStatus: 'subscribed',
+        webPushVapidPublicKey: config.publicKey,
+        webPushSubscribedAt: this.createResolvedTimestamp(),
+        webPushLastErrorAt: deleteField(),
+        webPushLastErrorCode: deleteField(),
+        notificationPermission: Notification.permission,
+      }).catch(() => undefined);
+
+      logger.debug('Web push subscription synced', { deviceId: this.currentDeviceId, context });
+    })().finally(() => {
+      this.webPushSyncInFlight = null;
+    });
+
+    return this.webPushSyncInFlight;
+  }
+
   private async sendPushViaBackend(message: Record<string, any> & { tenantId: string }): Promise<{ ok: boolean; result?: any }> {
     const baseUrl = this.getPushProxyBaseUrl();
     if (!baseUrl) {
@@ -860,6 +1317,7 @@ class DeviceTrackingService {
         this.setupWebNavigationTracking();
         // Initialize web notification listener for admin notifications
         await this.initializeWebNotificationListener();
+          await this.syncCurrentWebPushSubscription('initialize');
       }
       
       // Set up network state monitoring for security checks
@@ -1265,6 +1723,10 @@ class DeviceTrackingService {
         osVersion: deviceInfo.osVersion,
         userEmail: userEmail.substring(0, 10) + '...'
       });
+
+      if (Platform.OS === 'web') {
+        void this.syncCurrentWebPushSubscription('register');
+      }
       
       return deviceId;
     } catch (error) {
@@ -1689,6 +2151,9 @@ class DeviceTrackingService {
     try {
       const email = userEmail || this.currentUserEmail;
       if (this.currentDeviceId && email) {
+        if (Platform.OS === 'web') {
+          await this.unregisterCurrentWebPushSubscription('logged_out');
+        }
         await this.updateDeviceStatus(email, this.currentDeviceId, false);
 
         try {
@@ -1699,6 +2164,10 @@ class DeviceTrackingService {
             needsExpoPushTokenRefresh: true,
             lastPushTokenErrorAt: this.createResolvedTimestamp(),
             lastPushTokenErrorCode: 'logged_out',
+            webPushSubscription: deleteField(),
+            webPushStatus: 'unsubscribed',
+            webPushLastErrorAt: this.createResolvedTimestamp(),
+            webPushLastErrorCode: 'logged_out',
           });
         } catch (error) {
           logger.warn('Failed to clear expo push token on logout:', error);
@@ -1758,6 +2227,10 @@ class DeviceTrackingService {
         return;
       }
 
+      if (typeof preferences.notificationsEnabled === 'boolean') {
+        this.lastKnownNotificationsEnabled = preferences.notificationsEnabled;
+      }
+
       const deviceDoc = doc(
         firestore,
         'user_devices',
@@ -1776,6 +2249,10 @@ class DeviceTrackingService {
         userEmail: this.currentUserEmail,
         preferences: sanitizedPreferences,
       });
+
+      if (Platform.OS === 'web' && Object.prototype.hasOwnProperty.call(sanitizedPreferences, 'notificationsEnabled')) {
+        await this.syncCurrentWebPushSubscription('preferences');
+      }
     } catch (error) {
       logger.warn('Failed to update device notification preferences:', error);
     }
@@ -2292,7 +2769,7 @@ class DeviceTrackingService {
 
       // Handle web browser devices and mobile devices differently using notification service
       if (device.deviceType === 'web') {
-        return await this.sendWebBrowserNotification(deviceId, userEmail, notification);
+        return await this.sendWebBrowserNotification(deviceId, userEmail, notification, device);
       } else {
         // Handle mobile/Android devices with Expo push notifications
         return await this.sendMobileAppNotification(userEmail, device, notification);
@@ -2310,30 +2787,34 @@ class DeviceTrackingService {
     title: string;
     body: string;
     data?: any;
-  }): Promise<boolean> {
+  }, device?: UserDevice): Promise<boolean> {
     try {
       // Check if this is the current device/user
       const isCurrentDevice = deviceId === this.currentDeviceId && userEmail === this.currentUserEmail;
       
       if (isCurrentDevice) {
+        const notificationId = typeof notification.data?.notificationId === 'string' && notification.data.notificationId.trim()
+          ? notification.data.notificationId.trim()
+          : `web:${deviceId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+
         // Send local notification for current device
-  await getNotificationService().sendLocalNotification({
+        await getNotificationService().sendLocalNotification({
           title: notification.title,
           body: notification.body,
           data: {
             ...(notification.data ?? {}),
-            type: 'admin_notification',
             deviceId,
             userEmail,
             timestamp: Date.now(),
             allowWhenDisabled: true,
+            notificationId,
           }
         });
         logger.debug('Local web notification sent to current device:', deviceId);
         return true;
       } else {
         // For remote web devices, use Firebase Realtime Database for cross-device notification
-        return await this.sendRemoteWebNotification(deviceId, userEmail, notification);
+        return await this.sendRemoteWebNotification(deviceId, userEmail, notification, device);
       }
     } catch (error) {
       logger.error('Error sending web browser notification:', error);
@@ -2348,8 +2829,49 @@ class DeviceTrackingService {
     title: string;
     body: string;
     data?: any;
-  }): Promise<boolean> {
+  }, device?: UserDevice): Promise<boolean> {
     try {
+      const tenantId = device ? this.resolveTenantIdForNotification(device, notification) : null;
+      const hasWebPushSubscription = typeof device?.webPushSubscription?.endpoint === 'string' && device.webPushSubscription.endpoint.trim().length > 0;
+
+      if (tenantId && hasWebPushSubscription) {
+        const notificationId = typeof notification.data?.notificationId === 'string' && notification.data.notificationId.trim()
+          ? notification.data.notificationId.trim()
+          : `webpush:${deviceId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+
+        const webPushResult = await this.sendWebPushViaBackend({
+          tenantId,
+          deviceId,
+          title: notification.title,
+          body: notification.body,
+          data: {
+            ...(notification.data ?? {}),
+            allowWhenDisabled: true,
+            notificationId,
+          },
+          requireInteraction: notification.data?.type === 'daily_quote' || notification.data?.priority === 'high',
+          clickUrl: notification.data?.type === 'chat_message' || notification.data?.type === 'team_chat_message'
+            ? undefined
+            : '/(tabs)',
+          ttl: notification.data?.type === 'daily_quote' ? 60 : 300,
+          urgency: notification.data?.priority === 'high' ? 'high' : 'normal',
+        });
+
+        if (webPushResult.ok) {
+          logger.debug('Remote web push sent successfully via backend', { deviceId, userEmail, tenantId });
+          return true;
+        }
+
+        if (webPushResult.result?.error !== 'no_web_push_subscription') {
+          logger.warn('Backend web push failed; falling back to RTDB queue', {
+            deviceId,
+            userEmail,
+            tenantId,
+            error: webPushResult.result,
+          });
+        }
+      }
+
       // Use Firebase Realtime Database to send notifications to remote web browsers
       const database = getDatabase();
       
@@ -2359,12 +2881,16 @@ class DeviceTrackingService {
         data: {
           ...(notification.data ?? {}),
           allowWhenDisabled: true,
+          notificationId:
+            typeof notification.data?.notificationId === 'string' && notification.data.notificationId.trim()
+              ? notification.data.notificationId.trim()
+              : `web:${deviceId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
         },
         deviceId,
         userEmail,
         timestamp: this.createResolvedTimestamp(),
-        id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        type: 'admin_notification'
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+        type: typeof notification.data?.type === 'string' ? notification.data.type : 'admin_notification'
       };
 
       // Store notification in Firebase Realtime Database for the specific device
@@ -5051,6 +5577,21 @@ class DeviceTrackingService {
         if (Notification.permission === 'default') {
           await Notification.requestPermission();
         }
+
+        this.lastKnownNotificationsEnabled = Notification.permission !== 'denied';
+      }
+
+      if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+        navigator.serviceWorker.addEventListener('message', (event: MessageEvent) => {
+          if (event.data?.type === 'tm:web-push-resubscribe-needed') {
+            void this.syncCurrentWebPushSubscription('subscription_change');
+            return;
+          }
+
+          if (event.data?.type === 'tm:web-push-received') {
+            void this.syncStoredWebPushDiagnostics('push_message');
+          }
+        });
       }
 
       // Listen for notifications in Firebase Realtime Database
@@ -5075,6 +5616,8 @@ class DeviceTrackingService {
       });
 
       logger.debug('Web notification listener initialized for device:', this.currentDeviceId);
+      await this.syncStoredWebPushDiagnostics('listener_init');
+      await this.syncCurrentWebPushSubscription('listener_init');
     } catch (error) {
       logger.error('Error initializing web notification listener:', error);
     }
@@ -5088,13 +5631,25 @@ class DeviceTrackingService {
     body: string;
     data?: any;
     type?: string;
+    id?: string;
   }): Promise<void> {
     try {
-      
-  await getNotificationService().sendLocalNotification({
+      await getNotificationService().sendLocalNotification({
         title: notificationData.title,
         body: notificationData.body,
-        data: notificationData.data || {}
+        data: {
+          ...(notificationData.data || {}),
+          notificationId:
+            typeof notificationData.data?.notificationId === 'string' && notificationData.data.notificationId.trim()
+              ? notificationData.data.notificationId.trim()
+              : typeof notificationData.id === 'string'
+                ? notificationData.id
+                : undefined,
+          type:
+            typeof notificationData.data?.type === 'string'
+              ? notificationData.data.type
+              : notificationData.type,
+        }
       });
 
       logger.debug('Remote web notification displayed:', notificationData.title);
