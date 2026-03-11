@@ -4,6 +4,16 @@ Cross-platform tuition/coaching management app (web + iOS + Android) built with 
 
 Who it’s for: independent tutors, coaching centers, and small institutes that need a lightweight, mobile-friendly admin + communication workflow.
 
+## Download
+
+Android users can download and install the latest APK directly from the GitHub releases page:
+
+[![Download APK](https://img.shields.io/badge/Download-Android%20APK-green)](https://github.com/nouzen-shinei/project_2/releases)
+
+Download the latest `.apk` file from the most recent release and install it on your Android device.
+
+> You may need to enable **"Install unknown apps"** in Android settings to install the APK.
+
 ## App overview
 
 What you can do:
