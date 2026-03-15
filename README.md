@@ -1,6 +1,7 @@
 # Tuition Management App
 
-Cross-platform tuition/coaching management app (web + iOS + Android) built with Expo and Firebase. It helps a teacher/admin manage students, attendance, fees, and parent communication from one place.
+This is a cross-platform tuition/coaching management app built with Expo and Firebase. It runs on Web, Android, and iOS and is designed for small coaching centers and independent tutors who need a straightforward way to manage their classes without heavy software.
+I’ve been building this as a solo project for a while to simplify the everyday admin work that tutors usually handle through notebooks, spreadsheets, or scattered messages. It helps a teacher/admin manage students, attendance, fees, and parent communication from one place.
 
 Who it’s for: independent tutors, coaching centers, and small institutes that need a lightweight, mobile-friendly admin + communication workflow.
 
