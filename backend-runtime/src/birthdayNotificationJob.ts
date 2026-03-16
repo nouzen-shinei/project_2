@@ -536,6 +536,11 @@ async function fetchExpoPushTokens(
         const tokenRaw = typeof payload.expoPushToken === 'string' ? payload.expoPushToken.trim() : '';
         if (!tokenRaw) return;
         if (payload.isDeleted === true) return;
+        if (
+          payload.sessionActive === false ||
+          payload.logoutType === 'manual' ||
+          payload.logoutType === 'forced'
+        ) return;
         if (payload.isOnline !== true) return;
         if (payload.notificationsEnabled === false) return;
         if (payload.pushTokenStatus === 'missing') return;

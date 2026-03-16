@@ -67,6 +67,7 @@ import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useFrameTimingMonitor } from '../../hooks/useFrameTimingMonitor';
 import { getChatPaginationProfile } from '@/lib/chatPaginationConfig';
 import { clearDownloadState, setDownloadState } from '@/lib/downloadStateStore';
+import { reconcileConversationUnreadCount, shouldRefreshChatSummariesOnForegroundResume } from '@/lib/chatReceiptState';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { useLocalSearchParams, useRouter } from 'expo-router';
@@ -221,6 +222,8 @@ export default function Chat() {
   const appStateRef = useRef<AppStateStatus>(
     (Platform.OS === 'web' ? 'active' : (AppState.currentState ?? 'active')) as AppStateStatus
   );
+  const lastForegroundRefreshAtRef = useRef(0);
+  const wasForegroundInteractiveRef = useRef(false);
   const [isAppActive, setIsAppActive] = useState(appStateRef.current === 'active');
   // Moved to top: showUnreadSeparator, unreadSeparatorMessageId
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -315,6 +318,7 @@ export default function Chat() {
       read: boolean;
     } | null;
     lastMessageTime?: string;
+    summaryUpdatedAt?: string;
     pinnedSerial?: number;
   }
 
@@ -969,6 +973,16 @@ export default function Chat() {
     displayedMessagesRef.current = displayed;
   }, [displayedMessages, selectedTeamMember?.id, effectiveUser?.email]);
 
+  const selectedPartnerEmailRef = useRef<string | null>(null);
+  useEffect(() => {
+    selectedPartnerEmailRef.current = selectedTeamMember?.email?.toLowerCase?.() ?? null;
+  }, [selectedTeamMember?.email]);
+
+  const effectiveUserEmailRef = useRef<string | null>(null);
+  useEffect(() => {
+    effectiveUserEmailRef.current = effectiveUser?.email?.toLowerCase?.() ?? null;
+  }, [effectiveUser?.email]);
+
   const stickerUrlMapRef = useRef(stickerUrlMap);
   useEffect(() => { stickerUrlMapRef.current = stickerUrlMap; }, [stickerUrlMap]);
 
@@ -1051,9 +1065,119 @@ export default function Chat() {
   const [isInitialAnchorSettled, setIsInitialAnchorSettled] = useState(false);
   const [inputHeight, setInputHeight] = useState(40);
   const [lastTypingHeight, setLastTypingHeight] = useState(40);
-  const processedMessagesRef = useRef<Set<string>>(new Set());
-  const previousOnlineStatusRef = useRef<Map<string, boolean>>(new Map());
   const previousIncomingUnreadRef = useRef<number>(0);
+  const requestedReadReceiptIdsRef = useRef<Set<string>>(new Set());
+  const queuedReadReceiptIdsRef = useRef<Set<string>>(new Set());
+  const queuedConversationDeliverySyncRef = useRef(false);
+  const receiptSyncRunningRef = useRef(false);
+  const receiptSyncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastConversationDeliverySyncRef = useRef<{ partnerEmail: string | null; at: number }>({
+    partnerEmail: null,
+    at: 0,
+  });
+  const flushConversationReceiptSyncRef = useRef<() => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    requestedReadReceiptIdsRef.current.clear();
+    queuedReadReceiptIdsRef.current.clear();
+    queuedConversationDeliverySyncRef.current = false;
+    lastConversationDeliverySyncRef.current = {
+      partnerEmail: selectedTeamMember?.email?.toLowerCase?.() ?? null,
+      at: 0,
+    };
+  }, [selectedTeamMember?.id, selectedTeamMember?.email]);
+
+  useEffect(() => {
+    messages.forEach((msg: any) => {
+      if (msg?.id && msg.read) {
+        requestedReadReceiptIdsRef.current.add(String(msg.id));
+      }
+    });
+  }, [messages]);
+
+  const queueConversationReceiptSync = useCallback((options: {
+    readMessageIds?: string[];
+    requestConversationDelivered?: boolean;
+  }) => {
+    const readMessageIds = Array.isArray(options.readMessageIds) ? options.readMessageIds : [];
+    readMessageIds.forEach((messageId) => {
+      const normalized = String(messageId || '').trim();
+      if (!normalized || requestedReadReceiptIdsRef.current.has(normalized)) {
+        return;
+      }
+      queuedReadReceiptIdsRef.current.add(normalized);
+    });
+
+    if (options.requestConversationDelivered) {
+      queuedConversationDeliverySyncRef.current = true;
+    }
+
+    if (receiptSyncTimeoutRef.current) {
+      return;
+    }
+
+    receiptSyncTimeoutRef.current = setTimeout(() => {
+      receiptSyncTimeoutRef.current = null;
+      void flushConversationReceiptSyncRef.current();
+    }, 120);
+  }, []);
+
+  const flushConversationReceiptSync = useCallback(async () => {
+    if (receiptSyncRunningRef.current) {
+      return;
+    }
+
+    const partnerEmail = selectedPartnerEmailRef.current;
+    const userEmail = effectiveUserEmailRef.current;
+    if (!partnerEmail || !userEmail || !isFocused || !isAppActive) {
+      queuedReadReceiptIdsRef.current.clear();
+      queuedConversationDeliverySyncRef.current = false;
+      return;
+    }
+
+    const readMessageIds = Array.from(queuedReadReceiptIdsRef.current);
+    const requestConversationDelivered = queuedConversationDeliverySyncRef.current;
+    queuedReadReceiptIdsRef.current.clear();
+    queuedConversationDeliverySyncRef.current = false;
+
+    if (!readMessageIds.length && !requestConversationDelivered) {
+      return;
+    }
+
+    receiptSyncRunningRef.current = true;
+    readMessageIds.forEach((messageId) => requestedReadReceiptIdsRef.current.add(messageId));
+
+    try {
+      await chatService.syncConversationReceipts(partnerEmail, {
+        readMessageIds,
+        markConversationDelivered: requestConversationDelivered,
+      });
+    } catch (error) {
+      readMessageIds.forEach((messageId) => requestedReadReceiptIdsRef.current.delete(messageId));
+      if (requestConversationDelivered) {
+        lastConversationDeliverySyncRef.current = { partnerEmail, at: 0 };
+      }
+      logger.debug('Failed to sync chat receipts', error);
+    } finally {
+      receiptSyncRunningRef.current = false;
+      if (queuedReadReceiptIdsRef.current.size || queuedConversationDeliverySyncRef.current) {
+        void flushConversationReceiptSyncRef.current();
+      }
+    }
+  }, [isAppActive, isFocused]);
+
+  useEffect(() => {
+    flushConversationReceiptSyncRef.current = flushConversationReceiptSync;
+  }, [flushConversationReceiptSync]);
+
+  useEffect(() => {
+    return () => {
+      if (receiptSyncTimeoutRef.current) {
+        clearTimeout(receiptSyncTimeoutRef.current);
+        receiptSyncTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // Stable handler for FlashList viewability changes
   const onViewableItemsChangedRef = useRef(({ viewableItems }: any) => {
@@ -1064,10 +1188,11 @@ export default function Chat() {
     const resolveGif = resolveOptimizedGifUrlRef.current;
     const stickerMap = stickerUrlMapRef.current;
     const gifMap = gifUrlMapRef.current;
-    const memberId = selectedTeamMember?.id;
-    const userEmail = effectiveUser?.email;
-    if (memberId && userEmail && Array.isArray(viewableItems)) {
+    const partnerEmail = selectedPartnerEmailRef.current;
+    const userEmail = effectiveUserEmailRef.current;
+    if (partnerEmail && userEmail && Array.isArray(viewableItems)) {
       const warmTargets: { remoteUrl: string; fileName?: string }[] = [];
+      const visibleUnreadIncomingIds: string[] = [];
       viewableItems.forEach((viewable: any) => {
         const msg = viewable?.item;
         if (!msg) return;
@@ -1079,6 +1204,15 @@ export default function Chat() {
         if (Array.isArray(msg.attachments)) {
           msg.attachments.forEach((att: any) => addUrl(att.url, att.fileName));
         }
+        if (
+          msg.id &&
+          !msg.deleted &&
+          String(msg.sender || '').toLowerCase() === partnerEmail &&
+          String(msg.recipientId || '').toLowerCase() === userEmail.toLowerCase() &&
+          !msg.read
+        ) {
+          visibleUnreadIncomingIds.push(String(msg.id));
+        }
       });
       if (warmTargets.length) {
         Promise.allSettled(
@@ -1086,6 +1220,27 @@ export default function Chat() {
             chatCacheService.getMediaForDownload(remoteUrl, fileName, undefined, 'low').catch(() => undefined)
           )
         ).catch(() => undefined);
+      }
+
+      const normalizedPartner = selectedPartnerEmailRef.current;
+      const now = Date.now();
+      const requestConversationDelivered =
+        Boolean(normalizedPartner) &&
+        (lastConversationDeliverySyncRef.current.partnerEmail !== normalizedPartner ||
+          now - lastConversationDeliverySyncRef.current.at >= 15000);
+
+      if (requestConversationDelivered && normalizedPartner) {
+        lastConversationDeliverySyncRef.current = {
+          partnerEmail: normalizedPartner,
+          at: now,
+        };
+      }
+
+      if (visibleUnreadIncomingIds.length || requestConversationDelivered) {
+        queueConversationReceiptSync({
+          readMessageIds: visibleUnreadIncomingIds,
+          requestConversationDelivered,
+        });
       }
     }
 
@@ -1970,18 +2125,13 @@ export default function Chat() {
     }
 
     setConversationSummaries((prev) => {
-      const existing = prev.get(partnerEmail);
-      if (!existing || existing.unreadCount === incomingUnreadCount) {
-        return prev;
-      }
-      const next = new Map(prev);
-      next.set(partnerEmail, {
-        ...existing,
-        unreadCount: incomingUnreadCount,
+      return reconcileConversationUnreadCount(prev, partnerEmail, incomingUnreadCount, {
+        isFocused,
+        isAppActive,
+        loading,
       });
-      return next;
     });
-  }, [incomingUnreadCount, selectedTeamMember?.email, setConversationSummaries]);
+  }, [incomingUnreadCount, selectedTeamMember?.email, setConversationSummaries, isFocused, isAppActive, loading]);
 
   useEffect(() => () => {
     if (unreadSeparatorDismissTimeoutRef.current) {
@@ -2419,6 +2569,40 @@ export default function Chat() {
     }
   }, [effectiveUser?.email, activeTenant?.id, buildSummaryMap]);
 
+  useEffect(() => {
+    const isForegroundInteractive = Boolean(isFocused && isAppActive);
+    const shouldRefresh = shouldRefreshChatSummariesOnForegroundResume({
+      isFocused,
+      isAppActive,
+      wasForegroundInteractive: wasForegroundInteractiveRef.current,
+      hasUserEmail: Boolean(effectiveUser?.email),
+      hasTenantId: Boolean(activeTenant?.id),
+      now: Date.now(),
+      lastForegroundRefreshAt: lastForegroundRefreshAtRef.current,
+    });
+    wasForegroundInteractiveRef.current = isForegroundInteractive;
+
+    if (!shouldRefresh) {
+      return;
+    }
+
+    lastForegroundRefreshAtRef.current = Date.now();
+
+    void refreshChatSummaries();
+
+    if (selectedTeamMember?.id) {
+      reconnectChat();
+    }
+  }, [
+    isFocused,
+    isAppActive,
+    effectiveUser?.email,
+    activeTenant?.id,
+    selectedTeamMember?.id,
+    refreshChatSummaries,
+    reconnectChat,
+  ]);
+
   const loadTenantTeamMembers = useCallback(async () => {
     const requestId = ++tenantMembersRequestIdRef.current;
 
@@ -2594,6 +2778,7 @@ export default function Chat() {
         unreadCount: summary?.unreadCount ?? 0,
         lastMessage,
         lastMessageTime,
+        summaryUpdatedAt: summary?.updatedAt,
         pinnedSerial: pinnedChats[chatPreferencesService.sanitizeEmailKey(member.email)] || undefined,
       };
     });
@@ -2712,6 +2897,12 @@ export default function Chat() {
 
   // Use useMemo to properly handle filtering when user or teamMembers change
   const filteredTeamMembers = useMemo(() => {
+    const getRecencyTs = (member: TeamMemberWithChatInfo): number => {
+      const summaryTime = member.summaryUpdatedAt ? new Date(member.summaryUpdatedAt).getTime() : 0;
+      const messageTime = member.lastMessage?.timestamp ? new Date(member.lastMessage.timestamp).getTime() : 0;
+      return Math.max(summaryTime, messageTime);
+    };
+
     const withPin = teamMembersWithChatInfo.map((m: any) => ({
       ...m,
       pinnedSerial: pinnedChats[chatPreferencesService.sanitizeEmailKey(m.email)] || undefined,
@@ -2740,23 +2931,15 @@ export default function Chat() {
     if (aPin && bPin && aPin !== bPin) return aPin - bPin;
     if (aPin && !bPin) return -1;
     if (!aPin && bPin) return 1;
-    // Then by last message time (most recent first), then by unread count, then by name
-        if (a.lastMessage?.timestamp && b.lastMessage?.timestamp) {
-          const aTime = new Date(a.lastMessage.timestamp).getTime();
-          const bTime = new Date(b.lastMessage.timestamp).getTime();
-          if (aTime !== bTime) return bTime - aTime; // Most recent first
-        } else if (a.lastMessage?.timestamp && !b.lastMessage?.timestamp) {
-          return -1; // a has messages, b doesn't - a comes first
-        } else if (!a.lastMessage?.timestamp && b.lastMessage?.timestamp) {
-          return 1; // b has messages, a doesn't - b comes first
-        }
-        
-        // If timestamps are equal or both don't have messages, sort by unread count
+    // Then by summary recency (most recent first), then by unread count, then by name.
+        const aTime = getRecencyTs(a);
+        const bTime = getRecencyTs(b);
+        if (aTime !== bTime) return bTime - aTime;
+
         const aUnread = a.unreadCount || 0;
         const bUnread = b.unreadCount || 0;
-        if (aUnread !== bUnread) return bUnread - aUnread; // More unread first
-        
-        // Finally sort by name
+        if (aUnread !== bUnread) return bUnread - aUnread;
+
         return a.name.localeCompare(b.name);
     });
   }, [effectiveUser?.email, teamMembersWithChatInfo, pinnedChats, searchQuery]);
@@ -3267,198 +3450,17 @@ export default function Chat() {
     prevLoadingMoreRef.current = loadingMore;
   }, [loadingMore, restorePrependAnchorIfNeeded, shouldUseManualAnchorPreservation]);
 
-  // Auto-mark incoming messages as delivered and read + REAL push notifications
   useEffect(() => {
-    if (!selectedTeamMember || !effectiveUser?.email || messages.length === 0) return;
+    if (!selectedTeamMember?.email || !effectiveUser?.email || !isFocused || !isAppActive) {
+      return;
+    }
 
-    const markIncomingMessagesStatus = async () => {
-      try {
-        // Filter messages that need status updates
-        const userEmail = effectiveUser.email.toLowerCase();
-        const recipientEmail = selectedTeamMember.email.toLowerCase();
+    const timer = setTimeout(() => {
+      queueConversationReceiptSync({ requestConversationDelivered: true });
+    }, 250);
 
-        // Find messages sent TO the current user that need to be marked as delivered/read
-        const incomingMessages = messages.filter(msg => 
-          msg.sender.toLowerCase() === recipientEmail && 
-          msg.recipientId === userEmail
-        );
-
-        // Mark incoming messages as delivered ONLY when current user is actually online and can receive them
-        const undeliveredMessages = incomingMessages.filter(msg => !msg.delivered && msg.id);
-        if (undeliveredMessages.length > 0) {
-          // Current user is online (since they're actively using the app), so mark as delivered
-          const messageIds = undeliveredMessages.map(msg => msg.id!);
-          await chatService.markMessagesAsDelivered(messageIds);
-        }
-
-        // Mark all incoming messages as read if not already (since user is viewing the chat)
-        const unreadMessages = incomingMessages.filter(msg => !msg.read && msg.id);
-        if (unreadMessages.length > 0) {
-          const messageIds = unreadMessages.map(msg => msg.id!);
-          await chatService.markMessagesAsRead(messageIds);
-        }
-
-        // Smart chat notifications are already handled by sendSmartChatNotification
-        // when messages are sent, so no need for duplicate local notifications here
-
-      } catch (error) {
-        logger.error('Error updating incoming message status:', error);
-      }
-    };
-
-    // Only run once when chat is opened
-    const timeoutId = setTimeout(markIncomingMessagesStatus, 3000);
-    return () => clearTimeout(timeoutId);
-  }, [selectedTeamMember?.id, effectiveUser?.email, teamMembers]); // Exclude messages array to avoid unnecessary loops
-
-  // Auto-mark own messages as delivered ONLY when recipient is online and can receive them
-  useEffect(() => {
-    if (!selectedTeamMember || !effectiveUser?.email || messages.length === 0) return;
-
-    const markOwnMessagesAsDelivered = async () => {
-      try {
-        const userEmail = effectiveUser.email.toLowerCase();
-
-        // Find own undelivered messages that were sent to the selected team member
-        const ownUndeliveredMessages = messages.filter(msg => 
-          msg.sender.toLowerCase() === userEmail && 
-          !msg.delivered && 
-          msg.id &&
-          !processedMessagesRef.current.has(msg.id) && 
-          msg.timestamp &&
-          msg.recipientId === selectedTeamMember.email.toLowerCase()
-        );
-        
-        if (ownUndeliveredMessages.length > 0) {
-          // Check if recipient is currently online - ONLY mark as delivered if they are
-          const isRecipientOnline = selectedTeamMember.isOnline === true;
-          
-          if (isRecipientOnline) {
-            const messageIds = ownUndeliveredMessages.map(msg => msg.id!);
-            
-            // Mark as processed to prevent duplicate processing
-            messageIds.forEach(id => processedMessagesRef.current.add(id));
-            
-            try {
-              await chatService.markMessagesAsDelivered(messageIds);
-            } catch (error) {
-              logger.warn('Failed to mark own messages as delivered:', error);
-              // Remove from processed set on failure so we can retry
-              messageIds.forEach(id => processedMessagesRef.current.delete(id));
-            }
-          }
-        }
-
-      } catch (error) {
-        logger.error('Error checking recipient online status for delivery:', error);
-      }
-    };
-
-    // Check delivery status when messages change or recipient's online status changes
-    const timeoutId = setTimeout(markOwnMessagesAsDelivered, 1000);
-    return () => clearTimeout(timeoutId);
-  }, [messages.length, selectedTeamMember?.id, selectedTeamMember?.isOnline, effectiveUser?.email]);
-
-  // Mark messages as read when user actually opens this specific chat (REAL behavior)
-  useEffect(() => {
-    if (!selectedTeamMember || !effectiveUser?.email || messages.length === 0) return;
-
-    const markOwnMessagesAsRead = async () => {
-      try {
-        const userEmail = effectiveUser.email.toLowerCase();
-        const recipientEmail = selectedTeamMember.email.toLowerCase();
-        
-        // This represents the REAL scenario: when someone opens this chat, 
-        // they see unread messages FROM the current user, so those get marked as read
-        const messagesToMarkAsRead = messages.filter(msg => 
-          msg.sender.toLowerCase() === userEmail && // Messages sent by current user
-          msg.recipientId?.toLowerCase() === recipientEmail && // To the selected team member  
-          msg.delivered && // Must be delivered first
-          !msg.read && // Not already read
-          !msg.deleted &&
-          msg.id // Has an ID
-        );
-
-        if (messagesToMarkAsRead.length > 0) {
-          const messageIds = messagesToMarkAsRead.map(msg => msg.id!);
-          
-          // Mark immediately - this represents the real action of opening the chat
-          try {
-            await chatService.markMessagesAsRead(messageIds);
-          } catch (error) {
-            logger.warn('Failed to mark messages as read:', error);
-          }
-        }
-
-      } catch (error) {
-        logger.error('Error marking messages as read:', error);
-      }
-    };
-
-    // Only mark as read when the chat is actually opened - REAL behavior
-    const timeoutId = setTimeout(markOwnMessagesAsRead, 500); // Minimal delay just for UI stability
-    return () => clearTimeout(timeoutId);
-  }, [selectedTeamMember?.id, effectiveUser?.email]); // Only trigger when chat is opened
-
-  // Auto-mark incoming messages as read when chat is active and messages arrive
-  useEffect(() => {
-    if (!selectedTeamMember || !effectiveUser?.email || messages.length === 0 || !isFocused) return;
-
-    const markIncomingMessagesAsRead = async () => {
-      try {
-        const userEmail = effectiveUser.email.toLowerCase();
-        const senderEmail = selectedTeamMember.email.toLowerCase();
-        
-        // Find unread messages sent TO current user FROM selected team member
-        const incomingUnreadMessages = messages.filter(msg => 
-          msg.sender.toLowerCase() === senderEmail && // From selected team member
-          msg.recipientId?.toLowerCase() === userEmail && // To current user  
-          msg.delivered && // Must be delivered first
-          !msg.read && // Not already read
-          !msg.deleted &&
-          msg.id // Has an ID
-        );
-
-        if (incomingUnreadMessages.length > 0) {
-          const messageIds = incomingUnreadMessages.map(msg => msg.id!);
-          
-          try {
-            await chatService.markMessagesAsRead(messageIds);
-            const partnerEmailKey = senderEmail;
-            setConversationSummaries((prev) => {
-              if (!partnerEmailKey) {
-                return prev;
-              }
-              const key = partnerEmailKey.toLowerCase();
-              const existing = prev.get(key);
-              if (!existing) {
-                return prev;
-              }
-              const nextUnread = Math.max(0, (existing.unreadCount ?? 0) - messageIds.length);
-              if (nextUnread === existing.unreadCount) {
-                return prev;
-              }
-              const next = new Map(prev);
-              next.set(key, {
-                ...existing,
-                unreadCount: nextUnread,
-              });
-              return next;
-            });
-          } catch (error) {
-            logger.warn('Failed to auto-mark incoming messages as read:', error);
-          }
-        }
-
-      } catch (error) {
-        logger.error('Error auto-marking incoming messages as read:', error);
-      }
-    };
-
-    // Small delay to ensure the user has actually seen the message (back to 1 second)
-    const timeoutId = setTimeout(markIncomingMessagesAsRead, 1000); 
-    return () => clearTimeout(timeoutId);
-  }, [messages, selectedTeamMember?.id, effectiveUser?.email, isFocused]); // Trigger when messages change and screen is focused
+    return () => clearTimeout(timer);
+  }, [selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, queueConversationReceiptSync]);
 
   // Smart unread separator management - mirror live unread state of conversation
   useEffect(() => {
@@ -6021,7 +6023,9 @@ export default function Chat() {
                 {isOwnMessage && (
                   <MessageStatusTicks 
                     delivered={msg.delivered}
+                    deliveredAt={msg.deliveredAt}
                     read={msg.read}
+                    readAt={msg.readAt}
                     color={theme.textSecondary}
                     size={12}
                     theme={isDarkMode ? 'dark' : 'light'}
@@ -6153,7 +6157,9 @@ export default function Chat() {
                 {isOwnMessage && (
                   <MessageStatusTicks 
                     delivered={msg.delivered}
+                    deliveredAt={msg.deliveredAt}
                     read={msg.read}
+                    readAt={msg.readAt}
                     color={theme.textSecondary}
                     size={12}
                     theme={isDarkMode ? 'dark' : 'light'}
@@ -6388,7 +6394,9 @@ export default function Chat() {
               {isOwnMessage && (
                 <MessageStatusTicks 
                   delivered={msg.delivered}
+                  deliveredAt={msg.deliveredAt}
                   read={msg.read}
+                  readAt={msg.readAt}
                   color={isOwnMessage ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary}
                   size={12}
                   theme={isDarkMode ? 'dark' : 'light'}
@@ -7426,42 +7434,7 @@ export default function Chat() {
     );
   };
 
-  // Monitor ALL team members for online status changes and deliver pending messages
-  useEffect(() => {
-    if (!effectiveUser?.email || teamMembers.length === 0) return;
-
-    // Check each team member's current online status
-    teamMembers.forEach((member) => {
-      const wasOnline = previousOnlineStatusRef.current.get(member.id) || false;
-      const isNowOnline = member.isOnline === true;
-      
-      // If member just came online, check for pending messages to deliver
-      if (!wasOnline && isNowOnline) {
-        chatService.markPendingMessagesAsDelivered(member.email)
-          .then((deliveredCount) => {
-            // Messages delivered successfully
-          })
-          .catch((error) => {
-            logger.warn('Failed to auto-deliver pending messages to', member.name, ':', error);
-          });
-      }
-      
-      // Update the tracking
-      previousOnlineStatusRef.current.set(member.id, isNowOnline);
-    });
-
-    // Clean up tracking for members no longer in the list
-    const currentMemberIds = new Set(teamMembers.map(m => m.id));
-    for (const [memberId] of previousOnlineStatusRef.current) {
-      if (!currentMemberIds.has(memberId)) {
-        previousOnlineStatusRef.current.delete(memberId);
-      }
-    }
-
-  }, [teamMembers, effectiveUser?.email]);
-
   // Update selected team member when team members list changes (for real-time status updates)
-  // Also mark pending messages as delivered when recipients come online
   useEffect(() => {
     if (selectedTeamMember && teamMembers.length > 0) {
       const updatedMember = teamMembers.find(member => member.id === selectedTeamMember.id);
@@ -7476,29 +7449,11 @@ export default function Chat() {
         );
         
         if (hasStatusChanged) {
-          // Check if member just came online
-          const justCameOnline = !selectedTeamMember.isOnline && updatedMember.isOnline;
-          if (justCameOnline && effectiveUser?.email) {
-            // Mark any pending messages as delivered now that recipient is online
-            chatService.markPendingMessagesAsDelivered(updatedMember.email)
-              .then((deliveredCount) => {
-                // Messages delivered successfully
-              })
-              .catch((error) => {
-                logger.warn('Failed to deliver pending messages:', error);
-              });
-          }
-          
           setSelectedTeamMember(updatedMember);
         }
       }
     }
-  }, [teamMembers, selectedTeamMember, effectiveUser?.email]);
-
-  // Clear processed messages when team member changes
-  useEffect(() => {
-    processedMessagesRef.current.clear();
-  }, [selectedTeamMember?.id]);
+  }, [teamMembers, selectedTeamMember]);
 
   // Retry pending messages when back online
   const retryPendingMessages = async () => {
@@ -7922,7 +7877,9 @@ export default function Chat() {
                       {item.lastMessage.isOwnMessage && (
                         <MessageStatusTicks 
                           delivered={item.lastMessage.delivered}
+                          deliveredAt={null}
                           read={item.lastMessage.read}
+                          readAt={null}
                           color={theme.textSecondary}
                           size={12}
                           theme={isDarkMode ? 'dark' : 'light'}

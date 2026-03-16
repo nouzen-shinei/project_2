@@ -4,6 +4,8 @@ import { getConversationKey, normalizeEmail, sanitizeKey } from './chatRealtime'
 
 const DEFAULT_EDIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_DELETE_WINDOW_MS = 0; // unlimited by default
+const DEVICE_ONLINE_STALE_MS = 2 * 60 * 1000;
+const ACTIVE_CHAT_STALE_MS = 45 * 1000;
 
 function resolveWindowMs(secondsEnv?: string, msEnv?: string, fallbackMs: number = DEFAULT_EDIT_WINDOW_MS): number {
   const seconds = Number(secondsEnv);
@@ -54,6 +56,24 @@ type LastMessageType =
   | 'deleted'
   | 'unknown';
 type SummaryUpdateStrategy = 'increment' | 'decrement' | 'reset' | 'preserve';
+type ChatDeliverySource = 'presence' | 'push';
+
+export interface ChatDeliveryProvenance {
+  sources?: ChatDeliverySource[];
+  lastSource?: ChatDeliverySource;
+  lastUpdatedAt?: string;
+  presence?: {
+    deliveredAt?: string;
+    onlineDeviceCount?: number;
+    focusedDeviceCount?: number;
+  };
+  push?: {
+    deliveredAt?: string;
+    acceptedDeviceCount?: number;
+    mobileAcceptedCount?: number;
+    webAcceptedCount?: number;
+  };
+}
 
 export interface FileAttachment {
   url: string;
@@ -135,6 +155,7 @@ export interface ChatMessageRecord {
   read: boolean;
   deliveredAt?: string;
   readAt?: string;
+  deliveryProvenance?: ChatDeliveryProvenance;
   editedAt?: string;
   editCount?: number;
   deleted?: boolean;
@@ -147,6 +168,48 @@ export interface ToggleChatReactionInput {
   tenantId: string;
   actorEmail: string;
   reactionType: string;
+}
+
+export interface SyncChatConversationReceiptsInput {
+  tenantId: string;
+  actorEmail: string;
+  partnerEmail: string;
+  deliveredMessageIds?: string[];
+  readMessageIds?: string[];
+  markConversationDelivered?: boolean;
+}
+
+export interface SyncChatConversationReceiptsResult {
+  deliveredMessageIds: string[];
+  readMessageIds: string[];
+  deliveredCount: number;
+  readCount: number;
+  actorHasOnlineDevice: boolean;
+  actorHasFocusedChatDevice: boolean;
+}
+
+export interface ConfirmOutboundChatDeliveryInput {
+  tenantId: string;
+  actorEmail: string;
+  partnerEmail: string;
+  deliveredMessageIds: string[];
+  provenance?: ChatDeliveryProvenance;
+}
+
+export interface ConfirmOutboundChatDeliveryResult {
+  deliveredMessageIds: string[];
+  deliveredCount: number;
+}
+
+export interface MarkPendingChatMessagesDeliveredInput {
+  tenantId: string;
+  recipientEmail: string;
+}
+
+export interface MarkPendingChatMessagesDeliveredResult {
+  deliveredMessageIds: string[];
+  deliveredCount: number;
+  recipientHasOnlineDevice: boolean;
 }
 
 interface ConversationSummary {
@@ -181,6 +244,7 @@ interface ConversationLatestRecord {
   tenantId?: string | null;
   delivered: boolean;
   read: boolean;
+  deliveryProvenance?: ChatDeliveryProvenance;
   isSpecial: boolean;
   deleted?: boolean;
   editedAt?: string;
@@ -196,6 +260,180 @@ interface SummaryUpdateOptions {
   unreadAmount?: number;
   forceUpdateLastMessage?: boolean;
   updateIfSameMessageId?: boolean;
+}
+
+function sanitizeNonNegativeCount(value: unknown): number | undefined {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return undefined;
+  }
+  return Math.trunc(numeric);
+}
+
+function normalizeDeliverySource(value: unknown): ChatDeliverySource | undefined {
+  return value === 'presence' || value === 'push' ? value : undefined;
+}
+
+function normalizeDeliverySources(values: unknown[]): ChatDeliverySource[] {
+  const result: ChatDeliverySource[] = [];
+  for (const value of values) {
+    const normalized = normalizeDeliverySource(value);
+    if (normalized && !result.includes(normalized)) {
+      result.push(normalized);
+    }
+  }
+  return result;
+}
+
+function normalizeChatDeliveryProvenance(input: unknown): ChatDeliveryProvenance | undefined {
+  if (!input || typeof input !== 'object') {
+    return undefined;
+  }
+
+  const raw = input as Record<string, any>;
+  const lastSource = normalizeDeliverySource(raw.lastSource);
+  const presence = raw.presence && typeof raw.presence === 'object'
+    ? pruneUndefined({
+        deliveredAt: typeof raw.presence.deliveredAt === 'string' && raw.presence.deliveredAt.trim()
+          ? raw.presence.deliveredAt
+          : undefined,
+        onlineDeviceCount: sanitizeNonNegativeCount(raw.presence.onlineDeviceCount),
+        focusedDeviceCount: sanitizeNonNegativeCount(raw.presence.focusedDeviceCount),
+      })
+    : undefined;
+  const push = raw.push && typeof raw.push === 'object'
+    ? pruneUndefined({
+        deliveredAt: typeof raw.push.deliveredAt === 'string' && raw.push.deliveredAt.trim()
+          ? raw.push.deliveredAt
+          : undefined,
+        acceptedDeviceCount: sanitizeNonNegativeCount(raw.push.acceptedDeviceCount),
+        mobileAcceptedCount: sanitizeNonNegativeCount(raw.push.mobileAcceptedCount),
+        webAcceptedCount: sanitizeNonNegativeCount(raw.push.webAcceptedCount),
+      })
+    : undefined;
+
+  const sources = normalizeDeliverySources([
+    ...(Array.isArray(raw.sources) ? raw.sources : []),
+    lastSource,
+    presence ? 'presence' : undefined,
+    push ? 'push' : undefined,
+  ]);
+
+  const normalized = pruneUndefined({
+    sources: sources.length ? sources : undefined,
+    lastSource,
+    lastUpdatedAt: typeof raw.lastUpdatedAt === 'string' && raw.lastUpdatedAt.trim()
+      ? raw.lastUpdatedAt
+      : undefined,
+    presence: presence && Object.keys(presence).length ? presence : undefined,
+    push: push && Object.keys(push).length ? push : undefined,
+  });
+
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function maxDefinedCount(current: number | undefined, next: number | undefined): number | undefined {
+  if (typeof current !== 'number') {
+    return next;
+  }
+  if (typeof next !== 'number') {
+    return current;
+  }
+  return Math.max(current, next);
+}
+
+function mergeChatDeliveryProvenance(
+  current: ChatDeliveryProvenance | undefined,
+  update: ChatDeliveryProvenance | undefined,
+  fallbackTimestamp?: string
+): ChatDeliveryProvenance | undefined {
+  const existing = normalizeChatDeliveryProvenance(current);
+  const incoming = normalizeChatDeliveryProvenance(update);
+  if (!existing && !incoming) {
+    return undefined;
+  }
+
+  const presence = existing?.presence || incoming?.presence
+    ? pruneUndefined({
+        deliveredAt: existing?.presence?.deliveredAt ?? incoming?.presence?.deliveredAt,
+        onlineDeviceCount: maxDefinedCount(existing?.presence?.onlineDeviceCount, incoming?.presence?.onlineDeviceCount),
+        focusedDeviceCount: maxDefinedCount(existing?.presence?.focusedDeviceCount, incoming?.presence?.focusedDeviceCount),
+      })
+    : undefined;
+
+  const push = existing?.push || incoming?.push
+    ? pruneUndefined({
+        deliveredAt: existing?.push?.deliveredAt ?? incoming?.push?.deliveredAt,
+        acceptedDeviceCount: maxDefinedCount(existing?.push?.acceptedDeviceCount, incoming?.push?.acceptedDeviceCount),
+        mobileAcceptedCount: maxDefinedCount(existing?.push?.mobileAcceptedCount, incoming?.push?.mobileAcceptedCount),
+        webAcceptedCount: maxDefinedCount(existing?.push?.webAcceptedCount, incoming?.push?.webAcceptedCount),
+      })
+    : undefined;
+
+  const sources = normalizeDeliverySources([
+    ...(existing?.sources ?? []),
+    ...(incoming?.sources ?? []),
+    existing?.lastSource,
+    incoming?.lastSource,
+    presence ? 'presence' : undefined,
+    push ? 'push' : undefined,
+  ]);
+
+  const merged = pruneUndefined({
+    sources: sources.length ? sources : undefined,
+    lastSource: incoming?.lastSource ?? existing?.lastSource,
+    lastUpdatedAt: incoming?.lastUpdatedAt ?? fallbackTimestamp ?? existing?.lastUpdatedAt,
+    presence: presence && Object.keys(presence).length ? presence : undefined,
+    push: push && Object.keys(push).length ? push : undefined,
+  });
+
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+function buildPresenceDeliveryProvenance(
+  receiptState: { onlineDeviceCount: number; focusedChatDeviceCount: number },
+  deliveredAt: string
+): ChatDeliveryProvenance | undefined {
+  if (receiptState.onlineDeviceCount <= 0) {
+    return undefined;
+  }
+  return {
+    sources: ['presence'],
+    lastSource: 'presence',
+    lastUpdatedAt: deliveredAt,
+    presence: pruneUndefined({
+      deliveredAt,
+      onlineDeviceCount: receiptState.onlineDeviceCount,
+      focusedDeviceCount: receiptState.focusedChatDeviceCount,
+    }),
+  };
+}
+
+function buildPushDeliveryProvenance(
+  stats: {
+    acceptedDeviceCount?: number;
+    mobileAcceptedCount?: number;
+    webAcceptedCount?: number;
+  },
+  deliveredAt: string
+): ChatDeliveryProvenance | undefined {
+  const acceptedDeviceCount = sanitizeNonNegativeCount(stats.acceptedDeviceCount);
+  const mobileAcceptedCount = sanitizeNonNegativeCount(stats.mobileAcceptedCount);
+  const webAcceptedCount = sanitizeNonNegativeCount(stats.webAcceptedCount);
+  if (!acceptedDeviceCount && !mobileAcceptedCount && !webAcceptedCount) {
+    return undefined;
+  }
+  return {
+    sources: ['push'],
+    lastSource: 'push',
+    lastUpdatedAt: deliveredAt,
+    push: pruneUndefined({
+      deliveredAt,
+      acceptedDeviceCount,
+      mobileAcceptedCount,
+      webAcceptedCount,
+    }),
+  };
 }
 
 function pruneUndefined<T extends Record<string, unknown>>(value: T): T {
@@ -220,6 +458,196 @@ function getTimestampMs(value?: string | number | Date | null): number {
   }
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getArbitraryTimestampMs(value: unknown): number {
+  if (!value) {
+    return 0;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return getTimestampMs(value);
+  }
+  if (typeof (value as any)?.toMillis === 'function') {
+    try {
+      return Number((value as any).toMillis()) || 0;
+    } catch {
+      return 0;
+    }
+  }
+  if (typeof (value as any)?.toDate === 'function') {
+    try {
+      const date = (value as any).toDate();
+      return date instanceof Date ? date.getTime() : 0;
+    } catch {
+      return 0;
+    }
+  }
+  if (typeof (value as any)?.seconds === 'number') {
+    const seconds = Number((value as any).seconds);
+    const nanos = typeof (value as any)?.nanoseconds === 'number' ? Number((value as any).nanoseconds) : 0;
+    return Math.round(seconds * 1000 + nanos / 1_000_000);
+  }
+  return 0;
+}
+
+function tenantMatchesDevice(device: Record<string, any>, tenantId: string): boolean {
+  const normalizedTenantId = (tenantId || '').trim();
+  if (!normalizedTenantId) {
+    return false;
+  }
+
+  const tenantIds = Array.isArray(device.tenantIds)
+    ? device.tenantIds
+        .map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : ''))
+        .filter((entry: string) => Boolean(entry))
+    : [];
+  if (tenantIds.includes(normalizedTenantId)) {
+    return true;
+  }
+
+  const activeTenantId = typeof device.activeTenantId === 'string' ? device.activeTenantId.trim() : '';
+  if (activeTenantId === normalizedTenantId) {
+    return true;
+  }
+
+  if (Array.isArray(device.tenantMemberships)) {
+    return device.tenantMemberships.some((membership: any) => {
+      if (!membership || typeof membership.tenantId !== 'string') {
+        return false;
+      }
+      if (membership.tenantId.trim() !== normalizedTenantId) {
+        return false;
+      }
+      if (typeof membership.status !== 'string') {
+        return true;
+      }
+      return membership.status.trim().toLowerCase() === 'active';
+    });
+  }
+
+  return false;
+}
+
+function isDeviceLoggedOut(device: Record<string, any>): boolean {
+  if (device.sessionActive === false) return true;
+  const logoutType = typeof device.logoutType === 'string' ? device.logoutType : '';
+  if (logoutType === 'manual' || logoutType === 'forced') return true;
+  const lastActivityType = typeof device.lastActivityType === 'string' ? device.lastActivityType : '';
+  if (lastActivityType === 'logout' || lastActivityType === 'forced_logout') return true;
+  return false;
+}
+
+function isOnlineTenantDevice(device: Record<string, any>, tenantId: string, nowMs: number): boolean {
+  if (!tenantMatchesDevice(device, tenantId)) {
+    return false;
+  }
+  if (device.isDeleted === true) {
+    return false;
+  }
+  if (isDeviceLoggedOut(device)) {
+    return false;
+  }
+  if (device.isOnline !== true) {
+    return false;
+  }
+
+  const lastSeenMs = Math.max(
+    getArbitraryTimestampMs(device.lastSeen),
+    getArbitraryTimestampMs(device.updatedAt),
+    getArbitraryTimestampMs(device.lastActivity)
+  );
+
+  if (lastSeenMs <= 0) {
+    return false;
+  }
+
+  return nowMs - lastSeenMs <= DEVICE_ONLINE_STALE_MS;
+}
+
+function isFocusedChatTenantDevice(
+  device: Record<string, any>,
+  tenantId: string,
+  partnerEmail: string,
+  nowMs: number
+): boolean {
+  if (!isOnlineTenantDevice(device, tenantId, nowMs)) {
+    return false;
+  }
+  if (device.activeChatIsFocused !== true) {
+    return false;
+  }
+  if (normalizeEmail(device.activeChatPartner) !== normalizeEmail(partnerEmail)) {
+    return false;
+  }
+
+  const chatSeenMs = Math.max(
+    getArbitraryTimestampMs(device.activeChatLastSeenAt),
+    getArbitraryTimestampMs(device.lastSeen),
+    getArbitraryTimestampMs(device.updatedAt)
+  );
+
+  if (chatSeenMs <= 0) {
+    return false;
+  }
+
+  return nowMs - chatSeenMs <= ACTIVE_CHAT_STALE_MS;
+}
+
+async function resolveRecipientDeviceReceiptState(
+  tenantId: string,
+  recipientEmail: string,
+  partnerEmail: string
+): Promise<{
+  hasOnlineDevice: boolean;
+  hasFocusedChatDevice: boolean;
+  onlineDeviceCount: number;
+  focusedChatDeviceCount: number;
+}> {
+  ensureFirebase();
+  const db = admin.firestore();
+  const normalizedRecipient = normalizeEmail(recipientEmail);
+  const normalizedPartner = normalizeEmail(partnerEmail);
+  if (!normalizedRecipient || !normalizedPartner) {
+    return {
+      hasOnlineDevice: false,
+      hasFocusedChatDevice: false,
+      onlineDeviceCount: 0,
+      focusedChatDeviceCount: 0,
+    };
+  }
+
+  const devicesSnap = await db
+    .collection('user_devices')
+    .doc(normalizedRecipient)
+    .collection('devices')
+    .get();
+
+  const nowMs = Date.now();
+  let onlineDeviceCount = 0;
+  let focusedChatDeviceCount = 0;
+
+  for (const doc of devicesSnap.docs) {
+    const data = (doc.data() || {}) as Record<string, any>;
+    if (isOnlineTenantDevice(data, tenantId, nowMs)) {
+      onlineDeviceCount += 1;
+    }
+    if (isFocusedChatTenantDevice(data, tenantId, normalizedPartner, nowMs)) {
+      focusedChatDeviceCount += 1;
+    }
+  }
+
+  return {
+    hasOnlineDevice: onlineDeviceCount > 0,
+    hasFocusedChatDevice: focusedChatDeviceCount > 0,
+    onlineDeviceCount,
+    focusedChatDeviceCount,
+  };
 }
 
 function computeMessagePreview(message: ChatMessageRecord): {
@@ -311,6 +739,11 @@ function buildConversationLatestRecord(messageId: string, message: ChatMessageRe
     record.editedAt = message.editedAt;
   }
 
+  const deliveryProvenance = normalizeChatDeliveryProvenance(message.deliveryProvenance);
+  if (deliveryProvenance) {
+    record.deliveryProvenance = deliveryProvenance;
+  }
+
   if (typeof preview.attachmentCount === 'number') {
     record.preview.attachmentCount = preview.attachmentCount;
   }
@@ -366,6 +799,7 @@ function buildMessageIndexRecord(message: ChatMessageRecord) {
     isSpecial: Boolean(message.isSpecial),
     hasAttachments: Boolean((message.attachments && message.attachments.length > 0) || message.fileUrl),
     attachmentBytes: calculateAttachmentBytes(message),
+    deliveryProvenance: normalizeChatDeliveryProvenance(message.deliveryProvenance) ?? null,
     deleted: Boolean(message.deleted),
     editedAt: message.editedAt || null,
     lastUpdated: new Date().toISOString(),
@@ -673,6 +1107,95 @@ interface LoadedMessageContext {
   indexRef: admin.database.Reference;
 }
 
+async function applyReceiptPatchToMessageContext(
+  db: admin.database.Database,
+  context: LoadedMessageContext,
+  options: {
+    deliveredAt?: string;
+    readAt?: string;
+    markDelivered?: boolean;
+    markRead?: boolean;
+    deliveryProvenance?: ChatDeliveryProvenance;
+  }
+): Promise<ChatMessageRecord> {
+  const patch: Record<string, unknown> = {};
+  const indexPatch: Record<string, unknown> = {
+    lastUpdated: new Date().toISOString(),
+  };
+  let nextMessage: ChatMessageRecord = { ...context.message };
+  let changed = false;
+  let decrementedUnread = false;
+
+  if (options.markDelivered && !nextMessage.delivered) {
+    const deliveredAt = options.deliveredAt ?? new Date().toISOString();
+    patch.delivered = true;
+    patch.deliveredAt = deliveredAt;
+    indexPatch.delivered = true;
+    nextMessage = {
+      ...nextMessage,
+      delivered: true,
+      deliveredAt,
+    };
+    changed = true;
+  }
+
+  if (options.markRead && !nextMessage.read) {
+    const readAt = options.readAt ?? new Date().toISOString();
+    const deliveredAt = nextMessage.deliveredAt ?? options.deliveredAt ?? readAt;
+    patch.read = true;
+    patch.readAt = readAt;
+    patch.delivered = true;
+    patch.deliveredAt = deliveredAt;
+    indexPatch.read = true;
+    indexPatch.delivered = true;
+    nextMessage = {
+      ...nextMessage,
+      read: true,
+      readAt,
+      delivered: true,
+      deliveredAt,
+    };
+    changed = true;
+    decrementedUnread = true;
+  }
+
+  const mergedDeliveryProvenance = mergeChatDeliveryProvenance(
+    nextMessage.deliveryProvenance,
+    options.deliveryProvenance,
+    options.readAt ?? options.deliveredAt
+  );
+  if (
+    JSON.stringify(normalizeChatDeliveryProvenance(nextMessage.deliveryProvenance) ?? null)
+    !== JSON.stringify(mergedDeliveryProvenance ?? null)
+  ) {
+    patch.deliveryProvenance = mergedDeliveryProvenance ?? null;
+    indexPatch.deliveryProvenance = mergedDeliveryProvenance ?? null;
+    nextMessage = {
+      ...nextMessage,
+      deliveryProvenance: mergedDeliveryProvenance,
+    };
+    changed = true;
+  }
+
+  if (!changed) {
+    return nextMessage;
+  }
+
+  await Promise.all([
+    context.messageRef.update(patch),
+    context.indexRef.update(indexPatch),
+  ]);
+
+  await applySummaryUpdatesForMessage(db, context.messageId, nextMessage, {
+    recipientUnreadStrategy: decrementedUnread ? 'decrement' : 'preserve',
+    recipientUnreadAmount: decrementedUnread ? 1 : 0,
+    forceUpdateLastMessage: false,
+    updateIfSameMessageId: true,
+  });
+
+  return nextMessage;
+}
+
 async function loadMessageContext(
   db: admin.database.Database,
   tenantId: string,
@@ -732,6 +1255,7 @@ async function loadMessageContext(
     read: Boolean(raw.read),
     deliveredAt: typeof raw.deliveredAt === 'string' ? raw.deliveredAt : undefined,
     readAt: typeof raw.readAt === 'string' ? raw.readAt : undefined,
+    deliveryProvenance: normalizeChatDeliveryProvenance(raw.deliveryProvenance),
     editedAt: typeof raw.editedAt === 'string' ? raw.editedAt : undefined,
     editCount: typeof raw.editCount === 'number' ? raw.editCount : undefined,
     deleted: Boolean(raw.deleted),
@@ -959,6 +1483,243 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
   await applySummaryUpdatesForMessage(db, messageId, messageRecord);
 
   return messageRecord;
+}
+
+export async function markPendingChatMessagesDeliveredForRecipient(
+  input: MarkPendingChatMessagesDeliveredInput
+): Promise<MarkPendingChatMessagesDeliveredResult> {
+  ensureFirebase();
+  const db = admin.database();
+
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const recipientEmail = normalizeEmail(input.recipientEmail);
+  if (!tenantId || !recipientEmail) {
+    throw new ChatMessageActionError('Recipient and tenant are required', 'invalid_payload');
+  }
+
+  const receiptState = await resolveRecipientDeviceReceiptState(tenantId, recipientEmail, '');
+  if (!receiptState.hasOnlineDevice) {
+    return {
+      deliveredMessageIds: [],
+      deliveredCount: 0,
+      recipientHasOnlineDevice: false,
+    };
+  }
+
+  const indexQuery = tenantChatRootRef(db, tenantId)
+    .child('messageIndex')
+    .orderByChild('recipientId')
+    .equalTo(recipientEmail);
+  const indexSnapshot = await indexQuery.get();
+  if (!indexSnapshot.exists()) {
+    return {
+      deliveredMessageIds: [],
+      deliveredCount: 0,
+      recipientHasOnlineDevice: true,
+    };
+  }
+
+  const candidates = indexSnapshot.val() as Record<string, Record<string, any>>;
+  const deliveredMessageIds: string[] = [];
+
+  for (const [messageId, record] of Object.entries(candidates)) {
+    if (record?.delivered === true) {
+      continue;
+    }
+    const context = await loadMessageContext(db, tenantId, messageId);
+    if (!context || context.message.deleted || normalizeEmail(context.message.recipientId) !== recipientEmail) {
+      continue;
+    }
+    const updated = await applyReceiptPatchToMessageContext(db, context, {
+      markDelivered: true,
+      deliveryProvenance: buildPresenceDeliveryProvenance(receiptState, new Date().toISOString()),
+    });
+    if (updated.delivered) {
+      deliveredMessageIds.push(messageId);
+    }
+  }
+
+  return {
+    deliveredMessageIds,
+    deliveredCount: deliveredMessageIds.length,
+    recipientHasOnlineDevice: true,
+  };
+}
+
+export async function syncChatConversationReceipts(
+  input: SyncChatConversationReceiptsInput
+): Promise<SyncChatConversationReceiptsResult> {
+  ensureFirebase();
+  const db = admin.database();
+
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const actorEmail = normalizeEmail(input.actorEmail);
+  const partnerEmail = normalizeEmail(input.partnerEmail);
+  if (!tenantId || !actorEmail || !partnerEmail) {
+    throw new ChatMessageActionError('Actor, partner, and tenant are required', 'invalid_payload');
+  }
+
+  const conversationKey = getConversationKey(actorEmail, partnerEmail);
+  if (!conversationKey) {
+    throw new ChatMessageActionError('Unable to resolve conversation', 'invalid_payload');
+  }
+
+  const receiptState = await resolveRecipientDeviceReceiptState(tenantId, actorEmail, partnerEmail);
+  const deliveredTargets = new Set(
+    Array.isArray(input.deliveredMessageIds)
+      ? input.deliveredMessageIds.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : []
+  );
+  const readTargets = new Set(
+    Array.isArray(input.readMessageIds)
+      ? input.readMessageIds.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : []
+  );
+
+  if (input.markConversationDelivered && receiptState.hasOnlineDevice) {
+    const conversationSnapshot = await tenantChatRootRef(db, tenantId)
+      .child('conversationMessages')
+      .child(conversationKey)
+      .get();
+    if (conversationSnapshot.exists()) {
+      conversationSnapshot.forEach((child) => {
+        const raw = (child.val() || {}) as Record<string, any>;
+        const messageId = child.key;
+        if (!messageId) {
+          return false;
+        }
+        if (normalizeEmail(raw.sender) !== partnerEmail) {
+          return false;
+        }
+        if (normalizeEmail(raw.recipientId) !== actorEmail) {
+          return false;
+        }
+        if (raw.deleted === true || raw.delivered === true) {
+          return false;
+        }
+        deliveredTargets.add(messageId);
+        return false;
+      });
+    }
+  }
+
+  if (!receiptState.hasOnlineDevice) {
+    deliveredTargets.clear();
+  }
+  if (!receiptState.hasFocusedChatDevice) {
+    readTargets.clear();
+  }
+
+  const deliveredMessageIds: string[] = [];
+  const readMessageIds: string[] = [];
+  const targetedIds = new Set<string>([...deliveredTargets, ...readTargets]);
+
+  for (const messageId of targetedIds) {
+    const context = await loadMessageContext(db, tenantId, messageId);
+    if (!context) {
+      continue;
+    }
+    if (normalizeEmail(context.message.sender) !== partnerEmail) {
+      continue;
+    }
+    if (normalizeEmail(context.message.recipientId) !== actorEmail) {
+      continue;
+    }
+    if (context.message.deleted) {
+      continue;
+    }
+
+    const shouldRead = readTargets.has(messageId);
+    const shouldDeliver = deliveredTargets.has(messageId) || shouldRead;
+    const beforeDelivered = Boolean(context.message.delivered);
+    const beforeRead = Boolean(context.message.read);
+    const receiptTimestamp = new Date().toISOString();
+
+    const updated = await applyReceiptPatchToMessageContext(db, context, {
+      markDelivered: shouldDeliver,
+      markRead: shouldRead,
+      deliveredAt: shouldDeliver ? receiptTimestamp : undefined,
+      readAt: shouldRead ? receiptTimestamp : undefined,
+      deliveryProvenance: shouldDeliver ? buildPresenceDeliveryProvenance(receiptState, receiptTimestamp) : undefined,
+    });
+
+    if (!beforeDelivered && updated.delivered) {
+      deliveredMessageIds.push(messageId);
+    }
+    if (!beforeRead && updated.read) {
+      readMessageIds.push(messageId);
+    }
+  }
+
+  return {
+    deliveredMessageIds,
+    readMessageIds,
+    deliveredCount: deliveredMessageIds.length,
+    readCount: readMessageIds.length,
+    actorHasOnlineDevice: receiptState.hasOnlineDevice,
+    actorHasFocusedChatDevice: receiptState.hasFocusedChatDevice,
+  };
+}
+
+export async function confirmOutboundChatDelivery(
+  input: ConfirmOutboundChatDeliveryInput
+): Promise<ConfirmOutboundChatDeliveryResult> {
+  ensureFirebase();
+  const db = admin.database();
+
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const actorEmail = normalizeEmail(input.actorEmail);
+  const partnerEmail = normalizeEmail(input.partnerEmail);
+  const targetedIds = Array.isArray(input.deliveredMessageIds)
+    ? Array.from(new Set(input.deliveredMessageIds.map((entry) => String(entry || '').trim()).filter(Boolean)))
+    : [];
+
+  if (!tenantId || !actorEmail || !partnerEmail) {
+    throw new ChatMessageActionError('Actor, partner, and tenant are required', 'invalid_payload');
+  }
+
+  if (!targetedIds.length) {
+    return {
+      deliveredMessageIds: [],
+      deliveredCount: 0,
+    };
+  }
+
+  const deliveredMessageIds: string[] = [];
+  const baseProvenance = normalizeChatDeliveryProvenance(input.provenance);
+
+  for (const messageId of targetedIds) {
+    const context = await loadMessageContext(db, tenantId, messageId);
+    if (!context) {
+      continue;
+    }
+    if (normalizeEmail(context.message.sender) !== actorEmail) {
+      continue;
+    }
+    if (normalizeEmail(context.message.recipientId) !== partnerEmail) {
+      continue;
+    }
+    if (context.message.deleted) {
+      continue;
+    }
+
+    const beforeDelivered = Boolean(context.message.delivered);
+    const deliveredAt = new Date().toISOString();
+    const updated = await applyReceiptPatchToMessageContext(db, context, {
+      markDelivered: true,
+      deliveredAt,
+      deliveryProvenance: baseProvenance ?? buildPushDeliveryProvenance({ acceptedDeviceCount: targetedIds.length }, deliveredAt),
+    });
+
+    if (!beforeDelivered && updated.delivered) {
+      deliveredMessageIds.push(messageId);
+    }
+  }
+
+  return {
+    deliveredMessageIds,
+    deliveredCount: deliveredMessageIds.length,
+  };
 }
 
 export async function editChatMessage(input: EditChatMessageInput): Promise<ChatMessageRecord> {

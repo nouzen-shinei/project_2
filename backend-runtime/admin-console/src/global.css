@@ -237,6 +237,120 @@ label {
   border: 1px solid rgba(15, 118, 110, 0.3);
 }
 
+.receipt-inspector-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.receipt-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.receipt-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.receipt-chip--read {
+  background: rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
+}
+
+.receipt-chip--delivered {
+  background: rgba(16, 185, 129, 0.18);
+  color: #bbf7d0;
+}
+
+.receipt-chip--sent {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fde68a;
+}
+
+.receipt-chip--neutral {
+  background: rgba(148, 163, 184, 0.16);
+  color: #e2e8f0;
+}
+
+.receipt-chip--presence {
+  background: rgba(45, 212, 191, 0.18);
+  color: #99f6e4;
+}
+
+.receipt-chip--push {
+  background: rgba(251, 146, 60, 0.18);
+  color: #fdba74;
+}
+
+.receipt-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.receipt-message-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.receipt-message-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  min-width: 0;
+}
+
+.receipt-message-id {
+  color: #f8fafc;
+  font-size: 0.85rem;
+}
+
+.receipt-message-preview {
+  color: rgba(226, 232, 240, 0.88);
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 32rem;
+}
+
+.receipt-message-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  color: rgba(226, 232, 240, 0.76);
+  font-size: 0.78rem;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+@media (max-width: 900px) {
+  .receipt-message-row {
+    flex-direction: column;
+  }
+
+  .receipt-message-meta {
+    text-align: left;
+  }
+
+  .receipt-message-preview {
+    max-width: 100%;
+  }
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;

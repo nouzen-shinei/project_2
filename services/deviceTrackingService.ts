@@ -240,6 +240,7 @@ export interface UserDevice {
   // Status and timestamps
   lastSeen: Timestamp | Date;
   isOnline: boolean;
+  sessionActive?: boolean;
   createdAt: Timestamp | Date;
   updatedAt: Timestamp | Date;
   lastLogin?: Timestamp | Date; // When user last logged in through Google auth
@@ -270,6 +271,7 @@ export interface UserDevice {
   // Session information
   sessionId?: string;
   lastActivityType?: string;
+  lastTenantPingAt?: Timestamp | Date;
   lastHeartbeatId?: string; // Debug field to track heartbeat updates
   
   // Storage Information
@@ -334,6 +336,25 @@ export interface AuthorizedUser {
   isOnline: boolean;
   totalDevices: number;
   tenantIds?: string[];
+}
+
+export interface DeviceNotificationAttemptResult {
+  delivered: boolean;
+  deliverySource: 'presence' | 'push' | 'unknown';
+  pushChannel?: 'web_push' | 'mobile_push';
+}
+
+export interface DeviceNotificationFanoutResult {
+  success: number;
+  failed: number;
+  deliverableDeviceCount: number;
+  onlineDeliverableCount: number;
+  presenceDeliveredCount: number;
+  pushAcceptedCount: number;
+  mobilePushAcceptedCount: number;
+  webPushAcceptedCount: number;
+  staleWebPushSubscriptionsCleaned: number;
+  deduplicatedWebPushSubscriptionsCleaned: number;
 }
 
 class DeviceTrackingService {
@@ -554,6 +575,147 @@ class DeviceTrackingService {
     }
 
     return null;
+  }
+
+  private canAttemptRemoteNotificationDelivery(device: UserDevice): boolean {
+    if (device.isDeleted) {
+      return false;
+    }
+
+    if (this.isDeviceLoggedOut(device)) {
+      return false;
+    }
+
+    if (device.isOnline) {
+      return true;
+    }
+
+    if (device.deviceType === 'web') {
+      return typeof device.webPushSubscription?.endpoint === 'string'
+        && device.webPushSubscription.endpoint.trim().length > 0;
+    }
+
+    return typeof device.expoPushToken === 'string' && device.expoPushToken.trim().length > 0;
+  }
+
+  private isDeviceLoggedOut(device: UserDevice): boolean {
+    if (device.sessionActive === false) {
+      return true;
+    }
+
+    if (device.logoutType === 'manual' || device.logoutType === 'forced') {
+      return true;
+    }
+
+    return device.lastActivityType === 'logout' || device.lastActivityType === 'forced_logout';
+  }
+
+  private getWebPushEndpointKey(device: UserDevice): string | null {
+    const endpoint = typeof device.webPushSubscription?.endpoint === 'string'
+      ? device.webPushSubscription.endpoint.trim()
+      : '';
+    return endpoint || null;
+  }
+
+  private getDeviceFreshnessMs(device: UserDevice): number {
+    const candidates = [
+      device.updatedAt,
+      device.lastSeen,
+      device.webPushLastSyncedAt,
+      device.webPushSubscribedAt,
+      device.lastTenantPingAt,
+    ];
+    return candidates.reduce((latest, value) => {
+      if (!value) {
+        return latest;
+      }
+      try {
+        return Math.max(latest, DeviceTrackingService.resolveTimestamp(value).getTime());
+      } catch {
+        return latest;
+      }
+    }, 0);
+  }
+
+  private async cleanupStaleWebPushSubscriptions(
+    userEmail: string,
+    devices: UserDevice[]
+  ): Promise<{
+    devices: UserDevice[];
+    staleCleanedCount: number;
+    deduplicatedCount: number;
+  }> {
+    const webDevices = devices.filter((device) => device.deviceType === 'web' && !device.isDeleted);
+    if (!webDevices.length) {
+      return { devices, staleCleanedCount: 0, deduplicatedCount: 0 };
+    }
+
+    const now = Date.now();
+    const updates: Array<Promise<void>> = [];
+    const staleIds = new Set<string>();
+    const dedupedIds = new Set<string>();
+    const endpointWinners = new Map<string, UserDevice>();
+
+    for (const device of webDevices) {
+      const endpointKey = this.getWebPushEndpointKey(device);
+      const expirationTime = typeof device.webPushSubscription?.expirationTime === 'number'
+        ? device.webPushSubscription.expirationTime
+        : null;
+      const hasExpiredSubscription = typeof expirationTime === 'number' && Number.isFinite(expirationTime) && expirationTime > 0 && expirationTime <= now;
+      const subscribedWithoutEndpoint = device.webPushStatus === 'subscribed' && !endpointKey;
+
+      if (hasExpiredSubscription || subscribedWithoutEndpoint) {
+        staleIds.add(device.deviceId);
+        const deviceRef = doc(firestore, 'user_devices', userEmail, 'devices', device.deviceId);
+        updates.push(updateDoc(deviceRef, {
+          webPushSubscription: deleteField(),
+          webPushStatus: subscribedWithoutEndpoint ? 'sync_required' : 'unsubscribed',
+          webPushLastErrorCode: subscribedWithoutEndpoint ? 'subscription_missing' : 'subscription_expired',
+          webPushLastErrorAt: this.createResolvedTimestamp(),
+          updatedAt: this.createResolvedTimestamp(),
+        }).catch((error) => {
+          logger.warn('Failed to cleanup stale web push subscription', { userEmail, deviceId: device.deviceId, error });
+        }));
+        continue;
+      }
+
+      if (!endpointKey) {
+        continue;
+      }
+
+      const existingWinner = endpointWinners.get(endpointKey);
+      if (!existingWinner) {
+        endpointWinners.set(endpointKey, device);
+        continue;
+      }
+
+      const keepExisting = this.getDeviceFreshnessMs(existingWinner) >= this.getDeviceFreshnessMs(device);
+      const winner = keepExisting ? existingWinner : device;
+      const loser = keepExisting ? device : existingWinner;
+      endpointWinners.set(endpointKey, winner);
+      dedupedIds.add(loser.deviceId);
+
+      const loserRef = doc(firestore, 'user_devices', userEmail, 'devices', loser.deviceId);
+      updates.push(updateDoc(loserRef, {
+        webPushSubscription: deleteField(),
+        webPushStatus: 'unsubscribed',
+        webPushLastErrorCode: 'duplicate_subscription_replaced',
+        webPushLastErrorAt: this.createResolvedTimestamp(),
+        updatedAt: this.createResolvedTimestamp(),
+      }).catch((error) => {
+        logger.warn('Failed to deduplicate web push subscription', { userEmail, deviceId: loser.deviceId, error });
+      }));
+    }
+
+    if (updates.length) {
+      await Promise.all(updates);
+    }
+
+    return {
+      devices: devices.filter((device) => !staleIds.has(device.deviceId) && !dedupedIds.has(device.deviceId)),
+      staleCleanedCount: staleIds.size,
+      deduplicatedCount: dedupedIds.size,
+    };
   }
 
   /**
@@ -913,10 +1075,21 @@ class DeviceTrackingService {
       }).catch(() => undefined);
     }
 
+    const isLogoutReason = reason === 'logged_out' || reason === 'forced_logout';
     await this.updateCurrentDeviceWebPushState({
       webPushSubscription: deleteField(),
       webPushStatus: reason === 'permission_denied' ? 'permission_denied' : 'unsubscribed',
       webPushLastErrorCode: reason,
+      webPushVapidPublicKey: isLogoutReason ? deleteField() : undefined,
+      webPushSubscribedAt: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastSubscriptionSyncAt: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastSubscriptionContext: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastSubscriptionPermission: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastReceiptAt: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastReceiptType: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastReceiptNotificationId: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastReceiptTag: isLogoutReason ? deleteField() : undefined,
+      webPushClientLastReceiptTitle: isLogoutReason ? deleteField() : undefined,
     }).catch(() => undefined);
   }
 
@@ -1615,6 +1788,7 @@ class DeviceTrackingService {
       cleanDeviceInfo.forcedLogoutReason = deleteField();
       cleanDeviceInfo.logoutSignal = deleteField();
       cleanDeviceInfo.isOnline = true;
+      cleanDeviceInfo.sessionActive = true;
 
       if (expoPushToken) {
         cleanDeviceInfo.expoPushToken = expoPushToken;
@@ -2166,8 +2340,19 @@ class DeviceTrackingService {
             lastPushTokenErrorCode: 'logged_out',
             webPushSubscription: deleteField(),
             webPushStatus: 'unsubscribed',
-            webPushLastErrorAt: this.createResolvedTimestamp(),
-            webPushLastErrorCode: 'logged_out',
+            webPushVapidPublicKey: deleteField(),
+            webPushSubscribedAt: deleteField(),
+            webPushLastSyncedAt: deleteField(),
+            webPushLastErrorAt: deleteField(),
+            webPushLastErrorCode: deleteField(),
+            webPushClientLastSubscriptionSyncAt: deleteField(),
+            webPushClientLastSubscriptionContext: deleteField(),
+            webPushClientLastSubscriptionPermission: deleteField(),
+            webPushClientLastReceiptAt: deleteField(),
+            webPushClientLastReceiptType: deleteField(),
+            webPushClientLastReceiptNotificationId: deleteField(),
+            webPushClientLastReceiptTag: deleteField(),
+            webPushClientLastReceiptTitle: deleteField(),
           });
         } catch (error) {
           logger.warn('Failed to clear expo push token on logout:', error);
@@ -2454,6 +2639,9 @@ class DeviceTrackingService {
         const lastSeenTime = parseTimestamp(deviceData.lastSeen);
         const createdAtTime = parseTimestamp(deviceData.createdAt);
         const updatedAtTime = parseTimestamp(deviceData.updatedAt);
+        const lastTenantPingAt = deviceData.lastTenantPingAt
+          ? parseTimestamp(deviceData.lastTenantPingAt)
+          : undefined;
         const activeChatLastSeenAt = deviceData.activeChatLastSeenAt
           ? parseTimestamp(deviceData.activeChatLastSeenAt)
           : undefined;
@@ -2462,12 +2650,17 @@ class DeviceTrackingService {
           : undefined;
         
         // Use database isOnline field if it exists (properly managed during logout operations)
-        // but also verify with the 3-day rule as a fallback for legacy data
-        const hasRecentActivity = DeviceTrackingService.isDeviceOnline(lastSeenTime);
+        // but also verify with the recent-heartbeat rule so stale presence does not overstate delivery.
+        const freshnessCandidates = [lastSeenTime, updatedAtTime, lastTenantPingAt]
+          .filter((value): value is Date => value instanceof Date && Number.isFinite(value.getTime()));
+        const freshestPresenceAt = freshnessCandidates.length
+          ? freshnessCandidates.reduce((latest, value) => (value.getTime() > latest.getTime() ? value : latest))
+          : null;
+        const hasRecentActivity = DeviceTrackingService.isDeviceOnline(freshestPresenceAt);
         const databaseOnlineStatus = deviceData.isOnline;
         
         // A device is considered online if:
-        // 1. It has recent activity (within 3 days), AND
+        // 1. It has recent presence activity inside the heartbeat freshness window, AND
         // 2. Either the database doesn't have isOnline field (legacy) OR the database says it's online
         const isOnline = hasRecentActivity && (databaseOnlineStatus === undefined || databaseOnlineStatus === true);
         
@@ -2477,6 +2670,7 @@ class DeviceTrackingService {
           lastSeen: lastSeenTime,
           createdAt: createdAtTime,
           updatedAt: updatedAtTime,
+          lastTenantPingAt,
           isOnline: isOnline,
           activeChatLastSeenAt,
           activeChatLastMessageTimestamp,
@@ -2660,12 +2854,27 @@ class DeviceTrackingService {
     deviceOverride?: UserDevice,
     options?: DeviceTenantFilterOptions
   ): Promise<boolean> {
+    const result = await this.sendNotificationToDeviceDetailed(deviceId, userEmail, notification, deviceOverride, options);
+    return result.delivered;
+  }
+
+  private async sendNotificationToDeviceDetailed(
+    deviceId: string,
+    userEmail: string,
+    notification: {
+      title: string;
+      body: string;
+      data?: any;
+    },
+    deviceOverride?: UserDevice,
+    options?: DeviceTenantFilterOptions
+  ): Promise<DeviceNotificationAttemptResult> {
     try {
       const device = deviceOverride ?? (await this.getUserDevices(userEmail, options)).find(d => d.deviceId === deviceId);
       
       if (!device) {
         logger.warn('Device not found:', deviceId);
-        return false;
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
       if (options?.tenantId && !this.deviceMatchesTenant(device, options.tenantId, options.includeUntagged ?? true)) {
@@ -2674,15 +2883,16 @@ class DeviceTrackingService {
           deviceId,
           tenantId: options.tenantId,
         });
-        return false;
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
-      if (!device.isOnline) {
-        logger.debug('Skipping device notification: device is offline', {
+      if (!this.canAttemptRemoteNotificationDelivery(device)) {
+        logger.debug('Skipping device notification: no active delivery channel available', {
           userEmail,
           deviceId,
+          deviceType: device.deviceType,
         });
-        return false;
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
   const allowWhenDisabled = notification?.data?.allowWhenDisabled === true;
@@ -2701,7 +2911,7 @@ class DeviceTrackingService {
             userEmail,
             deviceId,
           });
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
 
         if (isChatNotification && device.chatNotificationsEnabled === false) {
@@ -2709,7 +2919,7 @@ class DeviceTrackingService {
             userEmail,
             deviceId,
           });
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
 
         if (isNoticeNotification && device.noticeNotificationsEnabled === false) {
@@ -2717,7 +2927,7 @@ class DeviceTrackingService {
             userEmail,
             deviceId,
           });
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
 
         if (isTeamNotification && device.teamNotificationsEnabled === false) {
@@ -2725,7 +2935,7 @@ class DeviceTrackingService {
             userEmail,
             deviceId,
           });
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
 
         if (notificationType === 'daily_quote' && device.dailyQuotesEnabled === false) {
@@ -2733,11 +2943,11 @@ class DeviceTrackingService {
             userEmail,
             deviceId,
           });
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
       }
 
-      if (isChatNotification && senderEmail) {
+      if (device.isOnline === true && isChatNotification && senderEmail) {
         const activePartner = typeof device.activeChatPartner === 'string'
           ? device.activeChatPartner.toLowerCase()
           : null;
@@ -2762,7 +2972,7 @@ class DeviceTrackingService {
               deviceId,
               senderEmail,
             });
-            return false;
+            return { delivered: false, deliverySource: 'unknown' };
           }
         }
       }
@@ -2776,7 +2986,7 @@ class DeviceTrackingService {
       }
     } catch (error) {
       logger.error('Error sending notification to device:', error);
-      return false;
+      return { delivered: false, deliverySource: 'unknown' };
     }
   }
 
@@ -2787,7 +2997,7 @@ class DeviceTrackingService {
     title: string;
     body: string;
     data?: any;
-  }, device?: UserDevice): Promise<boolean> {
+  }, device?: UserDevice): Promise<DeviceNotificationAttemptResult> {
     try {
       // Check if this is the current device/user
       const isCurrentDevice = deviceId === this.currentDeviceId && userEmail === this.currentUserEmail;
@@ -2811,14 +3021,14 @@ class DeviceTrackingService {
           }
         });
         logger.debug('Local web notification sent to current device:', deviceId);
-        return true;
+        return { delivered: true, deliverySource: 'presence' };
       } else {
         // For remote web devices, use Firebase Realtime Database for cross-device notification
         return await this.sendRemoteWebNotification(deviceId, userEmail, notification, device);
       }
     } catch (error) {
       logger.error('Error sending web browser notification:', error);
-      return false;
+      return { delivered: false, deliverySource: 'unknown' };
     }
   }
 
@@ -2829,10 +3039,11 @@ class DeviceTrackingService {
     title: string;
     body: string;
     data?: any;
-  }, device?: UserDevice): Promise<boolean> {
+  }, device?: UserDevice): Promise<DeviceNotificationAttemptResult> {
     try {
       const tenantId = device ? this.resolveTenantIdForNotification(device, notification) : null;
       const hasWebPushSubscription = typeof device?.webPushSubscription?.endpoint === 'string' && device.webPushSubscription.endpoint.trim().length > 0;
+      const isDeviceOnline = device?.isOnline === true;
 
       if (tenantId && hasWebPushSubscription) {
         const notificationId = typeof notification.data?.notificationId === 'string' && notification.data.notificationId.trim()
@@ -2859,7 +3070,7 @@ class DeviceTrackingService {
 
         if (webPushResult.ok) {
           logger.debug('Remote web push sent successfully via backend', { deviceId, userEmail, tenantId });
-          return true;
+          return { delivered: true, deliverySource: 'push', pushChannel: 'web_push' };
         }
 
         if (webPushResult.result?.error !== 'no_web_push_subscription') {
@@ -2870,6 +3081,16 @@ class DeviceTrackingService {
             error: webPushResult.result,
           });
         }
+      }
+
+      if (!isDeviceOnline) {
+        logger.debug('Skipping remote web notification fallback: device offline and no web push delivery path succeeded', {
+          deviceId,
+          userEmail,
+          hasWebPushSubscription,
+          tenantId,
+        });
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
       // Use Firebase Realtime Database to send notifications to remote web browsers
@@ -2914,10 +3135,10 @@ class DeviceTrackingService {
         }
       }
       
-      return true;
+      return { delivered: true, deliverySource: 'presence' };
     } catch (error) {
       logger.error('Error sending remote web browser notification:', error);
-      return false;
+      return { delivered: false, deliverySource: 'unknown' };
     }
   }
 
@@ -2928,12 +3149,12 @@ class DeviceTrackingService {
     title: string;
     body: string;
     data?: any;
-  }): Promise<boolean> {
+  }): Promise<DeviceNotificationAttemptResult> {
     try {
       if (!device.expoPushToken) {
         logger.warn('No push token available for mobile device:', device.deviceId);
         await this.requestPushTokenRefresh(userEmail, device.deviceId);
-        return false;
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
       const channelId = resolveNotificationChannelId({
@@ -2960,19 +3181,19 @@ class DeviceTrackingService {
             deviceId: device.deviceId,
             userEmail,
           });
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
         const backendResult = await this.sendPushViaBackend({ ...expoMessage, tenantId });
         if (!backendResult.ok) {
-          return false;
+          return { delivered: false, deliverySource: 'unknown' };
         }
         const status = this.extractExpoPushStatus(backendResult.result);
         if (status === 'ok') {
           logger.debug('Mobile app notification sent successfully to device via backend proxy:', device.deviceId);
-          return true;
+          return { delivered: true, deliverySource: 'push', pushChannel: 'mobile_push' };
         }
         logger.error('Failed to send mobile app notification through backend proxy:', backendResult.result);
-        return false;
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
       const response = await fetch('https://exp.host/--/api/v2/push/send', {
@@ -2998,14 +3219,14 @@ class DeviceTrackingService {
       const status = this.extractExpoPushStatus(result);
       if (status === 'ok') {
         logger.debug('Mobile app notification sent successfully to device:', device.deviceId);
-        return true;
+        return { delivered: true, deliverySource: 'push', pushChannel: 'mobile_push' };
       }
 
       logger.error('Failed to send mobile app notification:', result);
-      return false;
+      return { delivered: false, deliverySource: 'unknown' };
     } catch (error) {
       logger.error('Error sending mobile app notification:', error);
-      return false;
+      return { delivered: false, deliverySource: 'unknown' };
     }
   }
 
@@ -3030,9 +3251,10 @@ class DeviceTrackingService {
     title: string;
     body: string;
     data?: any;
-  }, onlineOnly: boolean = true, options?: DeviceTenantFilterOptions): Promise<{ success: number; failed: number }> {
+  }, onlineOnly: boolean = true, options?: DeviceTenantFilterOptions): Promise<DeviceNotificationFanoutResult> {
     try {
       const devices = await this.getUserDevices(userEmail, options);
+      const cleanupResult = await this.cleanupStaleWebPushSubscriptions(userEmail, devices);
       const allowWhenDisabled = notification?.data?.allowWhenDisabled === true;
       const notificationType = notification?.data?.type;
       const isChatNotification = notificationType === 'chat_message';
@@ -3043,12 +3265,16 @@ class DeviceTrackingService {
         : null;
       const ACTIVE_CHAT_SUPPRESSION_WINDOW_MS = 45_000;
 
-      const targetDevices = devices.filter(device => {
-        if (!device.isOnline || device.isDeleted) {
+      const targetDevices = cleanupResult.devices.filter(device => {
+        if (device.isDeleted) {
           return false;
         }
 
-        if (onlineOnly && device.isDeleted) {
+        if (onlineOnly && !device.isOnline) {
+          return false;
+        }
+
+        if (!onlineOnly && !this.canAttemptRemoteNotificationDelivery(device)) {
           return false;
         }
 
@@ -3094,7 +3320,7 @@ class DeviceTrackingService {
           return false;
         }
 
-        if (isChatNotification && senderEmail) {
+        if (device.isOnline === true && isChatNotification && senderEmail) {
           const activePartner = typeof device.activeChatPartner === 'string'
             ? device.activeChatPartner.toLowerCase()
             : null;
@@ -3129,7 +3355,12 @@ class DeviceTrackingService {
 
       let success = 0;
       let failed = 0;
+      let presenceDeliveredCount = 0;
+      let pushAcceptedCount = 0;
+      let mobilePushAcceptedCount = 0;
+      let webPushAcceptedCount = 0;
       const seenMobileTokens = new Set<string>();
+      const onlineDeliverableCount = targetDevices.filter((device) => device.isOnline).length;
 
       // Send notifications to each device individually
       for (const device of targetDevices) {
@@ -3147,16 +3378,53 @@ class DeviceTrackingService {
           }
         }
 
-        const sent = await this.sendNotificationToDevice(device.deviceId, userEmail, notification, device, options);
-        if (sent) success++;
-        else failed++;
+        const attempt = await this.sendNotificationToDeviceDetailed(device.deviceId, userEmail, notification, device, options);
+        if (attempt.delivered) {
+          success++;
+          if (attempt.deliverySource === 'presence') {
+            presenceDeliveredCount += 1;
+          }
+          if (attempt.deliverySource === 'push') {
+            pushAcceptedCount += 1;
+            if (attempt.pushChannel === 'mobile_push') {
+              mobilePushAcceptedCount += 1;
+            }
+            if (attempt.pushChannel === 'web_push') {
+              webPushAcceptedCount += 1;
+            }
+          }
+        } else {
+          failed++;
+        }
       }
 
       logger.debug(`Notification sent to user ${userEmail}: ${success} successful, ${failed} failed`);
-      return { success, failed };
+      return {
+        success,
+        failed,
+        deliverableDeviceCount: targetDevices.length,
+        onlineDeliverableCount,
+        presenceDeliveredCount,
+        pushAcceptedCount,
+        mobilePushAcceptedCount,
+        webPushAcceptedCount,
+        staleWebPushSubscriptionsCleaned: cleanupResult.staleCleanedCount,
+        deduplicatedWebPushSubscriptionsCleaned: cleanupResult.deduplicatedCount,
+      };
     } catch (error) {
       logger.error('Error sending notification to user:', error);
-      return { success: 0, failed: 1 };
+      return {
+        success: 0,
+        failed: 1,
+        deliverableDeviceCount: 0,
+        onlineDeliverableCount: 0,
+        presenceDeliveredCount: 0,
+        pushAcceptedCount: 0,
+        mobilePushAcceptedCount: 0,
+        webPushAcceptedCount: 0,
+        staleWebPushSubscriptionsCleaned: 0,
+        deduplicatedWebPushSubscriptionsCleaned: 0,
+      };
     }
   }
 
@@ -4822,7 +5090,35 @@ class DeviceTrackingService {
         forcedLogoutReason: reason || 'Administrative action',
         logoutType: 'forced',
         logoutSignal: true, // Signal for client to logout
-        isOnline: false // Mark device as offline
+        isOnline: false, // Mark device as offline
+        sessionActive: false,
+        expoPushToken: deleteField(),
+        pushTokenStatus: 'missing',
+        needsExpoPushTokenRefresh: true,
+        lastPushTokenErrorAt: this.createResolvedTimestamp(),
+        lastPushTokenErrorCode: 'forced_logout',
+        webPushSubscription: deleteField(),
+        webPushStatus: 'unsubscribed',
+        webPushVapidPublicKey: deleteField(),
+        webPushSubscribedAt: deleteField(),
+        webPushLastSyncedAt: deleteField(),
+        webPushLastErrorAt: deleteField(),
+        webPushLastErrorCode: deleteField(),
+        webPushClientLastSubscriptionSyncAt: deleteField(),
+        webPushClientLastSubscriptionContext: deleteField(),
+        webPushClientLastSubscriptionPermission: deleteField(),
+        webPushClientLastReceiptAt: deleteField(),
+        webPushClientLastReceiptType: deleteField(),
+        webPushClientLastReceiptNotificationId: deleteField(),
+        webPushClientLastReceiptTag: deleteField(),
+        webPushClientLastReceiptTitle: deleteField(),
+        activeChatPartner: deleteField(),
+        activeChatPartnerId: deleteField(),
+        activeChatPartnerName: deleteField(),
+        activeChatIsFocused: deleteField(),
+        activeChatLastSeenAt: deleteField(),
+        activeChatLastMessageId: deleteField(),
+        activeChatLastMessageTimestamp: deleteField(),
       };
 
       const cleanUpdates = this.cleanUndefinedValues(updates);
@@ -5044,44 +5340,71 @@ class DeviceTrackingService {
   async logUserLogout(userEmail: string, deviceId: string): Promise<void> {
     try {
       // Update device status with logout information
+      if (Platform.OS === 'web' && this.currentUserEmail === userEmail && this.currentDeviceId === deviceId) {
+        await this.unregisterCurrentWebPushSubscription('logged_out');
+      }
+
+      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
+      const updates = {
+        lastSeen: this.createResolvedTimestamp(),
+        updatedAt: this.createResolvedTimestamp(),
+        lastActivityType: 'logout',
+        manualLogoutAt: this.createResolvedTimestamp(),
+        logoutType: 'manual',
+        isOnline: false,
+        sessionActive: false,
+        expoPushToken: deleteField(),
+        pushTokenStatus: 'missing',
+        needsExpoPushTokenRefresh: true,
+        lastPushTokenErrorAt: this.createResolvedTimestamp(),
+        lastPushTokenErrorCode: 'logged_out',
+        webPushSubscription: deleteField(),
+        webPushStatus: 'unsubscribed',
+        webPushVapidPublicKey: deleteField(),
+        webPushSubscribedAt: deleteField(),
+        webPushLastSyncedAt: deleteField(),
+        webPushLastErrorAt: deleteField(),
+        webPushLastErrorCode: deleteField(),
+        webPushClientLastSubscriptionSyncAt: deleteField(),
+        webPushClientLastSubscriptionContext: deleteField(),
+        webPushClientLastSubscriptionPermission: deleteField(),
+        webPushClientLastReceiptAt: deleteField(),
+        webPushClientLastReceiptType: deleteField(),
+        webPushClientLastReceiptNotificationId: deleteField(),
+        webPushClientLastReceiptTag: deleteField(),
+        webPushClientLastReceiptTitle: deleteField(),
+        activeChatPartner: deleteField(),
+        activeChatPartnerId: deleteField(),
+        activeChatPartnerName: deleteField(),
+        activeChatIsFocused: deleteField(),
+        activeChatLastSeenAt: deleteField(),
+        activeChatLastMessageId: deleteField(),
+        activeChatLastMessageTimestamp: deleteField(),
+      };
+
+      const cleanUpdates = this.cleanUndefinedValues(updates);
+      await updateDoc(deviceDoc, cleanUpdates);
+
+      // Update user's last activity
+      const userDoc = doc(firestore, 'user_devices', userEmail);
+      await updateDoc(userDoc, { lastActivity: this.createResolvedTimestamp() });
+      
+      // Log the action
+      await this.logDeviceAction({
+        actionType: 'logout',
+        deviceId,
+        userId: userEmail,
+        timestamp: this.createResolvedTimestamp()
+      });
+      
       if (this.currentUserEmail === userEmail && this.currentDeviceId === deviceId) {
-        const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-        const updates = {
-          lastSeen: this.createResolvedTimestamp(),
-          updatedAt: this.createResolvedTimestamp(),
-          lastActivityType: 'logout',
-          manualLogoutAt: this.createResolvedTimestamp(),
-          logoutType: 'manual',
-          isOnline: false,
-          expoPushToken: deleteField(),
-          pushTokenStatus: 'missing',
-          needsExpoPushTokenRefresh: true,
-          lastPushTokenErrorAt: this.createResolvedTimestamp(),
-          lastPushTokenErrorCode: 'logged_out',
-        };
-
-        const cleanUpdates = this.cleanUndefinedValues(updates);
-        await updateDoc(deviceDoc, cleanUpdates);
-
-        // Update user's last activity
-        const userDoc = doc(firestore, 'user_devices', userEmail);
-        await updateDoc(userDoc, { lastActivity: this.createResolvedTimestamp() });
-        
-        // Log the action
-        await this.logDeviceAction({
-          actionType: 'logout',
-          deviceId,
-          userId: userEmail,
-          timestamp: this.createResolvedTimestamp()
-        });
-        
         // Clear local state
         this.currentUserEmail = null;
         this.currentDeviceId = null;
         this.stopHeartbeat();
-        
-        logger.debug('User logged out manually and device updated');
       }
+      
+      logger.debug('User logged out manually and device updated');
     } catch (error) {
       logger.error('Failed to log user logout:', error);
     }
@@ -5456,9 +5779,9 @@ class DeviceTrackingService {
   }
 
   /**
-   * Determine if a device should be considered online based on lastSeen within 3 days
+   * Determine if a device should be considered online based on recent heartbeat freshness.
    */
-  static isDeviceOnline(lastSeen: any): boolean {
+  static isDeviceOnline(lastSeen: any, freshnessWindowMs: number = 2 * 60 * 1000): boolean {
     if (!lastSeen) return false;
     
     let lastSeenDate: Date;
@@ -5495,11 +5818,12 @@ class DeviceTrackingService {
       return false;
     }
     
-    // Check if lastSeen is within the last 3 days
-    const threeDaysAgo = new Date();
-    threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-    
-    return lastSeenDate > threeDaysAgo;
+    const lastSeenMs = lastSeenDate.getTime();
+    if (!Number.isFinite(lastSeenMs)) {
+      return false;
+    }
+
+    return Date.now() - lastSeenMs <= Math.max(5_000, freshnessWindowMs);
   }
 
   /**

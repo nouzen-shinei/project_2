@@ -20,7 +20,7 @@ import { Student } from '../types';
 import { ChatMessage, chatService } from './chatService';
 import { adminNotificationHistoryService } from './adminNotificationHistoryService';
 import { router } from 'expo-router';
-import type { DeviceTenantFilterOptions } from './deviceTrackingService';
+import type { DeviceNotificationFanoutResult, DeviceTenantFilterOptions } from './deviceTrackingService';
 import { tenantService } from './tenantService';
 import { runtimeEndpoints } from './runtimeEndpoints';
 
@@ -34,7 +34,7 @@ export interface IDeviceTrackingService {
     notification: { title: string; body: string; data?: any },
     onlineOnly?: boolean,
     options?: DeviceTenantFilterOptions
-  ): Promise<{ success: number; failed: number }>;
+  ): Promise<DeviceNotificationFanoutResult>;
   sendNotificationToDevice(
     deviceId: string,
     userEmail: string,
@@ -2268,7 +2268,7 @@ class NotificationService {
 
       const notificationContent = this.buildTeamChatNotificationContent(message, senderName);
       const tenantFilterOptions = await this.resolveTenantFilterOptions(true);
-      await getDeviceTrackingService().sendNotificationToUser(
+      const deliveryResult = await getDeviceTrackingService().sendNotificationToUser(
         recipientEmail,
         {
           title: notificationContent.title,
@@ -2287,6 +2287,33 @@ class NotificationService {
         false,
         tenantFilterOptions
       );
+
+      const messageId = typeof message.id === 'string' ? message.id.trim() : '';
+      if (messageId && deliveryResult.pushAcceptedCount > 0) {
+        try {
+          await chatService.confirmOutboundDelivery(recipientEmail, [messageId], {
+            tenantId: tenantFilterOptions?.tenantId,
+            provenance: {
+              sources: ['push'],
+              lastSource: 'push',
+              lastUpdatedAt: new Date().toISOString(),
+              push: {
+                deliveredAt: new Date().toISOString(),
+                acceptedDeviceCount: deliveryResult.pushAcceptedCount,
+                mobileAcceptedCount: deliveryResult.mobilePushAcceptedCount,
+                webAcceptedCount: deliveryResult.webPushAcceptedCount,
+              },
+            },
+          });
+        } catch (error) {
+          logger.warn('Failed to confirm outbound chat delivery after notification send', {
+            error,
+            messageId,
+            recipientEmail,
+            pushAcceptedCount: deliveryResult.pushAcceptedCount,
+          });
+        }
+      }
     } catch (error) {
       logger.error('Failed to send remote chat notification:', error);
     }

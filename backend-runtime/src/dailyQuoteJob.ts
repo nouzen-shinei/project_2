@@ -549,6 +549,25 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
         continue;
       }
 
+      if (
+        deviceData.sessionActive === false ||
+        deviceData.logoutType === 'manual' ||
+        deviceData.logoutType === 'forced'
+      ) {
+        stats.skipped.deletedDevice += 1;
+        suppressToken(expoPushTokenRaw, preferenceTimestamp);
+        if (debugMatch) {
+          console.log('[daily_quote_job] debug skipped loggedOutDevice', {
+            userEmail,
+            deviceId,
+            token: expoPushTokenRaw,
+            sessionActive: deviceData.sessionActive,
+            logoutType: deviceData.logoutType,
+          });
+        }
+        continue;
+      }
+
       if (deviceData.isOnline !== true) {
         stats.skipped.offlineDevice += 1;
         if (debugMatch) {

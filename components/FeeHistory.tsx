@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import { View, Text, TouchableOpacity, TextInput, ActivityIndicator, StyleSheet, Modal, Pressable } from 'react-native';
+import { View, Text, TouchableOpacity, TextInput, ActivityIndicator, StyleSheet, Modal, Pressable, type FlatListProps } from 'react-native';
 import { ScrollView as GHScrollView, FlatList as GHFlatList } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -36,6 +36,18 @@ type FeeHistoryListItem =
   | { kind: 'controls' }
   | { kind: 'empty' }
   | { kind: 'payment'; payment: PaymentItem };
+
+type TimePresetOption = {
+  id: 'all' | '7d' | '30d' | '90d' | 'month' | 'custom';
+  label: string;
+};
+
+type StudentFilterOption = {
+  id: string;
+  name: string;
+};
+
+const TypedGHFlatList = GHFlatList as unknown as <ItemT>(props: FlatListProps<ItemT>) => React.ReactElement;
 
 // Humanize payment method identifiers for display
 function humanizeMethod(method?: string): string {
@@ -121,6 +133,15 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
     for (let i = 0; i < count; i += 1) out.push(monthIdFromOffset(i));
     return out;
   }, [monthListCount, monthIdFromOffset, maxMonthOptions]);
+
+  const timePresetOptions = useMemo<TimePresetOption[]>(() => ([
+    { id: 'month', label: 'By Month' },
+    { id: 'all', label: 'All time' },
+    { id: '7d', label: 'Last 7 days' },
+    { id: '30d', label: 'Last 30 days' },
+    { id: '90d', label: 'Last 90 days' },
+    { id: 'custom', label: 'Custom' },
+  ]), []);
 
   const deriveMonthId = useCallback((dateString: string) => {
     const t = Date.parse(dateString);
@@ -243,13 +264,13 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
   }, [filterStudentId, computedBounds.fromISO, computedBounds.toISO, filterMethod, activeTenant?.id]);
 
   // Build filters
-  const availableMethods = useMemo(() => {
+  const availableMethods = useMemo<string[]>(() => {
     const set = new Set<string>();
     allPayments.forEach(p => { if (p.method) set.add(String(p.method)); });
     return ['all', ...Array.from(set.values()).sort()];
   }, [allPayments]);
 
-  const availableStudents = useMemo(() => {
+  const availableStudents = useMemo<StudentFilterOption[]>(() => {
     const base = (studentList || []).map((s: any) => ({ id: s.id || s.studentId, name: s.name || s.studentName || s.id }));
     const unique = new Map<string, string>();
     base.forEach(s => { if (s.id) unique.set(s.id, s.name || s.id); });
@@ -746,18 +767,11 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
         <Pressable style={styles.filterModalOverlay} onPress={() => setShowTimePicker(false)}>
           <Pressable style={[styles.filterOptionsModal, { backgroundColor: theme.surface, borderColor: theme.border }]} onPress={() => {}}>
             <Text style={[styles.filterModalHeader, { color: theme.text }]}>Select Time Range</Text>
-            <GHFlatList
-              data={[
-                { id: 'month', label: 'By Month' },
-                { id: 'all', label: 'All time' },
-                { id: '7d', label: 'Last 7 days' },
-                { id: '30d', label: 'Last 30 days' },
-                { id: '90d', label: 'Last 90 days' },
-                { id: 'custom', label: 'Custom' },
-              ] as { id: 'all' | '7d' | '30d' | '90d' | 'month' | 'custom'; label: string }[]}
+            <TypedGHFlatList<TimePresetOption>
+              data={timePresetOptions}
               keyExtractor={(item) => item.id}
               style={{ maxHeight: 260 }}
-              renderItem={({ item }: { item: { id: 'all' | '7d' | '30d' | '90d' | 'month' | 'custom'; label: string } }) => {
+              renderItem={({ item }) => {
                 const isSelected = item.id === timePreset;
                 return (
                   <TouchableOpacity
@@ -787,13 +801,13 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
             {timePreset === 'month' && (
               <View style={{ marginTop: 10 }}>
                 <Text style={{ color: theme.textSecondary, fontSize: 12, marginBottom: 6 }}>Select Month</Text>
-                <GHFlatList
+                <TypedGHFlatList<string>
                   data={monthOptions}
                   keyExtractor={(id) => id}
                   style={{ maxHeight: 320 }}
                   onEndReached={() => setMonthListCount((c) => Math.min(c + 60, maxMonthOptions))}
                   onEndReachedThreshold={0.2}
-                  renderItem={({ item: monthId }: { item: string }) => {
+                  renderItem={({ item: monthId }) => {
                     const isSelected = monthId === selectedMonthId;
                     return (
                       <TouchableOpacity
@@ -821,11 +835,11 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
         <Pressable style={styles.filterModalOverlay} onPress={() => setShowMethodPicker(false)}>
           <Pressable style={[styles.filterOptionsModal, { backgroundColor: theme.surface, borderColor: theme.border }]} onPress={() => {}}>
             <Text style={[styles.filterModalHeader, { color: theme.text }]}>Select Method</Text>
-            <GHFlatList
+            <TypedGHFlatList<string>
               data={availableMethods}
               keyExtractor={(item) => item}
               style={{ maxHeight: 260 }}
-              renderItem={({ item }: { item: string }) => {
+              renderItem={({ item }) => {
                 const isSelected = item === filterMethod;
                 const label = item === 'all' ? 'All methods' : humanizeMethod(item);
                 return (
@@ -850,11 +864,11 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
         <Pressable style={styles.filterModalOverlay} onPress={() => setShowStudentPicker(false)}>
           <Pressable style={[styles.filterOptionsModal, { backgroundColor: theme.surface, borderColor: theme.border }]} onPress={() => {}}>
             <Text style={[styles.filterModalHeader, { color: theme.text }]}>Select Student</Text>
-            <GHFlatList
+            <TypedGHFlatList<StudentFilterOption>
               data={availableStudents}
               keyExtractor={(item) => item.id}
               style={{ maxHeight: 420 }}
-              renderItem={({ item }: { item: { id: string; name: string } }) => {
+              renderItem={({ item }) => {
                 const isSelected = item.id === filterStudentId;
                 return (
                   <TouchableOpacity
@@ -879,7 +893,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
           <ActivityIndicator />
         </View>
       ) : (
-        <GHFlatList
+        <TypedGHFlatList<FeeHistoryListItem>
           data={listData}
           keyExtractor={listKeyExtractor}
           renderItem={renderListItem}

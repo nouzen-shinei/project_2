@@ -31,6 +31,25 @@ export interface FileAttachment {
   thumbnailUrl?: string;
 }
 
+export type ChatDeliverySource = 'presence' | 'push';
+
+export interface ChatDeliveryProvenance {
+  sources?: ChatDeliverySource[];
+  lastSource?: ChatDeliverySource;
+  lastUpdatedAt?: string;
+  presence?: {
+    deliveredAt?: string;
+    onlineDeviceCount?: number;
+    focusedDeviceCount?: number;
+  };
+  push?: {
+    deliveredAt?: string;
+    acceptedDeviceCount?: number;
+    mobileAcceptedCount?: number;
+    webAcceptedCount?: number;
+  };
+}
+
 export interface ChatMessage {
   id?: string;
   text: string;
@@ -70,6 +89,7 @@ export interface ChatMessage {
   read?: boolean; // Blue tick
   deliveredAt?: string; // Timestamp when delivered
   readAt?: string; // Timestamp when read
+  deliveryProvenance?: ChatDeliveryProvenance;
   editedAt?: string;
   editCount?: number;
   deleted?: boolean;
@@ -122,6 +142,7 @@ interface MessageIndexRecord {
   timestamp: string;
   delivered?: boolean;
   read?: boolean;
+  deliveryProvenance?: ChatDeliveryProvenance;
   isSpecial?: boolean;
   hasAttachments?: boolean;
   lastUpdated?: string;
@@ -135,12 +156,106 @@ export interface ConversationLatestRecord {
   tenantId?: string | null;
   delivered: boolean;
   read: boolean;
+  deliveryProvenance?: ChatDeliveryProvenance;
   isSpecial: boolean;
   preview: {
     text: string;
     type: LastMessageType;
     attachmentCount?: number;
   };
+}
+
+export interface ChatReceiptSyncResult {
+  ok: boolean;
+  deliveredMessageIds: string[];
+  readMessageIds: string[];
+  deliveredCount: number;
+  readCount: number;
+  actorHasOnlineDevice: boolean;
+  actorHasFocusedChatDevice: boolean;
+}
+
+export interface ChatOutboundDeliverySyncResult {
+  ok: boolean;
+  deliveredMessageIds: string[];
+  deliveredCount: number;
+}
+
+function sanitizeNonNegativeCount(value: unknown): number | undefined {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return undefined;
+  }
+  return Math.trunc(numeric);
+}
+
+function normalizeDeliverySource(value: unknown): ChatDeliverySource | undefined {
+  return value === 'presence' || value === 'push' ? value : undefined;
+}
+
+function normalizeDeliverySources(values: unknown[]): ChatDeliverySource[] {
+  const result: ChatDeliverySource[] = [];
+  for (const value of values) {
+    const normalized = normalizeDeliverySource(value);
+    if (normalized && !result.includes(normalized)) {
+      result.push(normalized);
+    }
+  }
+  return result;
+}
+
+function normalizeChatDeliveryProvenance(input: unknown): ChatDeliveryProvenance | undefined {
+  if (!input || typeof input !== 'object') {
+    return undefined;
+  }
+
+  const raw = input as Record<string, any>;
+  const lastSource = normalizeDeliverySource(raw.lastSource);
+  const presence = raw.presence && typeof raw.presence === 'object'
+    ? {
+        deliveredAt: typeof raw.presence.deliveredAt === 'string' && raw.presence.deliveredAt.trim()
+          ? raw.presence.deliveredAt
+          : undefined,
+        onlineDeviceCount: sanitizeNonNegativeCount(raw.presence.onlineDeviceCount),
+        focusedDeviceCount: sanitizeNonNegativeCount(raw.presence.focusedDeviceCount),
+      }
+    : undefined;
+  const push = raw.push && typeof raw.push === 'object'
+    ? {
+        deliveredAt: typeof raw.push.deliveredAt === 'string' && raw.push.deliveredAt.trim()
+          ? raw.push.deliveredAt
+          : undefined,
+        acceptedDeviceCount: sanitizeNonNegativeCount(raw.push.acceptedDeviceCount),
+        mobileAcceptedCount: sanitizeNonNegativeCount(raw.push.mobileAcceptedCount),
+        webAcceptedCount: sanitizeNonNegativeCount(raw.push.webAcceptedCount),
+      }
+    : undefined;
+
+  const sources = normalizeDeliverySources([
+    ...(Array.isArray(raw.sources) ? raw.sources : []),
+    lastSource,
+    presence ? 'presence' : undefined,
+    push ? 'push' : undefined,
+  ]);
+
+  const normalized: ChatDeliveryProvenance = {
+    lastSource,
+    lastUpdatedAt: typeof raw.lastUpdatedAt === 'string' && raw.lastUpdatedAt.trim()
+      ? raw.lastUpdatedAt
+      : undefined,
+    presence,
+    push,
+  };
+
+  if (sources.length) {
+    normalized.sources = sources;
+  }
+
+  if (!normalized.sources && !normalized.lastSource && !normalized.lastUpdatedAt && !normalized.presence && !normalized.push) {
+    return undefined;
+  }
+
+  return normalized;
 }
 
 export class ChatRateLimitError extends Error {
@@ -302,6 +417,7 @@ class ChatService {
       read: typeof payload.read === 'boolean' ? payload.read : undefined,
       deliveredAt: typeof payload.deliveredAt === 'string' ? payload.deliveredAt : undefined,
       readAt: typeof payload.readAt === 'string' ? payload.readAt : undefined,
+      deliveryProvenance: normalizeChatDeliveryProvenance(payload.deliveryProvenance),
       editedAt: typeof payload.editedAt === 'string' ? payload.editedAt : undefined,
       editCount: typeof payload.editCount === 'number' ? payload.editCount : undefined,
       deleted: typeof payload.deleted === 'boolean' ? payload.deleted : undefined,
@@ -324,7 +440,7 @@ class ChatService {
   }
 
   private async performChatAction(
-    method: 'PATCH' | 'DELETE',
+    method: 'PATCH' | 'POST' | 'DELETE',
     endpoint: string,
     options: { body?: Record<string, unknown>; tenantId: string }
   ): Promise<any> {
@@ -336,7 +452,7 @@ class ChatService {
 
     let requestEndpoint = endpoint;
     let requestBody: string | undefined;
-    if (method === 'PATCH') {
+    if (method === 'PATCH' || method === 'POST') {
       requestBody = JSON.stringify({ ...(options.body ?? {}), tenantId: normalizedTenantId });
     } else {
       requestEndpoint = this.appendTenantQuery(endpoint, normalizedTenantId);
@@ -577,6 +693,7 @@ class ChatService {
         tenantId: typeof (raw as any).tenantId === 'string' ? raw.tenantId : null,
         delivered: Boolean(raw.delivered),
         read: Boolean(raw.read),
+        deliveryProvenance: normalizeChatDeliveryProvenance((raw as any).deliveryProvenance),
         isSpecial: Boolean(raw.isSpecial),
         preview: raw.preview,
       };
@@ -656,6 +773,7 @@ class ChatService {
       timestamp: message.timestamp,
       delivered: Boolean(message.delivered),
       read: Boolean(message.read),
+      deliveryProvenance: normalizeChatDeliveryProvenance(message.deliveryProvenance),
       isSpecial: Boolean(message.isSpecial),
       hasAttachments: Boolean((message.attachments && message.attachments.length > 0) || message.fileUrl),
       lastUpdated: new Date().toISOString(),
@@ -725,6 +843,7 @@ class ChatService {
       recipientId: this.normalizeEmail(message?.recipientId) || undefined,
       conversationKey: indexRecord.conversationKey,
       tenantId: indexRecord.tenantId ?? message.tenantId,
+      deliveryProvenance: normalizeChatDeliveryProvenance(message?.deliveryProvenance ?? indexRecord.deliveryProvenance),
     };
 
     return { message: hydrated, index: indexRecord };
@@ -758,6 +877,9 @@ class ChatService {
     }
     if (patch.read !== undefined) {
       indexPatch.read = patch.read;
+    }
+    if (patch.deliveryProvenance !== undefined) {
+      indexPatch.deliveryProvenance = normalizeChatDeliveryProvenance(patch.deliveryProvenance);
     }
     if (patch.isSpecial !== undefined) {
       indexPatch.isSpecial = patch.isSpecial;
@@ -1322,6 +1444,7 @@ class ChatService {
       tenantId: message.tenantId || null,
       delivered: Boolean(message.delivered),
       read: Boolean(message.read),
+      deliveryProvenance: normalizeChatDeliveryProvenance(message.deliveryProvenance),
       isSpecial: Boolean(message.isSpecial),
       preview: {
         text: preview.text,
@@ -3027,6 +3150,83 @@ class ChatService {
       recipientId,
       isSpecial: true,
     });
+  }
+
+  async syncConversationReceipts(
+    partnerEmail: string,
+    options: {
+      deliveredMessageIds?: string[];
+      readMessageIds?: string[];
+      markConversationDelivered?: boolean;
+      tenantId?: string | null;
+    } = {}
+  ): Promise<ChatReceiptSyncResult> {
+    const normalizedPartner = this.normalizeEmail(partnerEmail);
+    if (!normalizedPartner) {
+      throw new Error('Partner email is required for receipt sync');
+    }
+
+    const resolvedTenantId = options.tenantId ?? await tenantService.getCachedSelectedTenant();
+    const tenantScopeId = this.requireTenantId(resolvedTenantId);
+    const response = await this.performChatAction('POST', '/chat/receipts/sync', {
+      tenantId: tenantScopeId,
+      body: this.pruneUndefined({
+        partnerEmail: normalizedPartner,
+        deliveredMessageIds: options.deliveredMessageIds?.filter(Boolean),
+        readMessageIds: options.readMessageIds?.filter(Boolean),
+        markConversationDelivered: options.markConversationDelivered,
+      }),
+    });
+
+    return {
+      ok: Boolean(response?.ok),
+      deliveredMessageIds: Array.isArray(response?.deliveredMessageIds) ? response.deliveredMessageIds : [],
+      readMessageIds: Array.isArray(response?.readMessageIds) ? response.readMessageIds : [],
+      deliveredCount: typeof response?.deliveredCount === 'number' ? response.deliveredCount : 0,
+      readCount: typeof response?.readCount === 'number' ? response.readCount : 0,
+      actorHasOnlineDevice: response?.actorHasOnlineDevice === true,
+      actorHasFocusedChatDevice: response?.actorHasFocusedChatDevice === true,
+    };
+  }
+
+  async confirmOutboundDelivery(
+    partnerEmail: string,
+    deliveredMessageIds: string[],
+    options: {
+      tenantId?: string | null;
+      provenance?: ChatDeliveryProvenance;
+    } = {}
+  ): Promise<ChatOutboundDeliverySyncResult> {
+    const normalizedPartner = this.normalizeEmail(partnerEmail);
+    if (!normalizedPartner) {
+      throw new Error('Partner email is required for outbound delivery confirmation');
+    }
+
+    const normalizedIds = Array.from(new Set(deliveredMessageIds.map((entry) => String(entry || '').trim()).filter(Boolean)));
+    if (!normalizedIds.length) {
+      return {
+        ok: true,
+        deliveredMessageIds: [],
+        deliveredCount: 0,
+      };
+    }
+
+    const resolvedTenantId = options.tenantId ?? await tenantService.getCachedSelectedTenant();
+    const tenantScopeId = this.requireTenantId(resolvedTenantId);
+    const response = await this.performChatAction('POST', '/chat/receipts/outbound-delivered', {
+      tenantId: tenantScopeId,
+      body: this.pruneUndefined({
+        partnerEmail: normalizedPartner,
+        deliveredMessageIds: normalizedIds,
+        provenance: normalizeChatDeliveryProvenance(options.provenance),
+      }),
+    });
+
+    return {
+      ok: Boolean(response?.ok),
+      deliveredMessageIds: Array.isArray(response?.deliveredMessageIds) ? response.deliveredMessageIds : [],
+      deliveredCount: typeof response?.deliveredCount === 'number' ? response.deliveredCount : 0,
+    };
   }
 
   // Mark message as delivered (double tick)

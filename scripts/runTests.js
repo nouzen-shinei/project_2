@@ -26,6 +26,10 @@ const {
   getUsageStatus,
   getUsagePercentage,
 } = require('../backend-runtime/src/lib/planLimits');
+const {
+  reconcileConversationUnreadCount,
+  shouldRefreshChatSummariesOnForegroundResume,
+} = require('../lib/chatReceiptState');
 
 logger.debug('Running unit tests (basic runner)');
 
@@ -211,14 +215,16 @@ function withEnv(overrides, callback) {
     senderEmail: 'Alice.Teacher@example.com',
     recipientEmail: 'parent.ONE@school.edu',
   });
-  assert.strictEqual(
-    dual,
-    'alice_teacher_example_com__parent_one_school_edu',
-    'Expected folder to contain both participants as sanitized keys'
-  );
+  const dualReversed = resolveChatUploadFolder({
+    senderEmail: 'parent.ONE@school.edu',
+    recipientEmail: 'Alice.Teacher@example.com',
+  });
+  assert.strictEqual(dual, dualReversed, 'Conversation folder should be stable regardless of participant order');
+  assert.match(dual, /^c_[a-f0-9]{20}$/i, 'Expected conversation folder to use the hashed conversation key format');
 
   const single = resolveChatUploadFolder({ senderEmail: 'solo.user@demo.org' });
-  assert.strictEqual(single, 'solo_user_demo_org', 'Single participant should fall back to their sanitized key');
+  assert.match(single, /^c_[a-f0-9]{20}$/i, 'Single participant folder should use the hashed participant key format');
+  assert.notStrictEqual(single, dual, 'Single participant folder should not collide with a conversation folder');
 
   const fallback = resolveChatUploadFolder({});
   assert.strictEqual(fallback, 'unassigned', 'Missing participants should fall back to unassigned folder');
@@ -240,6 +246,73 @@ function withEnv(overrides, callback) {
   assert(percent > 55 && percent < 57, 'Percentage should be ~56%');
 
   logger.debug('✓ testPlanLimitsHelpers passed');
+})();
+
+(function testReconcileConversationUnreadCount() {
+  const previous = new Map([
+    ['partner@example.com', { unreadCount: 4, updatedAt: '2025-03-11T10:00:00.000Z' }],
+  ]);
+
+  const unchangedWhileBackgrounded = reconcileConversationUnreadCount(previous, 'partner@example.com', 1, {
+    isFocused: true,
+    isAppActive: false,
+    loading: false,
+  });
+  assert.strictEqual(unchangedWhileBackgrounded, previous, 'Backgrounded chat should not mutate unread summary state');
+
+  const updated = reconcileConversationUnreadCount(previous, 'partner@example.com', 1, {
+    isFocused: true,
+    isAppActive: true,
+    loading: false,
+  });
+  assert.notStrictEqual(updated, previous, 'Active chat should reconcile unread summary state');
+  assert.strictEqual(updated.get('partner@example.com').unreadCount, 1, 'Unread count should be reconciled to the live message count');
+  logger.debug('✓ testReconcileConversationUnreadCount passed');
+})();
+
+(function testForegroundResumeRefreshGate() {
+  assert.strictEqual(
+    shouldRefreshChatSummariesOnForegroundResume({
+      isFocused: true,
+      isAppActive: true,
+      wasForegroundInteractive: false,
+      hasUserEmail: true,
+      hasTenantId: true,
+      now: 5000,
+      lastForegroundRefreshAt: 1000,
+    }),
+    true,
+    'Foreground resume should trigger a summary refresh when outside the throttle window'
+  );
+
+  assert.strictEqual(
+    shouldRefreshChatSummariesOnForegroundResume({
+      isFocused: true,
+      isAppActive: true,
+      wasForegroundInteractive: false,
+      hasUserEmail: true,
+      hasTenantId: true,
+      now: 2000,
+      lastForegroundRefreshAt: 1000,
+    }),
+    false,
+    'Foreground resume should stay throttled when it happens too soon after the previous refresh'
+  );
+
+  assert.strictEqual(
+    shouldRefreshChatSummariesOnForegroundResume({
+      isFocused: true,
+      isAppActive: true,
+      wasForegroundInteractive: true,
+      hasUserEmail: true,
+      hasTenantId: true,
+      now: 5000,
+      lastForegroundRefreshAt: 0,
+    }),
+    false,
+    'A continuously active screen should not be treated as a resume event'
+  );
+  logger.debug('✓ testForegroundResumeRefreshGate passed');
 })();
 
 logger.debug('All basic tests passed');

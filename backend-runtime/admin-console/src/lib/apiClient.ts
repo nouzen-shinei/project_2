@@ -694,6 +694,7 @@ export interface TenantSearchResponse {
 
 export interface TenantUserDeviceRecord {
   deviceId: string;
+  deviceType?: string;
   isOnline?: boolean;
   lastSeen?: string;
   lastTenantPingAt?: string;
@@ -703,6 +704,21 @@ export interface TenantUserDeviceRecord {
   lastTenantId?: string;
   tenantIds?: string[];
   notificationsEnabled?: boolean;
+  chatNotificationsEnabled?: boolean;
+  pushTokenStatus?: string;
+  webPushStatus?: string;
+  hasExpoPushToken?: boolean;
+  hasWebPushSubscription?: boolean;
+  activeChatPartner?: string;
+  activeChatPartnerId?: string;
+  activeChatPartnerName?: string;
+  activeChatIsFocused?: boolean;
+  activeChatLastSeenAt?: string;
+  activeChatLastMessageId?: string;
+  activeChatLastMessageTimestamp?: string;
+  webPushClientLastReceiptAt?: string;
+  webPushClientLastReceiptType?: string;
+  webPushClientLastReceiptNotificationId?: string;
   isDeleted?: boolean;
 }
 

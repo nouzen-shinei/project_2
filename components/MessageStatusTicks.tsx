@@ -43,42 +43,51 @@ export const MessageStatusTicks: React.FC<MessageStatusTicksProps> = ({
   const isRead = Boolean(read || readAt);
   const isDelivered = isRead || Boolean(delivered || deliveredAt);
   const shouldShowSingle = !pending && !failed && !isDelivered && !isRead;
+  const accessibilityLabel = failed
+    ? 'Failed to send'
+    : pending
+    ? 'Sending'
+    : isRead
+    ? 'Read'
+    : isDelivered
+    ? 'Delivered'
+    : 'Sent';
 
   const renderDoubleTick = (tickColor: string) => (
     <View style={styles.doubleTickContainer}>
-      <Check size={size} color={tickColor} strokeWidth={2.8} style={[styles.firstTick, { marginLeft: overlapOffset }]} />
-      <Check size={size} color={tickColor} strokeWidth={2.8} style={[styles.secondTick, { marginLeft: overlapOffset }]} />
+      <Check size={size} color={tickColor} style={[styles.firstTick, { marginLeft: overlapOffset }]} />
+      <Check size={size} color={tickColor} style={[styles.secondTick, { marginLeft: overlapOffset }]} />
     </View>
   );
 
   if (failed) {
     return (
-      <View style={styles.container}>
-        <AlertCircle size={size} color={resolvedFailedColor} strokeWidth={2.4} />
+      <View style={styles.container} accessible accessibilityLabel={accessibilityLabel}>
+        <AlertCircle size={size} color={resolvedFailedColor} />
       </View>
     );
   }
 
   if (pending) {
     return (
-      <View style={styles.container}>
-        <Clock3 size={size} color={resolvedPendingColor} strokeWidth={2.6} />
+      <View style={styles.container} accessible accessibilityLabel={accessibilityLabel}>
+        <Clock3 size={size} color={resolvedPendingColor} />
       </View>
     );
   }
 
   if (isRead) {
-    return <View style={styles.container}>{renderDoubleTick(resolvedReadColor)}</View>;
+    return <View style={styles.container} accessible accessibilityLabel={accessibilityLabel}>{renderDoubleTick(resolvedReadColor)}</View>;
   }
 
   if (isDelivered) {
-    return <View style={styles.container}>{renderDoubleTick(baseColor)}</View>;
+    return <View style={styles.container} accessible accessibilityLabel={accessibilityLabel}>{renderDoubleTick(baseColor)}</View>;
   }
 
   if (shouldShowSingle) {
     return (
-      <View style={styles.container}>
-        <Check size={size} color={baseColor} strokeWidth={2.8} />
+      <View style={styles.container} accessible accessibilityLabel={accessibilityLabel}>
+        <Check size={size} color={baseColor} />
       </View>
     );
   }

@@ -57,8 +57,10 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import ConfirmationModal from './ConfirmationModal';
-import { createAudioPlayer, PLAYBACK_STATUS_UPDATE } from 'expo-audio';
+import { createAudioPlayer, type AudioStatus } from 'expo-audio';
 import { AudioPlayer } from './AudioPlayer';
+
+const PLAYBACK_STATUS_UPDATE_EVENT = 'playbackStatusUpdate';
 
 // Link normalizer function to add missing URL formats
 const normalizeUrl = (url: string): string => {
@@ -431,7 +433,7 @@ const getAudioDurationMs = async (uri: string): Promise<number | undefined> => {
       resolve(value);
     };
 
-    subscription = player.addListener(PLAYBACK_STATUS_UPDATE, (status) => {
+    subscription = player.addListener(PLAYBACK_STATUS_UPDATE_EVENT, (status: AudioStatus) => {
       if (status?.isLoaded && typeof status.duration === 'number' && status.duration > 0) {
         cleanup(Math.round(status.duration * 1000));
       }

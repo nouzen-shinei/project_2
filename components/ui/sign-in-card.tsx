@@ -318,6 +318,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000000', // Black background like in the design
+    width: '100%',
+    maxWidth: '100%',
+    overflow: 'hidden',
   },
   backgroundGradient: {
     position: 'absolute',
@@ -332,6 +335,7 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
+    overflow: 'hidden',
   },
   // Enhanced background glows inspired by the design
   topRadialGlow: {
@@ -421,12 +425,15 @@ const styles = StyleSheet.create({
   },
   scrollView: {
     flex: 1,
+    maxWidth: '100%',
   },
   scrollContent: {
     flexGrow: 1,
     paddingHorizontal: 20,
     paddingTop: 60,
     paddingBottom: 40,
+    width: '100%',
+    maxWidth: '100%',
   },
   header: {
     alignItems: 'center',

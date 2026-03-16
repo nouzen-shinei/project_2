@@ -26,7 +26,16 @@ import {
   watchConversationRealtime,
 } from './chatRealtime';
 import { checkChatRateLimit } from './chatRateLimiter';
-import { sendChatMessage, editChatMessage, deleteChatMessage, toggleChatMessageReaction, ChatMessageActionError } from './chatMessageWriter';
+import {
+  sendChatMessage,
+  editChatMessage,
+  deleteChatMessage,
+  toggleChatMessageReaction,
+  syncChatConversationReceipts,
+  confirmOutboundChatDelivery,
+  markPendingChatMessagesDeliveredForRecipient,
+  ChatMessageActionError,
+} from './chatMessageWriter';
 import {
   sendTeamMembershipChangeNotification,
   sendTenantJoinRequestNotification,
@@ -526,6 +535,62 @@ const chatMessageReactionSchema = z.object({
   tenantId: z.string().min(1),
   reactionType: z.string().min(1).max(32),
 });
+
+const chatReceiptSyncSchema = z
+  .object({
+    tenantId: z.string().min(1),
+    partnerEmail: z.string().email(),
+    deliveredMessageIds: z.array(z.string().trim().min(1)).max(200).optional(),
+    readMessageIds: z.array(z.string().trim().min(1)).max(200).optional(),
+    markConversationDelivered: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    const deliveredCount = Array.isArray(value.deliveredMessageIds) ? value.deliveredMessageIds.length : 0;
+    const readCount = Array.isArray(value.readMessageIds) ? value.readMessageIds.length : 0;
+    const wantsConversationDelivery = value.markConversationDelivered === true;
+
+    if (!deliveredCount && !readCount && !wantsConversationDelivery) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'At least one receipt sync action is required',
+        path: ['readMessageIds'],
+      });
+    }
+  });
+
+const chatDeliveryProvenanceSchema = z.object({
+  sources: z.array(z.enum(['presence', 'push'])).max(2).optional(),
+  lastSource: z.enum(['presence', 'push']).optional(),
+  lastUpdatedAt: z.string().datetime().optional(),
+  presence: z.object({
+    deliveredAt: z.string().datetime().optional(),
+    onlineDeviceCount: z.number().int().min(0).max(1000).optional(),
+    focusedDeviceCount: z.number().int().min(0).max(1000).optional(),
+  }).partial().optional(),
+  push: z.object({
+    deliveredAt: z.string().datetime().optional(),
+    acceptedDeviceCount: z.number().int().min(0).max(1000).optional(),
+    mobileAcceptedCount: z.number().int().min(0).max(1000).optional(),
+    webAcceptedCount: z.number().int().min(0).max(1000).optional(),
+  }).partial().optional(),
+}).partial();
+
+const chatOutboundDeliverySchema = z
+  .object({
+    tenantId: z.string().min(1),
+    partnerEmail: z.string().email(),
+    deliveredMessageIds: z.array(z.string().trim().min(1)).max(200),
+    provenance: chatDeliveryProvenanceSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.deliveredMessageIds.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'At least one delivered message id is required',
+        path: ['deliveredMessageIds'],
+      });
+    }
+  });
 
 const teamMembershipRoleEnum = z.enum(['owner', 'admin', 'staff', 'member', 'user']);
 const tenantMembershipRoleSchema = z.enum(['owner', 'admin', 'staff', 'member']);
@@ -5194,6 +5259,8 @@ type FirestoreResolver = () => admin.firestore.Firestore;
 export interface CreateAppOptions {
   overrides?: {
     sendChatMessage?: typeof sendChatMessage;
+    syncChatConversationReceipts?: typeof syncChatConversationReceipts;
+    confirmOutboundChatDelivery?: typeof confirmOutboundChatDelivery;
     requireTenantMembershipAccess?: TenantMembershipAccessFn;
     isTenantEmailActiveMember?: TenantEmailMemberChecker;
     runNotificationHistoryInspector?: typeof runNotificationHistoryInspector;
@@ -5237,6 +5304,10 @@ export function createApp(options: CreateAppOptions = {}){
   const app = express();
   const isTestProcess = process.env.TEST_MODE === '1' || process.argv.includes('--test');
   const sendChatMessageImpl = options.overrides?.sendChatMessage ?? sendChatMessage;
+  const syncChatConversationReceiptsImpl =
+    options.overrides?.syncChatConversationReceipts ?? syncChatConversationReceipts;
+  const confirmOutboundChatDeliveryImpl =
+    options.overrides?.confirmOutboundChatDelivery ?? confirmOutboundChatDelivery;
   const requireTenantMembershipAccessImpl = options.overrides?.requireTenantMembershipAccess ?? requireTenantMembershipAccess;
   const isTenantEmailActiveMemberImpl = options.overrides?.isTenantEmailActiveMember ?? isTenantEmailActiveMember;
   const runNotificationHistoryInspectorImpl = options.overrides?.runNotificationHistoryInspector ?? runNotificationHistoryInspector;
@@ -6200,6 +6271,7 @@ export function createApp(options: CreateAppOptions = {}){
         .collection('devices')
         .select(
           'deviceId',
+          'deviceType',
           'isOnline',
           'lastSeen',
           'lastTenantPingAt',
@@ -6209,6 +6281,21 @@ export function createApp(options: CreateAppOptions = {}){
           'lastTenantId',
           'tenantIds',
           'notificationsEnabled',
+          'chatNotificationsEnabled',
+          'expoPushToken',
+          'pushTokenStatus',
+          'webPushSubscription',
+          'webPushStatus',
+          'activeChatPartner',
+          'activeChatPartnerId',
+          'activeChatPartnerName',
+          'activeChatIsFocused',
+          'activeChatLastSeenAt',
+          'activeChatLastMessageId',
+          'activeChatLastMessageTimestamp',
+          'webPushClientLastReceiptAt',
+          'webPushClientLastReceiptType',
+          'webPushClientLastReceiptNotificationId',
           'isDeleted',
         )
         .get();
@@ -6227,6 +6314,7 @@ export function createApp(options: CreateAppOptions = {}){
 
           return {
             deviceId,
+            deviceType: typeof data.deviceType === 'string' ? data.deviceType : undefined,
             isOnline: typeof data.isOnline === 'boolean' ? data.isOnline : undefined,
             lastSeen: toIso(data.lastSeen),
             lastTenantPingAt: toIso(data.lastTenantPingAt),
@@ -6236,6 +6324,27 @@ export function createApp(options: CreateAppOptions = {}){
             lastTenantId,
             tenantIds,
             notificationsEnabled: typeof data.notificationsEnabled === 'boolean' ? data.notificationsEnabled : undefined,
+            chatNotificationsEnabled:
+              typeof data.chatNotificationsEnabled === 'boolean' ? data.chatNotificationsEnabled : undefined,
+            pushTokenStatus: typeof data.pushTokenStatus === 'string' ? data.pushTokenStatus : undefined,
+            webPushStatus: typeof data.webPushStatus === 'string' ? data.webPushStatus : undefined,
+            hasExpoPushToken: typeof data.expoPushToken === 'string' && data.expoPushToken.trim().length > 0,
+            hasWebPushSubscription:
+              typeof data.webPushSubscription?.endpoint === 'string' && data.webPushSubscription.endpoint.trim().length > 0,
+            activeChatPartner: typeof data.activeChatPartner === 'string' ? data.activeChatPartner : undefined,
+            activeChatPartnerId: typeof data.activeChatPartnerId === 'string' ? data.activeChatPartnerId : undefined,
+            activeChatPartnerName: typeof data.activeChatPartnerName === 'string' ? data.activeChatPartnerName : undefined,
+            activeChatIsFocused: typeof data.activeChatIsFocused === 'boolean' ? data.activeChatIsFocused : undefined,
+            activeChatLastSeenAt: toIso(data.activeChatLastSeenAt),
+            activeChatLastMessageId: typeof data.activeChatLastMessageId === 'string' ? data.activeChatLastMessageId : undefined,
+            activeChatLastMessageTimestamp: toIso(data.activeChatLastMessageTimestamp),
+            webPushClientLastReceiptAt: toIso(data.webPushClientLastReceiptAt),
+            webPushClientLastReceiptType:
+              typeof data.webPushClientLastReceiptType === 'string' ? data.webPushClientLastReceiptType : undefined,
+            webPushClientLastReceiptNotificationId:
+              typeof data.webPushClientLastReceiptNotificationId === 'string'
+                ? data.webPushClientLastReceiptNotificationId
+                : undefined,
             isDeleted: typeof data.isDeleted === 'boolean' ? data.isDeleted : undefined,
           };
         })
@@ -9563,6 +9672,121 @@ export function createApp(options: CreateAppOptions = {}){
       }
       console.error('[chat_messages_edit] failed', error);
       return res.status(500).json({ error: 'edit_failed' });
+    }
+  });
+
+  app.post('/chat/receipts/sync', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatReceiptSyncSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    const normalizedPartner = normalizeEmail(parsed.data.partnerEmail);
+    if (!normalizedPartner) {
+      return res.status(400).json({ error: 'invalid_partner' });
+    }
+
+    const partnerIsMember = await isTenantEmailActiveMemberImpl(tenantAccess.tenantId, normalizedPartner);
+    if (!partnerIsMember) {
+      return res.status(403).json({ error: 'partner_not_in_tenant' });
+    }
+
+    try {
+      const result = await syncChatConversationReceiptsImpl({
+        tenantId: tenantAccess.tenantId,
+        actorEmail,
+        partnerEmail: normalizedPartner,
+        deliveredMessageIds: parsed.data.deliveredMessageIds,
+        readMessageIds: parsed.data.readMessageIds,
+        markConversationDelivered: parsed.data.markConversationDelivered,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_receipts_sync] failed', error);
+      return res.status(500).json({ error: 'receipt_sync_failed' });
+    }
+  });
+
+  app.post('/chat/receipts/outbound-delivered', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatOutboundDeliverySchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    const normalizedPartner = normalizeEmail(parsed.data.partnerEmail);
+    if (!normalizedPartner) {
+      return res.status(400).json({ error: 'invalid_partner' });
+    }
+
+    const partnerIsMember = await isTenantEmailActiveMemberImpl(tenantAccess.tenantId, normalizedPartner);
+    if (!partnerIsMember) {
+      return res.status(403).json({ error: 'partner_not_in_tenant' });
+    }
+
+    try {
+      const result = await confirmOutboundChatDeliveryImpl({
+        tenantId: tenantAccess.tenantId,
+        actorEmail,
+        partnerEmail: normalizedPartner,
+        deliveredMessageIds: parsed.data.deliveredMessageIds,
+        provenance: parsed.data.provenance,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_receipts_outbound_delivered] failed', error);
+      return res.status(500).json({ error: 'outbound_delivery_confirmation_failed' });
     }
   });
 
@@ -15786,6 +16010,17 @@ export function createApp(options: CreateAppOptions = {}){
       }
       await userRef.set(parentUpdate, { merge: true });
 
+      void markPendingChatMessagesDeliveredForRecipient({
+        tenantId,
+        recipientEmail: normalizedEmail,
+      }).catch((error) => {
+        console.warn('[devices/ping] receipt promotion failed', {
+          tenantId,
+          userEmail: normalizedEmail,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+
       res.json({ ok: true, tenantId, deviceId });
     } catch (error) {
       console.error('[devices/ping] failed to enforce tenant metadata', error);
@@ -15914,7 +16149,7 @@ export function createApp(options: CreateAppOptions = {}){
     const actorEmail = await resolveAuthenticatedEmail(authContext);
     const normalizedActor = normalizeEmail(actorEmail);
     const normalizedUser = normalizeEmail(parsed.data.userEmail);
-    if (!normalizedActor || normalizedActor !== normalizedUser) {
+    if (authContext.tokenType !== 'master' && (!normalizedActor || normalizedActor !== normalizedUser)) {
       return res.status(403).json({ error: 'not_authorized', message: 'User email mismatch' });
     }
 

@@ -49,8 +49,10 @@ html {
 }
 body {
   display: flex;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior-y: none;
+  overscroll-behavior-x: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;

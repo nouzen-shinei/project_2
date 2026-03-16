@@ -127,6 +127,8 @@ interface UsageAlertDeviceRecord {
   usageAlertNotificationsEnabled?: boolean;
   isDeleted?: boolean;
   isOnline?: boolean;
+  sessionActive?: boolean;
+  logoutType?: string;
 }
 
 export async function notifyUsageAlert(params: NotifyUsageAlertParams): Promise<UsageAlertNotificationSummary | null> {
@@ -308,6 +310,8 @@ async function getDevicesForUser(
       'usageAlertNotificationsEnabled',
       'isDeleted',
       'isOnline',
+      'sessionActive',
+      'logoutType',
       'deviceId'
     )
     .get();
@@ -326,6 +330,8 @@ async function getDevicesForUser(
         usageAlertNotificationsEnabled: data?.usageAlertNotificationsEnabled,
         isDeleted: data?.isDeleted,
         isOnline: data?.isOnline,
+        sessionActive: data?.sessionActive,
+        logoutType: typeof data?.logoutType === 'string' ? data.logoutType : undefined,
       } satisfies UsageAlertDeviceRecord;
     })
     .filter((record) => Boolean(record.token));
@@ -334,6 +340,8 @@ async function getDevicesForUser(
 function shouldDeliverPushToDevice(device: UsageAlertDeviceRecord): boolean {
   if (!device.token) return false;
   if (device.isDeleted) return false;
+  if (device.sessionActive === false) return false;
+  if (device.logoutType === 'manual' || device.logoutType === 'forced') return false;
   if (device.isOnline !== true) return false;
   if (device.notificationsEnabled === false) return false;
   if (device.noticeNotificationsEnabled === false) return false;
