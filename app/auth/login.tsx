@@ -6,6 +6,12 @@ import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useNetworkQuality } from '../../hooks/useNetworkQuality';
 import SignInCard from '../../components/ui/sign-in-card';
 import AutoNetworkBanner from '../../components/AutoNetworkBanner';
+import {
+  clearReviewerQuickJoinPending,
+  getReviewerQuickJoinCenterName,
+  isReviewerQuickJoinEnabled,
+  markReviewerQuickJoinPending,
+} from '../../services/reviewerQuickJoin';
 
 export default function LoginScreen() {
   const { signInWithGoogle, loading, error, user, clearError } = useAuth();
@@ -68,16 +74,28 @@ export default function LoginScreen() {
     }
   }, [error]);
 
-  const handleGoogleSignIn = async () => {
+  const handleGoogleSignIn = async (options?: { reviewerQuickJoin?: boolean }) => {
+    const reviewerQuickJoinRequested = Boolean(options?.reviewerQuickJoin);
     setIsSigningIn(true);
     setDisplayError(null);
     setSuccess(null);
     clearError();
+
+    if (reviewerQuickJoinRequested) {
+      try {
+        await markReviewerQuickJoinPending();
+      } catch (storageError) {
+        logger.warn('LoginScreen: failed to persist reviewer quick join intent', storageError);
+      }
+    }
     
     try {
       const result = await signInWithGoogle();
       
       if (!result.success) {
+        if (reviewerQuickJoinRequested) {
+          await clearReviewerQuickJoinPending().catch(() => undefined);
+        }
         // For device ban errors on mobile, show alert for better visibility
         if (result.error && result.error.includes('DEVICE_BAN_ERROR:') && Platform.OS !== 'web') {
           // Clean the error message for display (remove internal marker)
@@ -102,7 +120,12 @@ export default function LoginScreen() {
       }
       if (result.success) {
         const name = result.user?.displayName || result.user?.email?.split('@')[0] || 'User';
-        setSuccess(`Login successful. Welcome, ${name}! Redirecting...`);
+        if (reviewerQuickJoinRequested) {
+          const center = getReviewerQuickJoinCenterName();
+          setSuccess(`Login successful. Welcome, ${name}! We will quickly request access to ${center}.`);
+        } else {
+          setSuccess(`Login successful. Welcome, ${name}! Redirecting...`);
+        }
         // Auto-clear success after a short delay in case navigation lingers
         setTimeout(() => setSuccess(null), 4000);
       }
@@ -119,7 +142,10 @@ export default function LoginScreen() {
       <AutoNetworkBanner />
       
       <SignInCard 
-        onGoogleSignIn={handleGoogleSignIn}
+        onGoogleSignIn={() => handleGoogleSignIn()}
+        onReviewerQuickSignIn={() => handleGoogleSignIn({ reviewerQuickJoin: true })}
+        reviewerQuickJoinEnabled={isReviewerQuickJoinEnabled()}
+        reviewerQuickJoinCenterName={getReviewerQuickJoinCenterName()}
         loading={loading || isSigningIn}
         error={displayError}
         success={success}

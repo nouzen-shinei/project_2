@@ -27,6 +27,9 @@ const { width, height } = Dimensions.get('window');
 
 interface SignInCardProps {
   onGoogleSignIn?: () => void;
+  onReviewerQuickSignIn?: () => void;
+  reviewerQuickJoinEnabled?: boolean;
+  reviewerQuickJoinCenterName?: string;
   loading?: boolean;
   error?: string | null;
   success?: string | null;
@@ -35,7 +38,15 @@ interface SignInCardProps {
 const AnimatedTouchableOpacity = Animated.createAnimatedComponent(TouchableOpacity);
 const AnimatedView = Animated.createAnimatedComponent(View);
 
-export default function SignInCard({ onGoogleSignIn, loading, error, success }: SignInCardProps) {
+export default function SignInCard({
+  onGoogleSignIn,
+  onReviewerQuickSignIn,
+  reviewerQuickJoinEnabled,
+  reviewerQuickJoinCenterName,
+  loading,
+  error,
+  success,
+}: SignInCardProps) {
   const sharedTopPadding = useSharedTopPadding();
   // Debug logging for error
   if (__DEV__ && error) {
@@ -121,6 +132,12 @@ export default function SignInCard({ onGoogleSignIn, loading, error, success }: 
   const handleGoogleSignIn = () => {
     if (onGoogleSignIn) {
       onGoogleSignIn();
+    }
+  };
+
+  const handleReviewerQuickSignIn = () => {
+    if (onReviewerQuickSignIn) {
+      onReviewerQuickSignIn();
     }
   };
 
@@ -251,6 +268,18 @@ export default function SignInCard({ onGoogleSignIn, loading, error, success }: 
                 </>
               )}
             </AnimatedTouchableOpacity>
+
+            {reviewerQuickJoinEnabled && (
+              <TouchableOpacity
+                style={styles.reviewerQuickButton}
+                onPress={handleReviewerQuickSignIn}
+                disabled={loading}
+              >
+                <Text style={styles.reviewerQuickButtonText}>
+                  Flavortown Reviewer Quick Sign-In to {reviewerQuickJoinCenterName || 'legacy-coachin'}
+                </Text>
+              </TouchableOpacity>
+            )}
 
             {/* <View style={styles.securityNote}>
               <Shield size={16} color="rgba(255, 255, 255, 0.7)" />
@@ -715,6 +744,23 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontFamily: 'Inter-SemiBold',
     color: '#000000', // Black text on white button
+  },
+  reviewerQuickButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.6)',
+    backgroundColor: '#F9E8D2',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginBottom: 12,
+  },
+  reviewerQuickButtonText: {
+    fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+    color: '#000000',
+    textAlign: 'center',
   },
   securityNote: {
     flexDirection: 'row',

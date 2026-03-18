@@ -38,6 +38,13 @@ import {
   TenantJoinCodeClaimResponse,
   TenantJoinCodePreviewResponse,
 } from '@/services/tenantBackendClient';
+import {
+  claimReviewerQuickJoin,
+  consumeReviewerQuickJoinPending,
+  getReviewerQuickJoinCenterName,
+  getReviewerQuickJoinCode,
+  isReviewerQuickJoinEnabled,
+} from '@/services/reviewerQuickJoin';
 import { tenantService } from '@/services/tenantService';
 import { uploadTenantLogo, TENANT_LOGO_MAX_BYTES, TenantLogoAsset } from '@/services/tenantBrandingService';
 import type { Tenant, TenantMembership, TenantMembershipStatus, TenantMembershipStatusEvent } from '@/types';
@@ -100,6 +107,7 @@ const STATUS_REASON_LABELS: Record<string, string> = {
   membership_created: 'Membership created',
   join_code_claim: 'Requested via join code',
   join_request_approved: 'Approved by admin',
+  join_code_auto_approved: 'Auto-approved via reviewer quick join',
   join_request_rejected: 'Rejected by admin',
   invite_received: 'Invite received',
   invite_accepted: 'Invite accepted',
@@ -509,6 +517,7 @@ const TenantMembershipManager = () => {
   const [joinError, setJoinError] = useState<string | null>(null);
   const [checkingCode, setCheckingCode] = useState(false);
   const [claimingCode, setClaimingCode] = useState(false);
+  const [reviewerQuickJoining, setReviewerQuickJoining] = useState(false);
 
   const deviceTimezone = useMemo(() => {
     try {
@@ -538,6 +547,9 @@ const TenantMembershipManager = () => {
 
   const normalizedCode = sanitizeCode(joinCode);
   const canSubmitCode = normalizedCode.length >= 5;
+  const reviewerQuickJoinEnabled = isReviewerQuickJoinEnabled();
+  const reviewerQuickJoinCenterName = getReviewerQuickJoinCenterName();
+  const reviewerQuickJoinCode = getReviewerQuickJoinCode();
   const membershipStatus = joinPreview?.membership?.status;
   const alreadyMember = membershipStatus === 'active';
   const alreadyInvitePending = membershipStatus === 'pending_invite' || joinPreview?.pendingInvite === true;
@@ -653,18 +665,10 @@ const TenantMembershipManager = () => {
     }
   };
 
-  const handleClaimCode = async () => {
-    if (!joinPreview || alreadyMember || alreadyPending) {
-      return;
-    }
-    setClaimingCode(true);
-    setJoinError(null);
-    try {
-      const response = await tenantBackendClient.claimJoinCode({
-        code: normalizedCode,
-        displayName: user?.displayName || undefined,
-      });
+  const applyJoinCodeClaimResult = useCallback(
+    async (response: TenantJoinCodeClaimResponse, codeUsed: string) => {
       setJoinSuccess(response);
+      setJoinCode(codeUsed);
       setJoinPreview({
         tenant: response.tenant,
         code: {
@@ -679,6 +683,23 @@ const TenantMembershipManager = () => {
         membership: response.membership,
       });
       await refreshTenants();
+    },
+    [refreshTenants],
+  );
+
+  const handleClaimCode = async () => {
+    if (!joinPreview || alreadyMember || alreadyPending) {
+      return;
+    }
+    setClaimingCode(true);
+    setJoinError(null);
+    try {
+      const codeUsed = normalizedCode;
+      const response = await tenantBackendClient.claimJoinCode({
+        code: codeUsed,
+        displayName: user?.displayName || undefined,
+      });
+      await applyJoinCodeClaimResult(response, codeUsed);
     } catch (claimError) {
       if (claimError instanceof TenantBackendError) {
         if (claimError.code === 'invite_pending') {
@@ -706,6 +727,82 @@ const TenantMembershipManager = () => {
       setClaimingCode(false);
     }
   };
+
+  const handleReviewerQuickJoin = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!reviewerQuickJoinEnabled || reviewerQuickJoining || claimingCode) {
+        return;
+      }
+
+      setReviewerQuickJoining(true);
+      setJoinError(null);
+      setJoinSuccess(null);
+
+      try {
+        const response = await claimReviewerQuickJoin(user?.displayName || undefined);
+        await applyJoinCodeClaimResult(response, reviewerQuickJoinCode);
+
+        if (response.membership.status === 'active') {
+          await selectTenant(response.tenant.id).catch((selectError) => {
+            logger.warn('TenantMembershipManager: reviewer quick join select failed', selectError);
+          });
+          if (!options?.silent) {
+            Alert.alert('Reviewer access granted', `You are now inside ${response.tenant.name}.`);
+          }
+        } else if (!options?.silent) {
+          Alert.alert('Request sent', `Your request for ${response.tenant.name} is pending admin review.`);
+        }
+      } catch (quickJoinError) {
+        const message =
+          quickJoinError instanceof TenantBackendError
+            ? quickJoinError.message
+            : quickJoinError instanceof Error
+              ? quickJoinError.message
+              : 'Unable to run reviewer quick join right now.';
+        if (options?.silent) {
+          logger.warn('TenantMembershipManager: silent reviewer quick join failed', quickJoinError);
+          setJoinError(message);
+        } else {
+          Alert.alert('Reviewer quick join failed', message);
+        }
+      } finally {
+        setReviewerQuickJoining(false);
+      }
+    },
+    [
+      applyJoinCodeClaimResult,
+      claimingCode,
+      reviewerQuickJoinCode,
+      reviewerQuickJoinEnabled,
+      reviewerQuickJoining,
+      selectTenant,
+      user?.displayName,
+    ],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!reviewerQuickJoinEnabled || !user?.uid) {
+      return;
+    }
+
+    const run = async () => {
+      try {
+        const shouldRun = await consumeReviewerQuickJoinPending();
+        if (!shouldRun || cancelled) {
+          return;
+        }
+        await handleReviewerQuickJoin({ silent: true });
+      } catch (error) {
+        logger.warn('TenantMembershipManager: reviewer quick join consume failed', error);
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [handleReviewerQuickJoin, reviewerQuickJoinEnabled, user?.uid]);
 
   const handleCreateTenant = async () => {
     if (!user?.uid || !user.email) {
@@ -1218,6 +1315,33 @@ const TenantMembershipManager = () => {
           </View>
           <ChevronRight size={18} color="rgba(255,255,255,0.85)" />
         </TouchableOpacity>
+
+        {reviewerQuickJoinEnabled && (
+          <TouchableOpacity
+            style={[
+              styles.actionCard,
+              styles.secondaryActionCard,
+              { borderColor: theme.border, backgroundColor: theme.surface, opacity: reviewerQuickJoining ? 0.75 : 1 },
+            ]}
+            onPress={() => {
+              void handleReviewerQuickJoin();
+            }}
+            disabled={reviewerQuickJoining}
+          >
+            <View style={[styles.actionIcon, { backgroundColor: `${theme.success}1A` }]}>
+              {reviewerQuickJoining ? (
+                <ActivityIndicator size="small" color={theme.success} />
+              ) : (
+                <Users size={18} color={theme.success} />
+              )}
+            </View>
+            <View style={styles.actionContent}>
+              <Text style={[styles.actionTitle, { color: theme.text }]}>Flavortown Reviewer quick join</Text>
+              <Text style={[styles.actionSubtitle, { color: theme.textSecondary }]}>Quickly request access to {reviewerQuickJoinCenterName}</Text>
+            </View>
+            <ChevronRight size={18} color={theme.textSecondary} />
+          </TouchableOpacity>
+        )}
       </View>
 
       <Modal
@@ -1406,6 +1530,29 @@ const TenantMembershipManager = () => {
             <Text style={[styles.modalDescription, { color: theme.textSecondary }]}> 
               Enter the join code shared by the coaching center admin to add this account.
             </Text>
+            {reviewerQuickJoinEnabled && (
+              <TouchableOpacity
+                style={[
+                  styles.quickJoinPillButton,
+                  {
+                    borderColor: theme.success,
+                    backgroundColor: `${theme.success}14`,
+                    opacity: reviewerQuickJoining ? 0.7 : 1,
+                  },
+                ]}
+                onPress={() => {
+                  void handleReviewerQuickJoin();
+                }}
+                disabled={reviewerQuickJoining}
+              >
+                {reviewerQuickJoining ? (
+                  <ActivityIndicator size="small" color={theme.success} />
+                ) : (
+                  <Users size={16} color={theme.success} />
+                )}
+                <Text style={[styles.quickJoinPillButtonText, { color: theme.success }]}>Quick join {reviewerQuickJoinCenterName}</Text>
+              </TouchableOpacity>
+            )}
             <TextInput
               style={[styles.input, { borderColor: theme.border, color: theme.text, backgroundColor: theme.surface }]}
               value={joinCode}
@@ -1953,6 +2100,21 @@ const styles = StyleSheet.create({
   modalDescription: {
     fontSize: 14,
     marginBottom: 12,
+  },
+  quickJoinPillButton: {
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 10,
+  },
+  quickJoinPillButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
   },
   modalLabel: {
     fontSize: 13,

@@ -201,6 +201,11 @@ EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID=...
 # Legacy fallbacks (only used if Firestore runtimeEndpoints is missing/unreachable)
 EXPO_PUBLIC_API_BASE_URL=https://your-backend.example.com
 EXPO_PUBLIC_EMAIL_API_BASE_URL=https://your-email-backend.example.com
+
+# Temporary reviewer quick join (client-visible, optional)
+EXPO_PUBLIC_REVIEWER_QUICK_JOIN_ENABLED=0
+EXPO_PUBLIC_REVIEWER_QUICK_JOIN_CODE=
+EXPO_PUBLIC_REVIEWER_QUICK_JOIN_CENTER_NAME=legacy-coachin
 ```
 
 ### Firebase Auth on Vercel (production web)

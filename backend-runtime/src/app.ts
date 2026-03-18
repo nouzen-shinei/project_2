@@ -728,6 +728,47 @@ type NotificationPreferenceKey = (typeof notificationPreferenceKeys)[number];
 
 const DEFAULT_INVITE_EXPIRY_DAYS = 7;
 
+const REVIEWER_AUTO_APPROVE_JOIN_CODE = normalizeTenantCode(process.env.REVIEWER_AUTO_APPROVE_JOIN_CODE || '');
+const REVIEWER_AUTO_APPROVE_ENABLED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.REVIEWER_AUTO_APPROVE_ENABLED || '').trim().toLowerCase(),
+);
+const REVIEWER_AUTO_APPROVE_TENANT_ID = String(process.env.REVIEWER_AUTO_APPROVE_TENANT_ID || '').trim();
+const REVIEWER_AUTO_APPROVE_TENANT_SLUG = String(process.env.REVIEWER_AUTO_APPROVE_TENANT_SLUG || '').trim().toLowerCase();
+const REVIEWER_AUTO_APPROVE_ROLE = (() => {
+  const candidate = String(process.env.REVIEWER_AUTO_APPROVE_ROLE || '').trim().toLowerCase();
+  if (candidate === 'admin' || candidate === 'staff' || candidate === 'member') {
+    return candidate;
+  }
+  return 'member';
+})();
+const REVIEWER_AUTO_APPROVE_ACTOR_NAME = String(process.env.REVIEWER_AUTO_APPROVE_ACTOR_NAME || 'Reviewer quick join').trim();
+
+function shouldAutoApproveReviewerJoinCode(options: {
+  code: string;
+  tenantId: string;
+  tenantSlug?: string;
+}): boolean {
+  if (!REVIEWER_AUTO_APPROVE_ENABLED) {
+    return false;
+  }
+  if (!REVIEWER_AUTO_APPROVE_JOIN_CODE) {
+    return false;
+  }
+  if (options.code !== REVIEWER_AUTO_APPROVE_JOIN_CODE) {
+    return false;
+  }
+  if (REVIEWER_AUTO_APPROVE_TENANT_ID && options.tenantId !== REVIEWER_AUTO_APPROVE_TENANT_ID) {
+    return false;
+  }
+  if (REVIEWER_AUTO_APPROVE_TENANT_SLUG) {
+    const slug = (options.tenantSlug || '').trim().toLowerCase();
+    if (!slug || slug !== REVIEWER_AUTO_APPROVE_TENANT_SLUG) {
+      return false;
+    }
+  }
+  return true;
+}
+
 const DEFAULT_WEB_APP_BASE_URL = 'https://tuitionmanager.app';
 
 function normalizeWebBaseUrl(raw: unknown): string | null {
@@ -9353,6 +9394,11 @@ export function createApp(options: CreateAppOptions = {}){
       const requestExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
       const joinRequestsRef = db.collection('tenantJoinRequests');
+      const shouldAutoApprove = shouldAutoApproveReviewerJoinCode({
+        code: normalizedCode,
+        tenantId: tenantSnap.id,
+        tenantSlug: typeof tenantData.slug === 'string' ? tenantData.slug : undefined,
+      });
       const existingRequestSnap = await joinRequestsRef
         .where('tenantId', '==', tenantSnap.id)
         .where('userId', '==', authContext.uid)
@@ -9424,7 +9470,7 @@ export function createApp(options: CreateAppOptions = {}){
 
       await membershipRef.set(membershipPayload, { merge: true });
 
-      if (createdNewJoinRequest) {
+      if (createdNewJoinRequest && !shouldAutoApprove) {
         void sendTenantJoinRequestNotificationImpl({
           tenantId: tenantSnap.id,
           tenantName: tenantData.name,
@@ -9468,7 +9514,7 @@ export function createApp(options: CreateAppOptions = {}){
         })
       );
 
-      const membershipResponse = {
+      let membershipResponse = {
         id: membershipId,
         tenantId: tenantSnap.id,
         userId: authContext.uid,
@@ -9480,7 +9526,7 @@ export function createApp(options: CreateAppOptions = {}){
         updatedAt: nowIso,
       };
 
-      const joinRequestResponse = {
+      let joinRequestResponse = {
         id: joinRequestData.id,
         status: joinRequestData.status,
         requestedAt: toIsoTimestamp(joinRequestData.requestedAt) ?? nowIso,
@@ -9489,9 +9535,127 @@ export function createApp(options: CreateAppOptions = {}){
         expiresAt: toIsoTimestamp(joinRequestData.expiresAt) ?? null,
       };
 
+      let pendingRequest = true;
+
+      if (shouldAutoApprove) {
+        const autoApprovedAt = new Date().toISOString();
+        const desiredRole = REVIEWER_AUTO_APPROVE_ROLE;
+        const actorId = 'system_reviewer_quick_join';
+        const actorEmail = 'system@reviewer-quick-join.local';
+        const reviewerName = REVIEWER_AUTO_APPROVE_ACTOR_NAME || 'Reviewer quick join';
+        const normalizedTargetEmail = userEmail.toLowerCase();
+        const needsSeat = desiredRole === 'admin' || desiredRole === 'staff';
+        const needsSeatCheck = needsSeat && (!existingMembership || existingMembership.status !== 'active');
+
+        if (needsSeatCheck) {
+          try {
+            await assertTenantStaffSeatAvailable(db, tenantSnap.id);
+          } catch (error) {
+            if (error instanceof TenantSeatLimitError) {
+              return res.status(409).json({ error: 'seat_limit_reached', limit: error.limit });
+            }
+            throw error;
+          }
+        }
+
+        const approvedStatusEvent: Record<string, any> = stripUndefinedDeep({
+          status: 'active',
+          at: autoApprovedAt,
+          actorId,
+          actorEmail,
+          actorName: reviewerName,
+          reason: 'join_code_auto_approved',
+          initiatedFrom: 'system',
+        });
+
+        await db.runTransaction(async (tx) => {
+          const freshRequestSnap = await tx.get(joinRequestDocRef);
+          if (!freshRequestSnap.exists) {
+            throw new TenantAccessError(404, { error: 'request_not_found' });
+          }
+          const freshRequest = freshRequestSnap.data() || {};
+          if (freshRequest.status && freshRequest.status !== 'pending') {
+            throw new TenantAccessError(409, { error: 'request_already_reviewed' });
+          }
+
+          const invitesQuery = db
+            .collection('tenantInvites')
+            .where('tenantId', '==', tenantSnap.id)
+            .where('email', '==', normalizedTargetEmail)
+            .where('status', '==', 'pending')
+            .limit(50);
+          const invitesSnap = await tx.get(invitesQuery);
+
+          tx.set(
+            membershipRef,
+            {
+              role: desiredRole,
+              status: 'active',
+              updatedAt: autoApprovedAt,
+              statusHistory: admin.firestore.FieldValue.arrayUnion(approvedStatusEvent),
+            },
+            { merge: true },
+          );
+          tx.update(joinRequestDocRef, {
+            status: 'approved',
+            reviewedAt: autoApprovedAt,
+            reviewedBy: actorId,
+            assignedRole: desiredRole,
+          });
+          invitesSnap.docs.forEach((docSnap) => {
+            tx.update(docSnap.ref, {
+              status: 'accepted',
+              acceptedAt: autoApprovedAt,
+              acceptedBy: actorId,
+              updatedAt: autoApprovedAt,
+            });
+          });
+        });
+
+        await db.collection('tenantAuditLogs').add(
+          stripUndefinedDeep({
+            tenantId: tenantSnap.id,
+            actorId,
+            actorEmail,
+            action: 'join_request_reviewed',
+            targetId: joinRequestData.id,
+            targetType: 'joinRequest',
+            metadata: { outcome: 'approved', role: desiredRole, via: 'reviewer_quick_join', codeId: codeDoc.id },
+            createdAt: autoApprovedAt,
+          }),
+        );
+
+        void sendTeamMembershipChangeNotificationImpl({
+          tenantId: tenantSnap.id,
+          tenantName: typeof tenantData.name === 'string' ? tenantData.name : undefined,
+          action: existingMembership ? 'role_changed' : 'added',
+          targetEmail: normalizedTargetEmail,
+          targetRole: desiredRole,
+          metadata: {
+            displayName,
+            reason: 'join_code_auto_approved',
+            initiatedFrom: 'system',
+            actorName: reviewerName,
+          },
+        }).catch((error) => console.warn('[tenant-join-code] auto-approve team notify failed', error));
+
+        pendingRequest = false;
+        membershipResponse = {
+          ...membershipResponse,
+          role: desiredRole,
+          status: 'active',
+          updatedAt: autoApprovedAt,
+        };
+        joinRequestResponse = {
+          ...joinRequestResponse,
+          status: 'approved',
+          reviewedAt: autoApprovedAt,
+        };
+      }
+
       return res.json({
         ok: true,
-        pendingRequest: true,
+        pendingRequest,
         tenant: {
           id: tenantSnap.id,
           name: tenantData.name,

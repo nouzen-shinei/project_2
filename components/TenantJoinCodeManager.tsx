@@ -17,6 +17,7 @@ import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
 import { useAuth } from '@/hooks/useAuthUnified';
 import { tenantService } from '@/services/tenantService';
+import { getReviewerQuickJoinCode } from '@/services/reviewerQuickJoin';
 import type { TenantCode } from '@/types';
 import { formatDateToString } from '@/lib/utils';
 import { logger } from '@/lib/logger';
@@ -86,6 +87,7 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
   const highlightTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null);
+  const reviewerQuickJoinCode = useMemo(() => getReviewerQuickJoinCode(), []);
 
   useEffect(() => {
     if (!activeTenant?.id || !canManageCodes) {
@@ -312,9 +314,17 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
   }, []);
 
   const confirmRevokeCode = useCallback((code: TenantCode) => {
+    const normalizedCode = code.code.trim().toUpperCase();
+    if (reviewerQuickJoinCode && normalizedCode === reviewerQuickJoinCode) {
+      Alert.alert(
+        'Protected join code',
+        'This code is reserved for reviewer quick join and cannot be revoked from this screen.',
+      );
+      return;
+    }
     setPendingRevokeCode(code);
     setShowRevokeModal(true);
-  }, []);
+  }, [reviewerQuickJoinCode]);
 
   const submitRevokeCode = useCallback(() => {
     if (!pendingRevokeCode) {
@@ -502,6 +512,9 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
           const expiresAtDate = parseIsoDate(code.expiresAt);
           const createdAtDate = parseIsoDate(code.createdAt);
           const normalizedCodeValue = code.code.trim().toUpperCase();
+          const isReviewerQuickJoinCode = Boolean(
+            reviewerQuickJoinCode && normalizedCodeValue === reviewerQuickJoinCode,
+          );
           const pendingCount =
             pendingRequestLookup.byId[code.id] ?? pendingRequestLookup.byValue[normalizedCodeValue] ?? 0;
           return (
@@ -558,7 +571,7 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
                     {copiedCodeId === code.id ? 'Copied!' : 'Copy code'}
                   </Text>
                 </TouchableOpacity>
-                {code.status === 'active' && (
+                {code.status === 'active' && !isReviewerQuickJoinCode && (
                   <TouchableOpacity
                     style={[styles.actionButton, { borderColor: theme.border }]}
                     onPress={() => confirmRevokeCode(code)}
