@@ -3,6 +3,7 @@ import { Stack , useRouter, useSegments } from 'expo-router';
 import { enforceClientSafety } from '../lib/runtimeEnv';
 import { injectCSP } from '../lib/security/csp';
 import { logger } from '../lib/logger';
+import '../services/notificationBackgroundTask';
 // Import log control (must be before other modules that log heavily)
 import '../lib/logControl';
 import BirthdayConfetti from '../components/BirthdayConfetti';

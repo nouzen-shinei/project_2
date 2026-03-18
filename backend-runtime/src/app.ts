@@ -926,7 +926,7 @@ async function loadTenantInviteFromFirestore(inviteId: string): Promise<TenantIn
 /* c8 ignore stop */
 
 async function executeExpoPushProxyRequestDefault(options: {
-  payload: Record<string, any>;
+  payload: unknown;
   endpoint: string;
   timeoutMs: number;
   fetchImpl: FetchLike;
@@ -15287,6 +15287,43 @@ export function createApp(options: CreateAppOptions = {}){
   });
 
   const pushProxyRL = rateLimitMiddleware({ windowMs: 60_000, max: 120 });
+  let apnsProviderCache: any | null = null;
+  let apnsProviderInitAttempted = false;
+
+  const resolveApnsProvider = (): { provider: any | null; topic: string | null } => {
+    const topic = (process.env.APNS_BUNDLE_ID || '').trim();
+    const keyId = (process.env.APNS_KEY_ID || '').trim();
+    const teamId = (process.env.APNS_TEAM_ID || '').trim();
+    const keyPath = (process.env.APNS_AUTH_KEY_PATH || '').trim();
+    const keyB64 = (process.env.APNS_AUTH_KEY_B64 || '').trim();
+
+    if (!topic || !keyId || !teamId || (!keyPath && !keyB64)) {
+      return { provider: null, topic: null };
+    }
+
+    if (!apnsProviderInitAttempted) {
+      apnsProviderInitAttempted = true;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const apnLib = require('apn') as any;
+        const key = keyB64 ? Buffer.from(keyB64, 'base64').toString('utf8') : keyPath;
+        apnsProviderCache = new apnLib.Provider({
+          token: {
+            key,
+            keyId,
+            teamId,
+          },
+          production: String(process.env.APNS_PRODUCTION || 'true').toLowerCase() !== 'false',
+        });
+      } catch (error) {
+        console.warn('[push_proxy] APNs provider init failed', error);
+        apnsProviderCache = null;
+      }
+    }
+
+    return { provider: apnsProviderCache, topic };
+  };
+
   app.post('/notifications/push', pushProxyRL, requireStaffTenantAccess, async (req,res)=>{
     const parsed = tenantScopedPushPayloadSchema.safeParse(req.body || {});
     if (!parsed.success) {
@@ -15335,24 +15372,270 @@ export function createApp(options: CreateAppOptions = {}){
     const requestPayload = 'messages' in payload ? { messages: payload.messages, dryRun: payload.dryRun } : payload;
     const endpoint = process.env.EXPO_PUSH_ENDPOINT || 'https://exp.host/--/api/v2/push/send';
     const timeoutMs = Number(process.env.EXPO_PUSH_PROXY_TIMEOUT_MS || 10000);
+
+    const isExpoPushToken = (token: string): boolean => /^(ExponentPushToken|ExpoPushToken)\[/i.test(token);
+    const toStringMap = (data: Record<string, unknown> | undefined): Record<string, string> => {
+      if (!data || typeof data !== 'object') return {};
+      const output: Record<string, string> = {};
+      for (const [key, value] of Object.entries(data)) {
+        if (value == null) continue;
+        if (typeof value === 'string') {
+          output[key] = value;
+          continue;
+        }
+        if (typeof value === 'number' || typeof value === 'boolean') {
+          output[key] = String(value);
+          continue;
+        }
+        try {
+          output[key] = JSON.stringify(value);
+        } catch {
+          output[key] = String(value);
+        }
+      }
+      return output;
+    };
+
+    const looksLikeApnsToken = (token: string): boolean => /^[a-f0-9]{64,}$/i.test(token);
+    const splitTargets = (raw: any): { expoMessages: any[]; fcmMessages: any[]; apnsMessages: any[] } => {
+      const rawMessages = Array.isArray(raw?.messages) ? raw.messages : [raw];
+      const expoMessages: any[] = [];
+      const fcmMessages: any[] = [];
+      const apnsMessages: any[] = [];
+
+      for (const rawMessage of rawMessages) {
+        const targets = Array.isArray(rawMessage?.to) ? rawMessage.to : [rawMessage?.to];
+        const common = { ...rawMessage };
+        delete (common as any).to;
+
+        for (const target of targets) {
+          if (typeof target !== 'string' || !target.trim()) {
+            continue;
+          }
+          const token = target.trim();
+          const hintRaw = common?.data?._tmPushTransportHint;
+          const hint = typeof hintRaw === 'string' ? hintRaw.toLowerCase() : '';
+          if (isExpoPushToken(token)) {
+            expoMessages.push({ ...common, to: token });
+          } else if (hint === 'apns' || looksLikeApnsToken(token)) {
+            apnsMessages.push({ ...common, to: token });
+          } else {
+            fcmMessages.push({ ...common, to: token });
+          }
+        }
+      }
+
+      return { expoMessages, fcmMessages, apnsMessages };
+    };
+
+    const sendApnsMessages = async (messages: any[]): Promise<{ sent: number; failed: number; errors: any[] }> => {
+      if (!messages.length) {
+        return { sent: 0, failed: 0, errors: [] };
+      }
+
+      const { provider, topic } = resolveApnsProvider();
+      if (!provider || !topic) {
+        return {
+          sent: 0,
+          failed: messages.length,
+          errors: messages.map((entry: any) => ({
+            token: entry?.to,
+            code: 'apns_not_configured',
+            message: 'APNS_BUNDLE_ID/APNS_KEY_ID/APNS_TEAM_ID/APNS_AUTH_KEY_* missing',
+          })),
+        };
+      }
+
+      let sent = 0;
+      let failed = 0;
+      const errors: any[] = [];
+
+      for (const message of messages) {
+        const token = typeof message?.to === 'string' ? message.to.trim() : '';
+        if (!token) {
+          failed += 1;
+          errors.push({ code: 'missing_token', message: 'Missing APNs token' });
+          continue;
+        }
+
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const apnLib = require('apn') as any;
+          const notification = new apnLib.Notification();
+          notification.topic = topic;
+          notification.pushType = (message?._contentAvailable || message?.data?._tmReceiptProbe) ? 'background' : 'alert';
+          notification.priority = (message?.priority === 'high') ? 10 : 5;
+
+          if (typeof message?.expiration === 'number') {
+            notification.expiry = message.expiration;
+          } else if (typeof message?.ttl === 'number' && Number.isFinite(message.ttl)) {
+            notification.expiry = Math.floor(Date.now() / 1000) + Math.max(0, Math.floor(message.ttl));
+          }
+
+          if (typeof message?.title === 'string' || typeof message?.body === 'string') {
+            notification.alert = {
+              title: typeof message?.title === 'string' ? message.title : undefined,
+              body: typeof message?.body === 'string' ? message.body : undefined,
+            };
+          }
+
+          if (message?.sound === 'default') {
+            notification.sound = 'default';
+          }
+
+          if (message?._contentAvailable) {
+            notification.contentAvailable = 1;
+          }
+          if (message?.mutableContent) {
+            notification.mutableContent = 1;
+          }
+
+          const payloadData = message?.data && typeof message.data === 'object' ? message.data : {};
+          notification.payload = payloadData;
+
+          const response = await provider.send(notification, token);
+          const sentCount = Array.isArray(response?.sent) ? response.sent.length : 0;
+          const failedItems = Array.isArray(response?.failed) ? response.failed : [];
+
+          sent += sentCount;
+          if (failedItems.length > 0) {
+            failed += failedItems.length;
+            for (const entry of failedItems) {
+              errors.push({
+                token,
+                code: entry?.response?.reason || entry?.error?.code || 'apns_send_failed',
+                message: entry?.response?.reason || entry?.error?.message || 'apns_send_failed',
+              });
+            }
+          }
+        } catch (error: any) {
+          failed += 1;
+          errors.push({
+            token,
+            code: error?.code || 'apns_send_failed',
+            message: error?.message || String(error),
+          });
+        }
+      }
+
+      return { sent, failed, errors };
+    };
+
+    const sendFcmMessages = async (messages: any[]): Promise<{ sent: number; failed: number; errors: any[] }> => {
+      if (!messages.length) {
+        return { sent: 0, failed: 0, errors: [] };
+      }
+
+      ensureFirebase();
+      const messaging = admin.messaging();
+      let sent = 0;
+      let failed = 0;
+      const errors: any[] = [];
+
+      for (const message of messages) {
+        const token = typeof message?.to === 'string' ? message.to.trim() : '';
+        if (!token) {
+          failed += 1;
+          errors.push({ error: 'missing_token' });
+          continue;
+        }
+
+        const data = toStringMap(message?.data as Record<string, unknown> | undefined);
+        const highPriority = (message?.priority === 'high') || data.priority === 'high';
+        const fcmPayload: admin.messaging.Message = {
+          token,
+          data,
+          android: {
+            priority: highPriority ? 'high' : 'normal',
+            notification: {
+              channelId: typeof message?.channelId === 'string' ? message.channelId : undefined,
+              sound: message?.sound === 'default' ? 'default' : undefined,
+            },
+          },
+          apns: {
+            headers: {
+              'apns-priority': highPriority ? '10' : '5',
+            },
+            payload: {
+              aps: {
+                sound: message?.sound === 'default' ? 'default' : undefined,
+                'content-available': message?._contentAvailable ? 1 : undefined,
+                'mutable-content': message?.mutableContent ? 1 : undefined,
+              },
+            },
+          },
+          notification: (typeof message?.title === 'string' || typeof message?.body === 'string')
+            ? {
+                title: typeof message?.title === 'string' ? message.title : undefined,
+                body: typeof message?.body === 'string' ? message.body : undefined,
+              }
+            : undefined,
+        };
+
+        try {
+          await messaging.send(stripUndefinedDeep(fcmPayload) as admin.messaging.Message, Boolean((requestPayload as any)?.dryRun));
+          sent += 1;
+        } catch (error: any) {
+          failed += 1;
+          errors.push({
+            token,
+            code: error?.code || 'fcm_send_failed',
+            message: error?.message || String(error),
+          });
+        }
+      }
+
+      return { sent, failed, errors };
+    };
+
     try {
-      const expoResult = await executeExpoPushProxyRequestImpl({
-        payload: requestPayload,
-        endpoint,
-        timeoutMs,
-        fetchImpl,
-      });
-      if (!expoResult.ok) {
+      const targets = splitTargets(requestPayload);
+      const expoPayload = targets.expoMessages.length === 1
+        ? targets.expoMessages[0]
+        : targets.expoMessages;
+      const expoResult = targets.expoMessages.length
+        ? await executeExpoPushProxyRequestImpl({
+            payload: expoPayload,
+            endpoint,
+            timeoutMs,
+            fetchImpl,
+          })
+        : null;
+
+      if (expoResult && !expoResult.ok) {
         console.warn('[push_proxy] expo push request failed', expoResult.status, expoResult.rawBody?.slice?.(0, 200));
         return res.status(expoResult.status).json(expoResult.body);
       }
+
+      const apnsResult = await sendApnsMessages(targets.apnsMessages);
+      const fcmResult = await sendFcmMessages(targets.fcmMessages);
+
       void logTenantAuditEventImpl({
         tenantId: normalizedTenantId,
         action: 'reminder_queued',
         authContext: req.authContext,
-        metadata: { ...auditMetadata, status: expoResult.status },
+        metadata: {
+          ...auditMetadata,
+          status: expoResult?.status ?? 200,
+          expoTargetCount: targets.expoMessages.length,
+          apnsTargetCount: targets.apnsMessages.length,
+          fcmTargetCount: targets.fcmMessages.length,
+          apnsSent: apnsResult.sent,
+          apnsFailed: apnsResult.failed,
+          fcmSent: fcmResult.sent,
+          fcmFailed: fcmResult.failed,
+        },
       });
-      return res.status(expoResult.status).json(expoResult.body);
+
+      const hasNativeFailures = apnsResult.failed > 0 || fcmResult.failed > 0;
+      const responseStatus = expoResult?.status ?? (hasNativeFailures ? 207 : 200);
+      const expoBody = expoResult?.body;
+      return res.status(responseStatus).json({
+        ok: apnsResult.failed === 0 && fcmResult.failed === 0,
+        expo: expoBody,
+        apns: apnsResult,
+        fcm: fcmResult,
+      });
     } catch (e: any) {
       const message = e?.name === 'AbortError' ? 'expo_push_timeout' : e?.message || String(e);
       console.warn('[push_proxy] error', message);

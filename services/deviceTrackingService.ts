@@ -168,6 +168,7 @@ export interface UserDevice {
   lastPushTokenSyncAt?: Timestamp | Date;
   lastPushTokenErrorAt?: Timestamp | Date;
   fcmToken?: string;
+  apnsToken?: string;
   webPushSubscription?: {
     endpoint: string;
     expirationTime?: number | null;
@@ -1430,6 +1431,10 @@ class DeviceTrackingService {
   private extractExpoPushStatus(result: any): string | undefined {
     if (!result) return undefined;
 
+    if (typeof result.ok === 'boolean') {
+      return result.ok ? 'ok' : 'error';
+    }
+
     if (Array.isArray(result)) {
       const first = result[0];
       if (first && typeof first.status === 'string') {
@@ -1720,6 +1725,9 @@ class DeviceTrackingService {
         expoPushToken = this.lastKnownExpoPushToken;
       }
       
+      let androidFcmToken: string | undefined;
+      let iosApnsToken: string | undefined;
+
       // Get Expo push token if not provided
       if (!expoPushToken && Platform.OS !== 'web') {
         try {
@@ -1735,12 +1743,34 @@ class DeviceTrackingService {
         }
       }
 
+      if (Platform.OS === 'android') {
+        try {
+          const nativeToken = await Notifications.getDevicePushTokenAsync();
+          if (nativeToken?.type === 'android' && typeof nativeToken.data === 'string' && nativeToken.data.trim()) {
+            androidFcmToken = nativeToken.data.trim();
+          }
+        } catch (error) {
+          logger.warn('Failed to get Android native FCM token:', error);
+        }
+      }
+
+      if (Platform.OS === 'ios') {
+        try {
+          const nativeToken = await Notifications.getDevicePushTokenAsync();
+          if (nativeToken?.type === 'ios' && typeof nativeToken.data === 'string' && nativeToken.data.trim()) {
+            iosApnsToken = nativeToken.data.trim();
+          }
+        } catch (error) {
+          logger.warn('Failed to get iOS native APNs token:', error);
+        }
+      }
+
       if (expoPushToken) {
         this.lastKnownExpoPushToken = expoPushToken;
       }
 
       // Collect comprehensive device information with the resolved push token
-      const deviceInfo = await this.collectDeviceInformation(deviceId, expoPushToken);
+      const deviceInfo = await this.collectDeviceInformation(deviceId, expoPushToken, androidFcmToken, iosApnsToken);
       const tenantMetadata = await this.getTenantMetadataForTagging();
       const resolvedTenantIdForPing = tenantMetadata.activeTenantId ?? tenantMetadata.tenantIds[0] ?? null;
       
@@ -1806,6 +1836,18 @@ class DeviceTrackingService {
         if (existingData?.lastPushTokenSyncAt) {
           cleanDeviceInfo.lastPushTokenSyncAt = existingData.lastPushTokenSyncAt;
         }
+      }
+
+      if (androidFcmToken) {
+        cleanDeviceInfo.fcmToken = androidFcmToken;
+      } else if (existingData?.fcmToken) {
+        cleanDeviceInfo.fcmToken = existingData.fcmToken;
+      }
+
+      if (iosApnsToken) {
+        cleanDeviceInfo.apnsToken = iosApnsToken;
+      } else if (existingData?.apnsToken) {
+        cleanDeviceInfo.apnsToken = existingData.apnsToken;
       }
       
       if (!existingDeviceSnap.exists()) {
@@ -1912,7 +1954,12 @@ class DeviceTrackingService {
   /**
    * Collect comprehensive device information
    */
-  private async collectDeviceInformation(deviceId: string, expoPushToken?: string): Promise<UserDevice> {
+  private async collectDeviceInformation(
+    deviceId: string,
+    expoPushToken?: string,
+    fcmToken?: string,
+    apnsToken?: string
+  ): Promise<UserDevice> {
     try {
       const basicInfo = await this.getBasicDeviceInfo();
       const hardwareInfo = await this.getHardwareInfo();
@@ -1990,6 +2037,8 @@ class DeviceTrackingService {
         
         // Notification tokens
         expoPushToken,
+        fcmToken,
+        apnsToken,
         
         // Status and timestamps - Use resolved timestamps for immediate availability
         lastSeen: this.createResolvedTimestamp(),
@@ -3164,70 +3213,188 @@ class DeviceTrackingService {
       });
 
       // Use Expo push notification API for mobile devices
+      const targetPush = this.resolvePreferredMobilePushTarget(device);
+      if (!targetPush) {
+        logger.warn('No preferred push token available for mobile device:', device.deviceId);
+        await this.requestPushTokenRefresh(userEmail, device.deviceId);
+        return { delivered: false, deliverySource: 'unknown' };
+      }
+
       const expoMessage = {
-        to: device.expoPushToken,
+        to: targetPush.token,
         sound: 'default',
         title: notification.title,
         body: notification.body,
-        data: notification.data || {},
+        data: {
+          ...(notification.data || {}),
+          _tmPushTransportHint: targetPush.transport,
+          _tmNativePlatform: device.platformOS,
+        },
         priority: 'high',
         channelId,
       };
 
-      if (Platform.OS === 'web') {
-        const tenantId = this.resolveTenantIdForNotification(device, notification);
-        if (!tenantId) {
-          logger.error('Cannot send push via backend proxy without tenantId', {
-            deviceId: device.deviceId,
-            userEmail,
-          });
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-        const backendResult = await this.sendPushViaBackend({ ...expoMessage, tenantId });
-        if (!backendResult.ok) {
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-        const status = this.extractExpoPushStatus(backendResult.result);
-        if (status === 'ok') {
-          logger.debug('Mobile app notification sent successfully to device via backend proxy:', device.deviceId);
-          return { delivered: true, deliverySource: 'push', pushChannel: 'mobile_push' };
-        }
-        logger.error('Failed to send mobile app notification through backend proxy:', backendResult.result);
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Accept-encoding': 'gzip, deflate',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(expoMessage),
-      });
-
-      const raw = await response.text();
-      let result: any = {};
-      if (raw) {
-        try {
-          result = JSON.parse(raw);
-        } catch {
-          result = { raw };
-        }
-      }
-
+      const result = await this.sendExpoPushMessage(userEmail, device, notification, expoMessage);
       const status = this.extractExpoPushStatus(result);
-      if (status === 'ok') {
+      let effectiveStatus = status;
+      let effectiveResult = result;
+
+      if (effectiveStatus !== 'ok') {
+        const expoFallbackToken = typeof device.expoPushToken === 'string' ? device.expoPushToken.trim() : '';
+        const primaryToken = targetPush.token;
+        if (expoFallbackToken && expoFallbackToken !== primaryToken) {
+          try {
+            const fallbackMessage = {
+              ...expoMessage,
+              to: expoFallbackToken,
+              data: {
+                ...(expoMessage.data as Record<string, any>),
+                _tmPushTransportHint: 'expo',
+                _tmTransportFallbackFrom: targetPush.transport,
+              },
+            };
+            const fallbackResult = await this.sendExpoPushMessage(userEmail, device, notification, fallbackMessage);
+            const fallbackStatus = this.extractExpoPushStatus(fallbackResult);
+            if (fallbackStatus === 'ok') {
+              logger.warn('Primary native push transport failed; Expo fallback accepted', {
+                deviceId: device.deviceId,
+                userEmail,
+                failedTransport: targetPush.transport,
+              });
+              effectiveStatus = fallbackStatus;
+              effectiveResult = fallbackResult;
+            } else {
+              logger.warn('Expo fallback push was not accepted after native transport failure', {
+                deviceId: device.deviceId,
+                userEmail,
+                failedTransport: targetPush.transport,
+                fallbackResult,
+              });
+            }
+          } catch (fallbackError) {
+            logger.warn('Expo fallback push failed after native transport failure', {
+              deviceId: device.deviceId,
+              userEmail,
+              failedTransport: targetPush.transport,
+              error: fallbackError,
+            });
+          }
+        }
+      }
+
+      if (effectiveStatus === 'ok') {
         logger.debug('Mobile app notification sent successfully to device:', device.deviceId);
+
+        const backgroundProbe = this.buildBackgroundReceiptProbeMessage(device, notification);
+        if (backgroundProbe) {
+          try {
+            const backgroundResult = await this.sendExpoPushMessage(userEmail, device, notification, backgroundProbe);
+            const backgroundStatus = this.extractExpoPushStatus(backgroundResult);
+            if (backgroundStatus !== 'ok') {
+              logger.warn('Background receipt probe push was not accepted', {
+                deviceId: device.deviceId,
+                userEmail,
+                backgroundResult,
+              });
+            }
+          } catch (backgroundError) {
+            logger.warn('Failed to send background receipt probe push', {
+              deviceId: device.deviceId,
+              userEmail,
+              error: backgroundError,
+            });
+          }
+        }
+
         return { delivered: true, deliverySource: 'push', pushChannel: 'mobile_push' };
       }
 
-      logger.error('Failed to send mobile app notification:', result);
+      logger.error('Failed to send mobile app notification:', effectiveResult);
       return { delivered: false, deliverySource: 'unknown' };
     } catch (error) {
       logger.error('Error sending mobile app notification:', error);
       return { delivered: false, deliverySource: 'unknown' };
     }
+  }
+
+  private buildBackgroundReceiptProbeMessage(
+    device: UserDevice,
+    notification: {
+      title: string;
+      body: string;
+      data?: any;
+    }
+  ): Record<string, unknown> | null {
+    const type = typeof notification.data?.type === 'string' ? notification.data.type : '';
+    if (type !== 'chat_message' && type !== 'team_chat_message') {
+      return null;
+    }
+
+    const targetPush = this.resolvePreferredMobilePushTarget(device);
+    if (!targetPush) {
+      return null;
+    }
+
+    return {
+      to: targetPush.token,
+      data: {
+        ...(notification.data || {}),
+        _tmReceiptProbe: true,
+        receiptProbe: true,
+        receiptProbeSentAt: new Date().toISOString(),
+        _tmPushTransportHint: targetPush.transport,
+        _tmNativePlatform: device.platformOS,
+      },
+      priority: 'high',
+      ttl: 120,
+      expiration: Math.floor(Date.now() / 1000) + 120,
+      _contentAvailable: true,
+      mutableContent: true,
+    };
+  }
+
+  private async sendExpoPushMessage(
+    userEmail: string,
+    device: UserDevice,
+    notification: {
+      title: string;
+      body: string;
+      data?: any;
+    },
+    expoMessage: Record<string, unknown>
+  ): Promise<any> {
+    const tenantId = this.resolveTenantIdForNotification(device, notification);
+    if (!tenantId) {
+      logger.error('Cannot send push via backend proxy without tenantId', {
+        deviceId: device.deviceId,
+        userEmail,
+      });
+      return { error: 'tenant_required' };
+    }
+
+    const backendResult = await this.sendPushViaBackend({ ...expoMessage, tenantId });
+    return backendResult.result;
+  }
+
+  private resolvePreferredMobilePushTarget(
+    device: UserDevice
+  ): { token: string; transport: 'fcm' | 'apns' | 'expo' } | null {
+    const apnsToken = typeof device.apnsToken === 'string' ? device.apnsToken.trim() : '';
+    if (apnsToken) {
+      return { token: apnsToken, transport: 'apns' };
+    }
+
+    const fcmToken = typeof device.fcmToken === 'string' ? device.fcmToken.trim() : '';
+    if (fcmToken) {
+      return { token: fcmToken, transport: 'fcm' };
+    }
+
+    const expoToken = typeof device.expoPushToken === 'string' ? device.expoPushToken.trim() : '';
+    if (expoToken) {
+      return { token: expoToken, transport: 'expo' };
+    }
+
+    return null;
   }
 
   private async requestPushTokenRefresh(userEmail: string, deviceId: string): Promise<void> {
@@ -3365,7 +3532,7 @@ class DeviceTrackingService {
       // Send notifications to each device individually
       for (const device of targetDevices) {
         if (device.deviceType !== 'web') {
-          const token = (device.expoPushToken || '').trim();
+          const token = this.resolvePreferredMobilePushTarget(device)?.token || '';
           if (token) {
             if (seenMobileTokens.has(token)) {
               logger.debug('Skipping duplicate mobile push token for notification delivery', {

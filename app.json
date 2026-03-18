@@ -92,7 +92,8 @@
           "color": "#1A73E8",
           "defaultChannel": "general_notifications",
           "sounds": [],
-          "mode": "production"
+          "mode": "production",
+          "enableBackgroundRemoteNotifications": true
         }
       ],
       [

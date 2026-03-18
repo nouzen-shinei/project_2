@@ -10,13 +10,44 @@
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
+		D37538595BA30E6BD4061AC0 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19BE219A9920D58C13C104CB /* NotificationService.swift */; };
+		E5BC7B5F45769337F29B89DB /* TmReceiptAck.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 7664DBCA44EBD85A28CD973C /* TmReceiptAck.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		EB0EF83C2D1E0B3D2FF1EB80 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1D30BEA3F5B12DCE46115591 /* Foundation.framework */; };
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		58D86E140A3CE9C1BBE6F466 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 83CBB9F71A601CBA00E9B192 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A2FE056EBDCE964D14D0F9D;
+			remoteInfo = TmReceiptAck;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		1056342EDAC64238AAA17682 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				E5BC7B5F45769337F29B89DB /* TmReceiptAck.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		13B07F961A680F5B00A75B9A /* MyTution.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MyTution.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = MyTution/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = MyTution/Info.plist; sourceTree = "<group>"; };
+		19BE219A9920D58C13C104CB /* NotificationService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = NotificationService.swift; path = TmReceiptAck/NotificationService.swift; sourceTree = "<group>"; };
+		1D30BEA3F5B12DCE46115591 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		7664DBCA44EBD85A28CD973C /* TmReceiptAck.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TmReceiptAck.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A4C0B05E8C410227965C4ADC /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; name = Info.plist; path = TmReceiptAck/Info.plist; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = MyTution/SplashScreen.storyboard; sourceTree = "<group>"; };
 		BB2F792C24A3F905000567C9 /* Expo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Expo.plist; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
@@ -29,6 +60,14 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		50B49826893C5CADC3A7A5F1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EB0EF83C2D1E0B3D2FF1EB80 /* Foundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -52,6 +91,8 @@
 			isa = PBXGroup;
 			children = (
 				ED297162215061F000B7C4FE /* JavaScriptCore.framework */,
+				7664DBCA44EBD85A28CD973C /* TmReceiptAck.appex */,
+				D3327BD7CDC7B5FA1B79DAA2 /* iOS */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -70,6 +111,7 @@
 				832341AE1AAA6A7D00B99B32 /* Libraries */,
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
+				8A50E542260F50D97F48C514 /* TmReceiptAck */,
 			);
 			indentWidth = 2;
 			sourceTree = "<group>";
@@ -84,6 +126,16 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		8A50E542260F50D97F48C514 /* TmReceiptAck */ = {
+			isa = PBXGroup;
+			children = (
+				19BE219A9920D58C13C104CB /* NotificationService.swift */,
+				A4C0B05E8C410227965C4ADC /* Info.plist */,
+			);
+			name = TmReceiptAck;
+			path = TmReceiptAck;
+			sourceTree = "<group>";
+		};
 		BB2F792B24A3F905000567C9 /* Supporting */ = {
 			isa = PBXGroup;
 			children = (
@@ -91,6 +143,14 @@
 			);
 			name = Supporting;
 			path = MyTution/Supporting;
+			sourceTree = "<group>";
+		};
+		D3327BD7CDC7B5FA1B79DAA2 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				1D30BEA3F5B12DCE46115591 /* Foundation.framework */,
+			);
+			name = iOS;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -106,15 +166,34 @@
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
 				800E24972A6A228C8D4807E9 /* [CP] Copy Pods Resources */,
+				1056342EDAC64238AAA17682 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				BA80EF3D98DA022512377160 /* PBXTargetDependency */,
 			);
 			name = MyTution;
 			productName = MyTution;
 			productReference = 13B07F961A680F5B00A75B9A /* MyTution.app */;
 			productType = "com.apple.product-type.application";
+		};
+		1A2FE056EBDCE964D14D0F9D /* TmReceiptAck */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 18C5FA9FE59A739ED18A5DE6 /* Build configuration list for PBXNativeTarget "TmReceiptAck" */;
+			buildPhases = (
+				79166DA5F08EF6B8A2990699 /* Sources */,
+				50B49826893C5CADC3A7A5F1 /* Frameworks */,
+				4FD3A4C9C03600686589C18F /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = TmReceiptAck;
+			productName = TmReceiptAck;
+			productReference = 7664DBCA44EBD85A28CD973C /* TmReceiptAck.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -143,6 +222,7 @@
 			projectRoot = "";
 			targets = (
 				13B07F861A680F5B00A75B9A /* MyTution */,
+				1A2FE056EBDCE964D14D0F9D /* TmReceiptAck */,
 			);
 		};
 /* End PBXProject section */
@@ -155,6 +235,13 @@
 				BB2F792D24A3F905000567C9 /* Expo.plist in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4FD3A4C9C03600686589C18F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -231,7 +318,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		79166DA5F08EF6B8A2990699 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D37538595BA30E6BD4061AC0 /* NotificationService.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		BA80EF3D98DA022512377160 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = TmReceiptAck;
+			target = 1A2FE056EBDCE964D14D0F9D /* TmReceiptAck */;
+			targetProxy = 58D86E140A3CE9C1BBE6F466 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
@@ -239,6 +343,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = MyTution/MyTution.entitlements;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_BITCODE = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -257,14 +362,13 @@
 					"-ObjC",
 					"-lc++",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.sneha.tution";
-				PRODUCT_NAME = "MyTution";
+				PRODUCT_BUNDLE_IDENTIFIER = com.sneha.tution;
+				PRODUCT_NAME = MyTution;
 				SWIFT_OBJC_BRIDGING_HEADER = "MyTution/MyTution-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
-				VERSIONING_SYSTEM = "apple-generic";
 				TARGETED_DEVICE_FAMILY = "1,2";
-				CODE_SIGN_ENTITLEMENTS = MyTution/MyTution.entitlements;
+				VERSIONING_SYSTEM = "apple-generic";
 			};
 			name = Debug;
 		};
@@ -273,6 +377,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = MyTution/MyTution.entitlements;
 				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = MyTution/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
@@ -286,13 +391,53 @@
 					"-ObjC",
 					"-lc++",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.sneha.tution";
-				PRODUCT_NAME = "MyTution";
+				PRODUCT_BUNDLE_IDENTIFIER = com.sneha.tution;
+				PRODUCT_NAME = MyTution;
 				SWIFT_OBJC_BRIDGING_HEADER = "MyTution/MyTution-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
-				VERSIONING_SYSTEM = "apple-generic";
 				TARGETED_DEVICE_FAMILY = "1,2";
-				CODE_SIGN_ENTITLEMENTS = MyTution/MyTution.entitlements;
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Release;
+		};
+		363C04627CC5D79A2B4C95F2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				INFOPLIST_FILE = TmReceiptAck/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.sneha.tution.TmReceiptAck;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		7D15C28BDCB070F2970317FE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				INFOPLIST_FILE = TmReceiptAck/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.sneha.tution.TmReceiptAck;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
 		};
@@ -415,6 +560,15 @@
 			buildConfigurations = (
 				13B07F941A680F5B00A75B9A /* Debug */,
 				13B07F951A680F5B00A75B9A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		18C5FA9FE59A739ED18A5DE6 /* Build configuration list for PBXNativeTarget "TmReceiptAck" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7D15C28BDCB070F2970317FE /* Release */,
+				363C04627CC5D79A2B4C95F2 /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

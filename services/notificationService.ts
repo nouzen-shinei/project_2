@@ -13,6 +13,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { twilioBackendClient, SMSMessage, VoiceCallMessage } from './twilioBackendClient';
 import { whatsappBusinessService, WABATemplateComponentParam } from './wabaService';
 import { getTemplateLanguage } from './wabaTemplateConstants';
+import {
+  confirmInboundChatDeliveryFromNotificationData,
+  flushPendingInboundChatDeliveryReceipts,
+} from './chatReceiptSync';
 import { whatsappConversationService } from './whatsappConversationService';
 import { emailService } from './emailService';
 import { quotesService } from './quotesService';
@@ -90,13 +94,32 @@ function getDeviceTrackingService(): DeviceTrackingServiceType & IDeviceTracking
 }
 
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-  }),
+  handleNotification: async (notification) => {
+    const data = notification?.request?.content?.data as Record<string, any> | undefined;
+    const isReceiptProbe = data?._tmReceiptProbe === true || data?.receiptProbe === true;
+    const title = notification?.request?.content?.title;
+    const body = notification?.request?.content?.body;
+    const hasVisibleContent = Boolean((title && String(title).trim()) || (body && String(body).trim()));
+
+    // Silent receipt probes should never surface UI banners/toasts.
+    if (isReceiptProbe || !hasVisibleContent) {
+      return {
+        shouldShowAlert: false,
+        shouldPlaySound: false,
+        shouldSetBadge: false,
+        shouldShowBanner: false,
+        shouldShowList: false,
+      };
+    }
+
+    return {
+      shouldShowAlert: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+      shouldShowBanner: true,
+      shouldShowList: true,
+    };
+  },
 });
 // Notification response listeners are registered after service initialization
 
@@ -156,6 +179,7 @@ class NotificationService {
   private currentUserEmail: string | null = null;
   private notificationCache: Set<string> = new Set();
   private cacheCleanupInterval: number | NodeJS.Timeout | null = null;
+  private receiptFlushInterval: number | NodeJS.Timeout | null = null;
   private isInitialized: boolean = false;
   private preferencesLoaded: boolean = false;
   private notificationsEnabled: boolean = true;
@@ -165,6 +189,7 @@ class NotificationService {
   private teamNotificationsEnabled: boolean = true;
   private pendingChatNavigation: PendingChatNavigationTarget | null = null;
   private activeChatPartnerEmail: string | null = null;
+  private lastActiveChatDeliveryBackfillAtByPartner = new Map<string, number>();
   private lastHandledNotificationId: string | null = null;
   private hasCheckedInitialNotificationResponse: boolean = false;
   private chatNavigationRetryTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -273,6 +298,33 @@ class NotificationService {
     } catch (error) {
       logger.debug('Failed to sync active chat partner state with device tracking:', error);
     }
+
+    if (normalizedEmail && (options.isActive ?? true)) {
+      await this.backfillDeliveredReceiptsForActiveChat(normalizedEmail);
+    }
+  }
+
+  private async backfillDeliveredReceiptsForActiveChat(partnerEmail: string): Promise<void> {
+    const now = Date.now();
+    const lastSyncedAt = this.lastActiveChatDeliveryBackfillAtByPartner.get(partnerEmail) ?? 0;
+    if (now - lastSyncedAt < 10_000) {
+      return;
+    }
+
+    this.lastActiveChatDeliveryBackfillAtByPartner.set(partnerEmail, now);
+
+    try {
+      const tenantId = await tenantService.getCachedSelectedTenant();
+      await chatService.syncConversationReceipts(partnerEmail, {
+        markConversationDelivered: true,
+        tenantId,
+      });
+    } catch (error) {
+      logger.debug('Active chat delivery backfill failed', {
+        partnerEmail,
+        error,
+      });
+    }
   }
 
   async initialize(userEmail?: string, options?: { force?: boolean }): Promise<void> {
@@ -324,6 +376,7 @@ class NotificationService {
 
     // Start cache cleanup interval (every 5 minutes) when notifications are enabled
     this.startCacheCleanup();
+    this.startReceiptFlushLoop();
   
     if (Platform.OS !== 'web') {
       await this.registerForPushNotificationsAsync();
@@ -656,6 +709,44 @@ class NotificationService {
    */
   private markNotificationSent(notificationId: string): void {
     this.notificationCache.add(notificationId);
+  }
+
+  async handleNotificationReceived(notification: Notifications.Notification): Promise<void> {
+    try {
+      const data = notification?.request?.content?.data as Record<string, any> | undefined;
+      await confirmInboundChatDeliveryFromNotificationData(data, 'received', {
+        currentUserEmail: this.currentUserEmail,
+      });
+      await flushPendingInboundChatDeliveryReceipts({
+        currentUserEmail: this.currentUserEmail,
+        maxBatchSize: 20,
+      });
+    } catch (error) {
+      logger.debug('Failed handling notification receive hook', error);
+    }
+  }
+
+  private startReceiptFlushLoop(): void {
+    if (this.receiptFlushInterval) {
+      clearInterval(this.receiptFlushInterval as number);
+    }
+
+    // Retry queued delivery receipts in case immediate sync failed (offline/background race).
+    this.receiptFlushInterval = setInterval(() => {
+      void flushPendingInboundChatDeliveryReceipts({
+        currentUserEmail: this.currentUserEmail,
+        maxBatchSize: 30,
+      }).catch((error) => {
+        logger.debug('Periodic pending chat delivery receipt flush failed', { error });
+      });
+    }, 20_000);
+
+    void flushPendingInboundChatDeliveryReceipts({
+      currentUserEmail: this.currentUserEmail,
+      maxBatchSize: 50,
+    }).catch((error) => {
+      logger.debug('Initial pending chat delivery receipt flush failed', { error });
+    });
   }
 
   /**
@@ -2281,38 +2372,20 @@ class NotificationService {
             chatId: `${message.sender}_${recipientEmail}`,
             timestamp: message.timestamp || new Date().toISOString(),
             isSpecial: message.isSpecial || false,
+            tenantId: tenantFilterOptions?.tenantId,
             remote: true,
           },
         },
         false,
         tenantFilterOptions
       );
-
-      const messageId = typeof message.id === 'string' ? message.id.trim() : '';
-      if (messageId && deliveryResult.pushAcceptedCount > 0) {
-        try {
-          await chatService.confirmOutboundDelivery(recipientEmail, [messageId], {
-            tenantId: tenantFilterOptions?.tenantId,
-            provenance: {
-              sources: ['push'],
-              lastSource: 'push',
-              lastUpdatedAt: new Date().toISOString(),
-              push: {
-                deliveredAt: new Date().toISOString(),
-                acceptedDeviceCount: deliveryResult.pushAcceptedCount,
-                mobileAcceptedCount: deliveryResult.mobilePushAcceptedCount,
-                webAcceptedCount: deliveryResult.webPushAcceptedCount,
-              },
-            },
-          });
-        } catch (error) {
-          logger.warn('Failed to confirm outbound chat delivery after notification send', {
-            error,
-            messageId,
-            recipientEmail,
-            pushAcceptedCount: deliveryResult.pushAcceptedCount,
-          });
-        }
+      if (deliveryResult.pushAcceptedCount > 0) {
+        logger.debug('Push accepted for chat notification; waiting for explicit recipient receipt to mark delivered', {
+          recipientEmail,
+          pushAcceptedCount: deliveryResult.pushAcceptedCount,
+          mobileAcceptedCount: deliveryResult.mobilePushAcceptedCount,
+          webAcceptedCount: deliveryResult.webPushAcceptedCount,
+        });
       }
     } catch (error) {
       logger.error('Failed to send remote chat notification:', error);
@@ -2322,6 +2395,14 @@ class NotificationService {
   async handleNotificationResponse(response: Notifications.NotificationResponse): Promise<void> {
     try {
       const { notification, userText, actionIdentifier } = response;
+      const responseData = notification?.request?.content?.data as Record<string, any> | undefined;
+      await confirmInboundChatDeliveryFromNotificationData(responseData, 'response', {
+        currentUserEmail: this.currentUserEmail,
+      });
+      await flushPendingInboundChatDeliveryReceipts({
+        currentUserEmail: this.currentUserEmail,
+        maxBatchSize: 30,
+      });
       const notificationId = notification?.request?.identifier ?? null;
 
       if (notificationId && this.lastHandledNotificationId === notificationId) {
@@ -3479,11 +3560,17 @@ class NotificationService {
         clearInterval(this.cacheCleanupInterval);
         this.cacheCleanupInterval = null;
       }
+
+      if (this.receiptFlushInterval) {
+        clearInterval(this.receiptFlushInterval);
+        this.receiptFlushInterval = null;
+      }
       
     // Clear notification cache
     this.notificationCache.clear();
     this.expoPushToken = null;
   this.activeChatPartnerEmail = null;
+    this.lastActiveChatDeliveryBackfillAtByPartner.clear();
       
       // Cleanup quotes service
       try {
@@ -3676,6 +3763,12 @@ class NotificationService {
 }
 
 export const notificationService = new NotificationService();
+
+Notifications.addNotificationReceivedListener((notification) => {
+  notificationService.handleNotificationReceived(notification).catch((error) => {
+    logger.debug('Notification received handler failed:', error);
+  });
+});
 
 Notifications.addNotificationResponseReceivedListener((response) => {
   notificationService.handleNotificationResponse(response).catch((error) => {
