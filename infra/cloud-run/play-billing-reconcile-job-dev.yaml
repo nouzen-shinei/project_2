@@ -1,7 +1,7 @@
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
-  name: play-billing-reconcile-job
+  name: play-billing-reconcile-job-dev
   annotations:
     run.googleapis.com/launch-stage: GA
 spec:
@@ -12,8 +12,8 @@ spec:
       template:
         spec:
           serviceAccountName: billing-stale-pending-job@tution-app-6c0c3.iam.gserviceaccount.com
-          maxRetries: 1
-          timeoutSeconds: 900
+          maxRetries: 0
+          timeoutSeconds: 600
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
               command: ["npm"]
@@ -41,17 +41,17 @@ spec:
                       key: latest
 
                 - name: PLAY_BILLING_RECONCILE_DRY_RUN
-                  value: "0"
-                - name: PLAY_BILLING_RECONCILE_VERBOSE
                   value: "1"
+                - name: PLAY_BILLING_RECONCILE_VERBOSE
+                  value: "0"
                 - name: PLAY_BILLING_RECONCILE_MAX_TENANTS
-                  value: "200"
+                  value: "10"
                 - name: PLAY_BILLING_RECONCILE_TENANT_IDS
                   value: ""
                 - name: PLAY_BILLING_RECONCILE_LOCK_ENABLED
                   value: "1"
                 - name: PLAY_BILLING_RECONCILE_LOCK_DOC
-                  value: billingLocks/play_billing_reconcile
+                  value: billingLocks/play_billing_reconcile_dev
                 - name: PLAY_BILLING_RECONCILE_LOCK_LEASE_MS
                   value: "900000"
 

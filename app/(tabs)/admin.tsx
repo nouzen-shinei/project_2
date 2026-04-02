@@ -49,6 +49,7 @@ const MEMBER_ROLE_FILTERS: { label: string; value: 'all' | TenantMembershipRole 
 
 const ROLE_OPTIONS: TenantMembershipRole[] = ['owner', 'admin', 'staff', 'member'];
 const USAGE_HISTORY_MONTHS = 6;
+const NOTIFICATIONS_TAB_ALLOWED_EMAIL = 'krvikrantsingh51@gmail.com';
 
 
 export default function AdminPanel() {
@@ -114,6 +115,8 @@ export default function AdminPanel() {
   const [roleChangeSelectedRole, setRoleChangeSelectedRole] = useState<TenantMembershipRole>('member');
   const [roleChangeMembership, setRoleChangeMembership] = useState<TenantMembership | null>(null);
   const [memberToDelete, setMemberToDelete] = useState<TenantMembership | null>(null);
+  const canAccessNotificationsTab =
+    (user?.email || '').trim().toLowerCase() === NOTIFICATIONS_TAB_ALLOWED_EMAIL;
   const inviteButtonVisible = activeTab === 'users' || activeTab === 'team';
   const needsInvitePortal = inviteButtonVisible && activeTab !== 'users';
   // Users search state
@@ -236,6 +239,12 @@ export default function AdminPanel() {
   const canManageMembers = Boolean(user?.isAuthorized) && (hasTenantAdminAccess || isLegacyAdmin);
   const initiatedFrom = Platform.OS === 'web' ? 'web' : 'mobile';
   const canAssignOwnerRole = activeMembership?.role === 'owner';
+
+  useEffect(() => {
+    if (!canAccessNotificationsTab && activeTab === 'notifications') {
+      setActiveTab('users');
+    }
+  }, [canAccessNotificationsTab, activeTab]);
 
   useEffect(() => {
     if (!tenantId || !canManageMembers) {
@@ -1706,28 +1715,30 @@ export default function AdminPanel() {
           </Text>
         </TouchableOpacity>
 
-        <TouchableOpacity
-          style={[
-            styles.tabButton,
-            activeTab === 'notifications' && [styles.activeTab, { borderBottomColor: theme.primary }]
-          ]}
-          onPress={() => setActiveTab('notifications')}
-        >
-          <Bell size={20} color={activeTab === 'notifications' ? theme.primary : theme.textSecondary} />
-          <Text
-            allowFontScaling={false}
+        {canAccessNotificationsTab && (
+          <TouchableOpacity
             style={[
-              styles.tabText,
-              { color: activeTab === 'notifications' ? theme.primary : theme.textSecondary }
+              styles.tabButton,
+              activeTab === 'notifications' && [styles.activeTab, { borderBottomColor: theme.primary }]
             ]}
+            onPress={() => setActiveTab('notifications')}
           >
-            Notifications
-          </Text>
-        </TouchableOpacity>
+            <Bell size={20} color={activeTab === 'notifications' ? theme.primary : theme.textSecondary} />
+            <Text
+              allowFontScaling={false}
+              style={[
+                styles.tabText,
+                { color: activeTab === 'notifications' ? theme.primary : theme.textSecondary }
+              ]}
+            >
+              Notifications
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {/* Tab Content */}
-      {activeTab === 'notifications' ? (
+      {canAccessNotificationsTab && activeTab === 'notifications' ? (
         <AdminNotificationCenter 
           adminEmail={user?.email || ''} 
           adminName={user?.displayName || user?.email || 'Admin'}

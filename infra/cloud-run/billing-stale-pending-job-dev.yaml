@@ -1,0 +1,79 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: billing-stale-pending-job-dev
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: billing-stale-pending-job@tution-app-6c0c3.iam.gserviceaccount.com
+          maxRetries: 0
+          timeoutSeconds: 600
+          containers:
+            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
+              command: ["npm"]
+              args: ["run", "billing:stale-pending"]
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
+              env:
+                - name: NODE_ENV
+                  value: production
+                - name: FIREBASE_PROJECT_ID
+                  value: tution-app-6c0c3
+                - name: FIREBASE_DATABASE_URL
+                  value: https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app
+                - name: FIREBASE_STORAGE_BUCKET
+                  value: tution-app-6c0c3.firebasestorage.app
+
+                - name: BILLING_STALE_PENDING_JOB_LABEL
+                  value: dev_stale_pending
+                - name: BILLING_STALE_PENDING_THRESHOLD_HOURS
+                  value: "24"
+                - name: BILLING_STALE_PENDING_TENANT_IDS
+                  value: ""
+                - name: BILLING_STALE_PENDING_MAX_TENANTS
+                  value: "10"
+                - name: BILLING_STALE_PENDING_DRY_RUN
+                  value: "1"
+                - name: BILLING_STALE_PENDING_VERBOSE
+                  value: "0"
+
+                - name: BILLING_STALE_PENDING_TENANT_LEASE_MS
+                  value: "180000"
+
+                - name: BILLING_STALE_PENDING_RUN_LEASE_MS
+                  value: "7200000"
+
+                - name: EMAIL_BACKEND_BASE_URL
+                  value: "https://my-email-backend.fly.dev"
+                - name: EMAIL_BACKEND_INTERNAL_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: email-backend-internal-key
+                      key: latest
+
+                - name: RAZORPAY_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: razorpay-key-id
+                      key: latest
+                - name: RAZORPAY_KEY_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: razorpay-key-secret
+                      key: latest
+
+                - name: GOOGLE_PLAY_PACKAGE_NAME
+                  value: "com.sneha.tution"
+                - name: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
+                  valueFrom:
+                    secretKeyRef:
+                      name: play-billing-service-account-json
+                      key: latest

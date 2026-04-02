@@ -12,8 +12,8 @@ spec:
       template:
         spec:
           serviceAccountName: usage-refresh-job@tution-app-6c0c3.iam.gserviceaccount.com
-          maxRetries: 1
-          timeoutSeconds: 1800
+          maxRetries: 0
+          timeoutSeconds: 900
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
               command: ["npm"]
@@ -21,7 +21,7 @@ spec:
               resources:
                 limits:
                   cpu: "1"
-                  memory: "1Gi"
+                  memory: "512Mi"
               env:
                 - name: NODE_ENV
                   value: production
