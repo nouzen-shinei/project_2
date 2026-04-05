@@ -1,13 +1,15 @@
 import { logger } from '@/lib/logger';
 import { useEffect, useCallback, useState, useRef } from 'react';
 import { notificationService } from '../services/notificationService';
-import { useAuth, authService } from './useAuthUnified';
+import { useAuth } from './useAuthUnified';
 import { ChatMessage, chatService } from '../services/chatService';
 import { Platform } from 'react-native';
 import type { DeviceTenantFilterOptions } from '../services/deviceTrackingService';
+import { tenantService } from '@/services/tenantService';
 
 export const useNotifications = () => {
   const { user } = useAuth();
+  const [activeTenantId, setActiveTenantId] = useState<string | null>(null);
   const [teamMembers, setTeamMembers] = useState<any[]>([]);
   const teamMembersRef = useRef<any[]>([]);
   const messageTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -23,6 +25,41 @@ export const useNotifications = () => {
   useEffect(() => {
     teamMembersRef.current = teamMembers;
   }, [teamMembers]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const syncTenantId = async () => {
+      try {
+        if (!user?.email) {
+          if (!disposed) {
+            setActiveTenantId(null);
+          }
+          return;
+        }
+
+        const tenantId = await tenantService.getCachedSelectedTenant();
+        if (!disposed) {
+          setActiveTenantId(tenantId);
+        }
+      } catch (error) {
+        logger.warn('useNotifications: failed to resolve active tenant id', error);
+        if (!disposed) {
+          setActiveTenantId(null);
+        }
+      }
+    };
+
+    void syncTenantId();
+    const interval = setInterval(() => {
+      void syncTenantId();
+    }, 5000);
+
+    return () => {
+      disposed = true;
+      clearInterval(interval);
+    };
+  }, [user?.email]);
 
   // Initialize notification service
   useEffect(() => {
@@ -66,24 +103,55 @@ export const useNotifications = () => {
 
   // Load team members for global chat notifications
   useEffect(() => {
-    if (!user?.email) return;
-
-    // Load initial team members
-    authService.forceRefreshTeamMembers().then((members) => {
-      setTeamMembers(members || []);
-    }).catch(() => {
+    if (!user?.email || !activeTenantId) {
       setTeamMembers([]);
-    });
+      return;
+    }
 
-    // Set up real-time listener for team member updates
-    const unsubscribe = authService.onTeamMembersChange((members) => {
-      setTeamMembers(members || []);
-    });
+    let disposed = false;
+
+    const loadMembers = async () => {
+      try {
+        const memberships = await tenantService.getActiveMembershipsForTenant(activeTenantId);
+        if (disposed) return;
+
+        const members = memberships.map((membership) => {
+          const normalizedEmail = String(membership.email || '').toLowerCase();
+          const rawName = String(membership.displayName || normalizedEmail.split('@')[0] || 'User');
+          const name = rawName
+            .replace(/[._-]+/g, ' ')
+            .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+          return {
+            id: normalizedEmail,
+            email: normalizedEmail,
+            name,
+            role: membership.role,
+          };
+        });
+
+        setTeamMembers(members);
+      } catch (error) {
+        logger.warn('useNotifications: failed to load tenant members', {
+          error,
+          tenantId: activeTenantId,
+        });
+        if (!disposed) {
+          setTeamMembers([]);
+        }
+      }
+    };
+
+    void loadMembers();
+    const interval = setInterval(() => {
+      void loadMembers();
+    }, 30000);
 
     return () => {
-      unsubscribe();
+      disposed = true;
+      clearInterval(interval);
     };
-  }, [user?.email]);
+  }, [user?.email, activeTenantId]);
 
   // Global chat message listener for incoming message notifications
   // This handles notifications when OTHER people send messages TO you
@@ -456,12 +524,12 @@ export const useNotifications = () => {
 
   const getAllUsersWithDevices = useCallback(
     async (
-      authorizedEmails: string[],
+      memberEmails: string[],
       includeCurrentUser: boolean = true,
       options?: DeviceTenantFilterOptions
     ) => {
       try {
-        return await notificationService.getAllUsersWithDevices(authorizedEmails, includeCurrentUser, options);
+        return await notificationService.getAllUsersWithDevices(memberEmails, includeCurrentUser, options);
       } catch (error) {
         logger.error('Failed to get all users with devices:', error);
         return [];

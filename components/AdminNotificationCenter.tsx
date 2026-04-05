@@ -70,10 +70,10 @@ type SortType = 'name' | 'lastSeen' | 'deviceType' | 'status';
 interface AdminNotificationCenterProps {
   adminEmail: string;
   adminName: string;
-  authorizedEmails?: string[];
+  tenantMemberEmails?: string[];
 }
 
-export default function AdminNotificationCenter({ adminEmail, adminName, authorizedEmails = [] }: AdminNotificationCenterProps) {
+export default function AdminNotificationCenter({ adminEmail, adminName, tenantMemberEmails = [] }: AdminNotificationCenterProps) {
   const { theme } = useTheme();
   const modalTopPadding = 16;
   const { user } = useAuth();
@@ -87,12 +87,12 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
 
   // Use notification service methods directly to avoid duplicate listeners
   const getAllUsersWithDevices = useCallback(async (
-    authorizedEmails: string[],
+    memberEmails: string[],
     includeCurrentUser: boolean = true
   ) => {
     try {
       return await notificationService.getAllUsersWithDevices(
-        authorizedEmails,
+        memberEmails,
         includeCurrentUser,
         tenantFilterOptions
       );
@@ -148,13 +148,13 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
   const [filterType, setFilterType] = useState<FilterType>('all');
   const [sortType, setSortType] = useState<SortType>('lastSeen');
   const [hideInactiveDevices, setHideInactiveDevices] = useState(false);
-  const [tenantAuthorizedEmails, setTenantAuthorizedEmails] = useState<string[]>(authorizedEmails);
+  const [scopedTenantMemberEmails, setScopedTenantMemberEmails] = useState<string[]>(tenantMemberEmails);
   useEffect(() => {
     let cancelled = false;
 
     const resolveTenantEmails = async () => {
       if (!activeTenant?.id) {
-        setTenantAuthorizedEmails(authorizedEmails);
+        setScopedTenantMemberEmails(tenantMemberEmails);
         return;
       }
 
@@ -168,12 +168,12 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
           )
         );
         if (!cancelled) {
-          setTenantAuthorizedEmails(scopedEmails.length ? scopedEmails : authorizedEmails);
+          setScopedTenantMemberEmails(scopedEmails.length ? scopedEmails : tenantMemberEmails);
         }
       } catch (error) {
         logger.warn('AdminNotificationCenter: failed to load tenant memberships', error);
         if (!cancelled) {
-          setTenantAuthorizedEmails(authorizedEmails);
+          setScopedTenantMemberEmails(tenantMemberEmails);
         }
       }
     };
@@ -183,7 +183,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
     return () => {
       cancelled = true;
     };
-  }, [activeTenant?.id, authorizedEmails]);
+  }, [activeTenant?.id, tenantMemberEmails]);
 
 
   // Animation for refresh button
@@ -414,12 +414,12 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
     try {
       setLoading(true);
       
-      const allUsersData = await getAllUsersWithDevices(tenantAuthorizedEmails, true);
+      const allUsersData = await getAllUsersWithDevices(scopedTenantMemberEmails, true);
       
-      // Filter users based on authorized emails
-      const normalizedAuthorizedEmails = tenantAuthorizedEmails.map(email => email.toLowerCase());
-      const filteredUsersData = tenantAuthorizedEmails.length > 0 
-        ? allUsersData.filter(userData => normalizedAuthorizedEmails.includes(userData.email.toLowerCase()))
+      // Filter users based on tenant member email scope
+      const normalizedMemberEmails = scopedTenantMemberEmails.map(email => email.toLowerCase());
+      const filteredUsersData = scopedTenantMemberEmails.length > 0 
+        ? allUsersData.filter(userData => normalizedMemberEmails.includes(userData.email.toLowerCase()))
         : allUsersData;
       
       setAuthorizedUsers(filteredUsersData);
@@ -447,7 +447,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
     } finally {
       setLoading(false);
     }
-  }, [getAllUsersWithDevices, getHardBanExpirationInfo, isDeviceOnline, tenantAuthorizedEmails]);
+  }, [getAllUsersWithDevices, getHardBanExpirationInfo, isDeviceOnline, scopedTenantMemberEmails]);
 
   // Initial load
   useEffect(() => {
@@ -463,7 +463,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, authori
       return;
     }
     loadAuthorizedUsersWithDevices();
-  }, [tenantAuthorizedEmails, loadAuthorizedUsersWithDevices]);
+  }, [scopedTenantMemberEmails, loadAuthorizedUsersWithDevices]);
 
   useEffect(() => {
     if (!showNotificationModal) {

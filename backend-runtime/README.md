@@ -115,6 +115,29 @@ POST /notifications/web-push/test { tenantId, deviceId, title?, body?, type?, cl
 Issue a token then use Authorization: Bearer <token>.
 Master key (INTERNAL_API_KEY) may also be used directly as bearer for automation.
 
+### Global Admin Custom Claims
+
+Firestore rules now support global admin checks via Firebase Auth custom claim `admin=true`.
+
+Set or revoke with the included script:
+
+```bash
+cd backend-runtime
+npm run auth:set-global-admin -- --email admin@example.com --admin true
+npm run auth:set-global-admin -- --uid <firebase-uid> --admin false
+npm run auth:set-global-admin -- --email admin@example.com --get
+npm run auth:set-global-admin -- --email ops@example.com --admin true --bootstrap
+```
+
+This script also revokes refresh tokens so claim changes take effect after the user refreshes auth.
+`--bootstrap` is recommended for first production setup: it refuses to set a new admin if another admin claim already exists (unless you pass `--force`).
+
+Operator endpoints:
+
+- `GET /admin/auth/global-admin/me` (requires global admin or master)
+- `POST /admin/auth/global-admin/get` with `{ "uid": "..." }` or `{ "email": "..." }` (requires global admin or master)
+- `POST /admin/auth/global-admin/set` with `{ "uid"|"email", "admin": true|false, "reason"? }` (master token only)
+
 ## Future Enhancements
 - Delivery/read webhook handling with status correlation
 - Extended metrics (success/fail counters, latency histograms)

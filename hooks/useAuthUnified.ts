@@ -2,9 +2,6 @@ import { logger } from '@/lib/logger';
 import { STORAGE_KEYS } from '@/lib/storageKeys';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { auth, firestore } from '../config/firebase';
-// For deleting custom profile pictures when removing a user
-import { storage } from '../config/firebase';
-import { ref as storageRef, deleteObject } from 'firebase/storage';
 import { 
   signOut as firebaseSignOut,
   onAuthStateChanged,
@@ -41,6 +38,7 @@ import { tenantService } from '@/services/tenantService';
 import { chatCacheService } from '@/services/chatCacheService';
 import { notificationService } from '@/services/notificationService';
 import { settingsService } from '@/services/settingsService';
+import { tenantBackendClient } from '@/services/tenantBackendClient';
 import type { TenantMembershipRole } from '@/types';
 // Lazy-load deviceTrackingService to avoid import cycles (typed)
 type DeviceTrackingServiceType = typeof import('../services/deviceTrackingService').deviceTrackingService;
@@ -153,6 +151,7 @@ let teamMembersListeners: Set<(members: TeamMember[]) => void> = new Set();
 let teamMembersUnsubscribe: Unsubscribe | null = null;
 let teamMembersReinitUnsub: (() => void) | null = null;
 let presenceInterval: ReturnType<typeof setInterval> | null = null;
+const tenantPresenceTenantIdsCache = new Map<string, { tenantIds: string[]; at: number }>();
 let isAppInBackground = false; // Track app state
 let roleListenerUnsubscribe: Unsubscribe | null = null;
 let lastRoleHeartbeatCheckAt = 0;
@@ -252,6 +251,24 @@ async function attemptPermissionRecovery(reason?: string): Promise<void> {
     }
   })();
   return permissionRecoveryInFlight;
+}
+
+async function bootstrapGlobalAdminClaim(user: User): Promise<void> {
+  if (!user) return;
+  if (globalAuthState.isOffline) return;
+  try {
+    const me = await tenantBackendClient.getGlobalAdminMe();
+    if (!me) return;
+    if (me.isGlobalAdmin === true) {
+      await user.getIdToken(true);
+      reinitFirestoreListeners('global-admin-claim-bootstrap');
+      logger.debug('🔐 Global admin claim bootstrap refresh completed', {
+        uid: user.uid,
+      });
+    }
+  } catch (error) {
+    logger.warn('Global admin claim bootstrap check failed', error);
+  }
 }
 
 function flagReloginRequired(reason?: string, error?: unknown): void {
@@ -606,6 +623,54 @@ async function updateUsersCollectionOnly(email: string, profileData: {
   }
 }
 
+async function updateTenantProfilesForUser(email: string, profileData: {
+  displayName?: string;
+  photoURL?: string;
+  customImageURL?: string | null;
+  school?: string;
+  bio?: string;
+  phone?: string;
+  dateOfBirth?: string;
+  salutation?: 'Mr.' | 'Ms.';
+  subjects?: string[];
+}): Promise<void> {
+  const normalizedEmail = email.toLowerCase();
+  const tenantIds = await getActiveTenantIdsForPresence(normalizedEmail);
+  if (!tenantIds.length) {
+    return;
+  }
+
+  const emailKey = sanitizeEmailKey(normalizedEmail);
+
+  await Promise.all(
+    tenantIds.map(async (tenantId) => {
+      const payload: Record<string, any> = {
+        tenantId,
+        email: normalizedEmail,
+        updatedAt: new Date(),
+      };
+
+      if (profileData.displayName !== undefined) payload.displayName = profileData.displayName;
+      if (profileData.photoURL !== undefined) payload.photoURL = profileData.photoURL;
+      if (profileData.customImageURL !== undefined) {
+        payload.customImageURL = profileData.customImageURL ? profileData.customImageURL : deleteField();
+      }
+      if (profileData.school !== undefined) payload.school = profileData.school;
+      if (profileData.bio !== undefined) payload.bio = profileData.bio;
+      if (profileData.phone !== undefined) payload.phone = profileData.phone;
+      if (profileData.dateOfBirth !== undefined) payload.dateOfBirth = profileData.dateOfBirth;
+      if (profileData.salutation !== undefined) payload.salutation = profileData.salutation;
+      if (profileData.subjects !== undefined) payload.subjects = profileData.subjects;
+
+      await setDoc(
+        doc(firestore, 'tenantProfiles', `${tenantId}_${emailKey}`),
+        payload,
+        { merge: true }
+      );
+    })
+  );
+}
+
 // Safe profile update with fallback
 async function updateUserProfileSafe(email: string, profileData: {
   displayName?: string;
@@ -629,31 +694,34 @@ async function updateUserProfileSafe(email: string, profileData: {
     }
     
     const normalizedEmail = email.toLowerCase();
-    
-    // Try to update user profile in the authorizedEmails collection first (primary source)
+
+    // Primary write path: tenantProfiles + tenantPresence (tenant-native stores)
     try {
-      const docId = normalizedEmail.replace(/[@.]/g, '_');
-      const authDocRef = doc(firestore, 'authorizedEmails', docId);
-      const existingAuth = await getDoc(authDocRef);
-      if (!existingAuth.exists()) {
-        if (shouldLog) logger.debug('⛔ Skipping authorizedEmails update; doc missing (revoked user):', normalizedEmail);
-        throw new Error('AUTH_DOC_MISSING');
+      await updateTenantProfilesForUser(normalizedEmail, {
+        displayName: profileData.displayName,
+        photoURL: profileData.photoURL,
+        customImageURL: profileData.customImageURL,
+        school: profileData.school,
+        bio: profileData.bio,
+        phone: profileData.phone,
+        dateOfBirth: profileData.dateOfBirth,
+        salutation: profileData.salutation,
+        subjects: profileData.subjects,
+      });
+
+      if (
+        profileData.isOnline !== undefined ||
+        profileData.lastSeen !== undefined ||
+        profileData.typingTo !== undefined
+      ) {
+        await updateTenantPresenceForUser(normalizedEmail, {
+          isOnline: profileData.isOnline,
+          lastSeen: profileData.lastSeen,
+          typingTo: profileData.typingTo,
+        });
       }
-      const authUpdateData: any = { email: normalizedEmail, updatedAt: new Date() };
-      if (profileData.isOnline !== undefined) authUpdateData.isOnline = profileData.isOnline;
-      if (profileData.lastSeen) authUpdateData.lastSeen = profileData.lastSeen;
-      if (profileData.displayName) authUpdateData.displayName = profileData.displayName;
-      if (profileData.photoURL) authUpdateData.photoURL = profileData.photoURL;
-      if (profileData.customImageURL !== undefined) authUpdateData.customImageURL = profileData.customImageURL ? profileData.customImageURL : deleteField();
-      if (profileData.typingTo !== undefined) authUpdateData.typingTo = profileData.typingTo;
-      if (profileData.school !== undefined) authUpdateData.school = profileData.school;
-      if (profileData.bio !== undefined) authUpdateData.bio = profileData.bio;
-      if (profileData.phone !== undefined) authUpdateData.phone = profileData.phone;
-      if (profileData.dateOfBirth !== undefined) authUpdateData.dateOfBirth = profileData.dateOfBirth;
-      if (profileData.salutation !== undefined) authUpdateData.salutation = profileData.salutation;
-      if (profileData.subjects !== undefined) authUpdateData.subjects = profileData.subjects;
-      await setDoc(authDocRef, authUpdateData, { merge: true });
-      if (shouldLog) logger.debug('✅ User profile update (existing doc) in authorizedEmails');
+      if (shouldLog) logger.debug('✅ User profile update successful in tenantProfiles/tenantPresence');
+      return;
     } catch (authError) {
       const errorMessage = authError instanceof Error ? authError.message : String(authError);
       const errorCode = (authError as any)?.code || '';
@@ -663,13 +731,12 @@ async function updateUserProfileSafe(email: string, profileData: {
                                errorMessage.includes('insufficient permissions') ||
                                errorMessage.includes('permission-denied') ||
                                errorCode === 'permission-denied';
-      const isMissingAuthDoc = errorMessage === 'AUTH_DOC_MISSING';
       
       if (isPermissionError) {
-        flagReloginRequired('updateUserProfileSafe.authorizedEmails', authError);
+        flagReloginRequired('updateUserProfileSafe.tenantCollections', authError);
       }
-      if (!isPermissionError && !isMissingAuthDoc && shouldLog) {
-        logger.warn('⚠️ AuthorizedEmails update failed, trying users collection:', authError);
+      if (!isPermissionError && shouldLog) {
+        logger.warn('⚠️ Tenant profile update failed, trying users collection:', authError);
       }
       
       // Fallback to users collection
@@ -709,8 +776,7 @@ async function updateUserProfileSafe(email: string, profileData: {
   if (profileData.subjects !== undefined) updateData.subjects = profileData.subjects;
         
   await setDoc(userRef, updateData, { merge: true });
-  if (shouldLog && !isMissingAuthDoc) logger.debug('✅ User profile update successful in users collection (fallback)');
-  if (shouldLog && isMissingAuthDoc) logger.debug('ℹ️ User profile updated only in users collection (revoked user)');
+  if (shouldLog) logger.debug('✅ User profile update successful in users collection (fallback)');
         return;
       } catch (firestoreError) {
         const usersErrorMessage = firestoreError instanceof Error ? firestoreError.message : String(firestoreError);
@@ -765,116 +831,83 @@ async function updateUserProfileSafe(email: string, profileData: {
   }
 }
 
-// Mirror role under UID in a dedicated collection for security rules (isAdmin by UID)
-async function ensureUidRoleMirror(email: string, role: 'user' | 'admin'): Promise<void> {
-  try {
-    const current = auth.currentUser;
-    if (!current || !current.uid) return;
-  const uidRef = doc(firestore, 'authorizedUsersByUid', current.uid);
-    await setDoc(uidRef, {
-      email: email.toLowerCase(),
-      role,
-      updatedAt: new Date(),
-    }, { merge: true });
-  } catch (e) {
-    logger.warn('ensureUidRoleMirror failed:', e);
-  }
-}
-
 // Ensure newly authorized user doc gets a default Google photo if missing
 async function ensureAuthorizedEmailHasPhoto(email: string, googlePhotoURL?: string | null): Promise<void> {
   try {
     if (!googlePhotoURL) return; // Nothing to set
     const normalized = email.toLowerCase();
-    const docId = normalized.replace(/[@.]/g, '_');
-    const ref = doc(firestore, 'authorizedEmails', docId);
-    const snap = await getDoc(ref);
-    if (!snap.exists()) return; // Doc must already exist (admin pre-created)
-    const data = snap.data();
-    // Only set if neither photoURL nor customImageURL is present (first-time population)
-    if (!data.photoURL && !data.customImageURL) {
-      await setDoc(ref, { photoURL: googlePhotoURL, updatedAt: new Date() }, { merge: true });
-      logger.debug('🖼️ Set default Google photoURL in authorizedEmails for', normalized);
-    }
+    const emailKey = sanitizeEmailKey(normalized);
+    const tenantIds = await getActiveTenantIdsForPresence(normalized);
+    if (!tenantIds.length) return;
+
+    await Promise.all(
+      tenantIds.map(async (tenantId) => {
+        const profileRef = doc(firestore, 'tenantProfiles', `${tenantId}_${emailKey}`);
+        const profileSnap = await getDoc(profileRef);
+        if (!profileSnap.exists()) return;
+        const data = profileSnap.data() as any;
+        if (!data.photoURL && !data.customImageURL) {
+          await setDoc(profileRef, { photoURL: googlePhotoURL, updatedAt: new Date() }, { merge: true });
+        }
+      })
+    );
+    logger.debug('🖼️ Set default Google photoURL in tenantProfiles for', normalized);
   } catch (e) {
-    logger.warn('Failed to ensure authorizedEmails default photoURL:', e);
+    logger.warn('Failed to ensure tenantProfiles default photoURL:', e);
   }
 }
 
-// Remove any UID-role mirror docs for a given email (cleanup when revoking access)
-async function deleteUidRoleMirrorsByEmail(email: string): Promise<void> {
-  try {
-    const normalized = email.toLowerCase();
-    const colRef = collection(firestore, 'authorizedUsersByUid');
-    const q = query(colRef, where('email', '==', normalized));
-    const snap = await getDocs(q);
-    const deletions: Promise<void>[] = [];
-    snap.forEach((docSnap) => {
-      deletions.push(deleteDoc(doc(firestore, 'authorizedUsersByUid', docSnap.id)));
-    });
-    if (deletions.length) {
-      await Promise.allSettled(deletions);
-      logger.debug(`🧹 Removed ${deletions.length} mirror doc(s) from authorizedUsersByUid for`, normalized);
-    }
-  } catch (e) {
-    logger.warn('Failed to delete UID role mirrors for', email, e);
-  }
-}
-
-// Update any UID-role mirror docs for a given email to a new role (when role changes)
-async function updateUidRoleMirrorsByEmail(email: string, role: 'user' | 'admin'): Promise<void> {
-  try {
-    const normalized = email.toLowerCase();
-    const colRef = collection(firestore, 'authorizedUsersByUid');
-    const q = query(colRef, where('email', '==', normalized));
-    const snap = await getDocs(q);
-    const updates: Promise<void>[] = [];
-    snap.forEach((docSnap) => {
-      updates.push(updateDoc(doc(firestore, 'authorizedUsersByUid', docSnap.id), {
-        role,
-        updatedAt: new Date(),
-      }));
-    });
-    if (updates.length) {
-      await Promise.allSettled(updates);
-      logger.debug(`🔄 Updated ${updates.length} mirror doc(s) in authorizedUsersByUid for`, normalized, 'to role', role);
-    }
-  } catch (e) {
-    logger.warn('Failed to update UID role mirrors for', email, e);
-  }
-}
-
-// Change role in authorizedEmails and sync UID mirror; does not force logout
+// Change role in tenant memberships; does not force logout
 async function changeAuthorizedEmailRole(email: string, newRole: 'user' | 'admin'): Promise<void> {
   const normalizedEmail = email.toLowerCase();
-  const authorizedRef = collection(firestore, 'authorizedEmails');
-  const docId = normalizedEmail.replace(/[@.]/g, '_');
-  const docRef = doc(authorizedRef, docId);
-  const existingSnap = await getDoc(docRef);
-  const previousData = existingSnap.exists() ? existingSnap.data() : null;
-  const previousRole = (previousData?.role ?? null) as 'user' | 'admin' | null;
+  const tenantId = await resolveTenantScopeForMembershipNotifications();
+  if (!tenantId) {
+    throw new Error('No tenant selected for role update');
+  }
 
-  // Update role in primary collection
-  await setDoc(docRef, { role: newRole, updatedAt: new Date() }, { merge: true });
-  // Update any existing UID mirrors for currently signed-in sessions
-  await updateUidRoleMirrorsByEmail(normalizedEmail, newRole);
+  const membershipsQuery = query(
+    collection(firestore, 'tenantMemberships'),
+    where('tenantId', '==', tenantId),
+    where('email', '==', normalizedEmail),
+    where('status', '==', 'active')
+  );
+  const membershipSnapshot = await getDocs(membershipsQuery);
+  const membershipDocs = membershipSnapshot.docs;
+  const previousRole = membershipDocs.length
+    ? ((String((membershipDocs[0].data() as any)?.role || '').toLowerCase() === 'owner' ||
+        String((membershipDocs[0].data() as any)?.role || '').toLowerCase() === 'admin')
+        ? 'admin'
+        : 'user')
+    : null;
+
+  const nextTenantRole: TenantMembershipRole = newRole === 'admin' ? 'admin' : 'member';
+  await Promise.all(
+    membershipDocs.map((membershipDoc) =>
+      updateDoc(membershipDoc.ref, {
+        role: nextTenantRole,
+        updatedAt: new Date().toISOString(),
+      })
+    )
+  );
+
+  const emailKey = sanitizeEmailKey(normalizedEmail);
+  await setDoc(
+    doc(firestore, 'tenantProfiles', `${tenantId}_${emailKey}`),
+    { role: nextTenantRole, updatedAt: new Date() },
+    { merge: true }
+  );
 
   if (previousRole && previousRole !== newRole) {
-    const tenantId = await resolveTenantScopeForMembershipNotifications();
-    if (!tenantId) {
-      logger.warn('Skipped team membership notification for role change: tenantId unavailable');
-    } else {
-      triggerTeamMembershipNotification({
-        tenantId,
-        action: 'role_changed',
-        targetEmail: normalizedEmail,
-        targetRole: newRole,
-        previousRole,
-        metadata: {
-          reason: 'role_updated',
-        },
-      });
-    }
+    triggerTeamMembershipNotification({
+      tenantId,
+      action: 'role_changed',
+      targetEmail: normalizedEmail,
+      targetRole: newRole,
+      previousRole,
+      metadata: {
+        reason: 'role_updated',
+      },
+    });
   }
 }
 
@@ -887,9 +920,10 @@ async function setUserOnline(email: string, isOnline: boolean = true) {
       logger.debug('🟢 Setting user online status:', { email, isOnline });
     }
     
-    await updateUserProfileSafe(email, {
+    await updateTenantPresenceForUser(email, {
       isOnline,
-  lastSeen: undefined,
+      lastSeen: new Date().toISOString(),
+      typingTo: isOnline ? undefined : null,
     });
   } catch (error) {
     // Silently handle errors - presence is not critical for app functionality
@@ -911,6 +945,90 @@ async function setUserOnline(email: string, isOnline: boolean = true) {
   }
 }
 
+function sanitizeEmailKey(value: string): string {
+  return value.replace(/[@.]/g, '_');
+}
+
+async function getActiveTenantIdsForPresence(email: string): Promise<string[]> {
+  const normalizedEmail = email.toLowerCase();
+  const cacheKey = `${auth.currentUser?.uid || 'nouid'}:${normalizedEmail}`;
+  const cached = tenantPresenceTenantIdsCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.at < 60000) {
+    return cached.tenantIds;
+  }
+
+  try {
+    const membershipCollection = collection(firestore, 'tenantMemberships');
+    const uid = auth.currentUser?.uid;
+    const membershipQuery = uid
+      ? query(
+          membershipCollection,
+          where('userId', '==', uid),
+          where('status', '==', 'active')
+        )
+      : query(
+          membershipCollection,
+          where('email', '==', normalizedEmail),
+          where('status', '==', 'active')
+        );
+
+    const snapshot = await getDocs(membershipQuery);
+    const tenantIds = Array.from(
+      new Set(
+        snapshot.docs
+          .map((docSnap) => String((docSnap.data() as any)?.tenantId || '').trim())
+          .filter((tenantId) => tenantId.length > 0)
+      )
+    );
+
+    tenantPresenceTenantIdsCache.set(cacheKey, { tenantIds, at: now });
+    return tenantIds;
+  } catch (error) {
+    logger.warn('Failed to load active tenant ids for presence update', { error, email: normalizedEmail });
+    return [];
+  }
+}
+
+async function updateTenantPresenceForUser(
+  email: string,
+  patch: {
+    isOnline?: boolean;
+    lastSeen?: string;
+    typingTo?: string | null;
+  }
+): Promise<void> {
+  const normalizedEmail = email.toLowerCase();
+  const tenantIds = await getActiveTenantIdsForPresence(normalizedEmail);
+  if (tenantIds.length === 0) {
+    return;
+  }
+
+  const emailKey = sanitizeEmailKey(normalizedEmail);
+  const payload: Record<string, any> = {
+    email: normalizedEmail,
+    updatedAt: new Date(),
+  };
+
+  if (patch.isOnline !== undefined) payload.isOnline = patch.isOnline;
+  if (patch.lastSeen) payload.lastSeen = patch.lastSeen;
+  if (patch.typingTo !== undefined) payload.typingTo = patch.typingTo;
+
+  await Promise.all(
+    tenantIds.map(async (tenantId) => {
+      const presenceDocId = `${tenantId}_${emailKey}`;
+      await setDoc(
+        doc(firestore, 'tenantPresence', presenceDocId),
+        {
+          tenantId,
+          ...payload,
+        },
+        { merge: true }
+      );
+    })
+  );
+}
+
 // Presence system
 // Global variables for event listener cleanup
 let currentSetOffline: (() => void) | null = null;
@@ -929,7 +1047,7 @@ function setupPresenceSystem(userEmail: string) {
   // Set user online initially
   setUserOnline(userEmail, true);
   
-  // Update presence every 30 seconds for better real-time experience
+  // Update presence every 15 seconds to reduce stale online state across devices.
   presenceInterval = setInterval(() => {
     // Don't update presence if app is in background
     if (isAppInBackground) {
@@ -949,13 +1067,8 @@ function setupPresenceSystem(userEmail: string) {
           try {
             const online = await checkNetworkStatus();
             if (!online) return;
-            const docId = userEmail.toLowerCase().replace(/[@.]/g, '_');
-            const ref = doc(firestore, 'authorizedEmails', docId);
-            const snap = await getDoc(ref);
-            if (snap.exists()) {
-              const newRole = (snap.data()?.role || 'user') as 'user' | 'admin';
-              await applyAuthoritativeRoleUpdate(newRole, { requireOnlineCheck: false });
-            }
+            const newRole = await getUserRole(userEmail.toLowerCase());
+            await applyAuthoritativeRoleUpdate(newRole, { requireOnlineCheck: false });
           } catch (e) {
             // Silent: heartbeat is best-effort
           }
@@ -965,7 +1078,7 @@ function setupPresenceSystem(userEmail: string) {
       logger.debug('❌ Presence interval mismatch - cleaning up for:', userEmail, 'Current auth user:', globalAuthState.user?.email, 'Current presence user:', currentPresenceUser);
       cleanupPresenceSystem();
     }
-  }, 30000); // 30 seconds for better real-time presence
+  }, 15000);
   
   // Define event handlers
   const setOffline = () => {
@@ -1122,38 +1235,48 @@ async function initializeAuthorizedEmails(): Promise<void> {
 // Load authorized emails
 async function loadAuthorizedEmails(): Promise<void> {
   try {
-    logger.debug('🔄 Loading authorized emails - checking preconditions...');
+    logger.debug('🔄 Loading team roster emails - checking preconditions...');
     
     const isOnline = await checkNetworkStatus();
     
     if (!isOnline) {
       // Use cached emails when offline
-      logger.debug('📱 Loading authorized emails from cache (offline)');
+      logger.debug('📱 Loading team roster emails from cache (offline)');
       authorizedEmails = await getCachedAuthorizedEmails();
       return;
     }
 
     // Check if user is authenticated before making Firestore calls
     if (!auth.currentUser) {
-      logger.debug('🔐 No authenticated user, loading authorized emails from cache only');
+      logger.debug('🔐 No authenticated user, loading team roster emails from cache only');
       authorizedEmails = await getCachedAuthorizedEmails();
       return;
     }
 
-    logger.debug('✅ User authenticated, proceeding with Firestore query for authorized emails');
+    logger.debug('✅ User authenticated, proceeding with Firestore query for tenant memberships');
 
-    // Try to load from Firestore collection when online and authenticated
-    const authCollection = collection(firestore, 'authorizedEmails');
+    const tenantId = await resolveTenantScopeForMembershipNotifications();
+    if (!tenantId) {
+      authorizedEmails = await getCachedAuthorizedEmails();
+      return;
+    }
+
+    // Try to load from tenant memberships when online and authenticated
+    const membershipQuery = query(
+      collection(firestore, 'tenantMemberships'),
+      where('tenantId', '==', tenantId),
+      where('status', '==', 'active')
+    );
     
     try {
       let querySnapshot;
       try {
-        querySnapshot = await getDocsFromServer(authCollection);
+        querySnapshot = await getDocsFromServer(membershipQuery);
       } catch (serverError: any) {
         logger.warn('⚠️ getDocsFromServer failed (likely offline/slow). Falling back to cache:', serverError);
-        querySnapshot = await getDocs(authCollection);
+        querySnapshot = await getDocs(membershipQuery);
         if (querySnapshot.metadata.fromCache) {
-          logger.debug('📦 Authorized emails query served from local cache. Treating as non-authoritative.');
+          logger.debug('📦 Team roster query served from local cache. Treating as non-authoritative.');
           // Use cached values instead of replacing with potentially empty snapshot.
           const cached = await getCachedAuthorizedEmails();
           if (cached.length > 0) {
@@ -1164,26 +1287,21 @@ async function loadAuthorizedEmails(): Promise<void> {
       }
 
       if (querySnapshot.metadata.fromCache && !querySnapshot.metadata.hasPendingWrites) {
-        logger.debug('📦 Authorized emails snapshot from cache; will not treat as authoritative.');
+        logger.debug('📦 Team roster snapshot from cache; will not treat as authoritative.');
       }
 
       const emails: string[] = [];
-      // Strict: only include docs that have both a valid email and a valid role
+      // Include any active membership with a valid email.
       querySnapshot.forEach((docSnap) => {
         const data = docSnap.data();
         if (data && typeof data.email === 'string') {
-          const roleVal = data.role;
-          if (roleVal === 'user' || roleVal === 'admin') {
-            emails.push(data.email.toLowerCase());
-          } else {
-            logger.debug('⛔ Skipping authorizedEmails doc missing valid role:', docSnap.id, 'email:', data.email);
-          }
+          emails.push(data.email.toLowerCase());
         } else {
-          logger.debug('⛔ Skipping authorizedEmails doc missing email field:', docSnap.id);
+          logger.debug('⛔ Skipping membership doc missing email field:', docSnap.id);
         }
       });
       if (querySnapshot.metadata.fromCache && emails.length === 0) {
-        logger.warn('⚠️ Authorized emails snapshot empty due to cache; preserving previous authorized list.');
+        logger.warn('⚠️ Team roster snapshot empty due to cache; preserving previous list.');
         const cached = await getCachedAuthorizedEmails();
         authorizedEmails = cached;
         return;
@@ -1191,14 +1309,14 @@ async function loadAuthorizedEmails(): Promise<void> {
 
       authorizedEmails = emails;
       await cacheAuthorizedEmails(emails);
-      logger.debug('✅ Loaded authorized emails from Firestore (valid w/ role):', emails.length);
+      logger.debug('✅ Loaded team roster emails from Firestore:', emails.length);
     } catch (error) {
-      logger.warn('⚠️ Failed to load authorized emails, using cache:', error);
+      logger.warn('⚠️ Failed to load team roster emails, using cache:', error);
       // Fallback to cached emails only
       authorizedEmails = await getCachedAuthorizedEmails();
     }
   } catch (error) {
-    logger.warn('⚠️ Unexpected error loading authorized emails, using cache:', error);
+    logger.warn('⚠️ Unexpected error loading team roster emails, using cache:', error);
     authorizedEmails = await getCachedAuthorizedEmails();
   }
 }
@@ -1207,36 +1325,22 @@ async function loadAuthorizedEmails(): Promise<void> {
 async function getUserRole(email: string): Promise<'user' | 'admin'> {
   try {
     const normalizedEmail = email.toLowerCase();
-    
-    // If not authenticated, use fallback logic
-    if (!auth.currentUser) {
-      logger.debug('🔐 No authenticated user, using fallback role logic');
-      return 'user'; // Default to user role when not authenticated
-    }
-    
-    // Try to get the role from the authorizedEmails collection
-    const docId = normalizedEmail.replace(/[@.]/g, '_');
-    const authDocRef = doc(firestore, 'authorizedEmails', docId);
-    
-    try {
-      const authDocSnap = await getDoc(authDocRef);
-      if (authDocSnap.exists()) {
-        const authData = authDocSnap.data();
-        if (authData.role) {
-          logger.debug(`📋 Found role for ${email}: ${authData.role}`);
-          return authData.role;
-        }
-      }
-    } catch (firestoreError) {
-      logger.warn('⚠️ Firestore permission error getting user role:', firestoreError);
-      // Fall back to default logic
-    }
-    
-    // Default to 'user' role for authorized users
-    return 'user';
+
+    const membershipQuery = query(
+      collection(firestore, 'tenantMemberships'),
+      where('email', '==', normalizedEmail),
+      where('status', '==', 'active')
+    );
+    const membershipSnapshot = await getDocs(membershipQuery);
+    const hasAdminRole = membershipSnapshot.docs.some((docSnap) => {
+      const role = String((docSnap.data() as any)?.role || '').toLowerCase();
+      return role === 'owner' || role === 'admin';
+    });
+
+    return hasAdminRole ? 'admin' : 'user';
   } catch (error) {
     logger.error('Error getting user role:', error);
-  return 'user';
+    return 'user';
   }
 }
 
@@ -1427,7 +1531,6 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
       let role: 'user' | 'admin' = 'user';
       try {
         role = await getUserRole(user.email);
-        await ensureUidRoleMirror(user.email, role);
       } catch (roleError) {
         logger.warn('Failed to resolve role during web sign-in, defaulting to user role:', roleError);
       }
@@ -1493,6 +1596,8 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
         isOnline: true,
         lastSeen: new Date().toISOString(),
       });
+
+      await bootstrapGlobalAdminClaim(user);
       
       // Setup presence system for real-time online status
       setupPresenceSystem(user.email);
@@ -1555,7 +1660,6 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
         let role: 'user' | 'admin' = 'user';
         try {
           role = await getUserRole(user.email);
-          await ensureUidRoleMirror(user.email, role);
         } catch (roleError) {
           logger.warn('Failed to resolve role during mobile sign-in, defaulting to user role:', roleError);
         }
@@ -1622,6 +1726,8 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
           isOnline: true,
           lastSeen: new Date().toISOString(),
         });
+
+        await bootstrapGlobalAdminClaim(user);
         
         // Setup presence system for real-time online status
         setupPresenceSystem(user.email);
@@ -1912,6 +2018,7 @@ function initializeAuth() {
         } catch (tokenError) {
           logger.warn('Failed to force token refresh on auth state change', tokenError);
         }
+        await bootstrapGlobalAdminClaim(user);
         startTokenRefreshTimer(user);
         logger.debug('🔐 Multi-tenant auth state change - granting access to authenticated user:', user.email);
         try {
@@ -1923,7 +2030,6 @@ function initializeAuth() {
         let role: 'user' | 'admin' = 'user';
         try {
           role = await getUserRole(user.email || '');
-          await ensureUidRoleMirror(user.email || '', role);
         } catch (roleError) {
           logger.warn('Failed to resolve role during auth state change, defaulting to user role:', roleError);
         }
@@ -2032,13 +2138,14 @@ function initializeAuth() {
               roleListenerUnsubscribe();
               roleListenerUnsubscribe = null;
             }
-            const roleDocId = authUser.email.toLowerCase().replace(/[@.]/g, '_');
-            const roleDocRef = doc(firestore, 'authorizedEmails', roleDocId);
-            roleListenerUnsubscribe = onSnapshot(roleDocRef, async (snap) => {
+            const roleMembershipQuery = query(
+              collection(firestore, 'tenantMemberships'),
+              where('email', '==', authUser.email.toLowerCase()),
+              where('status', '==', 'active')
+            );
+            roleListenerUnsubscribe = onSnapshot(roleMembershipQuery, async (_snap) => {
               try {
-                if (!snap.exists()) return;
-                const data = snap.data();
-                const newRole = (data?.role || 'user') as 'user' | 'admin';
+                const newRole = await getUserRole(authUser.email.toLowerCase());
                 await applyAuthoritativeRoleUpdate(newRole);
               } catch (e) {
                 logger.warn('Role change listener error:', e);
@@ -2188,109 +2295,160 @@ function onTeamMembersChange(callback: (members: TeamMember[]) => void): () => v
   
   // Set up Firestore listener if not already set up
   if (!teamMembersUnsubscribe) {
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    const attach = (context?: string) => {
-      teamMembersUnsubscribe?.();
-      teamMembersUnsubscribe = onSnapshot(authorizedRef, async (snapshot) => {
-        try {
-          const members: TeamMember[] = [];
-          snapshot.forEach((docSnap) => {
-            const data = docSnap.data();
-            if (data && data.email) {
-              const name = data.displayName || data.email.split('@')[0]
-                .replace(/[._-]/g, ' ')
-                .replace(/\b\w/g, (l: string) => l.toUpperCase());
-              
-              // Presence derivation: by env mode (last_seen vs flag)
-              const lastSeen = data.lastSeen;
-              const FIRESTORE_ONLINE_THRESHOLD_MIN = getPresenceThresholdMin();
-
-              // Robust timestamp parsing (supports ISO string, number, Date, Firestore Timestamp-like objects)
-              const parseAnyTimestamp = (val: any): Date | null => {
-                try {
-                  if (!val) return null;
-                  // Firestore server timestamp sentinel (unresolved) – treat as now
-                  if (val && typeof val === 'object' && val._methodName === 'serverTimestamp')
-                    return new Date();
-                  // Firestore Timestamp shape { seconds, nanoseconds }
-                  if (val && typeof val === 'object' && typeof val.seconds === 'number')
-                    return new Date(val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6));
-                  // Actual Timestamp with toDate()
-                  if (val && typeof val.toDate === 'function') return val.toDate();
-                  if (val instanceof Date) return val;
-                  if (typeof val === 'number' || typeof val === 'string') return new Date(val);
-                  return null;
-                } catch {
-                  return null;
-                }
-              };
-
-              // Compute online status based on configured mode
-              let isOnline = false;
-              if (PRESENCE_MODE === 'flag') {
-                isOnline = data.isOnline === true;
-              } else {
-                const parsedLastSeen = parseAnyTimestamp(lastSeen);
-                if (parsedLastSeen) {
-                  const now = new Date();
-                  const timeDiffMinutes = (now.getTime() - parsedLastSeen.getTime()) / (1000 * 60);
-                  isOnline = timeDiffMinutes <= FIRESTORE_ONLINE_THRESHOLD_MIN;
-                  if (!isOnline && (data.isOnline === true)) {
-                    // (Removed verbose derived offline discrepancy debug log)
-                  }
-                } else {
-                  // No usable lastSeen; trust stored flag as a fallback
-                  isOnline = data.isOnline ?? false;
-                }
-              }
-              
-              // (Removed admin user presence debug log)
-              
-              members.push({
-                id: data.email.toLowerCase(),
-                name,
-                email: data.email.toLowerCase(),
-                avatar: data.email.charAt(0).toUpperCase(),
-                photoURL: data.photoURL,
-                customImageURL: data.customImageURL,
-                role: data.role || 'user',
-                isOnline: isOnline,
-                lastSeen: lastSeen,
-                typingTo: data.typingTo?.toLowerCase() || data.typingTo,
-                school: data.school,
-                bio: data.bio,
-                phone: data.phone,
-                dateOfBirth: data.dateOfBirth,
-                salutation: data.salutation,
-                subjects: Array.isArray(data.subjects) ? data.subjects : undefined,
-              });
-            }
-          });
-          
-          members.sort((a, b) => {
-            if (a.isOnline !== b.isOnline) {
-              return a.isOnline ? -1 : 1;
-            }
-            return a.name.localeCompare(b.name);
-          });
-          
-          teamMembersListeners.forEach((listener) => {
-            listener(members);
-          });
-        } catch (error) {
-          logger.error('Error in team members listener:', error);
+    const parseAnyTimestamp = (val: any): Date | null => {
+      try {
+        if (!val) return null;
+        if (val && typeof val === 'object' && val._methodName === 'serverTimestamp') return new Date();
+        if (val && typeof val === 'object' && typeof val.seconds === 'number') {
+          return new Date(val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6));
         }
+        if (val && typeof val.toDate === 'function') return val.toDate();
+        if (val instanceof Date) return val;
+        if (typeof val === 'number' || typeof val === 'string') return new Date(val);
+        return null;
+      } catch {
+        return null;
+      }
+    };
+
+    const emitMembers = (
+      memberships: any[],
+      profilesByEmail: Map<string, any>,
+      presenceByEmail: Map<string, any>
+    ) => {
+      const FIRESTORE_ONLINE_THRESHOLD_MIN = getPresenceThresholdMin();
+      const members: TeamMember[] = memberships.map((membership) => {
+        const email = String(membership.email || '').toLowerCase();
+        const profile = profilesByEmail.get(email) || {};
+        const presence = presenceByEmail.get(email) || {};
+
+        const lastSeen = presence.lastSeen;
+        let isOnline = false;
+        if (PRESENCE_MODE === 'flag') {
+          isOnline = presence.isOnline === true;
+        } else {
+          const parsedLastSeen = parseAnyTimestamp(lastSeen);
+          if (parsedLastSeen) {
+            const timeDiffMinutes = (Date.now() - parsedLastSeen.getTime()) / (1000 * 60);
+            isOnline = timeDiffMinutes <= FIRESTORE_ONLINE_THRESHOLD_MIN;
+          } else {
+            isOnline = presence.isOnline ?? false;
+          }
+        }
+
+        const nameSource = profile.displayName || membership.displayName || email.split('@')[0];
+        const tenantRole = String(membership.role || 'member').toLowerCase() as TenantMembershipRole;
+        const role: 'user' | 'admin' = tenantRole === 'owner' || tenantRole === 'admin' ? 'admin' : 'user';
+
+        return {
+          id: email,
+          name: String(nameSource)
+            .replace(/[._-]/g, ' ')
+            .replace(/\b\w/g, (l: string) => l.toUpperCase()),
+          email,
+          avatar: email.charAt(0).toUpperCase(),
+          photoURL: profile.photoURL,
+          customImageURL: profile.customImageURL,
+          role,
+          tenantRole,
+          isOnline,
+          lastSeen,
+          typingTo: presence.typingTo?.toLowerCase() || presence.typingTo,
+          school: profile.school,
+          bio: profile.bio,
+          phone: profile.phone,
+          dateOfBirth: profile.dateOfBirth,
+          salutation: profile.salutation,
+          subjects: Array.isArray(profile.subjects) ? profile.subjects : undefined,
+        };
       });
+
+      members.sort((a, b) => {
+        if (a.isOnline !== b.isOnline) {
+          return a.isOnline ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name);
+      });
+
+      teamMembersListeners.forEach((listener) => listener(members));
+    };
+
+    const attach = async (context?: string) => {
+      teamMembersUnsubscribe?.();
+
+      const tenantId = await resolveTenantScopeForMembershipNotifications();
+      if (!tenantId) {
+        teamMembersListeners.forEach((listener) => listener([]));
+        teamMembersUnsubscribe = null;
+        return;
+      }
+
+      let memberships: any[] = [];
+      let profilesByEmail = new Map<string, any>();
+      let presenceByEmail = new Map<string, any>();
+
+      const membershipsQuery = query(
+        collection(firestore, 'tenantMemberships'),
+        where('tenantId', '==', tenantId),
+        where('status', '==', 'active')
+      );
+      const profilesQuery = query(
+        collection(firestore, 'tenantProfiles'),
+        where('tenantId', '==', tenantId)
+      );
+      const presenceQuery = query(
+        collection(firestore, 'tenantPresence'),
+        where('tenantId', '==', tenantId)
+      );
+
+      const membershipsUnsub = onSnapshot(membershipsQuery, (snapshot) => {
+        memberships = snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...(docSnap.data() as any) }));
+        emitMembers(memberships, profilesByEmail, presenceByEmail);
+      });
+
+      const profilesUnsub = onSnapshot(profilesQuery, (snapshot) => {
+        profilesByEmail = new Map(
+          snapshot.docs
+            .map((docSnap) => {
+              const data = docSnap.data() as any;
+              const email = String(data?.email || '').toLowerCase();
+              return email ? [email, data] : null;
+            })
+            .filter(Boolean) as Array<[string, any]>
+        );
+        emitMembers(memberships, profilesByEmail, presenceByEmail);
+      });
+
+      const presenceUnsub = onSnapshot(presenceQuery, (snapshot) => {
+        presenceByEmail = new Map(
+          snapshot.docs
+            .map((docSnap) => {
+              const data = docSnap.data() as any;
+              const email = String(data?.email || '').toLowerCase();
+              return email ? [email, data] : null;
+            })
+            .filter(Boolean) as Array<[string, any]>
+        );
+        emitMembers(memberships, profilesByEmail, presenceByEmail);
+      });
+
+      teamMembersUnsubscribe = () => {
+        membershipsUnsub();
+        profilesUnsub();
+        presenceUnsub();
+      };
 
       if (context) {
         logger.debug('Team members listener reattached', { context });
       }
     };
 
-    attach('initial');
+    void attach('initial');
 
     if (!teamMembersReinitUnsub) {
-      teamMembersReinitUnsub = registerFirestoreReinit?.(() => attach('reinit')) || null;
+      teamMembersReinitUnsub = registerFirestoreReinit?.(() => {
+        void attach('reinit');
+      }) || null;
     }
   }
   
@@ -2314,64 +2472,101 @@ function onTeamMembersChange(callback: (members: TeamMember[]) => void): () => v
 // Force refresh team members
 async function forceRefreshTeamMembers(): Promise<TeamMember[]> {
   try {
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    const snapshot = await getDocs(authorizedRef);
-    
-    const members: TeamMember[] = [];
-    
-    snapshot.forEach((doc) => {
-      const data = doc.data();
-      if (data.email) {
-        const name = data.displayName || data.email.split('@')[0]
+    const tenantId = await resolveTenantScopeForMembershipNotifications();
+    if (!tenantId) return [];
+
+    const [membershipSnap, profilesSnap, presenceSnap] = await Promise.all([
+      getDocs(
+        query(
+          collection(firestore, 'tenantMemberships'),
+          where('tenantId', '==', tenantId),
+          where('status', '==', 'active')
+        )
+      ),
+      getDocs(query(collection(firestore, 'tenantProfiles'), where('tenantId', '==', tenantId))),
+      getDocs(query(collection(firestore, 'tenantPresence'), where('tenantId', '==', tenantId))),
+    ]);
+
+    const profilesByEmail = new Map<string, any>();
+    profilesSnap.forEach((docSnap) => {
+      const data = docSnap.data() as any;
+      const email = String(data?.email || '').toLowerCase();
+      if (email) profilesByEmail.set(email, data);
+    });
+
+    const presenceByEmail = new Map<string, any>();
+    presenceSnap.forEach((docSnap) => {
+      const data = docSnap.data() as any;
+      const email = String(data?.email || '').toLowerCase();
+      if (email) presenceByEmail.set(email, data);
+    });
+
+    const parseAnyTimestamp = (val: any): Date | null => {
+      try {
+        if (!val) return null;
+        if (val && typeof val === 'object' && val._methodName === 'serverTimestamp') return new Date();
+        if (val && typeof val === 'object' && typeof val.seconds === 'number') {
+          return new Date(val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6));
+        }
+        if (val && typeof val.toDate === 'function') return val.toDate();
+        if (val instanceof Date) return val;
+        if (typeof val === 'number' || typeof val === 'string') return new Date(val);
+        return null;
+      } catch {
+        return null;
+      }
+    };
+
+    const FIRESTORE_ONLINE_THRESHOLD_MIN = getPresenceThresholdMin();
+    const members: TeamMember[] = membershipSnap.docs.map((docSnap) => {
+      const membership = docSnap.data() as any;
+      const email = String(membership?.email || '').toLowerCase();
+      const profile = profilesByEmail.get(email) || {};
+      const presence = presenceByEmail.get(email) || {};
+
+      const lastSeen = presence.lastSeen;
+      let isOnline = false;
+      if (PRESENCE_MODE === 'flag') {
+        isOnline = presence.isOnline === true;
+      } else {
+        const parsedLastSeen = parseAnyTimestamp(lastSeen);
+        if (parsedLastSeen) {
+          const diffMin = (Date.now() - parsedLastSeen.getTime()) / 60000;
+          isOnline = diffMin <= FIRESTORE_ONLINE_THRESHOLD_MIN;
+        } else {
+          isOnline = presence.isOnline ?? false;
+        }
+      }
+
+      const displayName =
+        profile.displayName ||
+        membership.displayName ||
+        email.split('@')[0]
           .replace(/[._-]/g, ' ')
           .replace(/\b\w/g, (l: string) => l.toUpperCase());
-        
-  // Presence derivation consistent with listener, controlled by env
-  const lastSeen = data.lastSeen;
-  const FIRESTORE_ONLINE_THRESHOLD_MIN = getPresenceThresholdMin();
-        const parseAnyTimestamp = (val: any): Date | null => {
-          try {
-            if (!val) return null;
-            if (val && typeof val === 'object' && val._methodName === 'serverTimestamp') return new Date();
-            if (val && typeof val === 'object' && typeof val.seconds === 'number') return new Date(val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6));
-            if (val && typeof val.toDate === 'function') return val.toDate();
-            if (val instanceof Date) return val;
-            if (typeof val === 'number' || typeof val === 'string') return new Date(val);
-            return null;
-          } catch { return null; }
-        };
-        let isOnline = false;
-        if (PRESENCE_MODE === 'flag') {
-          isOnline = data.isOnline === true;
-        } else {
-          const parsedLastSeen = parseAnyTimestamp(lastSeen);
-          if (parsedLastSeen) {
-            const diffMin = (Date.now() - parsedLastSeen.getTime()) / 60000;
-            isOnline = diffMin <= FIRESTORE_ONLINE_THRESHOLD_MIN;
-          } else {
-            isOnline = data.isOnline ?? false;
-          }
-        }
-        
-        members.push({
-          id: data.email,
-          name,
-          email: data.email,
-          avatar: data.email.charAt(0).toUpperCase(),
-          photoURL: data.photoURL,
-          customImageURL: data.customImageURL,
-          role: data.role || 'user',
-          isOnline: isOnline,
-          lastSeen: lastSeen,
-          typingTo: data.typingTo,
-          school: data.school,
-          bio: data.bio,
-          phone: data.phone,
-          dateOfBirth: data.dateOfBirth,
-          salutation: data.salutation,
-          subjects: Array.isArray(data.subjects) ? data.subjects : undefined,
-        });
-      }
+
+      const tenantRole = String(membership?.role || 'member').toLowerCase() as TenantMembershipRole;
+      const role: 'user' | 'admin' = tenantRole === 'owner' || tenantRole === 'admin' ? 'admin' : 'user';
+
+      return {
+        id: email,
+        name: displayName,
+        email,
+        avatar: email.charAt(0).toUpperCase(),
+        photoURL: profile.photoURL,
+        customImageURL: profile.customImageURL,
+        role,
+        tenantRole,
+        isOnline,
+        lastSeen,
+        typingTo: presence.typingTo,
+        school: profile.school,
+        bio: profile.bio,
+        phone: profile.phone,
+        dateOfBirth: profile.dateOfBirth,
+        salutation: profile.salutation,
+        subjects: Array.isArray(profile.subjects) ? profile.subjects : undefined,
+      };
     });
     
     // Sort by online status, then by name
@@ -2414,36 +2609,47 @@ async function getUserProfile(email: string): Promise<{
 } | null> {
   try {
     const normalizedEmail = email.toLowerCase();
-    const docId = normalizedEmail.replace(/[@.]/g, '_');
-    
-    // Get user profile from the authorizedEmails collection first (this has the most up-to-date role info)
-    const authDocRef = doc(firestore, 'authorizedEmails', docId);
-    
+    const tenantId = (await tenantService.getCachedSelectedTenant()) || 'legacy-coaching';
+    const profileDocId = `${tenantId}_${normalizedEmail.replace(/[@.]/g, '_')}`;
+
+    let profileData: any = null;
     try {
-      const authDocSnap = await getDoc(authDocRef);
-      if (authDocSnap.exists()) {
-        const authData = authDocSnap.data();
-        return {
-          email: authData.email || normalizedEmail,
-          displayName: authData.displayName || email.split('@')[0],
-          photoURL: authData.photoURL,
-          customImageURL: authData.customImageURL,
-          role: authData.role || 'user',
-          isOnline: authData.isOnline || false,
-          lastSeen: authData.lastSeen,
-          school: authData.school,
-          bio: authData.bio,
-          phone: authData.phone,
-          dateOfBirth: authData.dateOfBirth,
-          salutation: authData.salutation,
-          subjects: Array.isArray(authData.subjects) ? authData.subjects : undefined,
-        };
+      const profileSnap = await getDoc(doc(firestore, 'tenantProfiles', profileDocId));
+      if (profileSnap.exists()) {
+        profileData = profileSnap.data();
       }
-    } catch (authError) {
-      logger.debug('No authorizedEmails document found for:', email);
+    } catch (profileError) {
+      logger.debug('No tenantProfiles document found for:', { email, tenantId, profileError });
     }
-    
-  // Fallback: Try to get user profile from the users collection (if it exists)
+
+    let presenceData: any = null;
+    try {
+      const presenceSnap = await getDoc(doc(firestore, 'tenantPresence', profileDocId));
+      if (presenceSnap.exists()) {
+        presenceData = presenceSnap.data();
+      }
+    } catch {}
+
+    if (profileData || presenceData) {
+      const role = await getUserRole(normalizedEmail);
+      return {
+        email: normalizedEmail,
+        displayName: profileData?.displayName || email.split('@')[0],
+        photoURL: profileData?.photoURL,
+        customImageURL: profileData?.customImageURL,
+        role,
+        isOnline: presenceData?.isOnline || false,
+        lastSeen: presenceData?.lastSeen,
+        school: profileData?.school,
+        bio: profileData?.bio,
+        phone: profileData?.phone,
+        dateOfBirth: profileData?.dateOfBirth,
+        salutation: profileData?.salutation,
+        subjects: Array.isArray(profileData?.subjects) ? profileData.subjects : undefined,
+      };
+    }
+
+    // Fallback: Try to get user profile from the users collection (if it exists)
     const userRef = doc(firestore, 'users', auth.currentUser?.uid || 'unknown');
     
     try {
@@ -2454,7 +2660,7 @@ async function getUserProfile(email: string): Promise<{
           email: data.email || normalizedEmail,
           displayName: data.displayName || email.split('@')[0],
           photoURL: data.photoURL,
-          role: 'user',
+          role: await getUserRole(normalizedEmail),
           isOnline: data.isOnline || false,
           lastSeen: data.lastSeen,
           school: data.school,
@@ -2539,53 +2745,72 @@ async function addAuthorizedEmail(email: string, role: 'user' | 'admin' = 'user'
   if (!authorizedEmails.includes(normalizedEmail)) {
     authorizedEmails.push(normalizedEmail);
   }
-  
-  // Save the email with role and complete profile fields directly in authorizedEmails collection
+
   try {
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    const docId = normalizedEmail.replace(/[@.]/g, '_');
-    const docRef = doc(authorizedRef, docId);
-    
-    // Generate a display name from email
+    const tenantId = await resolveTenantScopeForMembershipNotifications();
+    if (!tenantId) {
+      throw new Error('No tenant selected for adding member');
+    }
+
     const displayName = normalizedEmail.split('@')[0]
       .replace(/[._-]/g, ' ')
       .replace(/\b\w/g, (l: string) => l.toUpperCase());
-    
-    const currentTime = new Date();
-    
-    // Use the provided role only; no email-based overrides
-    const finalRole = role;
-    const addedByEmail = globalAuthState.user?.email || auth.currentUser?.email || null;
-    
-    await setDoc(docRef, {
-      email: normalizedEmail,
-      isActive: true,
-      addedAt: currentTime,
-      role: finalRole,
-      displayName: displayName,
-      isOnline: false, // Default to offline when first added
-      photoURL: '', // Empty initially, will be filled when user signs in
-      updatedAt: currentTime,
-      ...(addedByEmail ? { addedBy: addedByEmail } : {}),
-    });
-    
-    logger.debug(`Added authorized email ${normalizedEmail} with role: ${finalRole}`);
+    const emailKey = sanitizeEmailKey(normalizedEmail);
+    const now = new Date();
+    const nextTenantRole: TenantMembershipRole = role === 'admin' ? 'admin' : 'member';
 
-    const tenantId = await resolveTenantScopeForMembershipNotifications();
-    if (!tenantId) {
-      logger.warn('Skipped team membership notification for authorized email add: tenantId unavailable');
-    } else {
-      triggerTeamMembershipNotification({
+    await setDoc(
+      doc(firestore, 'tenantProfiles', `${tenantId}_${emailKey}`),
+      {
         tenantId,
-        action: 'added',
-        targetEmail: normalizedEmail,
-        targetRole: finalRole,
-        metadata: {
-          displayName,
-        },
-      });
+        email: normalizedEmail,
+        displayName,
+        role: nextTenantRole,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+
+    await setDoc(
+      doc(firestore, 'tenantPresence', `${tenantId}_${emailKey}`),
+      {
+        tenantId,
+        email: normalizedEmail,
+        isOnline: false,
+        lastSeen: now.toISOString(),
+        typingTo: null,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+
+    const membershipsQuery = query(
+      collection(firestore, 'tenantMemberships'),
+      where('tenantId', '==', tenantId),
+      where('email', '==', normalizedEmail)
+    );
+    const membershipSnapshot = await getDocs(membershipsQuery);
+    if (!membershipSnapshot.empty) {
+      await Promise.all(
+        membershipSnapshot.docs.map((membershipDoc) =>
+          updateDoc(membershipDoc.ref, {
+            role: nextTenantRole,
+            status: 'active',
+            updatedAt: now.toISOString(),
+          })
+        )
+      );
     }
-    
+
+    triggerTeamMembershipNotification({
+      tenantId,
+      action: 'added',
+      targetEmail: normalizedEmail,
+      targetRole: role,
+      metadata: {
+        displayName,
+      },
+    });
   } catch (error) {
     throw error;
   }
@@ -2618,81 +2843,46 @@ async function removeAuthorizedEmail(email: string): Promise<void> {
     authorizedEmails.splice(index, 1);
   }
 
-  // Remove from Firestore (but first attempt to delete any stored custom profile image)
+  // Revoke from tenant-native stores
   try {
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    const docId = normalizedEmail.replace(/[@.]/g, '_');
-    const docRef = doc(authorizedRef, docId);
-    let customImageURL: string | undefined;
-
-    // Fetch existing doc to inspect customImageURL before deleting
-    try {
-      const existing = await getDoc(docRef);
-      if (existing.exists()) {
-        const data = existing.data() as any;
-        customImageURL = data?.customImageURL as string | undefined;
-        if (typeof data?.role === 'string') {
-          removedRole = data.role;
-        }
-        if (typeof data?.displayName === 'string') {
-          removedDisplayName = data.displayName;
-        }
-      } else if (!hadCachedEntry) {
-        logger.warn('⚠️ No authorizedEmails doc found during removal, but continuing:', normalizedEmail);
-      }
-    } catch (e) {
-      logger.warn('⚠️ Could not fetch user doc before deletion (continuing):', e);
+    const tenantId = await resolveTenantScopeForMembershipNotifications();
+    if (!tenantId) {
+      throw new Error('No tenant selected for member removal');
     }
 
-    // Attempt to delete stored profile picture if present and not embedded base64
+    const emailKey = sanitizeEmailKey(normalizedEmail);
+
+    const profileRef = doc(firestore, 'tenantProfiles', `${tenantId}_${emailKey}`);
     try {
-      const sanitizedForPath = normalizedEmail.replace(/[^a-zA-Z0-9]/g, '_');
-      const deterministicPath = `profile-pictures/${sanitizedForPath}.jpg`;
-
-      const attempted: string[] = [];
-      const maybeTargets: string[] = [];
-
-      if (customImageURL && typeof customImageURL === 'string') {
-        if (!customImageURL.startsWith('data:')) {
-          // If it's already a storage URL/path, try deleting via that first
-          maybeTargets.push(customImageURL);
-        } else {
-          // It's an embedded data URL; no storage object referenced explicitly.
-          // We'll still attempt deterministic path deletion in case an older upload exists.
-          logger.debug(
-            'ℹ️ customImageURL is an inline data URL; will try deterministic storage path cleanup.'
-          );
-        }
+      const profileSnap = await getDoc(profileRef);
+      if (profileSnap.exists()) {
+        const profileData = profileSnap.data() as any;
+        removedDisplayName = typeof profileData?.displayName === 'string' ? profileData.displayName : undefined;
+        const roleVal = String(profileData?.role || '').toLowerCase();
+        removedRole = roleVal === 'owner' || roleVal === 'admin' ? 'admin' : 'user';
       }
-      // Always attempt deterministic path as fallback (idempotent if object not found)
-      if (!maybeTargets.includes(deterministicPath)) maybeTargets.push(deterministicPath);
+    } catch {}
 
-      for (const target of maybeTargets) {
-        try {
-          const fileRef = storageRef(storage, target);
-          await deleteObject(fileRef);
-          attempted.push(target);
-          logger.debug('🧹 Deleted profile picture from storage:', target);
-          // Don't break; continue to try other possible paths to ensure full cleanup
-        } catch (delErr: any) {
-          // Ignore not-found errors; log others
-          const msg = (delErr && delErr.message) || '';
-          if (msg.includes('object-not-found')) {
-            continue;
-          }
-          logger.warn('⚠️ Failed deleting potential profile picture path:', target, delErr);
-        }
-      }
-      if (attempted.length === 0) {
-        logger.debug('ℹ️ No stored profile picture objects were deleted (none found or only inline data URL).');
-      }
-    } catch (storageCleanupErr) {
-      logger.warn('⚠️ Error during profile picture storage cleanup (continuing):', storageCleanupErr);
-    }
-    
-    await deleteDoc(docRef);
-    // Also remove any UID mirror entries for this email (admin revocation cleanup)
-    await deleteUidRoleMirrorsByEmail(normalizedEmail);
+    const membershipsQuery = query(
+      collection(firestore, 'tenantMemberships'),
+      where('tenantId', '==', tenantId),
+      where('email', '==', normalizedEmail)
+    );
+    const membershipSnapshot = await getDocs(membershipsQuery);
+    await Promise.all(
+      membershipSnapshot.docs.map((membershipDoc) =>
+        updateDoc(membershipDoc.ref, {
+          status: 'revoked',
+          updatedAt: new Date().toISOString(),
+        })
+      )
+    );
+
+    await Promise.allSettled([
+      deleteDoc(doc(firestore, 'tenantPresence', `${tenantId}_${emailKey}`)),
+      setDoc(profileRef, { isActive: false, updatedAt: new Date() }, { merge: true }),
+    ]);
+
     if (hadCachedEntry) {
       try {
         await cacheAuthorizedEmails([...authorizedEmails]);
@@ -2700,23 +2890,18 @@ async function removeAuthorizedEmail(email: string): Promise<void> {
         logger.warn('⚠️ Failed to update authorized emails cache after removal:', cacheErr);
       }
     }
-    logger.debug(`✅ User ${normalizedEmail} successfully removed from authorization and logged out`);
+    logger.debug(`✅ User ${normalizedEmail} successfully removed from tenant membership and logged out`);
 
-    const tenantId = await resolveTenantScopeForMembershipNotifications();
-    if (!tenantId) {
-      logger.warn('Skipped team membership notification for authorized email removal: tenantId unavailable');
-    } else {
-      triggerTeamMembershipNotification({
-        tenantId,
-        action: 'removed',
-        targetEmail: normalizedEmail,
-        targetRole: removedRole,
-        metadata: {
-          displayName: removedDisplayName,
-          reason: 'removed_from_authorized_list',
-        },
-      });
-    }
+    triggerTeamMembershipNotification({
+      tenantId,
+      action: 'removed',
+      targetEmail: normalizedEmail,
+      targetRole: removedRole,
+      metadata: {
+        displayName: removedDisplayName,
+        reason: 'removed_from_tenant_membership',
+      },
+    });
   } catch (error) {
     throw error;
   }
@@ -2725,48 +2910,23 @@ async function removeAuthorizedEmail(email: string): Promise<void> {
 // Update authorized emails
 async function updateAuthorizedEmails(emails: string[]): Promise<void> {
   try {
-    // Clear existing emails and add new ones
-    authorizedEmails = emails.map(email => email.toLowerCase());
-    
-    // Save each email to Firestore with complete profile fields
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    
-    for (const email of authorizedEmails) {
-      const docId = email.replace(/[@.]/g, '_');
-      const docRef = doc(authorizedRef, docId);
-      
-      // Check if document already exists to preserve existing data
-      const existingDoc = await getDoc(docRef);
-      const existingData = existingDoc.exists() ? existingDoc.data() : {};
-      
-      // Determine role: preserve existing role if present; otherwise default to 'user'
-      let role = existingData.role;
-      if (!role) {
-        role = 'user';
-      }
-      
-      // Generate display name if not already present
-      const displayName = existingData.displayName || email.split('@')[0]
-        .replace(/[._-]/g, ' ')
-        .replace(/\b\w/g, (l: string) => l.toUpperCase());
-      
-      const currentTime = new Date();
-      const timeString = currentTime.toISOString();
-      
-      await setDoc(docRef, { 
-        email: email,
-        isActive: true,
-        addedAt: existingData.addedAt || currentTime,
-        role: role,
-        displayName: displayName,
-        isOnline: existingData.isOnline || false,
-        lastSeen: existingData.lastSeen || timeString,
-        photoURL: existingData.photoURL || '',
-        updatedAt: currentTime
-      });
+    const normalizedTarget = Array.from(new Set(emails.map((email) => email.toLowerCase())));
+    const existing = new Set(authorizedEmails.map((email) => email.toLowerCase()));
+    const target = new Set(normalizedTarget);
+
+    const toRemove = Array.from(existing).filter((email) => !target.has(email));
+    const toAdd = normalizedTarget.filter((email) => !existing.has(email));
+
+    for (const email of toRemove) {
+      await removeAuthorizedEmail(email);
     }
-    
-    logger.debug(`Updated authorized emails list with ${emails.length} emails`);
+    for (const email of toAdd) {
+      await addAuthorizedEmail(email, 'user');
+    }
+
+    authorizedEmails = normalizedTarget;
+    await cacheAuthorizedEmails(authorizedEmails);
+    logger.debug(`Updated team roster email cache with ${authorizedEmails.length} emails`);
   } catch (error) {
     logger.error('Error updating authorized emails:', error);
     throw error;
@@ -2783,28 +2943,10 @@ async function updateUserProfile(email: string, profileData: {
   typingTo?: string | null;
 }): Promise<void> {
   try {
-    const normalizedEmail = email.toLowerCase();
-    const docId = normalizedEmail.replace(/[@.]/g, '_');
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    const docRef = doc(authorizedRef, docId);
-    
-    // Get existing data
-    const existingDoc = await getDoc(docRef);
-    const existingData = existingDoc.exists() ? existingDoc.data() : {};
-    
-    // Update with new profile data
-    await setDoc(docRef, {
-      ...existingData,
+    await updateUserProfileSafe(email, {
       ...profileData,
-      email: normalizedEmail,
-      isActive: true,
-      updatedAt: new Date(),
-    }, { merge: true });
-    
-    // Only log 10% of the time to reduce noise
-    if (Math.random() < 0.1) {
-      logger.debug(`Updated profile for ${email}`);
-    }
+      customImageURL: profileData.customImageURL,
+    });
   } catch (error) {
     // Handle permission errors silently
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -2838,33 +2980,15 @@ async function getAuthorizedUsersWithProfiles(): Promise<Array<{
   lastSeen?: string;
 }>> {
   try {
-    const authorizedRef = collection(firestore, 'authorizedEmails');
-    const snapshot = await getDocs(authorizedRef);
-    
-    const users: Array<{
-      email: string;
-      displayName: string;
-      photoURL?: string;
-      role: 'user' | 'admin';
-      isOnline?: boolean;
-      lastSeen?: string;
-    }> = [];
-    
-    snapshot.forEach((doc) => {
-      const data = doc.data();
-      if (data && data.email) {
-        users.push({
-          email: data.email,
-          displayName: data.displayName || data.email.split('@')[0],
-          photoURL: data.photoURL,
-          role: data.role || 'user',
-          isOnline: data.isOnline,
-          lastSeen: data.lastSeen,
-        });
-      }
-    });
-    
-    return users;
+    const members = await forceRefreshTeamMembers();
+    return members.map((member) => ({
+      email: member.email,
+      displayName: member.name,
+      photoURL: member.customImageURL || member.photoURL,
+      role: member.role,
+      isOnline: member.isOnline,
+      lastSeen: member.lastSeen,
+    }));
   } catch (error) {
     logger.warn('Failed to fetch user profiles:', error);
     // Fallback to basic email list
@@ -2881,18 +3005,15 @@ async function updateTypingStatus(email: string, typingTo: string | null): Promi
   try {
     const normalizedEmail = email.toLowerCase();
     const normalizedTypingTo = typingTo?.toLowerCase() || null;
-    const docId = normalizedEmail.replace(/[@.]/g, '_');
-    const authDocRef = doc(firestore, 'authorizedEmails', docId);
-    
-    // Update the typing status directly in authorizedEmails collection
-    await updateDoc(authDocRef, {
+    await updateTenantPresenceForUser(normalizedEmail, {
+      isOnline: true,
+      lastSeen: new Date().toISOString(),
       typingTo: normalizedTypingTo,
-      updatedAt: new Date(),
     });
   } catch (error) {
-    logger.warn('❌ Failed to update typing status in authorizedEmails:', error);
+    logger.warn('❌ Failed to update typing status in tenantPresence:', error);
     
-    // Fallback to the old method if direct update fails
+    // Fallback: keep in-memory profile sync path alive if tenantPresence update fails.
     try {
       await updateUserProfileSafe(email, {
         typingTo: typingTo?.toLowerCase() || null,

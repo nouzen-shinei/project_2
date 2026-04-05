@@ -72,11 +72,59 @@ import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { tenantService } from '@/services/tenantService';
+import { firestore } from '../../config/firebase';
+import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import TenantRoleBadge from '@/components/TenantRoleBadge';
 import { normalizeSharedFileName } from '@/services/sharedFileService';
 import { useDownloadState } from '@/hooks/useDownloadState';
 import { setEditingMessageId, setMessageReactionsForMessage } from '@/lib/messageUiStateStore';
 import { useMessageUiState } from '@/hooks/useMessageUiState';
+
+const CHAT_PRESENCE_MODE = (process.env.EXPO_PUBLIC_PRESENCE_MODE || 'last_seen').toLowerCase();
+const CHAT_PRESENCE_THRESHOLD_MIN = (() => {
+  const raw = process.env.EXPO_PUBLIC_FIRESTORE_ONLINE_THRESHOLD_MIN;
+  const parsed = raw !== undefined ? parseFloat(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0.5;
+})();
+
+function parsePresenceTimestamp(value: unknown): Date | null {
+  try {
+    if (!value) return null;
+    if (value instanceof Date) return value;
+    if (typeof value === 'string' || typeof value === 'number') {
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    const maybeObj = value as { seconds?: number; nanoseconds?: number; toDate?: () => Date };
+    if (typeof maybeObj.toDate === 'function') {
+      const parsed = maybeObj.toDate();
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    if (typeof maybeObj.seconds === 'number') {
+      const parsed = new Date(
+        maybeObj.seconds * 1000 + Math.floor(((maybeObj.nanoseconds || 0) as number) / 1e6)
+      );
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function deriveRealtimeOnline(isOnline: boolean | undefined, lastSeen: unknown): boolean {
+  if (CHAT_PRESENCE_MODE === 'flag') {
+    return isOnline === true;
+  }
+
+  const parsedLastSeen = parsePresenceTimestamp(lastSeen);
+  if (parsedLastSeen) {
+    const diffMinutes = (Date.now() - parsedLastSeen.getTime()) / (1000 * 60);
+    return diffMinutes <= CHAT_PRESENCE_THRESHOLD_MIN;
+  }
+
+  return isOnline ?? false;
+}
 
 export default function Chat() {
   const { theme, isDarkMode } = useTheme();
@@ -96,6 +144,7 @@ export default function Chat() {
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
   const [teamMembersWithChatInfo, setTeamMembersWithChatInfo] = useState<any[]>([]);
   const [teamMembersLoading, setTeamMembersLoading] = useState(false);
+  const [isManualListRefresh, setIsManualListRefresh] = useState(false);
   const [teamMembersError, setTeamMembersError] = useState<string | null>(null);
   const [selectedTeamMember, setSelectedTeamMember] = useState<TeamMember | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -110,6 +159,7 @@ export default function Chat() {
   const attachmentUploadCancelMap = useRef<Map<string, () => void | Promise<void>>>(new Map());
   const attachmentFinalizeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const tenantMembersRequestIdRef = useRef(0);
+  const teamMembersVisibleLoadCountRef = useRef(0);
   const tenantRosterRef = useRef<TeamMember[]>([]);
   const presenceSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
   const rawPresenceSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
@@ -223,10 +273,21 @@ export default function Chat() {
     (Platform.OS === 'web' ? 'active' : (AppState.currentState ?? 'active')) as AppStateStatus
   );
   const lastForegroundRefreshAtRef = useRef(0);
+  const lastBackgroundAtRef = useRef<number | null>(null);
   const wasForegroundInteractiveRef = useRef(false);
   const [isAppActive, setIsAppActive] = useState(appStateRef.current === 'active');
-  // Moved to top: showUnreadSeparator, unreadSeparatorMessageId
+  const [presenceRenderTick, setPresenceRenderTick] = useState(0);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPresenceRenderTick((prev) => prev + 1);
+    }, 10000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
   const [screenData, setScreenData] = useState(Dimensions.get('window'));
   const [isUserActiveInChat, setIsUserActiveInChat] = useState(false);
   const [lastUserActivityAt, setLastUserActivityAt] = useState<number>(Date.now());
@@ -274,6 +335,9 @@ export default function Chat() {
     const handleAppStateChange = (nextState: AppStateStatus) => {
       appStateRef.current = nextState;
       setIsAppActive(nextState === 'active');
+      if (nextState !== 'active') {
+        lastBackgroundAtRef.current = Date.now();
+      }
     };
 
     if (Platform.OS === 'web' && typeof AppState.addEventListener !== 'function') {
@@ -281,6 +345,9 @@ export default function Chat() {
         const visible = typeof document !== 'undefined' ? document.visibilityState === 'visible' : true;
         appStateRef.current = visible ? 'active' : 'background';
         setIsAppActive(visible);
+        if (!visible) {
+          lastBackgroundAtRef.current = Date.now();
+        }
       };
 
       handleVisibilityChange();
@@ -384,7 +451,10 @@ export default function Chat() {
   } = useChat(selectedTeamMember?.id, { live: isFocused && isAppActive });
 
   const CHAT_RECONNECT_TIMEOUT_MS = 8000;
+  const CHAT_OPEN_LOADING_HANG_MS = 9000;
   const [showReconnectFallback, setShowReconnectFallback] = useState(false);
+  const [showChatOpenHangActions, setShowChatOpenHangActions] = useState(false);
+  const [isChatBootstrapGateDone, setIsChatBootstrapGateDone] = useState(false);
   const shouldTrackReconnectFallback =
     Boolean(selectedTeamMember) &&
     Boolean(error) &&
@@ -1017,6 +1087,7 @@ export default function Chat() {
     hasMoreRef.current = hasMore;
   }, [hasMore]);
   const autoLoadAnchorRef = useRef<string | null>(null);
+  const allowTopAutoPaginationRef = useRef(false);
   const shouldUseManualAnchorPreservation = Platform.OS === 'web';
 
   // Scroll + anchor state shared across pagination and sticky headers
@@ -1063,9 +1134,15 @@ export default function Chat() {
   const stabilizationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevLoadingMoreRef = useRef(false);
   const [isInitialAnchorSettled, setIsInitialAnchorSettled] = useState(false);
+  const isInitialAnchorSettledRef = useRef(false);
   const [inputHeight, setInputHeight] = useState(40);
   const [lastTypingHeight, setLastTypingHeight] = useState(40);
   const previousIncomingUnreadRef = useRef<number>(0);
+  const unreadRepairInFlightRef = useRef(false);
+  const lastUnreadRepairAtRef = useRef<{ partnerEmail: string | null; at: number }>({
+    partnerEmail: null,
+    at: 0,
+  });
   const requestedReadReceiptIdsRef = useRef<Set<string>>(new Set());
   const queuedReadReceiptIdsRef = useRef<Set<string>>(new Set());
   const queuedConversationDeliverySyncRef = useRef(false);
@@ -1076,6 +1153,39 @@ export default function Chat() {
     at: 0,
   });
   const flushConversationReceiptSyncRef = useRef<() => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    if (!selectedTeamMember) {
+      setIsChatBootstrapGateDone(false);
+      return;
+    }
+
+    if (loading || !isInitialAnchorSettled) {
+      setIsChatBootstrapGateDone(false);
+      return;
+    }
+
+    setIsChatBootstrapGateDone(false);
+    const timer = setTimeout(() => {
+      setIsChatBootstrapGateDone(true);
+    }, 420);
+
+    return () => clearTimeout(timer);
+  }, [selectedTeamMember?.id, selectedTeamMember?.email, loading, isInitialAnchorSettled]);
+
+  useEffect(() => {
+    if (!selectedTeamMember || isChatBootstrapGateDone) {
+      setShowChatOpenHangActions(false);
+      return;
+    }
+
+    setShowChatOpenHangActions(false);
+    const timer = setTimeout(() => {
+      setShowChatOpenHangActions(true);
+    }, CHAT_OPEN_LOADING_HANG_MS);
+
+    return () => clearTimeout(timer);
+  }, [selectedTeamMember?.id, selectedTeamMember?.email, isChatBootstrapGateDone]);
 
   useEffect(() => {
     requestedReadReceiptIdsRef.current.clear();
@@ -1289,7 +1399,7 @@ export default function Chat() {
     const unreadId = unreadSeparatorMessageIdRef.current;
     if (unreadId) {
       const isUnreadVisible = Array.isArray(viewableItems) && viewableItems.some((viewable: any) => {
-        const itemId = viewable?.item?.id;
+        const itemId = normalizeMessageId(viewable?.item?.id);
         return itemId && itemId === unreadId;
       });
 
@@ -1323,13 +1433,15 @@ export default function Chat() {
         };
 
         const anchorBlocked = shouldUseManualAnchorPreservation && Boolean(pendingPrependAnchorRef.current);
-        if (topIndex <= TOP_AUTO_LOAD_THRESHOLD) {
-          if (topId !== autoLoadAnchorRef.current && !anchorBlocked) {
-            autoLoadAnchorRef.current = topId;
-            requestOlderMessagesRef.current?.('auto');
+        if (isInitialAnchorSettledRef.current && userInteractedRef.current && allowTopAutoPaginationRef.current) {
+          if (topIndex <= TOP_AUTO_LOAD_THRESHOLD) {
+            if (topId !== autoLoadAnchorRef.current && !anchorBlocked) {
+              autoLoadAnchorRef.current = topId;
+              requestOlderMessagesRef.current?.('auto');
+            }
+          } else if (topIndex > TOP_AUTO_LOAD_THRESHOLD + 1) {
+            autoLoadAnchorRef.current = null;
           }
-        } else if (topIndex > TOP_AUTO_LOAD_THRESHOLD + 1) {
-          autoLoadAnchorRef.current = null;
         }
 
         if (topIndex <= TOP_PREFETCH_THRESHOLD) {
@@ -2032,6 +2144,7 @@ export default function Chat() {
   const [showNewDivider, setShowNewDivider] = useState(false);
   const [newDividerMessageId, setNewDividerMessageId] = useState<string | null>(null);
   const [chatWasActiveWhenMessageArrived, setChatWasActiveWhenMessageArrived] = useState(false);
+  const forceBottomAnchorChatKeyRef = useRef<string | null>(null);
   const hasAnchoredInitialScrollRef = useRef(false); // ensures we only snap to bottom once per chat load
   const pendingInitialAnchorRef = useRef(false); // tracks when we still need to align to the latest message
   const scrollToUnreadAttemptedRef = useRef(false); // tracks if we attempted to scroll to first unread
@@ -2072,11 +2185,15 @@ export default function Chat() {
   }, []);
 
   const firstUnreadMessageId = useMemo(() => {
-    if (!Array.isArray(messages) || messages.length === 0) return null;
+    const isConversationActive = Boolean(
+      isFocused && isAppActive && selectedTeamMember?.email && effectiveUser?.email
+    );
+    if (isConversationActive) return null;
+    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) return null;
     if (!effectiveUser?.email || !selectedTeamMember?.email) return null;
     const userEmail = effectiveUser.email.toLowerCase();
     const senderEmail = selectedTeamMember.email.toLowerCase();
-    const unread = messages.filter((msg: any) =>
+    const unread = displayedMessages.filter((msg: any) =>
       msg?.sender?.toLowerCase?.() === senderEmail &&
       msg?.recipientId?.toLowerCase?.() === userEmail &&
       !msg?.read &&
@@ -2084,16 +2201,20 @@ export default function Chat() {
       msg?.id
     );
     if (!unread.length) return null;
-    return unread[0]?.id ?? null;
-  }, [messages, effectiveUser?.email, selectedTeamMember?.email]);
+    return normalizeMessageId(unread[0]?.id) || null;
+  }, [displayedMessages, effectiveUser?.email, selectedTeamMember?.email, normalizeMessageId, isFocused, isAppActive]);
 
   const incomingUnreadCount = useMemo(() => {
-    if (!Array.isArray(messages) || messages.length === 0) return 0;
+    const isConversationActive = Boolean(
+      isFocused && isAppActive && selectedTeamMember?.email && effectiveUser?.email
+    );
+    if (isConversationActive) return 0;
+    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) return 0;
     if (!effectiveUser?.email || !selectedTeamMember?.email) return 0;
     const userEmail = effectiveUser.email.toLowerCase();
     const senderEmail = selectedTeamMember.email.toLowerCase();
 
-    return messages.reduce((count, msg: any) => {
+    return displayedMessages.reduce((count, msg: any) => {
       if (
         msg?.sender?.toLowerCase?.() === senderEmail &&
         msg?.recipientId?.toLowerCase?.() === userEmail &&
@@ -2104,7 +2225,184 @@ export default function Chat() {
       }
       return count;
     }, 0);
-  }, [messages, effectiveUser?.email, selectedTeamMember?.email]);
+  }, [displayedMessages, effectiveUser?.email, selectedTeamMember?.email, isFocused, isAppActive]);
+
+  const liveSelectedConversationSummary = useMemo<ConversationSummary | null>(() => {
+    const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
+    const userEmail = effectiveUser?.email?.toLowerCase?.();
+    if (!partnerEmail || !userEmail || !Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      return null;
+    }
+
+    const latestMessage = [...displayedMessages]
+      .reverse()
+      .find((msg: any) => Boolean(msg?.id));
+
+    const toIsoString = (value: any): string => {
+      if (typeof value === 'string' && value.trim()) {
+        return value;
+      }
+      if (value instanceof Date) {
+        return value.toISOString();
+      }
+      if (value && typeof value.toDate === 'function') {
+        try {
+          return value.toDate().toISOString();
+        } catch {
+          return new Date().toISOString();
+        }
+      }
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return new Date(value).toISOString();
+      }
+      return new Date().toISOString();
+    };
+
+    const getPreview = (msg: any): { text: string; type: 'text' | 'sticker' | 'gif' | 'attachment' | 'special' | 'unknown' } => {
+      if (!msg) {
+        return { text: '', type: 'unknown' };
+      }
+      if (msg.deleted) {
+        return { text: 'Message removed', type: 'text' };
+      }
+      if (msg.isSpecial) {
+        const txt = typeof msg.text === 'string' ? msg.text.trim() : '';
+        return { text: txt || 'Special message', type: 'special' };
+      }
+      if (msg.sticker) {
+        return { text: 'Sticker', type: 'sticker' };
+      }
+      if (msg.gif) {
+        return { text: 'GIF', type: 'gif' };
+      }
+      if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+        return { text: '📎 Attachment', type: 'attachment' };
+      }
+      const txt = typeof msg.text === 'string' ? msg.text.trim() : '';
+      return { text: txt || '📎 Attachment', type: 'text' };
+    };
+
+    const unreadCount = displayedMessages.reduce((count, msg: any) => {
+      if (
+        msg?.sender?.toLowerCase?.() === partnerEmail &&
+        msg?.recipientId?.toLowerCase?.() === userEmail &&
+        !msg?.read &&
+        !msg?.deleted
+      ) {
+        return count + 1;
+      }
+      return count;
+    }, 0);
+
+    const effectiveUnread = isFocused && isAppActive ? 0 : unreadCount;
+
+    const timestamp = toIsoString(latestMessage?.timestamp);
+    const preview = getPreview(latestMessage);
+    const isOwnMessage = String(latestMessage?.sender || '').toLowerCase() === userEmail;
+
+    return {
+      partnerEmail,
+      partnerId: selectedTeamMember?.id ?? partnerEmail,
+      partnerName: selectedTeamMember?.name ?? null,
+      tenantId: activeTenant?.id ?? null,
+      unreadCount: effectiveUnread,
+      updatedAt: timestamp,
+      lastMessage: latestMessage
+        ? {
+            messageId: String(latestMessage.id),
+            text: preview.text,
+            timestamp,
+            sender: String(latestMessage.sender || ''),
+            isOwnMessage,
+            delivered: Boolean(latestMessage.delivered),
+            read: Boolean(latestMessage.read),
+            type: preview.type,
+            attachmentCount: Array.isArray(latestMessage.attachments) ? latestMessage.attachments.length : undefined,
+            editedAt: latestMessage.editedAt ? String(latestMessage.editedAt) : undefined,
+            editCount: typeof latestMessage.editCount === 'number' ? latestMessage.editCount : undefined,
+            deleted: Boolean(latestMessage.deleted),
+            deletedAt: latestMessage.deletedAt ? String(latestMessage.deletedAt) : undefined,
+            deletedBy: latestMessage.deletedBy ? String(latestMessage.deletedBy) : undefined,
+            isSpecial: Boolean(latestMessage.isSpecial),
+          }
+        : undefined,
+    };
+  }, [displayedMessages, selectedTeamMember?.email, selectedTeamMember?.id, selectedTeamMember?.name, effectiveUser?.email, activeTenant?.id, isFocused, isAppActive]);
+
+  useEffect(() => {
+    if (!liveSelectedConversationSummary) {
+      return;
+    }
+
+    const partnerEmail = liveSelectedConversationSummary.partnerEmail?.toLowerCase?.();
+    if (!partnerEmail) {
+      return;
+    }
+
+    setConversationSummaries((prev) => {
+      const existing = prev.get(partnerEmail);
+      const existingLast = existing?.lastMessage;
+      const nextLast = liveSelectedConversationSummary.lastMessage;
+      const unchanged = Boolean(
+        existing &&
+        existing.unreadCount === liveSelectedConversationSummary.unreadCount &&
+        existing.updatedAt === liveSelectedConversationSummary.updatedAt &&
+        existingLast?.messageId === nextLast?.messageId &&
+        existingLast?.delivered === nextLast?.delivered &&
+        existingLast?.read === nextLast?.read &&
+        existingLast?.text === nextLast?.text
+      );
+
+      if (unchanged) {
+        return prev;
+      }
+
+      const next = new Map(prev);
+      next.set(partnerEmail, {
+        ...(existing ?? {
+          partnerEmail,
+          tenantId: activeTenant?.id ?? null,
+          unreadCount: 0,
+          updatedAt: liveSelectedConversationSummary.updatedAt,
+        }),
+        ...liveSelectedConversationSummary,
+        partnerEmail,
+        tenantId: liveSelectedConversationSummary.tenantId ?? existing?.tenantId ?? activeTenant?.id ?? null,
+      });
+      return next;
+    });
+  }, [liveSelectedConversationSummary, activeTenant?.id]);
+
+  useEffect(() => {
+    if (!isFocused || !isAppActive) {
+      return;
+    }
+
+    const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
+    const userEmail = effectiveUser?.email?.toLowerCase?.();
+    if (!partnerEmail || !userEmail || !Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      return;
+    }
+
+    const unreadIncomingIds = displayedMessages
+      .filter((msg: any) => (
+        msg?.id &&
+        !msg?.deleted &&
+        String(msg.sender || '').toLowerCase() === partnerEmail &&
+        String(msg.recipientId || '').toLowerCase() === userEmail &&
+        !msg?.read
+      ))
+      .map((msg: any) => String(msg.id));
+
+    if (!unreadIncomingIds.length) {
+      return;
+    }
+
+    queueConversationReceiptSync({
+      readMessageIds: unreadIncomingIds,
+      requestConversationDelivered: true,
+    });
+  }, [displayedMessages, selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, queueConversationReceiptSync]);
 
   useEffect(() => {
     unreadSeparatorMessageIdRef.current = unreadSeparatorMessageId;
@@ -2207,6 +2505,7 @@ export default function Chat() {
         );
 
     if (matchInChatInfo) {
+      forceBottomAnchorChatKeyRef.current = String((matchInChatInfo as TeamMember).id || (matchInChatInfo as TeamMember).email || '');
       setSelectedTeamMember(matchInChatInfo as TeamMember);
       notificationService.consumePendingChatNavigationTarget();
     }
@@ -2235,6 +2534,7 @@ export default function Chat() {
       return;
     }
 
+    forceBottomAnchorChatKeyRef.current = String((match as TeamMember).id || (match as TeamMember).email || '');
     setSelectedTeamMember(match as TeamMember);
     router.replace('/(tabs)/chat');
   }, [isFocused, router, searchParams.senderEmail, teamMembers, teamMembersWithChatInfo]);
@@ -2548,14 +2848,19 @@ export default function Chat() {
     );
   }, [activeTenant?.id]);
 
-  const refreshChatSummaries = useCallback(async () => {
+  const refreshChatSummaries = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
     if (!effectiveUser?.email || !activeTenant?.id) {
       setConversationSummaries(new Map());
-      setIsLoadingChatInfo(false);
+      if (!silent) {
+        setIsLoadingChatInfo(false);
+      }
       return;
     }
 
-    setIsLoadingChatInfo(true);
+    if (!silent) {
+      setIsLoadingChatInfo(true);
+    }
     try {
       await chatService.rebuildConversationSummariesForUser(effectiveUser.email).catch((error) => {
         logger.warn('Failed to rebuild conversation summaries before refresh', error);
@@ -2565,11 +2870,68 @@ export default function Chat() {
     } catch (error) {
       logger.warn('Failed to refresh conversation summaries', error);
     } finally {
-      setIsLoadingChatInfo(false);
+      if (!silent) {
+        setIsLoadingChatInfo(false);
+      }
     }
   }, [effectiveUser?.email, activeTenant?.id, buildSummaryMap]);
 
+  const repairConversationUnreadState = useCallback(async () => {
+    const userEmail = effectiveUser?.email?.toLowerCase?.();
+    const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
+    if (!userEmail || !partnerEmail || !isFocused || !isAppActive) {
+      return;
+    }
+
+    if (unreadRepairInFlightRef.current) {
+      return;
+    }
+
+    const now = Date.now();
+    const last = lastUnreadRepairAtRef.current;
+    if (last.partnerEmail === partnerEmail && now - last.at < 45000) {
+      return;
+    }
+
+    unreadRepairInFlightRef.current = true;
+    lastUnreadRepairAtRef.current = { partnerEmail, at: now };
+    const repairStartedAt = Date.now();
+
+    try {
+      const fixedCount = await chatService.markConversationAsRead(userEmail, partnerEmail);
+
+      logger.metric('chat.unread.repair.run', {
+        partnerEmail,
+        fixedCount,
+        durationMs: Date.now() - repairStartedAt,
+      });
+
+      await chatService.rebuildConversationSummariesForUser(userEmail);
+      await refreshChatSummaries();
+    } catch (error) {
+      logger.warn('Failed to repair stale unread conversation state', {
+        error,
+        partnerEmail,
+      });
+    } finally {
+      unreadRepairInFlightRef.current = false;
+    }
+  }, [effectiveUser?.email, selectedTeamMember?.email, isFocused, isAppActive, refreshChatSummaries]);
+
   useEffect(() => {
+    if (!selectedTeamMember?.email || !effectiveUser?.email || !isFocused || !isAppActive) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      void repairConversationUnreadState();
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, repairConversationUnreadState]);
+
+  useEffect(() => {
+    const now = Date.now();
     const isForegroundInteractive = Boolean(isFocused && isAppActive);
     const shouldRefresh = shouldRefreshChatSummariesOnForegroundResume({
       isFocused,
@@ -2577,8 +2939,9 @@ export default function Chat() {
       wasForegroundInteractive: wasForegroundInteractiveRef.current,
       hasUserEmail: Boolean(effectiveUser?.email),
       hasTenantId: Boolean(activeTenant?.id),
-      now: Date.now(),
+      now,
       lastForegroundRefreshAt: lastForegroundRefreshAtRef.current,
+      throttleMs: 20000,
     });
     wasForegroundInteractiveRef.current = isForegroundInteractive;
 
@@ -2586,25 +2949,28 @@ export default function Chat() {
       return;
     }
 
-    lastForegroundRefreshAtRef.current = Date.now();
+    const lastBackgroundAt = lastBackgroundAtRef.current;
+    const foregroundIdleMs = lastBackgroundAt ? now - lastBackgroundAt : 0;
+    const MIN_BACKGROUND_IDLE_BEFORE_REFRESH_MS = 60000;
+    if (foregroundIdleMs < MIN_BACKGROUND_IDLE_BEFORE_REFRESH_MS) {
+      return;
+    }
+
+    lastForegroundRefreshAtRef.current = now;
 
     void refreshChatSummaries();
-
-    if (selectedTeamMember?.id) {
-      reconnectChat();
-    }
   }, [
     isFocused,
     isAppActive,
     effectiveUser?.email,
     activeTenant?.id,
-    selectedTeamMember?.id,
     refreshChatSummaries,
-    reconnectChat,
   ]);
 
-  const loadTenantTeamMembers = useCallback(async () => {
+  const loadTenantTeamMembers = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
     const requestId = ++tenantMembersRequestIdRef.current;
+    const hasVisibleLoader = !silent;
 
     if (!activeTenant?.id) {
       if (tenantMembersRequestIdRef.current === requestId) {
@@ -2614,10 +2980,16 @@ export default function Chat() {
         setTeamMembersLoading(false);
         presenceSnapshotRef.current = new Map();
       }
+      if (hasVisibleLoader) {
+        teamMembersVisibleLoadCountRef.current = Math.max(0, teamMembersVisibleLoadCountRef.current - 1);
+      }
       return;
     }
 
-    setTeamMembersLoading(true);
+    if (hasVisibleLoader) {
+      teamMembersVisibleLoadCountRef.current += 1;
+      setTeamMembersLoading(true);
+    }
     setTeamMembersError(null);
 
     try {
@@ -2645,6 +3017,9 @@ export default function Chat() {
             tenantRole: membership.role,
             photoURL: undefined,
             customImageURL: undefined,
+            isOnline: false,
+            lastSeen: undefined,
+            typingTo: undefined,
           } satisfies TeamMember;
         })
         .sort((a, b) => a.name.localeCompare(b.name));
@@ -2663,8 +3038,9 @@ export default function Chat() {
       setTeamMembersError('Unable to load team members. Pull to refresh to try again.');
       presenceSnapshotRef.current = new Map();
     } finally {
-      if (tenantMembersRequestIdRef.current === requestId) {
-        setTeamMembersLoading(false);
+      if (hasVisibleLoader) {
+        teamMembersVisibleLoadCountRef.current = Math.max(0, teamMembersVisibleLoadCountRef.current - 1);
+        setTeamMembersLoading(teamMembersVisibleLoadCountRef.current > 0);
       }
     }
   }, [activeTenant?.id, buildPresenceSnapshotForRoster, mergeRosterWithPresence]);
@@ -2673,29 +3049,73 @@ export default function Chat() {
     loadTenantTeamMembers();
   }, [loadTenantTeamMembers]);
 
-  useEffect(() => {
-    const unsubscribe = authService.onTeamMembersChange((members) => {
-      const presenceMap = new Map<string, TeamMember>();
-      members.forEach((member) => {
-        const key = member.email?.toLowerCase?.();
-        if (!key) {
-          return;
-        }
-        presenceMap.set(key, { ...member, email: key, id: key });
-      });
+  useFocusEffect(
+    useCallback(() => {
+      if (selectedTeamMember) {
+        return;
+      }
 
-      rawPresenceSnapshotRef.current = presenceMap;
-      const filtered = buildPresenceSnapshotForRoster(tenantRosterRef.current);
-      presenceSnapshotRef.current = filtered;
-      setTeamMembers(mergeRosterWithPresence(tenantRosterRef.current, filtered));
-    });
+      void refreshChatSummaries({ silent: true });
+      void loadTenantTeamMembers({ silent: true });
+    }, [selectedTeamMember, refreshChatSummaries, loadTenantTeamMembers])
+  );
+
+  useEffect(() => {
+    if (!activeTenant?.id) {
+      rawPresenceSnapshotRef.current = new Map();
+      presenceSnapshotRef.current = new Map();
+      setTeamMembers(mergeRosterWithPresence(tenantRosterRef.current, new Map()));
+      return;
+    }
+
+    const presenceQuery = query(
+      collection(firestore, 'tenantPresence'),
+      where('tenantId', '==', activeTenant.id)
+    );
+
+    const unsubscribe = onSnapshot(
+      presenceQuery,
+      (snapshot) => {
+        const presenceMap = new Map<string, TeamMember>();
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as any;
+          const emailKey = String(data?.email || '').toLowerCase().trim();
+          if (!emailKey) {
+            return;
+          }
+
+          const typingTo = data?.typingTo == null ? undefined : String(data.typingTo).toLowerCase().trim();
+
+          presenceMap.set(emailKey, {
+            id: emailKey,
+            email: emailKey,
+            name: typeof data?.displayName === 'string' ? data.displayName.trim() : '',
+            avatar: '',
+            role: 'user',
+            isOnline: deriveRealtimeOnline(data?.isOnline, data?.lastSeen),
+            lastSeen: typeof data?.lastSeen === 'string' ? data.lastSeen : undefined,
+            typingTo,
+            photoURL: typeof data?.photoURL === 'string' ? data.photoURL : undefined,
+            customImageURL: typeof data?.customImageURL === 'string' ? data.customImageURL : undefined,
+          });
+        });
+
+        rawPresenceSnapshotRef.current = presenceMap;
+        const filtered = buildPresenceSnapshotForRoster(tenantRosterRef.current);
+        presenceSnapshotRef.current = filtered;
+        setTeamMembers(mergeRosterWithPresence(tenantRosterRef.current, filtered));
+      },
+      (error) => {
+        logger.warn('Chat: tenantPresence listener failed', { error, tenantId: activeTenant.id });
+      }
+    );
 
     return () => {
       try {
         unsubscribe?.();
       } catch {}
     };
-  }, [buildPresenceSnapshotForRoster, mergeRosterWithPresence]);
+  }, [activeTenant?.id, buildPresenceSnapshotForRoster, mergeRosterWithPresence]);
 
   // Subscribe to conversation summaries for the current user
   useEffect(() => {
@@ -2775,6 +3195,7 @@ export default function Chat() {
 
       return {
         ...member,
+        isOnline: deriveRealtimeOnline(member.isOnline, member.lastSeen),
         unreadCount: summary?.unreadCount ?? 0,
         lastMessage,
         lastMessageTime,
@@ -2784,7 +3205,7 @@ export default function Chat() {
     });
 
     setTeamMembersWithChatInfo(merged);
-  }, [teamMembers, conversationSummaries, pinnedChats, formatLastMessageTime]);
+  }, [teamMembers, conversationSummaries, pinnedChats, formatLastMessageTime, presenceRenderTick]);
 
   // Reactions are stored on the message record and streamed via chat realtime updates.
   // Derive a local Map keyed by message id for existing UI rendering.
@@ -3193,6 +3614,7 @@ export default function Chat() {
   useEffect(() => {
     const prev = prevSettlementRef.current;
     prevSettlementRef.current = isInitialAnchorSettled;
+    isInitialAnchorSettledRef.current = isInitialAnchorSettled;
 
     const conversationId = selectedTeamMember?.id || selectedTeamMember?.email || 'unknown';
     if (prev === isInitialAnchorSettled && prev !== null) {
@@ -3252,8 +3674,10 @@ export default function Chat() {
   const handleScroll = (event: any) => {
     const scrollY = event.nativeEvent.contentOffset.y;
     lastScrollOffsetRef.current = scrollY;
-    if (!isAutoScrollingRef.current) {
+    const isDragging = Boolean(event?.nativeEvent?.isDragging);
+    if (isInitialAnchorSettledRef.current && !isAutoScrollingRef.current && isDragging) {
       userInteractedRef.current = true;
+      allowTopAutoPaginationRef.current = true;
       stopAnchorStabilization();
     }
     
@@ -3442,6 +3866,39 @@ export default function Chat() {
   }, [isFocused, selectedTeamMember?.id, selectedTeamMember?.email, firstUnreadMessageId]);
 
   useEffect(() => {
+    if (!selectedTeamMember) {
+      return;
+    }
+
+    const chatKey = String(selectedTeamMember.id || selectedTeamMember.email || '');
+    if (!chatKey || forceBottomAnchorChatKeyRef.current !== chatKey) {
+      return;
+    }
+
+    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      return;
+    }
+
+    if (firstUnreadMessageId) {
+      return;
+    }
+
+    const contentReady = contentHeightRef.current > 0 && layoutHeightRef.current > 0;
+    if (!contentReady) {
+      pendingInitialAnchorRef.current = true;
+      return;
+    }
+
+    userInteractedRef.current = false;
+    markAutoScroll(320);
+    tryAnchorToBottom(true);
+    scheduleScrollToBottom({ animated: false, delay: 0 });
+    setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
+    setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 220);
+    forceBottomAnchorChatKeyRef.current = null;
+  }, [selectedTeamMember, displayedMessages, firstUnreadMessageId, markAutoScroll]);
+
+  useEffect(() => {
     if (prevLoadingMoreRef.current && !loadingMore) {
       if (shouldUseManualAnchorPreservation && pendingPrependAnchorRef.current) {
         restorePrependAnchorIfNeeded();
@@ -3483,8 +3940,21 @@ export default function Chat() {
       setUnreadSeparatorMessageId(firstUnreadMessageId);
       setShowUnreadSeparator(true);
       hasAcknowledgedUnreadRef.current = false;
-    } else if (hasAcknowledgedUnreadRef.current && incomingUnreadCountRef.current === 0) {
-      scheduleUnreadSeparatorDismiss(320);
+      return;
+    }
+
+    // No unread anchor left: clear stale divider immediately when conversation is fully read.
+    if (incomingUnreadCountRef.current === 0) {
+      if (hasAcknowledgedUnreadRef.current) {
+        scheduleUnreadSeparatorDismiss(320);
+      } else {
+        if (unreadSeparatorDismissTimeoutRef.current) {
+          clearTimeout(unreadSeparatorDismissTimeoutRef.current);
+          unreadSeparatorDismissTimeoutRef.current = null;
+        }
+        setShowUnreadSeparator(false);
+        setUnreadSeparatorMessageId(null);
+      }
     }
   }, [firstUnreadMessageId, selectedTeamMember?.email, effectiveUser?.email, scheduleUnreadSeparatorDismiss]);
 
@@ -3496,10 +3966,6 @@ export default function Chat() {
 
     const previousCount = previousIncomingUnreadRef.current;
     previousIncomingUnreadRef.current = incomingUnreadCount;
-
-    if (!teamMembers.length) {
-      return;
-    }
 
     if (incomingUnreadCount === 0 && hasAcknowledgedUnreadRef.current) {
       scheduleUnreadSeparatorDismiss(320);
@@ -3517,7 +3983,7 @@ export default function Chat() {
       }
     }
 
-  }, [incomingUnreadCount, selectedTeamMember?.email, effectiveUser?.email, teamMembers, scheduleUnreadSeparatorDismiss, firstUnreadMessageId]);
+  }, [incomingUnreadCount, selectedTeamMember?.email, effectiveUser?.email, scheduleUnreadSeparatorDismiss, firstUnreadMessageId]);
 
   // Reset separator when switching chats
   useEffect(() => {
@@ -3536,6 +4002,7 @@ export default function Chat() {
     hasAnchoredInitialScrollRef.current = false; // ensure next chat anchors once
     pendingInitialAnchorRef.current = false;
     scrollToUnreadAttemptedRef.current = false;
+    allowTopAutoPaginationRef.current = false;
     onScrollFailAttemptsRef.current = 0;
   pendingPrependAnchorRef.current = null;
     setIsInitialAnchorSettled(false);
@@ -5541,6 +6008,15 @@ export default function Chat() {
     const scaleAnim = useRef(new Animated.Value(1)).current; // Start at normal size
 
     useEffect(() => {
+      // FlashList recycles rows; reset transforms for rows that should not animate.
+      if (!isNewMessage || !isFocused) {
+        fadeAnim.setValue(1);
+        slideAnim.setValue(0);
+        scaleAnim.setValue(1);
+      }
+    }, [isNewMessage, isFocused, fadeAnim, slideAnim, scaleAnim]);
+
+    useEffect(() => {
       // Check if this message should be animated
       if (isNewMessage && !globalAnimatedMessages.current.has(messageId)) {
         globalAnimatedMessages.current.add(messageId);
@@ -6439,9 +6915,14 @@ export default function Chat() {
     ({ item, index }: { item: any; index: number }) => {
       const previousMsg = index > 0 ? displayedMessages[index - 1] : undefined;
       const dateSeparator = getChatDateSeparator(item.timestamp, previousMsg?.timestamp);
+      const itemId = normalizeMessageId(item?.id);
 
-      const shouldShowUnreadSeparator = showUnreadSeparator && unreadSeparatorMessageId === item.id;
-      const shouldShowNewDivider = showNewDivider && newDividerMessageId === item.id && !shouldShowUnreadSeparator;
+      const shouldShowUnreadSeparator = Boolean(
+        showUnreadSeparator && unreadSeparatorMessageId && itemId && unreadSeparatorMessageId === itemId
+      );
+      const shouldShowNewDivider = Boolean(
+        showNewDivider && newDividerMessageId && itemId && newDividerMessageId === itemId && !shouldShowUnreadSeparator
+      );
 
       return (
         <View
@@ -6515,6 +6996,7 @@ export default function Chat() {
       showNewDivider,
       showUnreadSeparator,
       unreadSeparatorMessageId,
+      normalizeMessageId,
       theme.border,
       theme.background,
       theme.textSecondary,
@@ -7436,8 +7918,8 @@ export default function Chat() {
 
   // Update selected team member when team members list changes (for real-time status updates)
   useEffect(() => {
-    if (selectedTeamMember && teamMembers.length > 0) {
-      const updatedMember = teamMembers.find(member => member.id === selectedTeamMember.id);
+    if (selectedTeamMember && teamMembersWithChatInfo.length > 0) {
+      const updatedMember = teamMembersWithChatInfo.find(member => member.id === selectedTeamMember.id) as TeamMember | undefined;
       if (updatedMember) {
         // Check if any relevant properties have changed
         const hasStatusChanged = (
@@ -7453,7 +7935,7 @@ export default function Chat() {
         }
       }
     }
-  }, [teamMembers, selectedTeamMember]);
+  }, [teamMembersWithChatInfo, selectedTeamMember]);
 
   // Retry pending messages when back online
   const retryPendingMessages = async () => {
@@ -7789,6 +8271,7 @@ export default function Chat() {
             <TouchableOpacity
               style={[styles.userListItem, { backgroundColor: theme.background }]}
               onPress={() => {
+                forceBottomAnchorChatKeyRef.current = String(item.id || item.email || '');
                 setSelectedTeamMember(item);
                 // Auto-focus input when selecting a chat
                 setTimeout(() => {
@@ -7832,7 +8315,7 @@ export default function Chat() {
                   </Text>
                 )}
                 {/* Online status indicator */}
-                {item.isOnline !== undefined && item.lastSeen && (
+                {item.isOnline !== undefined && (
                   <View style={[styles.onlineIndicator, { backgroundColor: item.isOnline ? theme.success : theme.error }]} />
                 )}
               </View>
@@ -7864,7 +8347,7 @@ export default function Chat() {
                 </View>
                 
                 <View style={styles.userStatusRow}>
-                  {item.typingTo && item.typingTo === effectiveUserEmail ? (
+                  {String(item.typingTo || '').toLowerCase().trim() === String(effectiveUserEmail || '').toLowerCase().trim() ? (
                     <View style={styles.typingIndicatorSmall}>
                       <AnimatedTypingIndicator color={theme.primary} />
                       <Text style={[styles.userStatus, { color: theme.primary, fontStyle: 'italic', marginLeft: 8 }]}>
@@ -7937,9 +8420,12 @@ export default function Chat() {
           }}
           style={styles.usersList}
           showsVerticalScrollIndicator={false}
-          refreshing={isLoadingChatInfo || teamMembersLoading}
+          refreshing={isManualListRefresh}
           onRefresh={() => {
-            void Promise.all([refreshChatSummaries(), loadTenantTeamMembers()]);
+            setIsManualListRefresh(true);
+            void Promise.all([refreshChatSummaries(), loadTenantTeamMembers()]).finally(() => {
+              setIsManualListRefresh(false);
+            });
           }}
           ListEmptyComponent={() => (
             <View style={styles.emptyUsersList}>
@@ -8076,7 +8562,7 @@ export default function Chat() {
               )}
             </View>
             <View style={styles.friendStatusContainer}>
-              {selectedTeamMember?.isOnline !== undefined && selectedTeamMember?.lastSeen && (
+              {selectedTeamMember?.isOnline !== undefined && (
                 <View style={[
                   styles.statusDot,
                   { backgroundColor: selectedTeamMember.isOnline ? theme.success : theme.textSecondary }
@@ -8136,74 +8622,7 @@ export default function Chat() {
             viewabilityConfig={viewabilityConfigRef.current}
             getItemType={getMessageItemType}
             overrideItemLayout={overrideMessageLayout}
-            renderItem={({ item, index }) => {
-                const previousMsg = index > 0 ? displayedMessages[index - 1] : undefined;
-                const dateSeparator = getChatDateSeparator(item.timestamp, previousMsg?.timestamp);
-
-                const shouldShowUnreadSeparator = showUnreadSeparator && unreadSeparatorMessageId === item.id;
-                  // New messages divider (only if not showing unread separator at same spot)
-                  const shouldShowNewDivider = showNewDivider && newDividerMessageId === item.id && !shouldShowUnreadSeparator;
-
-                return (
-                  <View
-                    onLayout={(event) => {
-                      const { y, height } = event.nativeEvent.layout;
-                      const currentDate = getMessageDate(item, previousMsg);
-                      if (item.id) {
-                        const messageId = String(item.id);
-                        const newPosition = { y, height, date: currentDate || '' };
-                        setMessagePositions(prev => {
-                          const existingPosition = prev[messageId];
-                          if (existingPosition &&
-                              existingPosition.y === newPosition.y &&
-                              existingPosition.height === newPosition.height &&
-                              existingPosition.date === newPosition.date) {
-                            return prev;
-                          }
-                          const next = { ...prev };
-                          next[messageId] = newPosition;
-                          return next;
-                        });
-                      }
-                    }}
-                  >
-                    {dateSeparator && typeof dateSeparator === 'string' && dateSeparator.trim().length > 0 && (
-                      <View style={styles.dateSeparatorContainer}>
-                        <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
-                        <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.textSecondary }]}>
-                          {(() => {
-                            const safeDate = String(dateSeparator).trim();
-                            if (!safeDate || safeDate === '.' || safeDate.length === 0) return 'Today';
-                            return safeDate;
-                          })()}
-                        </Text>
-                        <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
-                      </View>
-                    )}
-
-                    {shouldShowUnreadSeparator && unreadSeparatorMessageId && (
-                      <View style={styles.dateSeparatorContainer}>
-                        <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
-                        <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: isDarkMode ? '#FF4444' : '#FF0000', fontWeight: '600' }]}>
-                          Unread messages
-                        </Text>
-                        <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
-                      </View>
-                    )}
-                    {shouldShowNewDivider && (
-                      <View style={styles.dateSeparatorContainer}>
-                        <View style={[styles.dateSeparatorLine, { backgroundColor: theme.primary }]} />
-                        <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.primary, fontWeight: '600' }]}>
-                          New messages
-                        </Text>
-                        <View style={[styles.dateSeparatorLine, { backgroundColor: theme.primary }]} />
-                      </View>
-                    )}
-
-                    <MessageRow item={item} />
-                  </View>
-                );
-              }}
+            renderItem={renderMessageItem}
             contentContainerStyle={StyleSheet.flatten([
               styles.messagesContent,
               { paddingBottom: bottomVisibilityPadding },
@@ -8234,6 +8653,16 @@ export default function Chat() {
             scrollEventThrottle={32}
             onContentSizeChange={(_w, h) => {
             contentHeightRef.current = h;
+            const forceChatKey = forceBottomAnchorChatKeyRef.current;
+            const selectedChatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
+            if (forceChatKey && selectedChatKey && forceChatKey === selectedChatKey && !firstUnreadMessageId && layoutHeightRef.current > 0) {
+              userInteractedRef.current = false;
+              markAutoScroll(320);
+              tryAnchorToBottom(true);
+              scheduleScrollToBottom({ animated: false, delay: 0 });
+              setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
+              forceBottomAnchorChatKeyRef.current = null;
+            }
             if (shouldUseManualAnchorPreservation && pendingPrependAnchorRef.current) {
               restorePrependAnchorIfNeeded();
               if (pendingPrependAnchorRef.current) return;
@@ -8252,6 +8681,16 @@ export default function Chat() {
           }}
             onLayout={(e) => {
             layoutHeightRef.current = e.nativeEvent.layout.height;
+            const forceChatKey = forceBottomAnchorChatKeyRef.current;
+            const selectedChatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
+            if (forceChatKey && selectedChatKey && forceChatKey === selectedChatKey && !firstUnreadMessageId && contentHeightRef.current > 0) {
+              userInteractedRef.current = false;
+              markAutoScroll(320);
+              tryAnchorToBottom(true);
+              scheduleScrollToBottom({ animated: false, delay: 0 });
+              setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
+              forceBottomAnchorChatKeyRef.current = null;
+            }
             if (shouldUseManualAnchorPreservation && pendingPrependAnchorRef.current) {
               restorePrependAnchorIfNeeded();
               if (pendingPrependAnchorRef.current) return;
@@ -8414,11 +8853,6 @@ export default function Chat() {
             })()}
           />
         </View>
-        {!isInitialAnchorSettled && (
-          <View style={[styles.loadingOverlay, { backgroundColor: theme.background, pointerEvents: 'auto' }]}>
-            <ActivityIndicator size="large" color={theme.primary} />
-          </View>
-        )}
         {showScrollToBottom && (
           <TouchableOpacity
             onPress={() => {
@@ -8882,6 +9316,16 @@ export default function Chat() {
         teamMember={selectedTeamMember}
         theme={theme}
       />
+
+      {selectedTeamMember && !isChatBootstrapGateDone && (
+        <View style={[styles.loadingOverlay, { backgroundColor: theme.background, pointerEvents: 'auto', zIndex: 40 }]}> 
+          <ActivityIndicator size="large" color={theme.primary} />
+          <Text style={[styles.loadingText, { color: theme.textSecondary, marginTop: 16 }]}>Loading conversation…</Text>
+          {showChatOpenHangActions && (
+            <Text style={[styles.reconnectSubtext, { color: theme.textSecondary, marginTop: 10, textAlign: 'center', maxWidth: 360 }]}>Hang on, connection is slow</Text>
+          )}
+        </View>
+      )}
 
     </KeyboardAvoidingView>
   );

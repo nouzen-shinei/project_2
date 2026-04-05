@@ -175,7 +175,7 @@ export default function Settings() {
     return ROLE_BADGE_MAP[derivedRole] ?? null;
   }, [derivedRole]);
 
-  const canShowAuthorizedEmails = isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins;
+  const canShowTeamMembersList = isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins;
 
   const [componentLoading, setComponentLoading] = useState(true);
 
@@ -434,7 +434,7 @@ export default function Settings() {
             ...updatedProfileData
           }));
           
-          // Update current profile picture URL with the actual photoURL from authorizedEmails collection
+          // Update current profile picture URL with the actual photoURL from tenant profile collection
           setCurrentProfilePictureURL(profile?.photoURL || user.photoURL || '');
         } catch (error) {
           logger.error('Error loading user profile:', error);
@@ -669,8 +669,8 @@ export default function Settings() {
       });
       setAuthorizedMembers(sorted);
     } catch (error) {
-      logger.warn('Settings: failed to load authorized members', error);
-      setAuthorizedMembersError('Unable to load authorized emails. Please try again.');
+      logger.warn('Settings: failed to load tenant members', error);
+      setAuthorizedMembersError('Unable to load team members. Please try again.');
       setAuthorizedMembers([]);
     } finally {
       setAuthorizedMembersLoading(false);
@@ -678,11 +678,11 @@ export default function Settings() {
   }, [activeTenant?.id]);
 
   useEffect(() => {
-    if (!activeTenant?.id || !canShowAuthorizedEmails) {
+    if (!activeTenant?.id || !canShowTeamMembersList) {
       return;
     }
     loadAuthorizedMembers();
-  }, [activeTenant?.id, canShowAuthorizedEmails, loadAuthorizedMembers]);
+  }, [activeTenant?.id, canShowTeamMembersList, loadAuthorizedMembers]);
 
   useEffect(() => {
     if (!showEmailModal || !activeTenant?.id) {
@@ -692,7 +692,7 @@ export default function Settings() {
   }, [showEmailModal, activeTenant?.id, loadAuthorizedMembers]);
 
   useEffect(() => {
-    if (!showEmailModal || !activeTenant?.id || tenantUnavailable || !canShowAuthorizedEmails) {
+    if (!showEmailModal || !activeTenant?.id || tenantUnavailable || !canShowTeamMembersList) {
       setPendingInvites([]);
       setPendingInvitesLoading(false);
       setPendingInvitesError(null);
@@ -738,7 +738,7 @@ export default function Settings() {
         logger.warn('Settings: failed to cleanup invite listener', cleanupError);
       }
     };
-  }, [showEmailModal, activeTenant?.id, tenantUnavailable, canShowAuthorizedEmails]);
+  }, [showEmailModal, activeTenant?.id, tenantUnavailable, canShowTeamMembersList]);
 
   // Safe early return after all hooks and effects are registered
   if (showOfflineLoadingSettings) {
@@ -1021,7 +1021,7 @@ export default function Settings() {
       
       // Update Firestore - set both photoURL (current active) and customImageURL (backup)
       await authService.updateUserProfileSafe(user.email, {
-        photoURL: photoURL, // Current active image in authorizedEmails
+        photoURL: photoURL, // Current active image in tenant profile
         customImageURL: photoURL, // Backup for switching
       });
       
@@ -1315,7 +1315,7 @@ export default function Settings() {
   //         setProfileData(data.profile);
   //       }
 
-  //       if (data.authorizedEmails) {
+  //       if (data.teamMembers) {
   //         // Team members will be automatically updated through the subscription
   //       }
 
@@ -1525,13 +1525,13 @@ export default function Settings() {
     extraContent?: React.ReactNode;
   };
 
-  const authorizedEmailsSubtitle = tenantUnavailable
+  const teamMembersSubtitle = tenantUnavailable
     ? 'Select a coaching center to view'
     : authorizedMembersLoading
-      ? 'Loading authorized emails...'
+      ? 'Loading team members...'
       : authorizedMembersError
-        ? 'Unable to load emails'
-        : `${authorizedMembers.length} authorized email${authorizedMembers.length !== 1 ? 's' : ''}`;
+        ? 'Unable to load members'
+        : `${authorizedMembers.length} team member${authorizedMembers.length !== 1 ? 's' : ''}`;
 
   const adminSettingsSubtitle = tenantUnavailable
     ? 'Select a coaching center to manage'
@@ -1575,12 +1575,12 @@ export default function Settings() {
               },
             ]
           : []),
-        ...(canShowAuthorizedEmails && !tenantUnavailable
+        ...(canShowTeamMembersList && !tenantUnavailable
           ? [
               {
                 icon: UserCheck,
-                title: 'Authorized Emails',
-                subtitle: authorizedEmailsSubtitle,
+                title: 'Team Members',
+                subtitle: teamMembersSubtitle,
                 onPress: tenantUnavailable ? undefined : () => setShowEmailModal(true),
                 disabled: tenantUnavailable,
               },
@@ -2492,9 +2492,9 @@ export default function Settings() {
         </View>
       </Modal>
 
-      {/* Authorized Emails Modal */}
+      {/* Team Members Modal */}
       <Modal
-        visible={showEmailModal && canShowAuthorizedEmails}
+        visible={showEmailModal && canShowTeamMembersList}
         animationType="slide"
         presentationStyle="pageSheet"
       >
@@ -2503,7 +2503,7 @@ export default function Settings() {
             <TouchableOpacity onPress={() => setShowEmailModal(false)}>
               <X size={24} color={theme.textSecondary} />
             </TouchableOpacity>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Authorized Emails</Text>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Team Members</Text>
             <View style={{ width: 24 }} />
           </View>
 
@@ -2511,28 +2511,28 @@ export default function Settings() {
             {tenantUnavailable ? (
               <TenantSelectionEmptyState
                 title="Select a coaching center first"
-                description="Choose, create, or join a coaching center from the Coaching centers panel in Settings before viewing authorized emails."
+                description="Choose, create, or join a coaching center from the Coaching centers panel in Settings before viewing team members."
                 primaryActionLabel="Manage Coaching Centers"
                 onPrimaryAction={() => setShowEmailModal(false)}
               />
             ) : (
               <>
                 <Text style={[styles.modalDescription, { color: theme.textSecondary }] }>
-                  These are all the email addresses authorized to access this application. {isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins ? 'All authorized users can view this list for transparency.' : 'Only admins can view this list (as configured in Admin Settings).'}
+                  These are all active team members in this coaching center. {isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins ? 'All members can view this list for transparency.' : 'Only admins can view this list (as configured in Admin Settings).'}
                 </Text>
                 
                 {/* Admin-only note */}
                 <View style={[styles.infoBox, { backgroundColor: theme.surface, borderColor: theme.border }]}>
                   <Text style={[styles.infoText, { color: theme.textSecondary }]}>
-                    To add or remove authorized emails, please use the Admin Settings page. Only administrators can manage the authorized emails list.
+                    To add or remove team members, please use the Admin Settings page. Only administrators can manage membership.
                   </Text>
                 </View>
 
-                {/* Authorized Emails List */}
+                {/* Team Members List */}
                 <View style={styles.emailsList}>
                   <View style={styles.emailsListHeader}>
                     <Text style={[styles.sectionLabel, { color: theme.text }]}>
-                      Authorized Emails ({authorizedMembersLoading ? '...' : authorizedMembers.length})
+                      Team Members ({authorizedMembersLoading ? '...' : authorizedMembers.length})
                     </Text>
                     {!authorizedMembersLoading && !tenantUnavailable && (
                       <TouchableOpacity onPress={loadAuthorizedMembers} style={styles.refreshButtonInline}>

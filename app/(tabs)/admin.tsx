@@ -1742,7 +1742,7 @@ export default function AdminPanel() {
         <AdminNotificationCenter 
           adminEmail={user?.email || ''} 
           adminName={user?.displayName || user?.email || 'Admin'}
-          authorizedEmails={tenantMemberEmails}
+          tenantMemberEmails={tenantMemberEmails}
         />
       ) : (
         <ScrollView

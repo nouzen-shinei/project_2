@@ -242,7 +242,6 @@ function shouldDeliverToDevice(device: CachedDeviceRecord): boolean {
   if (device.isDeleted) return false;
   if (device.sessionActive === false) return false;
   if (device.logoutType === 'manual' || device.logoutType === 'forced') return false;
-  if (device.isOnline !== true) return false;
   if (device.notificationsEnabled === false) return false;
   if (device.teamNotificationsEnabled === false) return false;
   return true;

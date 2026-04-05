@@ -2,19 +2,24 @@ import { logger } from '@/lib/logger';
 import { doc, getDoc, onSnapshot, setDoc, updateDoc, deleteField, runTransaction } from 'firebase/firestore';
 import { firestore } from '@/config/firebase';
 import { authService } from '@/hooks/useAuthUnified';
+import { tenantService } from '@/services/tenantService';
 
 export type PinnedChatsMap = Record<string, number>; // key = sanitized email ([@,.] -> _), value = serial
 
 const sanitizeEmailKey = (email: string) => email.toLowerCase().replace(/[@.]/g, '_');
+const DEFAULT_CHAT_PREFS_TENANT_ID = process.env.EXPO_PUBLIC_DEFAULT_TENANT_ID || 'legacy-coaching';
 
-const userDocRef = (email: string) => doc(firestore, 'authorizedEmails', sanitizeEmailKey(email));
+const resolveTenantScopedProfileDocRef = async (email: string) => {
+  const tenantId = (await tenantService.getCachedSelectedTenant()) || DEFAULT_CHAT_PREFS_TENANT_ID;
+  return doc(firestore, 'tenantProfiles', `${tenantId}_${sanitizeEmailKey(email)}`);
+};
 
 export const chatPreferencesService = {
   sanitizeEmailKey,
 
   async getPinnedChats(userEmail: string): Promise<PinnedChatsMap> {
     try {
-      const snap = await getDoc(userDocRef(userEmail));
+      const snap = await getDoc(await resolveTenantScopedProfileDocRef(userEmail));
       const data = snap.exists() ? (snap.data() as any) : {};
       return (data.pinnedChats as PinnedChatsMap) || {};
     } catch (e) {
@@ -24,11 +29,12 @@ export const chatPreferencesService = {
   },
 
   onPinnedChatsChange(userEmail: string, cb: (map: PinnedChatsMap) => void) {
-    const ref = userDocRef(userEmail);
     let disposed = false;
     let unsubscribe: (() => void) | null = null;
 
-    const attach = (context?: string) => {
+    const attach = async (context?: string) => {
+      if (disposed) return;
+      const ref = await resolveTenantScopedProfileDocRef(userEmail);
       if (disposed) return;
       unsubscribe?.();
       unsubscribe = onSnapshot(ref, (snap) => {
@@ -41,8 +47,10 @@ export const chatPreferencesService = {
       }
     };
 
-    attach('initial');
-    const unregister = authService.registerFirestoreReinit?.(() => attach('reinit'));
+    void attach('initial');
+    const unregister = authService.registerFirestoreReinit?.(() => {
+      void attach('reinit');
+    });
 
     return () => {
       disposed = true;
@@ -54,7 +62,7 @@ export const chatPreferencesService = {
   },
 
   async pinChat(userEmail: string, otherEmail: string): Promise<PinnedChatsMap> {
-    const ref = userDocRef(userEmail);
+    const ref = await resolveTenantScopedProfileDocRef(userEmail);
     await runTransaction(firestore, async (tx) => {
       const snap = await tx.get(ref);
       const data = snap.exists() ? (snap.data() as any) : {};
@@ -73,7 +81,7 @@ export const chatPreferencesService = {
   },
 
   async unpinChat(userEmail: string, otherEmail: string): Promise<PinnedChatsMap> {
-    const ref = userDocRef(userEmail);
+    const ref = await resolveTenantScopedProfileDocRef(userEmail);
     const key = sanitizeEmailKey(otherEmail);
     await runTransaction(firestore, async (tx) => {
       const snap = await tx.get(ref);
@@ -105,7 +113,7 @@ export const chatPreferencesService = {
   },
 
   async setPinnedOrder(userEmail: string, orderedEmails: string[]): Promise<PinnedChatsMap> {
-    const ref = userDocRef(userEmail);
+    const ref = await resolveTenantScopedProfileDocRef(userEmail);
     // Assign serials starting from 1 in given order
     const updated: PinnedChatsMap = {};
     orderedEmails.forEach((email, idx) => {

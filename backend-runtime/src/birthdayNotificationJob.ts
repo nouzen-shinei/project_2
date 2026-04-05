@@ -21,8 +21,6 @@ const DEFAULT_WHATSAPP_COUNTRY_CODE = (() => {
 const LEGACY_COACHING_NAME_CACHE_MS = Number(process.env.BIRTHDAY_COACHING_NAME_CACHE_MS || 5 * 60 * 1000);
 const BIRTHDAY_WHATSAPP_IMAGE_URL = process.env.BIRTHDAY_WHATSAPP_IMAGE_URL?.trim() || undefined;
 const BIRTHDAY_PROFILE_COLLECTION = process.env.BIRTHDAY_PROFILE_COLLECTION?.trim() || 'tenantProfiles';
-const BIRTHDAY_FALLBACK_COLLECTION = process.env.BIRTHDAY_FALLBACK_COLLECTION?.trim() || 'authorizedEmails';
-const BIRTHDAY_PROFILE_FALLBACK_ENABLED = process.env.BIRTHDAY_PROFILE_FALLBACK !== 'false';
 const BIRTHDAY_DEFAULT_TENANT_ID = process.env.BIRTHDAY_DEFAULT_TENANT_ID?.trim() || 'legacy-coaching';
 
 let cachedLegacyCoachingName: { value: string | null; expiresAt: number } | null = null;
@@ -490,21 +488,7 @@ async function loadBirthdayRoster(
   db: admin.firestore.Firestore,
   tenantId: string
 ): Promise<admin.firestore.QuerySnapshot<admin.firestore.DocumentData>> {
-  try {
-    const snapshot = await db.collection(BIRTHDAY_PROFILE_COLLECTION).where('tenantId', '==', tenantId).get();
-    if (!snapshot.empty || !BIRTHDAY_PROFILE_FALLBACK_ENABLED) {
-      return snapshot;
-    }
-    console.warn(
-      `[birthday_job] tenantProfiles empty for ${tenantId}; falling back to ${BIRTHDAY_FALLBACK_COLLECTION}`
-    );
-  } catch (error) {
-    console.error('[birthday_job] failed to load tenantProfiles roster', error);
-    if (!BIRTHDAY_PROFILE_FALLBACK_ENABLED) {
-      throw error;
-    }
-  }
-  return db.collection(BIRTHDAY_FALLBACK_COLLECTION).get();
+  return db.collection(BIRTHDAY_PROFILE_COLLECTION).where('tenantId', '==', tenantId).get();
 }
 
 async function fetchExpoPushTokens(

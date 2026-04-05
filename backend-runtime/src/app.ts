@@ -144,6 +144,7 @@ declare module 'express-serve-static-core' {
       tokenType: 'master' | 'internal' | 'firebase';
       uid?: string;
       email?: string;
+      isGlobalAdmin?: boolean;
     };
     tenantAccess?: TenantAccessContext;
   }
@@ -713,6 +714,23 @@ const adminMembershipRoleOverrideSchema = z
     userId: z.string().trim().min(1).max(200),
   })
   .merge(membershipRoleUpdateSchema);
+
+const globalAdminClaimLookupSchemaBase = z
+  .object({
+    uid: z.string().trim().min(1).max(200).optional(),
+    email: z.string().trim().email().max(320).optional(),
+  });
+
+const globalAdminClaimLookupSchema = globalAdminClaimLookupSchemaBase.refine((value) => Boolean(value.uid || value.email), {
+    message: 'uid_or_email_required',
+  });
+
+const globalAdminClaimUpdateSchema = globalAdminClaimLookupSchemaBase.extend({
+  admin: z.boolean(),
+  reason: z.string().trim().max(200).optional(),
+}).refine((value) => Boolean(value.uid || value.email), {
+  message: 'uid_or_email_required',
+});
 
 const notificationPreferenceKeys = [
   'membershipEventsEmail',
@@ -5299,6 +5317,11 @@ type FirestoreResolver = () => admin.firestore.Firestore;
 
 export interface CreateAppOptions {
   overrides?: {
+    verifyFirebaseIdToken?: (token: string) => Promise<any>;
+    getAuthUserByUid?: (uid: string) => Promise<any>;
+    getAuthUserByEmail?: (email: string) => Promise<any>;
+    setAuthCustomUserClaims?: (uid: string, claims: Record<string, unknown> | null) => Promise<void>;
+    revokeAuthRefreshTokens?: (uid: string) => Promise<void>;
     sendChatMessage?: typeof sendChatMessage;
     syncChatConversationReceipts?: typeof syncChatConversationReceipts;
     confirmOutboundChatDelivery?: typeof confirmOutboundChatDelivery;
@@ -5407,6 +5430,15 @@ export function createApp(options: CreateAppOptions = {}){
       const sessionRef = await db.collection('billingCheckoutSessions').add(stripUndefinedDeep(record));
       return { sessionId: sessionRef.id };
     });
+  const verifyFirebaseIdTokenImpl = options.overrides?.verifyFirebaseIdToken ?? ((token: string) => admin.auth().verifyIdToken(token));
+  const getAuthUserByUidImpl = options.overrides?.getAuthUserByUid ?? ((uid: string) => admin.auth().getUser(uid));
+  const getAuthUserByEmailImpl = options.overrides?.getAuthUserByEmail ?? ((email: string) => admin.auth().getUserByEmail(email));
+  const setAuthCustomUserClaimsImpl =
+    options.overrides?.setAuthCustomUserClaims ??
+    ((uid: string, claims: Record<string, unknown> | null) => admin.auth().setCustomUserClaims(uid, claims));
+  const revokeAuthRefreshTokensImpl =
+    options.overrides?.revokeAuthRefreshTokens ??
+    ((uid: string) => admin.auth().revokeRefreshTokens(uid));
   const requireMemberTenantAccess = tenantAccessMiddleware({ minRole: 'member' }, requireTenantMembershipAccessImpl, getFirestoreImpl);
   const requireMemberTenantAccessFromQuery = tenantAccessMiddleware(
     { minRole: 'member', resolveTenantId: queryTenantIdResolver() },
@@ -5499,6 +5531,7 @@ export function createApp(options: CreateAppOptions = {}){
     /^\/admin\/settings\/runtime-endpoints$/,
     /^\/admin\/settings\/maintenance$/,
     /^\/admin\/settings\/reminder-channels$/,
+    /^\/admin\/auth\/global-admin\//,
     /^\/notifications\/daily-quotes\/status$/,
     /^\/metrics$/,
     /^\/ready$/,
@@ -5679,7 +5712,7 @@ export function createApp(options: CreateAppOptions = {}){
       if(!idToken) idToken=(req.body as any)?.firebaseIdToken;
       if(!idToken) return res.status(401).json({error:'missing_id_token'});
       ensureFirebase();
-  const decoded = await admin.auth().verifyIdToken(idToken);
+  const decoded = await verifyFirebaseIdTokenImpl(idToken);
   const ttl=300; const internal=signInternalToken(decoded.uid, ttl, decoded.email);
       res.json({ token: internal, expiresIn: ttl, expiresAt: Date.now()+ttl*1000 });
     } catch(e:any){ console.error('[auth_bridge] verify failed:', e?.message); return res.status(401).json({error:'invalid_id_token'}); } finally { const dur=Date.now()-start; if(dur>1000) console.warn('[auth_bridge] slow', dur+'ms'); }
@@ -5700,7 +5733,7 @@ export function createApp(options: CreateAppOptions = {}){
     const cand=auth.slice(7);
 
     if(cand===master){
-      req.authContext = { tokenType: 'master', uid: 'system' };
+      req.authContext = { tokenType: 'master', uid: 'system', isGlobalAdmin: true };
       return next();
     }
 
@@ -5710,17 +5743,19 @@ export function createApp(options: CreateAppOptions = {}){
         tokenType: payload.master ? 'master' : 'internal',
         uid: typeof payload.sub === 'string' ? payload.sub : undefined,
         email: payload.email,
+        isGlobalAdmin: Boolean(payload.master),
       };
       return next();
     }
 
     ensureFirebase();
-    return admin.auth().verifyIdToken(cand)
+    return verifyFirebaseIdTokenImpl(cand)
       .then(decoded => {
         req.authContext = {
           tokenType: 'firebase',
           uid: decoded.uid,
           email: decoded.email || undefined,
+          isGlobalAdmin: (decoded as any)?.admin === true,
         };
         next();
       })
@@ -6149,11 +6184,52 @@ export function createApp(options: CreateAppOptions = {}){
   });
 
   function requireOperatorAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-    const tokenType = req.authContext?.tokenType;
+    const authContext = req.authContext;
+    const tokenType = authContext?.tokenType;
     if (tokenType === 'master' || tokenType === 'internal') {
       return next();
     }
+    if (tokenType === 'firebase' && authContext?.isGlobalAdmin === true) {
+      return next();
+    }
     return res.status(403).json({ error: 'not_authorized' });
+  }
+
+  function requireGlobalAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (authContext.tokenType === 'master') {
+      return next();
+    }
+    if (authContext.tokenType === 'firebase' && authContext.isGlobalAdmin === true) {
+      return next();
+    }
+    return res.status(403).json({ error: 'not_authorized' });
+  }
+
+  async function resolveGlobalAdminLookup(input: { uid?: string; email?: string }): Promise<{
+    uid: string;
+    email: string | null;
+  }> {
+    ensureFirebase();
+    const normalizedEmail = normalizeEmail(input.email || '');
+    if (input.uid) {
+      const userRecord = await getAuthUserByUidImpl(input.uid);
+      return {
+        uid: userRecord.uid,
+        email: normalizeEmail(userRecord.email || undefined) || null,
+      };
+    }
+    if (!normalizedEmail) {
+      throw new Error('uid_or_email_required');
+    }
+    const userRecord = await getAuthUserByEmailImpl(normalizedEmail);
+    return {
+      uid: userRecord.uid,
+      email: normalizeEmail(userRecord.email || undefined) || normalizedEmail,
+    };
   }
 
   const internalReminderHistoryEmailResultSchema = z.object({
@@ -6220,7 +6296,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.post('/admin/tenants/search', async (req, res) => {
     const authContext = req.authContext;
-    if (!authContext || authContext.tokenType !== 'master') {
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
       return res.status(403).json({ error: 'not_authorized' });
     }
     const parsed = tenantSearchSchema.safeParse(req.body || {});
@@ -6276,7 +6352,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.post('/admin/tenants/user-devices', async (req, res) => {
     const authContext = req.authContext;
-    if (!authContext || authContext.tokenType !== 'master') {
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
       return res.status(403).json({ error: 'not_authorized' });
     }
 
@@ -6409,7 +6485,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.post('/admin/tenants/memberships/role', async (req, res) => {
     const authContext = req.authContext;
-    if (!authContext || authContext.tokenType !== 'master') {
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
       return res.status(403).json({ error: 'not_authorized' });
     }
 
@@ -6461,7 +6537,7 @@ export function createApp(options: CreateAppOptions = {}){
         previousRole,
         newRole: desiredRole,
         previousStatus: membership.status,
-        actorRole: 'master',
+        actorRole: authContext.tokenType === 'master' ? 'master' : 'global_admin',
       };
       if (metadata.reason) {
         auditMetadata.reason = metadata.reason;
@@ -7029,7 +7105,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.post('/admin/tenants/quotas', async (req, res) => {
     const authContext = req.authContext;
-    if (!authContext || authContext.tokenType !== 'master') {
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
       return res.status(403).json({ error: 'not_authorized' });
     }
 
@@ -7098,7 +7174,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.post('/admin/tenants/billing/plan-variant', async (req, res) => {
     const authContext = req.authContext;
-    if (!authContext || authContext.tokenType !== 'master') {
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
       return res.status(403).json({ error: 'not_authorized' });
     }
 
@@ -7392,6 +7468,111 @@ export function createApp(options: CreateAppOptions = {}){
     } catch (error) {
       console.error('[tenant_billing_plan_override] failed', error);
       return res.status(500).json({ error: 'tenant_billing_plan_override_failed' });
+    }
+  });
+
+  app.get('/admin/auth/global-admin/me', requireGlobalAdminAuth, (req, res) => {
+    const authContext = req.authContext;
+    return res.json({
+      ok: true,
+      uid: authContext?.uid || null,
+      email: authContext?.email || null,
+      tokenType: authContext?.tokenType || null,
+      isGlobalAdmin: authContext?.tokenType === 'master' || authContext?.isGlobalAdmin === true,
+    });
+  });
+
+  app.post('/admin/auth/global-admin/get', requireGlobalAdminAuth, async (req, res) => {
+    const parsed = globalAdminClaimLookupSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const target = await resolveGlobalAdminLookup(parsed.data);
+      const userRecord = await getAuthUserByUidImpl(target.uid);
+      const currentClaims = ((userRecord.customClaims || {}) as Record<string, unknown>) || {};
+      return res.json({
+        ok: true,
+        uid: userRecord.uid,
+        email: normalizeEmail(userRecord.email || undefined) || target.email,
+        admin: currentClaims.admin === true,
+        customClaims: currentClaims,
+      });
+    } catch (error: any) {
+      const code = typeof error?.code === 'string' ? error.code : '';
+      if (code === 'auth/user-not-found') {
+        return res.status(404).json({ error: 'user_not_found' });
+      }
+      console.error('[admin_global_admin_get] failed', error);
+      return res.status(500).json({ error: 'global_admin_lookup_failed' });
+    }
+  });
+
+  app.post('/admin/auth/global-admin/set', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || authContext.tokenType !== 'master') {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = globalAdminClaimUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const target = await resolveGlobalAdminLookup(parsed.data);
+      const userRecord = await getAuthUserByUidImpl(target.uid);
+      const currentClaims = ((userRecord.customClaims || {}) as Record<string, unknown>) || {};
+      const previousAdmin = currentClaims.admin === true;
+
+      const nextClaims: Record<string, unknown> = { ...currentClaims };
+      if (parsed.data.admin) {
+        nextClaims.admin = true;
+      } else {
+        delete nextClaims.admin;
+      }
+
+      await setAuthCustomUserClaimsImpl(userRecord.uid, Object.keys(nextClaims).length ? nextClaims : null);
+      await revokeAuthRefreshTokensImpl(userRecord.uid);
+
+      try {
+        const actorId = authContext.uid || authContext.tokenType || 'system';
+        const actorEmail = await resolveAuthenticatedEmail(authContext);
+        await getFirestoreImpl().collection('adminSecurityAuditLogs').add(
+          stripUndefinedDeep({
+            action: 'global_admin_claim_set',
+            actorId,
+            actorEmail: actorEmail || undefined,
+            targetUid: userRecord.uid,
+            targetEmail: normalizeEmail(userRecord.email || undefined) || target.email,
+            previousAdmin,
+            nextAdmin: parsed.data.admin,
+            changed: previousAdmin !== parsed.data.admin,
+            reason: parsed.data.reason || undefined,
+            createdAt: new Date().toISOString(),
+          })
+        );
+      } catch (auditError) {
+        console.warn('[admin_global_admin_set] audit_log_failed', auditError);
+      }
+
+      return res.json({
+        ok: true,
+        uid: userRecord.uid,
+        email: normalizeEmail(userRecord.email || undefined) || target.email,
+        admin: parsed.data.admin,
+        previousAdmin,
+        changed: previousAdmin !== parsed.data.admin,
+        reason: parsed.data.reason || null,
+      });
+    } catch (error: any) {
+      const code = typeof error?.code === 'string' ? error.code : '';
+      if (code === 'auth/user-not-found') {
+        return res.status(404).json({ error: 'user_not_found' });
+      }
+      console.error('[admin_global_admin_set] failed', error);
+      return res.status(500).json({ error: 'global_admin_update_failed' });
     }
   });
 

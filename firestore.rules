@@ -37,13 +37,10 @@ service cloud.firestore {
       );
     }
 
-  // Admin check: use a UID-keyed mirror doc in authorizedUsersByUid
-  // Rationale: Security rules cannot compute dynamic string replacements reliably in path segments,
-  // so we keep a separate collection keyed by request.auth.uid.
+  // Admin check via custom auth claims (set by backend/admin tooling).
+  // Expected claim shape: request.auth.token.admin == true
     function isAdmin() {
-      return isSignedIn() &&
-    exists(/databases/$(database)/documents/authorizedUsersByUid/$(request.auth.uid)) &&
-    get(/databases/$(database)/documents/authorizedUsersByUid/$(request.auth.uid)).data.role == 'admin';
+      return isSignedIn() && request.auth.token.admin == true;
     }
 
     match /tenantUsage/{tenantId}/months/{monthId} {
@@ -97,6 +94,44 @@ service cloud.firestore {
 
       // Writes: keep permissive for now (client admin UI enforces role)
       allow create, update, delete: if isSignedIn();
+    }
+
+    // Tenant-scoped profile records (source of truth for per-tenant user profile fields)
+    match /tenantProfiles/{docId} {
+      allow get, list: if isSignedIn() && (
+        (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId)) ||
+        isAdmin()
+      );
+
+      allow create, update: if isSignedIn() && (
+        (
+          request.resource.data.tenantId is string &&
+          hasTenantStaffAccess(request.resource.data.tenantId) &&
+          request.resource.data.email == request.auth.token.email
+        ) ||
+        isAdmin()
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Tenant-scoped presence records (online/lastSeen/typing)
+    match /tenantPresence/{docId} {
+      allow get, list: if isSignedIn() && (
+        (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId)) ||
+        isAdmin()
+      );
+
+      allow create, update: if isSignedIn() && (
+        (
+          request.resource.data.tenantId is string &&
+          hasTenantStaffAccess(request.resource.data.tenantId) &&
+          request.resource.data.email == request.auth.token.email
+        ) ||
+        isAdmin()
+      );
+
+      allow delete: if isAdmin();
     }
 
     // App settings: readable and writable to authenticated users (admin UI is client-side)

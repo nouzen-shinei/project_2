@@ -48,7 +48,7 @@ export interface IDeviceTrackingService {
   ): Promise<boolean>;
   getUserDevices(userEmail: string, options?: DeviceTenantFilterOptions): Promise<any[]>;
   getAllUsersWithDevices(
-    authorizedEmails: string[],
+    memberEmails: string[],
     currentUserEmail?: string,
     includeCurrentUser?: boolean,
     options?: DeviceTenantFilterOptions
@@ -3506,14 +3506,14 @@ class NotificationService {
    * Get all users with their devices (for admin panel)
    */
   async getAllUsersWithDevices(
-    authorizedEmails: string[],
+    memberEmails: string[],
     includeCurrentUser: boolean = true,
     options?: DeviceTenantFilterOptions
   ): Promise<any[]> {
     try {
       const scopedTenantOptions = options ?? (await this.resolveTenantFilterOptions(false));
       return await getDeviceTrackingService().getAllUsersWithDevices(
-        authorizedEmails,
+        memberEmails,
         this.currentUserEmail || undefined,
         includeCurrentUser,
         scopedTenantOptions

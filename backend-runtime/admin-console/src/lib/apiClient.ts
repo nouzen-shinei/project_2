@@ -191,6 +191,52 @@ export function updateMaintenanceMode(payload: Partial<MaintenanceModeDoc>) {
   });
 }
 
+export type GlobalAdminMe = {
+  ok: boolean;
+  uid: string | null;
+  email: string | null;
+  tokenType: string | null;
+  isGlobalAdmin: boolean;
+};
+
+export type GlobalAdminLookupResult = {
+  ok: boolean;
+  uid: string;
+  email: string | null;
+  admin: boolean;
+  customClaims?: Record<string, unknown>;
+};
+
+export function fetchGlobalAdminMe() {
+  return apiRequest<GlobalAdminMe>('/admin/auth/global-admin/me', {
+    auth: 'auto',
+  });
+}
+
+export function fetchGlobalAdminClaim(payload: { uid?: string; email?: string }) {
+  return apiRequest<GlobalAdminLookupResult>('/admin/auth/global-admin/get', {
+    method: 'POST',
+    auth: 'auto',
+    body: payload,
+  });
+}
+
+export function updateGlobalAdminClaim(payload: { uid?: string; email?: string; admin: boolean; reason?: string }) {
+  return apiRequest<{
+    ok: boolean;
+    uid: string;
+    email: string | null;
+    admin: boolean;
+    previousAdmin: boolean;
+    changed: boolean;
+    reason: string | null;
+  }>('/admin/auth/global-admin/set', {
+    method: 'POST',
+    auth: 'master',
+    body: payload,
+  });
+}
+
 export type ReminderChannelKey = 'email' | 'sms' | 'whatsapp' | 'voice';
 
 export type TenantReminderSettingsDoc = {

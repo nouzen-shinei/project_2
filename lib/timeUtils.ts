@@ -90,7 +90,7 @@ export function formatOnlineStatus(isOnline: boolean | undefined, lastSeen: stri
   }
 
   if (!lastSeen) {
-    return '';
+    return 'Offline';
   }
 
   return formatLastSeen(lastSeen);

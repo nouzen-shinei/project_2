@@ -3414,6 +3414,72 @@ class ChatService {
     }
   }
 
+  async markConversationAsRead(currentUserEmail: string, otherUserEmail: string): Promise<number> {
+    try {
+      const me = this.normalizeEmail(currentUserEmail);
+      const them = this.normalizeEmail(otherUserEmail);
+      const conversationKey = this.getConversationKey(me, them);
+      if (!conversationKey || !me || !them) {
+        return 0;
+      }
+
+      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
+      const tenantScopeId = this.requireTenantId(resolvedTenantId);
+      const conversationRef = this.tenantConversationMessagesRef(tenantScopeId, conversationKey);
+      const snapshot = await get(conversationRef);
+      if (!snapshot.exists()) {
+        return 0;
+      }
+
+      const nowIso = new Date().toISOString();
+      const patch: Record<string, any> = {};
+      let updatedCount = 0;
+
+      snapshot.forEach((childSnapshot) => {
+        const messageId = childSnapshot.key;
+        const data = childSnapshot.val();
+        if (!messageId || !data) {
+          return undefined;
+        }
+
+        const sender = this.normalizeEmail(data.sender);
+        const recipient = this.normalizeEmail(data.recipientId);
+        const isUnreadIncoming = sender === them && recipient === me && !data.read && !data.deleted;
+        if (!isUnreadIncoming) {
+          return undefined;
+        }
+
+        patch[`${messageId}/read`] = true;
+        patch[`${messageId}/readAt`] = nowIso;
+        if (!data.delivered) {
+          patch[`${messageId}/delivered`] = true;
+        }
+        if (!data.deliveredAt) {
+          patch[`${messageId}/deliveredAt`] = nowIso;
+        }
+        updatedCount += 1;
+        return undefined;
+      });
+
+      if (!updatedCount) {
+        return 0;
+      }
+
+      await update(conversationRef, patch);
+      await this.rebuildConversationSummariesForUser(me, tenantScopeId);
+
+      logger.metric('chat.conversation.read_all', {
+        conversationKey,
+        updatedCount,
+      });
+
+      return updatedCount;
+    } catch (error) {
+      logger.error('Error marking conversation as read:', error);
+      return 0;
+    }
+  }
+
   // Get undelivered messages for a user
   async getUndeliveredMessages(recipientEmail: string): Promise<ChatMessage[]> {
     try {
@@ -3554,7 +3620,12 @@ class ChatService {
       let unreadCount = 0;
       snapshot.forEach((child) => {
         const data = child.val();
-        if (this.normalizeEmail(data.recipientId) === me && this.normalizeEmail(data.sender) === them && !data.read) {
+        if (
+          this.normalizeEmail(data.recipientId) === me &&
+          this.normalizeEmail(data.sender) === them &&
+          !data.read &&
+          !data.deleted
+        ) {
           unreadCount += 1;
         }
         return undefined;

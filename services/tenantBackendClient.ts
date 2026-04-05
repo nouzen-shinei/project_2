@@ -72,6 +72,14 @@ export interface TenantNotificationPreferenceUpdateResponse {
   changedKeys: TenantNotificationPreferenceKey[];
 }
 
+export interface GlobalAdminMeResponse {
+  ok: boolean;
+  uid?: string | null;
+  email?: string | null;
+  tokenType?: string | null;
+  isGlobalAdmin?: boolean;
+}
+
 export class TenantBackendError extends Error {
   code: string;
 
@@ -239,6 +247,49 @@ class TenantBackendClient {
 
   notifyTenantInvite(payload: { tenantId: string; inviteId: string }): Promise<void> {
     return this.request<void>('/notifications/tenant-invite', payload);
+  }
+
+  async getGlobalAdminMe(): Promise<GlobalAdminMeResponse | null> {
+    const baseUrl = runtimeEndpoints.getPreferredBackendBaseUrl();
+    if (!baseUrl) {
+      return null;
+    }
+    internalTokenManager.setBaseUrl(baseUrl);
+
+    let headers = await this.buildHeaders();
+    let response = await fetch(`${baseUrl}/admin/auth/global-admin/me`, {
+      method: 'GET',
+      headers,
+    });
+
+    if (response.status === 401) {
+      await internalTokenManager.forceRefresh(baseUrl);
+      headers = await this.buildHeaders();
+      response = await fetch(`${baseUrl}/admin/auth/global-admin/me`, {
+        method: 'GET',
+        headers,
+      });
+    }
+
+    if (response.status === 403 || response.status === 404) {
+      return null;
+    }
+
+    const raw = await response.text();
+    if (!response.ok) {
+      const code = `http_${response.status}`;
+      throw new TenantBackendError(code, this.describeError(code));
+    }
+
+    if (!raw) {
+      return { ok: true };
+    }
+
+    try {
+      return JSON.parse(raw) as GlobalAdminMeResponse;
+    } catch {
+      return { ok: true };
+    }
   }
 
   approveJoinRequest(payload: {
