@@ -27,7 +27,8 @@ import {
   deleteField,
   Timestamp,
   query,
-  where
+  where,
+  limit
 } from 'firebase/firestore';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { GoogleSignin } from '@react-native-google-signin/google-signin';
@@ -116,6 +117,42 @@ let globalAuthState: {
 // Constants for offline caching
 const CACHED_USER_KEY = STORAGE_KEYS.cachedUserData;
 const CACHED_AUTH_EMAILS_KEY = STORAGE_KEYS.cachedAuthorizedEmails;
+const MAX_PROFILE_IMAGE_URL_LENGTH = 4096;
+
+function sanitizeProfileImageUrl(
+  value: unknown,
+  fieldName: 'photoURL' | 'customImageURL'
+): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const lower = trimmed.toLowerCase();
+  const isRemoteUrl = lower.startsWith('https://') || lower.startsWith('http://');
+  if (!isRemoteUrl) {
+    logger.warn(`Skipping non-remote ${fieldName} value during profile sync`, {
+      fieldName,
+      length: trimmed.length,
+    });
+    return undefined;
+  }
+
+  if (trimmed.length > MAX_PROFILE_IMAGE_URL_LENGTH) {
+    logger.warn(`Skipping oversized ${fieldName} value during profile sync`, {
+      fieldName,
+      length: trimmed.length,
+      max: MAX_PROFILE_IMAGE_URL_LENGTH,
+    });
+    return undefined;
+  }
+
+  return trimmed;
+}
 
 // Presence configuration (client-side)
 // EXPO_PUBLIC_PRESENCE_MODE: 'last_seen' | 'flag'
@@ -594,13 +631,18 @@ async function updateUsersCollectionOnly(email: string, profileData: {
       email: normalizedEmail,
       updatedAt: new Date(),
     };
+
+    const safePhotoURL = sanitizeProfileImageUrl(profileData.photoURL, 'photoURL');
+    const safeCustomImageURL = sanitizeProfileImageUrl(profileData.customImageURL, 'customImageURL');
     
     // Only include fields that are provided
     if (profileData.displayName) updateData.displayName = profileData.displayName;
-    if (profileData.photoURL) updateData.photoURL = profileData.photoURL;
+    if (safePhotoURL) updateData.photoURL = safePhotoURL;
     if (profileData.customImageURL !== undefined) {
       if (profileData.customImageURL) {
-        updateData.customImageURL = profileData.customImageURL;
+        if (safeCustomImageURL) {
+          updateData.customImageURL = safeCustomImageURL;
+        }
       } else {
         // Use deleteField to explicitly remove the customImageURL field when null or empty
         updateData.customImageURL = deleteField();
@@ -641,6 +683,8 @@ async function updateTenantProfilesForUser(email: string, profileData: {
   }
 
   const emailKey = sanitizeEmailKey(normalizedEmail);
+  const safePhotoURL = sanitizeProfileImageUrl(profileData.photoURL, 'photoURL');
+  const safeCustomImageURL = sanitizeProfileImageUrl(profileData.customImageURL, 'customImageURL');
 
   await Promise.all(
     tenantIds.map(async (tenantId) => {
@@ -651,9 +695,15 @@ async function updateTenantProfilesForUser(email: string, profileData: {
       };
 
       if (profileData.displayName !== undefined) payload.displayName = profileData.displayName;
-      if (profileData.photoURL !== undefined) payload.photoURL = profileData.photoURL;
+      if (safePhotoURL) payload.photoURL = safePhotoURL;
       if (profileData.customImageURL !== undefined) {
-        payload.customImageURL = profileData.customImageURL ? profileData.customImageURL : deleteField();
+        if (profileData.customImageURL) {
+          if (safeCustomImageURL) {
+            payload.customImageURL = safeCustomImageURL;
+          }
+        } else {
+          payload.customImageURL = deleteField();
+        }
       }
       if (profileData.school !== undefined) payload.school = profileData.school;
       if (profileData.bio !== undefined) payload.bio = profileData.bio;
@@ -694,13 +744,15 @@ async function updateUserProfileSafe(email: string, profileData: {
     }
     
     const normalizedEmail = email.toLowerCase();
+    const safePhotoURL = sanitizeProfileImageUrl(profileData.photoURL, 'photoURL');
+    const safeCustomImageURL = sanitizeProfileImageUrl(profileData.customImageURL, 'customImageURL');
 
     // Primary write path: tenantProfiles + tenantPresence (tenant-native stores)
     try {
       await updateTenantProfilesForUser(normalizedEmail, {
         displayName: profileData.displayName,
-        photoURL: profileData.photoURL,
-        customImageURL: profileData.customImageURL,
+        photoURL: safePhotoURL,
+        customImageURL: profileData.customImageURL ? safeCustomImageURL : profileData.customImageURL,
         school: profileData.school,
         bio: profileData.bio,
         phone: profileData.phone,
@@ -758,10 +810,12 @@ async function updateUserProfileSafe(email: string, profileData: {
         if (profileData.isOnline !== undefined) updateData.isOnline = profileData.isOnline;
         if (profileData.lastSeen) updateData.lastSeen = profileData.lastSeen;
         if (profileData.displayName) updateData.displayName = profileData.displayName;
-        if (profileData.photoURL) updateData.photoURL = profileData.photoURL;
+        if (safePhotoURL) updateData.photoURL = safePhotoURL;
         if (profileData.customImageURL !== undefined) {
           if (profileData.customImageURL) {
-            updateData.customImageURL = profileData.customImageURL;
+            if (safeCustomImageURL) {
+              updateData.customImageURL = safeCustomImageURL;
+            }
           } else {
             // Use deleteField to explicitly remove the customImageURL field when null or empty
             updateData.customImageURL = deleteField();
@@ -834,7 +888,8 @@ async function updateUserProfileSafe(email: string, profileData: {
 // Ensure newly authorized user doc gets a default Google photo if missing
 async function ensureAuthorizedEmailHasPhoto(email: string, googlePhotoURL?: string | null): Promise<void> {
   try {
-    if (!googlePhotoURL) return; // Nothing to set
+    const safeGooglePhotoURL = sanitizeProfileImageUrl(googlePhotoURL, 'photoURL');
+    if (!safeGooglePhotoURL) return; // Nothing safe to set
     const normalized = email.toLowerCase();
     const emailKey = sanitizeEmailKey(normalized);
     const tenantIds = await getActiveTenantIdsForPresence(normalized);
@@ -847,7 +902,7 @@ async function ensureAuthorizedEmailHasPhoto(email: string, googlePhotoURL?: str
         if (!profileSnap.exists()) return;
         const data = profileSnap.data() as any;
         if (!data.photoURL && !data.customImageURL) {
-          await setDoc(profileRef, { photoURL: googlePhotoURL, updatedAt: new Date() }, { merge: true });
+          await setDoc(profileRef, { photoURL: safeGooglePhotoURL, updatedAt: new Date() }, { merge: true });
         }
       })
     );
@@ -2649,13 +2704,18 @@ async function getUserProfile(email: string): Promise<{
       };
     }
 
-    // Fallback: Try to get user profile from the users collection (if it exists)
-    const userRef = doc(firestore, 'users', auth.currentUser?.uid || 'unknown');
-    
+    // Fallback: Try to get user profile from the users collection by email.
     try {
-      const docSnap = await getDoc(userRef);
-      if (docSnap.exists()) {
-        const data = docSnap.data();
+      const usersByEmailQuery = query(
+        collection(firestore, 'users'),
+        where('email', '==', normalizedEmail),
+        limit(1)
+      );
+      const usersByEmailSnap = await getDocs(usersByEmailQuery);
+      const matchedDoc = usersByEmailSnap.docs[0];
+
+      if (matchedDoc) {
+        const data = matchedDoc.data();
         return {
           email: data.email || normalizedEmail,
           displayName: data.displayName || email.split('@')[0],

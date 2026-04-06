@@ -1336,7 +1336,7 @@ const TenantMembershipManager = () => {
               )}
             </View>
             <View style={styles.actionContent}>
-              <Text style={[styles.actionTitle, { color: theme.text }]}>Flavortown Reviewer quick join</Text>
+              <Text style={[styles.actionTitle, { color: theme.text }]}>App Reviewer quick join</Text>
               <Text style={[styles.actionSubtitle, { color: theme.textSecondary }]}>Quickly request access to {reviewerQuickJoinCenterName}</Text>
             </View>
             <ChevronRight size={18} color={theme.textSecondary} />

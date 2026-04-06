@@ -161,7 +161,9 @@ export default function Chat() {
   const tenantMembersRequestIdRef = useRef(0);
   const teamMembersVisibleLoadCountRef = useRef(0);
   const tenantRosterRef = useRef<TeamMember[]>([]);
+  const profileSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
   const presenceSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
+  const rawProfileSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
   const rawPresenceSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
   const [retryingPendingMessages, setRetryingPendingMessages] = useState<Set<string>>(new Set());
   const clearAttachmentFinalizeTimer = useCallback((tempId: string) => {
@@ -197,7 +199,11 @@ export default function Chat() {
   );
 
     const mergeRosterWithPresence = useCallback(
-      (roster: TeamMember[], presenceMap: Map<string, TeamMember>): TeamMember[] => {
+      (
+        roster: TeamMember[],
+        presenceMap: Map<string, TeamMember>,
+        profileMap: Map<string, TeamMember>
+      ): TeamMember[] => {
         if (!roster || roster.length === 0) {
           return [];
         }
@@ -205,8 +211,9 @@ export default function Chat() {
         return roster.map((member) => {
           const key = member.email?.toLowerCase?.() || member.id;
           const presence = key ? presenceMap.get(key) : undefined;
+          const profile = key ? profileMap.get(key) : undefined;
 
-          if (!presence) {
+          if (!presence && !profile) {
             return member;
           }
 
@@ -214,19 +221,19 @@ export default function Chat() {
             ...member,
             role: member.role, // ensure tenant role overwrites stale role values
             tenantRole: member.tenantRole,
-            name: presence.name || member.name,
-            avatar: presence.avatar || member.avatar,
-            photoURL: presence.photoURL ?? member.photoURL,
-            customImageURL: presence.customImageURL ?? member.customImageURL,
-            isOnline: presence.isOnline ?? member.isOnline,
-            lastSeen: presence.lastSeen ?? member.lastSeen,
-            typingTo: presence.typingTo ?? member.typingTo,
-            school: presence.school ?? member.school,
-            bio: presence.bio ?? member.bio,
-            phone: presence.phone ?? member.phone,
-            dateOfBirth: presence.dateOfBirth ?? member.dateOfBirth,
-            salutation: presence.salutation ?? member.salutation,
-            subjects: presence.subjects ?? member.subjects,
+            name: profile?.name || presence?.name || member.name,
+            avatar: profile?.avatar || presence?.avatar || member.avatar,
+            photoURL: profile?.photoURL ?? presence?.photoURL ?? member.photoURL,
+            customImageURL: profile?.customImageURL ?? presence?.customImageURL ?? member.customImageURL,
+            isOnline: presence?.isOnline ?? member.isOnline,
+            lastSeen: presence?.lastSeen ?? member.lastSeen,
+            typingTo: presence?.typingTo ?? member.typingTo,
+            school: profile?.school ?? member.school,
+            bio: profile?.bio ?? member.bio,
+            phone: profile?.phone ?? member.phone,
+            dateOfBirth: profile?.dateOfBirth ?? member.dateOfBirth,
+            salutation: profile?.salutation ?? member.salutation,
+            subjects: profile?.subjects ?? member.subjects,
           } satisfies TeamMember;
         });
       },
@@ -248,6 +255,29 @@ export default function Chat() {
 
       const filtered = new Map<string, TeamMember>();
       rawPresenceSnapshotRef.current.forEach((member, key) => {
+        if (rosterEmails.has(key)) {
+          filtered.set(key, member);
+        }
+      });
+
+      return filtered;
+    }, []);
+
+    const buildProfileSnapshotForRoster = useCallback((
+      roster: TeamMember[],
+    ): Map<string, TeamMember> => {
+      if (!roster || roster.length === 0) {
+        return new Map();
+      }
+
+      const rosterEmails = new Set(
+        roster
+          .map((member) => member.email?.toLowerCase?.())
+          .filter((value): value is string => Boolean(value))
+      );
+
+      const filtered = new Map<string, TeamMember>();
+      rawProfileSnapshotRef.current.forEach((member, key) => {
         if (rosterEmails.has(key)) {
           filtered.set(key, member);
         }
@@ -3026,8 +3056,10 @@ export default function Chat() {
 
       tenantRosterRef.current = normalizedMembers;
       const filteredPresence = buildPresenceSnapshotForRoster(normalizedMembers);
+      const filteredProfiles = buildProfileSnapshotForRoster(normalizedMembers);
       presenceSnapshotRef.current = filteredPresence;
-      setTeamMembers(mergeRosterWithPresence(normalizedMembers, filteredPresence));
+      profileSnapshotRef.current = filteredProfiles;
+      setTeamMembers(mergeRosterWithPresence(normalizedMembers, filteredPresence, filteredProfiles));
     } catch (error) {
       logger.warn('Chat: failed to load tenant members', { error, tenantId: activeTenant?.id });
       if (tenantMembersRequestIdRef.current !== requestId) {
@@ -3037,13 +3069,14 @@ export default function Chat() {
       setTeamMembers([]);
       setTeamMembersError('Unable to load team members. Pull to refresh to try again.');
       presenceSnapshotRef.current = new Map();
+      profileSnapshotRef.current = new Map();
     } finally {
       if (hasVisibleLoader) {
         teamMembersVisibleLoadCountRef.current = Math.max(0, teamMembersVisibleLoadCountRef.current - 1);
         setTeamMembersLoading(teamMembersVisibleLoadCountRef.current > 0);
       }
     }
-  }, [activeTenant?.id, buildPresenceSnapshotForRoster, mergeRosterWithPresence]);
+  }, [activeTenant?.id, buildPresenceSnapshotForRoster, buildProfileSnapshotForRoster, mergeRosterWithPresence]);
 
   useEffect(() => {
     loadTenantTeamMembers();
@@ -3062,11 +3095,62 @@ export default function Chat() {
 
   useEffect(() => {
     if (!activeTenant?.id) {
+      rawProfileSnapshotRef.current = new Map();
       rawPresenceSnapshotRef.current = new Map();
+      profileSnapshotRef.current = new Map();
       presenceSnapshotRef.current = new Map();
-      setTeamMembers(mergeRosterWithPresence(tenantRosterRef.current, new Map()));
+      setTeamMembers(mergeRosterWithPresence(tenantRosterRef.current, new Map(), new Map()));
       return;
     }
+
+    const profileQuery = query(
+      collection(firestore, 'tenantProfiles'),
+      where('tenantId', '==', activeTenant.id)
+    );
+
+    const unsubscribeProfiles = onSnapshot(
+      profileQuery,
+      (snapshot) => {
+        const profileMap = new Map<string, TeamMember>();
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as any;
+          const emailKey = String(data?.email || '').toLowerCase().trim();
+          if (!emailKey) {
+            return;
+          }
+
+          profileMap.set(emailKey, {
+            id: emailKey,
+            email: emailKey,
+            name: typeof data?.displayName === 'string' ? data.displayName.trim() : '',
+            avatar: '',
+            role: 'user',
+            photoURL: typeof data?.photoURL === 'string' ? data.photoURL : undefined,
+            customImageURL: typeof data?.customImageURL === 'string' ? data.customImageURL : undefined,
+            school: typeof data?.school === 'string' ? data.school : undefined,
+            bio: typeof data?.bio === 'string' ? data.bio : undefined,
+            phone: typeof data?.phone === 'string' ? data.phone : undefined,
+            dateOfBirth: typeof data?.dateOfBirth === 'string' ? data.dateOfBirth : undefined,
+            salutation: data?.salutation === 'Mr.' || data?.salutation === 'Ms.' ? data.salutation : undefined,
+            subjects: Array.isArray(data?.subjects) ? data.subjects : undefined,
+          });
+        });
+
+        rawProfileSnapshotRef.current = profileMap;
+        const filteredProfiles = buildProfileSnapshotForRoster(tenantRosterRef.current);
+        profileSnapshotRef.current = filteredProfiles;
+        setTeamMembers(
+          mergeRosterWithPresence(
+            tenantRosterRef.current,
+            presenceSnapshotRef.current,
+            filteredProfiles
+          )
+        );
+      },
+      (error) => {
+        logger.warn('Chat: tenantProfiles listener failed', { error, tenantId: activeTenant.id });
+      }
+    );
 
     const presenceQuery = query(
       collection(firestore, 'tenantPresence'),
@@ -3089,21 +3173,25 @@ export default function Chat() {
           presenceMap.set(emailKey, {
             id: emailKey,
             email: emailKey,
-            name: typeof data?.displayName === 'string' ? data.displayName.trim() : '',
+            name: '',
             avatar: '',
             role: 'user',
             isOnline: deriveRealtimeOnline(data?.isOnline, data?.lastSeen),
             lastSeen: typeof data?.lastSeen === 'string' ? data.lastSeen : undefined,
             typingTo,
-            photoURL: typeof data?.photoURL === 'string' ? data.photoURL : undefined,
-            customImageURL: typeof data?.customImageURL === 'string' ? data.customImageURL : undefined,
           });
         });
 
         rawPresenceSnapshotRef.current = presenceMap;
         const filtered = buildPresenceSnapshotForRoster(tenantRosterRef.current);
         presenceSnapshotRef.current = filtered;
-        setTeamMembers(mergeRosterWithPresence(tenantRosterRef.current, filtered));
+        setTeamMembers(
+          mergeRosterWithPresence(
+            tenantRosterRef.current,
+            filtered,
+            profileSnapshotRef.current
+          )
+        );
       },
       (error) => {
         logger.warn('Chat: tenantPresence listener failed', { error, tenantId: activeTenant.id });
@@ -3112,10 +3200,13 @@ export default function Chat() {
 
     return () => {
       try {
+        unsubscribeProfiles?.();
+      } catch {}
+      try {
         unsubscribe?.();
       } catch {}
     };
-  }, [activeTenant?.id, buildPresenceSnapshotForRoster, mergeRosterWithPresence]);
+  }, [activeTenant?.id, buildPresenceSnapshotForRoster, buildProfileSnapshotForRoster, mergeRosterWithPresence]);
 
   // Subscribe to conversation summaries for the current user
   useEffect(() => {

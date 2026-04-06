@@ -276,7 +276,7 @@ export default function SignInCard({
                 disabled={loading}
               >
                 <Text style={styles.reviewerQuickButtonText}>
-                  Flavortown Reviewer Quick Sign-In to {reviewerQuickJoinCenterName || 'legacy-coachin'}
+                  App Reviewer Quick Sign-In to {reviewerQuickJoinCenterName || 'legacy-coachin'}
                 </Text>
               </TouchableOpacity>
             )}

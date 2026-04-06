@@ -568,16 +568,14 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
         continue;
       }
 
-      if (deviceData.isOnline !== true) {
-        stats.skipped.offlineDevice += 1;
-        if (debugMatch) {
-          console.log('[daily_quote_job] debug skipped offlineDevice', {
-            userEmail,
-            deviceId,
-            token: expoPushTokenRaw,
-          });
-        }
-        continue;
+      const deviceIsOnline = deviceData.isOnline === true;
+      if (!deviceIsOnline && debugMatch) {
+        // Do not hard-skip quotes for offline devices: push can still deliver while app/browser is backgrounded.
+        console.log('[daily_quote_job] debug offlineDeviceIncluded', {
+          userEmail,
+          deviceId,
+          token: expoPushTokenRaw,
+        });
       }
 
       if (deviceData.notificationsEnabled === false) {

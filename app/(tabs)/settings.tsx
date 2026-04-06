@@ -782,16 +782,52 @@ export default function Settings() {
   const saveProfile = async () => {
     try {
   setSavingProfile(true);
+      const googlePhotoURLRaw = user?.email ? await getOriginalGooglePhotoURL(user.email) : '';
+      const fallbackGooglePhotoURL = isRemoteProfileImageUrl(googlePhotoURLRaw)
+        ? googlePhotoURLRaw
+        : (isRemoteProfileImageUrl(user?.photoURL) ? (user?.photoURL as string) : '');
+      const previousProfilePictureUrl =
+        originalProfilePictureURL ||
+        (isRemoteProfileImageUrl(user?.photoURL) ? (user?.photoURL as string) : '') ||
+        (isRemoteProfileImageUrl(profileData.photoURL) ? (profileData.photoURL as string) : '');
+      let forceGoogleFallback = false;
+      let clearCustomImageUrl = false;
+      let showGoogleFallbackNotice = false;
+      let uploadedPhotoUrlFromPending: string | undefined;
+
       // If there's a pending local image preview and it's selected as current, upload it now
       if (pendingProfilePictureUri && user?.email) {
-        if (getCurrentProfilePictureURL() === pendingProfilePictureUri) {
+        const currentPhotoBeforeUpload = getCurrentProfilePictureURL();
+        const shouldUploadPendingImage =
+          currentPhotoBeforeUpload === pendingProfilePictureUri ||
+          !isRemoteProfileImageUrl(currentPhotoBeforeUpload);
+
+        if (shouldUploadPendingImage) {
           setUploadingProfilePicture(true);
           setUploadProgress(0);
-          await uploadCustomProfilePicture(pendingProfilePictureUri);
+          try {
+            const uploaded = await uploadCustomProfilePicture(pendingProfilePictureUri);
+            if (isRemoteProfileImageUrl(uploaded)) {
+              uploadedPhotoUrlFromPending = uploaded;
+            }
+          } catch (uploadError) {
+            // Any upload failure (including quota) must fall back to Google and clear custom URL.
+            forceGoogleFallback = true;
+            clearCustomImageUrl = true;
+            setCurrentProfilePictureURL(fallbackGooglePhotoURL || previousProfilePictureUrl || '');
+            setCustomProfilePicture(null);
+            setPendingProfilePictureUri(null);
+            setSelectedImageFileName(null);
+            setSelectedImageFileSize(null);
+            logger.warn('Profile upload failed; forcing Google profile photo fallback', uploadError);
+            showGoogleFallbackNotice = true;
+          }
           // Clear pending after successful upload
-          setPendingProfilePictureUri(null);
-          setSelectedImageFileName(null);
-          setSelectedImageFileSize(null);
+          if (!forceGoogleFallback) {
+            setPendingProfilePictureUri(null);
+            setSelectedImageFileName(null);
+            setSelectedImageFileSize(null);
+          }
           setUploadingProfilePicture(false);
         } else {
           // Pending exists but user selected Google; discard pending
@@ -805,33 +841,65 @@ export default function Settings() {
       await AsyncStorage.setItem('userProfile', JSON.stringify(profileData));
       
       // Save custom profile picture to AsyncStorage (if exists)
-      if (customProfilePicture) {
-        await AsyncStorage.setItem('customProfilePicture', customProfilePicture);
+      const effectiveCustomPhoto = uploadedPhotoUrlFromPending || customProfilePicture || '';
+      if (!forceGoogleFallback && isRemoteProfileImageUrl(effectiveCustomPhoto)) {
+        await AsyncStorage.setItem('customProfilePicture', effectiveCustomPhoto);
+      } else if (forceGoogleFallback) {
+        await AsyncStorage.removeItem('customProfilePicture');
       }
       
       // Update user profile in Firebase - photoURL is current active image
       if (user?.email) {
         const currentPhotoURL = getCurrentProfilePictureURL();
+        const uploadedCustomPhotoURL = isRemoteProfileImageUrl(uploadedPhotoUrlFromPending)
+          ? uploadedPhotoUrlFromPending
+          : isRemoteProfileImageUrl(customProfilePicture)
+          ? customProfilePicture
+          : undefined;
+        const currentPhotoIsRemote = isRemoteProfileImageUrl(currentPhotoURL);
+        const photoURLToPersist =
+          forceGoogleFallback
+            ? fallbackGooglePhotoURL
+            : uploadedCustomPhotoURL
+            ? uploadedCustomPhotoURL
+            : currentPhotoIsRemote
+            ? currentPhotoURL
+            : fallbackGooglePhotoURL;
+
+        if (currentPhotoURL && !currentPhotoIsRemote && !uploadedCustomPhotoURL) {
+          logger.warn('Skipping non-remote profile photo URL during saveProfile', {
+            length: currentPhotoURL.length,
+          });
+          clearCustomImageUrl = true;
+        }
+
         // Determine if the currently selected image is a custom image
         let customUrlToSave: string | undefined;
-        try {
-          const googlePhotoURL = await getOriginalGooglePhotoURL(user.email);
-          if (currentPhotoURL && currentPhotoURL !== googlePhotoURL) {
+        if (!clearCustomImageUrl) {
+          try {
+            const googlePhotoURL = fallbackGooglePhotoURL;
+            if (photoURLToPersist && photoURLToPersist !== googlePhotoURL) {
             // Selected is a custom image; store it in customImageURL
-            customUrlToSave = currentPhotoURL;
-          } else if (customProfilePicture) {
+              customUrlToSave = photoURLToPersist;
+            } else if (uploadedCustomPhotoURL && isRemoteProfileImageUrl(uploadedCustomPhotoURL)) {
+            // Prefer URL returned by current upload attempt
+              customUrlToSave = uploadedCustomPhotoURL;
+            } else if (customProfilePicture && isRemoteProfileImageUrl(customProfilePicture)) {
             // Fallback: we have a known custom profile picture URL
-            customUrlToSave = customProfilePicture;
-          } else if (user?.customImageURL) {
+              customUrlToSave = customProfilePicture;
+            } else if (user?.customImageURL && isRemoteProfileImageUrl(user.customImageURL)) {
             // Preserve existing customImageURL if any
-            customUrlToSave = user.customImageURL;
-          }
-        } catch {}
+              customUrlToSave = user.customImageURL;
+            }
+          } catch {}
+        }
 
         await authService.updateUserProfileSafe(user.email, {
           displayName: profileData.displayName,
-          photoURL: currentPhotoURL, // This is the current active image
-          ...(customUrlToSave ? { customImageURL: customUrlToSave } : {}),
+          ...(photoURLToPersist ? { photoURL: photoURLToPersist } : {}),
+          ...(clearCustomImageUrl
+            ? { customImageURL: null }
+            : (customUrlToSave ? { customImageURL: customUrlToSave } : {})),
           school: profileData.school,
           bio: profileData.bio,
           phone: profileData.phone,
@@ -841,7 +909,14 @@ export default function Settings() {
         });
         
         // Update profileData with the current photo URL for consistency
-        setProfileData(prev => ({ ...prev, photoURL: currentPhotoURL }));
+        if (photoURLToPersist) {
+          setCurrentProfilePictureURL(photoURLToPersist);
+          setProfileData(prev => ({ ...prev, photoURL: photoURLToPersist }));
+        }
+
+        if (clearCustomImageUrl) {
+          setCustomProfilePicture(null);
+        }
       }
       
   // Update original data to current data
@@ -849,6 +924,12 @@ export default function Settings() {
   // Reset the upload tracking flag since changes are saved
       setNewCustomPictureUploaded(false);
   setEditingProfile(false);
+      if (showGoogleFallbackNotice) {
+        Alert.alert(
+          'Profile photo reverted',
+          'Custom photo upload failed (including storage quota errors). We switched back to your Google profile photo.'
+        );
+      }
   // Removed success alert for silent save UX
     } catch (error) {
       logger.error('Error saving profile:', error);
@@ -1004,9 +1085,11 @@ export default function Settings() {
     }
   };
 
-  const uploadCustomProfilePicture = async (uri: string) => {
+  const uploadCustomProfilePicture = async (uri: string): Promise<string> => {
     try {
-      if (!user?.email) return;
+      if (!user?.email) {
+        throw new Error('User email missing for profile upload');
+      }
       // Overwrite upload (legacy cleanup removed)
       const photoURL = await chatService.uploadProfilePicture(uri, user.email, (progress) => {
         setUploadProgress(progress);
@@ -1018,22 +1101,18 @@ export default function Settings() {
       setCurrentProfilePictureURL(photoURL);
       // Mark that a new custom picture was uploaded during this editing session
       setNewCustomPictureUploaded(true);
-      
-      // Update Firestore - set both photoURL (current active) and customImageURL (backup)
-      await authService.updateUserProfileSafe(user.email, {
-        photoURL: photoURL, // Current active image in tenant profile
-        customImageURL: photoURL, // Backup for switching
-      });
-      
+
       // Update local profileData for consistency
       setProfileData(prev => ({ ...prev, photoURL: photoURL }));
+
+      return photoURL;
 
   // Previous image deletion removed intentionally (single overwrite path)
       
   // Removed success alert after custom profile picture upload for cleaner UX
     } catch (error) {
       logger.error('❌ ERROR: Profile picture upload failed:', error);
-      Alert.alert('Error', 'Failed to upload profile picture');
+      throw error;
     }
   };
 
@@ -1086,6 +1165,12 @@ export default function Settings() {
   // Get the current profile picture URL - show what's currently selected in UI first
   const getCurrentProfilePictureURL = () => {
     return currentProfilePictureURL || user?.photoURL || profileData.photoURL || '';
+  };
+
+  const isRemoteProfileImageUrl = (value: string | null | undefined): boolean => {
+    if (!value) return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized.startsWith('https://') || normalized.startsWith('http://');
   };
 
   // Helper: format bytes to human-readable text
