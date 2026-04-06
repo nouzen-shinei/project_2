@@ -55,7 +55,7 @@ import { setLastInAppRoute } from '../lib/lastInAppRoute';
 import { tryPresentModalAlert } from '../services/modalAlertService';
 import { wasStorageLimitReachedAlertShownRecently } from '../services/storageLimitAlert';
 import { runtimeEndpoints } from '../services/runtimeEndpoints';
-import { ensurePwaHeadTags, initPWAInstallPrompt, registerServiceWorker } from '../lib/pwa';
+import { ensurePwaHeadTags, ensureWebFontPreloads, initPWAInstallPrompt, registerServiceWorker } from '../lib/pwa';
 import ReloginRequiredModal from '../components/ReloginRequiredModal';
 
 SplashScreen.preventAutoHideAsync();
@@ -107,8 +107,26 @@ if (typeof document !== 'undefined') {
   // Initialize PWA capabilities (web-only)
   try {
     ensurePwaHeadTags();
+    ensureWebFontPreloads();
     registerServiceWorker();
     initPWAInstallPrompt();
+  } catch {}
+
+  // Some browsers may emit a fontfaceobserver timeout rejection while custom
+  // web fonts are still resolving over slow networks; treat it as non-fatal.
+  try {
+    if (typeof window !== 'undefined') {
+      const winAny = window as any;
+      if (!winAny.__fontTimeoutRejectionHandlerInstalled) {
+        window.addEventListener('unhandledrejection', (event) => {
+          const message = ((event as any)?.reason?.message || (event as any)?.reason || '').toString();
+          if (/^\d+ms timeout exceeded$/i.test(message)) {
+            event.preventDefault();
+          }
+        });
+        winAny.__fontTimeoutRejectionHandlerInstalled = true;
+      }
+    }
   } catch {}
 }
 
@@ -180,6 +198,7 @@ export default function RootLayout() {
   const [tenantBootstrapped, setTenantBootstrapped] = useState(false);
   const [splashHidden, setSplashHidden] = useState(false);
   const [authRedirectPending, setAuthRedirectPending] = useState(false);
+  const [fontGraceElapsed, setFontGraceElapsed] = useState(false);
 
   // Safety net: never keep the native splash up forever.
   useEffect(() => {
@@ -317,7 +336,8 @@ export default function RootLayout() {
 
   // No offline page - disabled completely
 
-  const [fontsLoaded, fontError] = useFonts({
+  const shouldLoadRuntimeFonts = Platform.OS !== 'web';
+  const [fontsLoaded, fontError] = useFonts(shouldLoadRuntimeFonts ? {
     'Inter-Regular': Inter_400Regular,
     'Inter-Medium': Inter_500Medium,
     'Inter-SemiBold': Inter_600SemiBold,
@@ -326,7 +346,21 @@ export default function RootLayout() {
     'Poppins-Medium': Poppins_500Medium,
     'Poppins-SemiBold': Poppins_600SemiBold,
     'Poppins-Bold': Poppins_700Bold,
-  });
+  } : {});
+
+  useEffect(() => {
+    if (fontsLoaded || fontError || fontGraceElapsed) {
+      return;
+    }
+
+    // Keep a short grace period to avoid startup flash, then continue with fallback fonts.
+    const timeout = setTimeout(() => {
+      setFontGraceElapsed(true);
+      logger.warn('[RootLayout] Font grace timeout reached; continuing with fallback fonts');
+    }, 1500);
+
+    return () => clearTimeout(timeout);
+  }, [fontsLoaded, fontError, fontGraceElapsed]);
 
   useEffect(() => {
     // Keep the native splash visible until:
@@ -337,7 +371,7 @@ export default function RootLayout() {
       return;
     }
 
-    const fontsReady = Boolean(fontsLoaded || fontError);
+    const fontsReady = Boolean(fontsLoaded || fontError || fontGraceElapsed);
     const authReady = Boolean(isInitialized && !loading);
     const tenantReady = user?.isAuthorized ? tenantBootstrapped : true;
 
@@ -347,7 +381,7 @@ export default function RootLayout() {
       });
       setSplashHidden(true);
     }
-  }, [fontsLoaded, fontError, isInitialized, loading, user?.isAuthorized, tenantBootstrapped, splashHidden]);
+  }, [fontsLoaded, fontError, fontGraceElapsed, isInitialized, loading, user?.isAuthorized, tenantBootstrapped, splashHidden]);
 
   // Global handler for billing delinquency enforcement (HTTP 402 billing_past_due)
   useEffect(() => {
@@ -502,10 +536,6 @@ export default function RootLayout() {
       sessionStorage.setItem('navigation_active', 'true');
     }
   }, [user, loading, isOffline, segments, hasRedirected, router]);
-
-  if (!fontsLoaded && !fontError) {
-    return null;
-  }
 
   // Show splash/loading while auth is initializing
   if (loading || !isInitialized || authRedirectPending) {

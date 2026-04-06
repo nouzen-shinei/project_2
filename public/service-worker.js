@@ -12,6 +12,57 @@ self.addEventListener('message', (event) => {
   }
 });
 
+const FONT_CACHE = 'tm-font-cache-v1';
+
+function isFontRequest(request) {
+  if (!request || request.method !== 'GET') {
+    return false;
+  }
+
+  const destination = request.destination || '';
+  if (destination === 'font') {
+    return true;
+  }
+
+  try {
+    const url = new URL(request.url);
+    if (url.origin !== self.location.origin) {
+      return false;
+    }
+    return /\.(woff2?|ttf|otf)$/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  if (!isFontRequest(request)) {
+    return;
+  }
+
+  event.respondWith((async () => {
+    const cache = await caches.open(FONT_CACHE);
+    const cached = await cache.match(request);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const networkResponse = await fetch(request);
+      if (networkResponse && networkResponse.ok) {
+        cache.put(request, networkResponse.clone()).catch(() => {});
+      }
+      return networkResponse;
+    } catch {
+      if (cached) {
+        return cached;
+      }
+      throw new Error('font_fetch_failed');
+    }
+  })());
+});
+
 const DIAGNOSTICS_DB_NAME = 'tm-web-push-diagnostics';
 const DIAGNOSTICS_STORE_NAME = 'kv';
 

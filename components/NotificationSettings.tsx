@@ -595,7 +595,12 @@ const NotificationsPage: React.FC<NotificationsPageProps> = ({ onClose }) => {
         <View style={styles.modalBackdrop}>
           <View style={[styles.modalContent, { backgroundColor: theme.surface }]}> 
             <ActivityIndicator size="large" color={theme.primary} />
-            <Text style={[styles.modalText, { color: theme.textSecondary }]}>
+            <Text
+              style={[styles.modalText, { color: theme.textSecondary }]}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.82}
+            >
               {processingMessage ?? 'Processing notification changes…'}
             </Text>
           </View>
@@ -697,8 +702,8 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   modalContent: {
-    width: '70%',
-    maxWidth: 320,
+    width: '88%',
+    maxWidth: 420,
     borderRadius: 18,
     paddingVertical: 32,
     paddingHorizontal: 24,

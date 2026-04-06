@@ -276,6 +276,7 @@ const TenantMembershipManager = () => {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'pending' | 'rejected' | 'revoked'>('all');
+  const [showAdditionalOptions, setShowAdditionalOptions] = useState(false);
 
   const filteredMembershipRows = useMemo(() => {
     const queryValue = searchQuery.trim().toLowerCase();
@@ -325,6 +326,8 @@ const TenantMembershipManager = () => {
   const activeCount = useMemo(() => {
     return membershipRows.filter(({ membership }) => membership.status === 'active').length;
   }, [membershipRows]);
+
+  const hasJoinedCoachingCenter = activeCount > 0;
 
   const rejectedCount = useMemo(() => {
     return membershipRows.filter(({ membership }) => membership.status === 'rejected').length;
@@ -1288,59 +1291,88 @@ const TenantMembershipManager = () => {
       )}
 
       <View style={styles.actionStack}>
-        <TouchableOpacity
-          style={[styles.actionCard, styles.actionCardFirst, styles.secondaryActionCard, { borderColor: theme.border, backgroundColor: theme.surface }]}
-          onPress={openCreateModal}
-        >
-          <View style={[styles.actionIcon, { backgroundColor: `${theme.primary}1A` }]}>
-            <CheckCircle2 size={18} color={theme.primary} />
-          </View>
-          <View style={styles.actionContent}>
-            <Text style={[styles.actionTitle, { color: theme.text }]}>Create a coaching center</Text>
-            <Text style={[styles.actionSubtitle, { color: theme.textSecondary }]}>Spin up a new workspace as owner</Text>
-          </View>
-          <ChevronRight size={18} color={theme.textSecondary} />
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[styles.actionCard, styles.primaryActionCard, { backgroundColor: theme.primary }]}
-          onPress={openJoinModal}
-        >
-          <View style={[styles.actionIcon, styles.primaryActionIcon]}>
-            <Plus size={18} color="#fff" />
-          </View>
-          <View style={styles.actionContent}>
-            <Text style={[styles.actionTitle, styles.primaryActionText]}>Join a coaching center</Text>
-            <Text style={[styles.actionSubtitle, styles.primaryActionTextMuted]}>Use a join code from an admin</Text>
-          </View>
-          <ChevronRight size={18} color="rgba(255,255,255,0.85)" />
-        </TouchableOpacity>
-
-        {reviewerQuickJoinEnabled && (
+        {hasJoinedCoachingCenter ? (
           <TouchableOpacity
             style={[
-              styles.actionCard,
+              styles.additionalOptionsToggle,
               styles.secondaryActionCard,
-              { borderColor: theme.border, backgroundColor: theme.surface, opacity: reviewerQuickJoining ? 0.75 : 1 },
+              { borderColor: theme.border, backgroundColor: theme.surface },
             ]}
-            onPress={() => {
-              void handleReviewerQuickJoin();
-            }}
-            disabled={reviewerQuickJoining}
+            onPress={() => setShowAdditionalOptions((prev) => !prev)}
           >
-            <View style={[styles.actionIcon, { backgroundColor: `${theme.success}1A` }]}>
-              {reviewerQuickJoining ? (
-                <ActivityIndicator size="small" color={theme.success} />
-              ) : (
-                <Users size={18} color={theme.success} />
-              )}
-            </View>
-            <View style={styles.actionContent}>
-              <Text style={[styles.actionTitle, { color: theme.text }]}>App Reviewer quick join</Text>
-              <Text style={[styles.actionSubtitle, { color: theme.textSecondary }]}>Quickly request access to {reviewerQuickJoinCenterName}</Text>
-            </View>
-            <ChevronRight size={18} color={theme.textSecondary} />
+            <Text style={[styles.additionalOptionsToggleText, { color: theme.text }]}>
+              {showAdditionalOptions ? 'Hide additional options' : 'Show additional options'}
+            </Text>
+            {showAdditionalOptions ? (
+              <ChevronDown size={18} color={theme.textSecondary} />
+            ) : (
+              <ChevronRight size={18} color={theme.textSecondary} />
+            )}
           </TouchableOpacity>
+        ) : null}
+
+        {(!hasJoinedCoachingCenter || showAdditionalOptions) && (
+          <>
+            <TouchableOpacity
+              style={[
+                styles.actionCard,
+                !hasJoinedCoachingCenter ? styles.actionCardFirst : null,
+                styles.secondaryActionCard,
+                { borderColor: theme.border, backgroundColor: theme.surface },
+              ]}
+              onPress={openCreateModal}
+            >
+              <View style={[styles.actionIcon, { backgroundColor: `${theme.primary}1A` }]}> 
+                <CheckCircle2 size={18} color={theme.primary} />
+              </View>
+              <View style={styles.actionContent}>
+                <Text style={[styles.actionTitle, { color: theme.text }]}>Create a coaching center</Text>
+                <Text style={[styles.actionSubtitle, { color: theme.textSecondary }]}>Spin up a new workspace as owner</Text>
+              </View>
+              <ChevronRight size={18} color={theme.textSecondary} />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.actionCard, styles.primaryActionCard, { backgroundColor: theme.primary }]}
+              onPress={openJoinModal}
+            >
+              <View style={[styles.actionIcon, styles.primaryActionIcon]}>
+                <Plus size={18} color="#fff" />
+              </View>
+              <View style={styles.actionContent}>
+                <Text style={[styles.actionTitle, styles.primaryActionText]}>Join a coaching center</Text>
+                <Text style={[styles.actionSubtitle, styles.primaryActionTextMuted]}>Use a join code from an admin</Text>
+              </View>
+              <ChevronRight size={18} color="rgba(255,255,255,0.85)" />
+            </TouchableOpacity>
+
+            {reviewerQuickJoinEnabled && (
+              <TouchableOpacity
+                style={[
+                  styles.actionCard,
+                  styles.secondaryActionCard,
+                  { borderColor: theme.border, backgroundColor: theme.surface, opacity: reviewerQuickJoining ? 0.75 : 1 },
+                ]}
+                onPress={() => {
+                  void handleReviewerQuickJoin();
+                }}
+                disabled={reviewerQuickJoining}
+              >
+                <View style={[styles.actionIcon, { backgroundColor: `${theme.success}1A` }]}>
+                  {reviewerQuickJoining ? (
+                    <ActivityIndicator size="small" color={theme.success} />
+                  ) : (
+                    <Users size={18} color={theme.success} />
+                  )}
+                </View>
+                <View style={styles.actionContent}>
+                  <Text style={[styles.actionTitle, { color: theme.text }]}>App Reviewer quick join</Text>
+                  <Text style={[styles.actionSubtitle, { color: theme.textSecondary }]}>Quickly request access to {reviewerQuickJoinCenterName}</Text>
+                </View>
+                <ChevronRight size={18} color={theme.textSecondary} />
+              </TouchableOpacity>
+            )}
+          </>
         )}
       </View>
 
@@ -2033,6 +2065,18 @@ const styles = StyleSheet.create({
   },
   actionStack: {
     marginTop: 16,
+  },
+  additionalOptionsToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  additionalOptionsToggleText: {
+    fontSize: 14,
+    fontWeight: '600',
   },
   actionCard: {
     flexDirection: 'row',

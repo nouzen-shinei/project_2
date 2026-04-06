@@ -37,10 +37,9 @@ export function injectCSP(opts: InjectOptions = {}) {
     ? ["'self'", scriptHashes, scriptExtra].filter(Boolean).join(' ')
     : ["'self'", "'unsafe-eval'", scriptHashes, scriptExtra].filter(Boolean).join(' ');
 
-  // If we have style hashes we can drop unsafe-inline; else keep it for dev.
-  const styleSrc = styleHashesEnabled
-    ? ["'self'", "'unsafe-hashes'", styleHashes].join(' ')
-    : ["'self'", "'unsafe-inline'"].join(' ');
+  // React Native Web emits runtime style attributes; permit style attrs explicitly.
+  // Cannot use hashes since RN Web generates unpredictable dynamic inline styles.
+  const styleSrc = ["'self'", "'unsafe-inline'", 'https:'].join(' ');
 
   // NOTE: Some directives (frame-ancestors, report-uri, report-to) are ignored by browsers when delivered via <meta>.
   // We exclude those that are guaranteed to be ignored to avoid console noise. Use real HTTP headers at CDN/server for enforcement.
@@ -56,7 +55,8 @@ export function injectCSP(opts: InjectOptions = {}) {
     `img-src 'self' data: https:`,
     `font-src 'self' data: https:`,
   `media-src 'self' data: blob: https:`,
-    `style-src ${styleSrc} https:`,
+    `style-src ${styleSrc}`,
+    `style-src-attr 'unsafe-inline'`,
     `script-src ${scriptSrc}`,
   // Allow websocket (dev) & https API calls, and data/blob URIs for local file reads on web
   `connect-src 'self' https: wss: data: blob: ${connectExtra}`.trim(),

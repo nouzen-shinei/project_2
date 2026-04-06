@@ -4,6 +4,7 @@ import { internalTokenManager } from './internalTokenManager';
 import { maybeEmitBillingPastDueFromParsed } from '@/lib/billingPastDue';
 import { runtimeEndpoints } from './runtimeEndpoints';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
+import { auth } from '@/config/firebase';
 
 export interface TenantJoinCodeTenant {
   id: string;
@@ -91,6 +92,12 @@ export class TenantBackendError extends Error {
 
 class TenantBackendClient {
   private readonly debug = process.env.EXPO_PUBLIC_DEBUG_AUTH === '1' || process.env.EXPO_PUBLIC_DEBUG_AUTH === 'true';
+
+  private getAdminBaseUrl(): string | undefined {
+    const snapshot = runtimeEndpoints.getSnapshot();
+    // Admin auth endpoints are expected on the primary API backend.
+    return snapshot.apiBaseUrl || snapshot.notificationsApiBaseUrl || snapshot.chatApiBaseUrl || runtimeEndpoints.getPreferredBackendBaseUrl();
+  }
 
   constructor() {
     const base = runtimeEndpoints.getPreferredBackendBaseUrl();
@@ -250,7 +257,20 @@ class TenantBackendClient {
   }
 
   async getGlobalAdminMe(): Promise<GlobalAdminMeResponse | null> {
-    const baseUrl = runtimeEndpoints.getPreferredBackendBaseUrl();
+    const currentUser = auth.currentUser;
+    if (currentUser) {
+      try {
+        const tokenResult = await currentUser.getIdTokenResult();
+        // Avoid 403 noise for regular users; this endpoint requires global-admin auth.
+        if (tokenResult?.claims?.admin !== true) {
+          return null;
+        }
+      } catch (error) {
+        logger.warn('[tenant-backend] failed to inspect admin claim before global admin probe', error);
+      }
+    }
+
+    const baseUrl = this.getAdminBaseUrl();
     if (!baseUrl) {
       return null;
     }

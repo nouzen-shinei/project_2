@@ -74,7 +74,21 @@
     },
     "plugins": [
       "expo-router",
-      "expo-font",
+      [
+        "expo-font",
+        {
+          "fonts": [
+            "assets/fonts/Inter_400Regular.ttf",
+            "assets/fonts/Inter_500Medium.ttf",
+            "assets/fonts/Inter_600SemiBold.ttf",
+            "assets/fonts/Inter_700Bold.ttf",
+            "assets/fonts/Poppins_400Regular.ttf",
+            "assets/fonts/Poppins_500Medium.ttf",
+            "assets/fonts/Poppins_600SemiBold.ttf",
+            "assets/fonts/Poppins_700Bold.ttf"
+          ]
+        }
+      ],
       "expo-web-browser",
       "expo-localization",
       [

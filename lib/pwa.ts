@@ -24,6 +24,19 @@ function upsertLink(rel: string, href: string, extra?: Record<string, string>) {
   if (!existing) document.head?.appendChild(el);
 }
 
+function upsertPreloadFontLink(href: string) {
+  if (typeof document === 'undefined') return;
+  const selector = `link[rel="preload"][href="${href}"]`;
+  const existing = document.head?.querySelector(selector) as HTMLLinkElement | null;
+  const el = existing || document.createElement('link');
+  el.setAttribute('rel', 'preload');
+  el.setAttribute('as', 'font');
+  el.setAttribute('type', 'font/ttf');
+  el.setAttribute('href', href);
+  el.setAttribute('crossorigin', 'anonymous');
+  if (!existing) document.head?.appendChild(el);
+}
+
 /**
  * Ensure required PWA head tags exist.
  * This is important in Expo web dev, where the served HTML may not come from `web/index.html`.
@@ -42,6 +55,28 @@ export function ensurePwaHeadTags() {
     upsertLink('manifest', '/manifest.json');
     upsertLink('icon', '/favicon.ico');
     upsertLink('apple-touch-icon', '/pwa/apple-touch-icon-180.png', { sizes: '180x180' });
+  } catch {
+    // ignore
+  }
+}
+
+export function ensureWebFontPreloads() {
+  if (typeof document === 'undefined') return;
+  try {
+    const fontUrls = [
+      '/fonts/Inter_400Regular.ttf',
+      '/fonts/Inter_500Medium.ttf',
+      '/fonts/Inter_600SemiBold.ttf',
+      '/fonts/Inter_700Bold.ttf',
+      '/fonts/Poppins_400Regular.ttf',
+      '/fonts/Poppins_500Medium.ttf',
+      '/fonts/Poppins_600SemiBold.ttf',
+      '/fonts/Poppins_700Bold.ttf',
+    ];
+
+    for (const fontUrl of fontUrls) {
+      upsertPreloadFontLink(fontUrl);
+    }
   } catch {
     // ignore
   }

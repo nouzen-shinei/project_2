@@ -42,9 +42,7 @@ export function buildCsp(opts: CspBuildOptions = {}): CspResult {
   const scriptHashes = hashes.script?.length ? hashes.script.join(' ') : '';
 
   const scriptSrc = ["'self'", scriptHashes, ...extraScript].filter(Boolean).join(' ');
-  const styleSrc = hashes.style?.length
-    ? ["'self'", "'unsafe-hashes'", styleHashes].join(' ')
-    : ["'self'", "'unsafe-inline'"].join(' ');
+  const styleSrc = ["'self'", "'unsafe-inline'", 'https:'].join(' ');
 
   const connectSrc = ["'self'", 'https:', 'wss:', 'data:', 'blob:', ...extraConnect].join(' ');
   const frameSrc = ["'self'", ...extraFrame].join(' ');
@@ -58,7 +56,8 @@ export function buildCsp(opts: CspBuildOptions = {}): CspResult {
     "img-src 'self' data: https:",
     "font-src 'self' data: https:",
   "media-src 'self' data: blob: https:",
-    `style-src ${styleSrc} https:`,
+    `style-src ${styleSrc}`,
+    "style-src-attr 'unsafe-inline'",
     `script-src ${scriptSrc}`,
   `connect-src ${connectSrc}`,
   `frame-src ${frameSrc}`,
