@@ -11,6 +11,7 @@
     "prebuild:preview": "node scripts/verifyEnv.js --profile preview && node scripts/enforceProdEnv.js preview",
     "prebuild:production": "node scripts/verifyEnv.js --profile production && node scripts/enforceProdEnv.js production",
     "build:web": "node scripts/verifyEnv.js --profile production && node scripts/enforceProdEnv.js production && expo export --platform web && node scripts/stripHtmlComments.mjs dist && node scripts/generateStyleScriptHashes.mjs dist csp-hashes.json",
+    "pwa:assets": "pwa-asset-generator public/pwa/icon-512.png public/pwa --icon-only --scrape false --type png --padding \"8%\" --background \"transparent\" --opaque false --log false && node scripts/fixTransparentPngRgb.mjs 0 0 0 public/pwa/apple-icon-180.png public/pwa/manifest-icon-192.maskable.png public/pwa/manifest-icon-512.maskable.png",
     "lint": "expo lint",
     "test:unit": "node scripts/runTests.js",
     "migrate:logs": "ts-node scripts/migrateLogsToLogger.ts",
@@ -149,6 +150,8 @@
     "metro": "^0.82.4",
     "metro-config": "^0.82.4",
     "patch-package": "^8.0.0",
+    "pngjs": "^7.0.0",
+    "pwa-asset-generator": "^8.1.4",
     "ts-node": "^10.9.2",
     "typescript": "~5.8.3"
   },

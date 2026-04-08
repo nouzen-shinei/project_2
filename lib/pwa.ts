@@ -24,6 +24,23 @@ function upsertLink(rel: string, href: string, extra?: Record<string, string>) {
   if (!existing) document.head?.appendChild(el);
 }
 
+function upsertThemeColorMeta(content: string, media?: string) {
+  if (typeof document === 'undefined') return;
+  const selector = media
+    ? `meta[name="theme-color"][media="${media}"]`
+    : 'meta[name="theme-color"]:not([media])';
+  const existing = document.head?.querySelector(selector) as HTMLMetaElement | null;
+  const el = existing || document.createElement('meta');
+  el.setAttribute('name', 'theme-color');
+  if (media) {
+    el.setAttribute('media', media);
+  } else {
+    el.removeAttribute('media');
+  }
+  el.setAttribute('content', content);
+  if (!existing) document.head?.appendChild(el);
+}
+
 function upsertPreloadFontLink(href: string) {
   if (typeof document === 'undefined') return;
   const selector = `link[rel="preload"][href="${href}"]`;
@@ -46,15 +63,17 @@ export function ensurePwaHeadTags() {
   try {
     upsertMeta('application-name', 'Tuition Manager');
     upsertMeta('description', 'Complete tuition and coaching class management solution');
-    upsertMeta('theme-color', '#4f46e5');
+    upsertThemeColorMeta('#ffffff', '(prefers-color-scheme: light)');
+    upsertThemeColorMeta('#1e293b', '(prefers-color-scheme: dark)');
+    upsertThemeColorMeta('#1e293b');
     upsertMeta('mobile-web-app-capable', 'yes');
     upsertMeta('apple-mobile-web-app-capable', 'yes');
     upsertMeta('apple-mobile-web-app-status-bar-style', 'black-translucent');
     upsertMeta('apple-mobile-web-app-title', 'Tuition Manager');
 
-    upsertLink('manifest', '/manifest.json');
+    upsertLink('manifest', '/manifest-r12.json');
     upsertLink('icon', '/favicon.ico');
-    upsertLink('apple-touch-icon', '/pwa/apple-touch-icon-180.png', { sizes: '180x180' });
+    upsertLink('apple-touch-icon', '/pwa/apple-icon-180.png?v=20260407r12', { sizes: '180x180' });
   } catch {
     // ignore
   }
@@ -85,6 +104,8 @@ export function ensureWebFontPreloads() {
 export function registerServiceWorker() {
   if (typeof window === 'undefined') return;
   if (!('serviceWorker' in navigator)) return;
+
+  const SERVICE_WORKER_URL = '/service-worker.js?v=20260407r12';
 
   // In development, a registered service worker commonly causes stale bundles to
   // be served on normal refresh (hard refresh bypasses the SW cache). Avoid
@@ -138,12 +159,12 @@ export function registerServiceWorker() {
   }
 
   const doRegister = () => {
-    fetch('/service-worker.js', { method: 'HEAD', cache: 'no-store' })
+    fetch(SERVICE_WORKER_URL, { method: 'HEAD', cache: 'no-store' })
       .then((res) => {
         if (!res.ok) return null;
         const ct = res.headers.get('content-type') || '';
         if (!ct.includes('javascript')) return null;
-        return navigator.serviceWorker.register('/service-worker.js');
+        return navigator.serviceWorker.register(SERVICE_WORKER_URL);
       })
       .then((registration) => {
         if (!registration) return;

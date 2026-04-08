@@ -111,23 +111,6 @@ if (typeof document !== 'undefined') {
     registerServiceWorker();
     initPWAInstallPrompt();
   } catch {}
-
-  // Some browsers may emit a fontfaceobserver timeout rejection while custom
-  // web fonts are still resolving over slow networks; treat it as non-fatal.
-  try {
-    if (typeof window !== 'undefined') {
-      const winAny = window as any;
-      if (!winAny.__fontTimeoutRejectionHandlerInstalled) {
-        window.addEventListener('unhandledrejection', (event) => {
-          const message = ((event as any)?.reason?.message || (event as any)?.reason || '').toString();
-          if (/^\d+ms timeout exceeded$/i.test(message)) {
-            event.preventDefault();
-          }
-        });
-        winAny.__fontTimeoutRejectionHandlerInstalled = true;
-      }
-    }
-  } catch {}
 }
 
 // Install the Alert.alert → in-app modal shim as early as possible.
@@ -549,7 +532,7 @@ export default function RootLayout() {
                   <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colorScheme === 'dark' ? '#0f172a' : '#fff' }}>
                     <Image
                       source={require('../assets/images/icon.png')}
-                      style={{ width: 120, height: 120, marginBottom: 32, borderRadius: 24 }}
+                      style={{ width: 140, height: 140, marginBottom: 28, borderRadius: 30 }}
                       resizeMode="contain"
                     />
                     <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#aaa' : '#888'} />
@@ -761,7 +744,7 @@ const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router, on
       <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colorScheme === 'dark' ? '#0f172a' : '#fff' }}>
         <Image
           source={require('../assets/images/icon.png')}
-          style={{ width: 120, height: 120, marginBottom: 32, borderRadius: 24 }}
+          style={{ width: 140, height: 140, marginBottom: 28, borderRadius: 30 }}
           resizeMode="contain"
         />
         <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#aaa' : '#888'} />

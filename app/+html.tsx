@@ -15,14 +15,16 @@ export default function Root({ children }: { children: React.ReactNode }) {
         <meta name="application-name" content="Tuition Manager" />
         <meta name="description" content="Complete tuition and coaching class management solution" />
         <meta name="google-site-verification" content="FnTndAGX4rzdc8f6zvpaV_4ich9qLQTzH_zfI8nF9I4" />
-        <meta name="theme-color" content="#4f46e5" />
+        <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+        <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1e293b" />
+        <meta name="theme-color" content="#1e293b" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
         <meta name="apple-mobile-web-app-title" content="Tuition Manager" />
 
-        <link rel="manifest" href="/manifest.json" />
-        <link rel="apple-touch-icon" sizes="180x180" href="/pwa/apple-touch-icon-180.png" />
+        <link rel="manifest" href="/manifest-r12.json" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/pwa/apple-icon-180.png?v=20260407r12" />
         <link rel="preload" href="/fonts/Inter_400Regular.ttf" as="font" type="font/ttf" crossOrigin="anonymous" />
         <link rel="preload" href="/fonts/Inter_500Medium.ttf" as="font" type="font/ttf" crossOrigin="anonymous" />
         <link rel="preload" href="/fonts/Inter_600SemiBold.ttf" as="font" type="font/ttf" crossOrigin="anonymous" />

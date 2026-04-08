@@ -10,6 +10,56 @@ interface ThemeProviderProps {
   children: React.ReactNode;
 }
 
+const LIGHT_THEME_COLOR = '#ffffff';
+const DARK_THEME_COLOR = '#1e293b';
+const THEME_MEDIA_LIGHT = '(prefers-color-scheme: light)';
+const THEME_MEDIA_DARK = '(prefers-color-scheme: dark)';
+
+function upsertThemeColorMeta(content: string, media?: string) {
+  if (typeof document === 'undefined') return;
+  const selector = media
+    ? `meta[name="theme-color"][media="${media}"]`
+    : 'meta[name="theme-color"]:not([media])';
+  const existing = document.head?.querySelector(selector) as HTMLMetaElement | null;
+  const el = existing || document.createElement('meta');
+  el.setAttribute('name', 'theme-color');
+  if (media) {
+    el.setAttribute('media', media);
+  } else {
+    el.removeAttribute('media');
+  }
+  el.setAttribute('content', content);
+  if (!existing) document.head?.appendChild(el);
+}
+
+function removeThemeColorMediaMetas() {
+  if (typeof document === 'undefined') return;
+  const metas = document.head?.querySelectorAll('meta[name="theme-color"][media]');
+  if (!metas) return;
+  metas.forEach((meta) => {
+    try {
+      meta.remove();
+    } catch {
+      // ignore
+    }
+  });
+}
+
+function applyWebThemeColor(themeMode: ThemeMode, isDarkMode: boolean) {
+  if (typeof document === 'undefined') return;
+
+  const activeColor = isDarkMode ? DARK_THEME_COLOR : LIGHT_THEME_COLOR;
+  upsertThemeColorMeta(activeColor);
+
+  if (themeMode === 'system') {
+    upsertThemeColorMeta(LIGHT_THEME_COLOR, THEME_MEDIA_LIGHT);
+    upsertThemeColorMeta(DARK_THEME_COLOR, THEME_MEDIA_DARK);
+  } else {
+    // Explicit app theme should win over system preference on web.
+    removeThemeColorMediaMetas();
+  }
+}
+
 export function ThemeProvider({ children }: ThemeProviderProps) {
   const [themeMode, setThemeModeState] = useState<ThemeMode>('system');
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -35,11 +85,15 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
       const root = document.documentElement;
       if (isDarkMode) {
         root.classList.add('dark');
+        root.style.colorScheme = 'dark';
       } else {
         root.classList.remove('dark');
+        root.style.colorScheme = 'light';
       }
+
+      applyWebThemeColor(themeMode, isDarkMode);
     }
-  }, [isDarkMode]);
+  }, [themeMode, isDarkMode]);
 
   const loadTheme = async () => {
     try {

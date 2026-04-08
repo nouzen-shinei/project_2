@@ -18,12 +18,42 @@ export function useNetworkStatus() {
     isWifiEnabled: false,
   });
   const [wasOffline, setWasOffline] = useState(false);
-  const [isInitialized, setIsInitialized] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const previousOnlineStatusRef = useRef<boolean | null>(null);
+  const isInitializedRef = useRef(false);
+  const isInitialLoadRef = useRef(true);
+
+  const resolveConnectionFromState = (state: NetInfoState): {
+    isConnected: boolean;
+    isInternetReachable: boolean;
+    isOnline: boolean;
+  } => {
+    const rawConnected = state.isConnected ?? false;
+    const rawReachable = state.isInternetReachable;
+
+    if (Platform.OS === 'web') {
+      const browserOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+      const isConnected = browserOnline || rawConnected;
+      const isInternetReachable = browserOnline || (rawReachable ?? rawConnected);
+      return {
+        isConnected,
+        isInternetReachable,
+        isOnline: browserOnline,
+      };
+    }
+
+    const isInternetReachable = rawReachable ?? false;
+    const isConnected = rawConnected;
+    return {
+      isConnected,
+      isInternetReachable,
+      isOnline: isConnected && isInternetReachable,
+    };
+  };
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
+    let initialLoadTimer: ReturnType<typeof setTimeout> | undefined;
 
     const setupNetworkListener = async () => {
       try {
@@ -38,11 +68,6 @@ export function useNetworkStatus() {
             type: 'unknown',
             isWifiEnabled: false,
           });
-          // If the app opens while offline, mark that we were offline so we can show
-          // the "Back online" banner once connectivity returns.
-          if (!immediateOnline) {
-            setWasOffline(true);
-          }
           
           if (!immediateOnline) {
             logger.debug('🚨 IMMEDIATE: Page loaded while offline');
@@ -51,9 +76,7 @@ export function useNetworkStatus() {
         
         // Get initial state from NetInfo (more detailed but slower)
         const state = await NetInfo.fetch();
-        const isConnected = state.isConnected ?? false;
-        const isInternetReachable = state.isInternetReachable ?? false;
-        const isOnline = isConnected && isInternetReachable;
+        const { isConnected, isInternetReachable, isOnline } = resolveConnectionFromState(state);
         
         logger.debug('🌐 NetInfo initial state:', { isConnected, isInternetReachable, isOnline });
         
@@ -64,29 +87,26 @@ export function useNetworkStatus() {
           isWifiEnabled: state.isWifiEnabled,
         });
 
-        // If the app starts offline, mark wasOffline so the UI can later show
-        // the "Back online" banner when connectivity is restored.
-        if (!isOnline) {
-          setWasOffline(true);
-        }
-
         // Set initial previous status and mark as initialized
         previousOnlineStatusRef.current = isOnline;
-        setIsInitialized(true);
+        isInitializedRef.current = true;
         
         // After 2 seconds, mark as no longer initial load
-        setTimeout(() => {
+        initialLoadTimer = setTimeout(() => {
+          isInitialLoadRef.current = false;
           setIsInitialLoad(false);
         }, 2000);
 
         // Set up listener for network changes
         unsubscribe = NetInfo.addEventListener((state: NetInfoState) => {
-          const isConnected = state.isConnected ?? false;
-          const isInternetReachable = state.isInternetReachable ?? false;
-          const isNowOnline = isConnected && isInternetReachable;
+          const {
+            isConnected,
+            isInternetReachable,
+            isOnline: isNowOnline,
+          } = resolveConnectionFromState(state);
 
           // Only track offline status changes after initialization AND after initial load period
-          if (previousOnlineStatusRef.current !== null && !isInitialLoad) {
+          if (previousOnlineStatusRef.current !== null && !isInitialLoadRef.current) {
             const wasOnline = previousOnlineStatusRef.current;
             
             // Set wasOffline to true when going from online to offline
@@ -116,7 +136,7 @@ export function useNetworkStatus() {
             const wasOnline = previousOnlineStatusRef.current;
             
             // Only track offline status changes after initialization AND after initial load
-            if (isInitialized && wasOnline !== null && !isInitialLoad) {
+            if (isInitializedRef.current && wasOnline !== null && !isInitialLoadRef.current) {
               // Set wasOffline to true when going from online to offline
               if (wasOnline && !isOnline) {
                 logger.debug('📱 Web: Going offline (after initial load period)');
@@ -124,16 +144,12 @@ export function useNetworkStatus() {
               }
             }
 
-            // Also handle the case where the page loads offline initially.
-            if (!isOnline && wasOnline === null) {
-              setWasOffline(true);
-            }
-
             previousOnlineStatusRef.current = isOnline;
-            if (!isInitialized) {
-              setIsInitialized(true);
+            if (!isInitializedRef.current) {
+              isInitializedRef.current = true;
               // Also set the initial load timer for web
-              setTimeout(() => {
+              initialLoadTimer = setTimeout(() => {
+                isInitialLoadRef.current = false;
                 setIsInitialLoad(false);
               }, 2000);
             }
@@ -160,11 +176,14 @@ export function useNetworkStatus() {
     setupNetworkListener();
 
     return () => {
+      if (initialLoadTimer) {
+        clearTimeout(initialLoadTimer);
+      }
       if (unsubscribe) {
         unsubscribe();
       }
     };
-  }, [isInitialLoad]); // Include isInitialLoad in dependencies
+  }, []);
 
   const isOnline = networkStatus.isConnected && networkStatus.isInternetReachable;
   const isOffline = !isOnline;

@@ -118,6 +118,99 @@ let globalAuthState: {
 const CACHED_USER_KEY = STORAGE_KEYS.cachedUserData;
 const CACHED_AUTH_EMAILS_KEY = STORAGE_KEYS.cachedAuthorizedEmails;
 const MAX_PROFILE_IMAGE_URL_LENGTH = 4096;
+const MAX_PROFILE_DISPLAY_NAME_LENGTH = 120;
+
+function sanitizeDisplayName(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return undefined;
+  }
+
+  return normalized.slice(0, MAX_PROFILE_DISPLAY_NAME_LENGTH);
+}
+
+function fallbackDisplayNameFromEmail(email: string): string {
+  const localPart = email.split('@')[0]?.trim();
+  if (!localPart) {
+    return 'User';
+  }
+  return localPart.slice(0, MAX_PROFILE_DISPLAY_NAME_LENGTH);
+}
+
+function normalizeNameForComparison(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function isEmailPrefixFallbackDisplayName(displayName: unknown, email: string): boolean {
+  const normalizedDisplayName = sanitizeDisplayName(displayName);
+  if (!normalizedDisplayName) {
+    return false;
+  }
+
+  const localPart = email.split('@')[0]?.trim();
+  if (!localPart) {
+    return false;
+  }
+
+  const rawFallback = localPart.slice(0, MAX_PROFILE_DISPLAY_NAME_LENGTH);
+  const spacedFallback = rawFallback.replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const titleFallback = spacedFallback.replace(/\b\w/g, (letter: string) => letter.toUpperCase());
+
+  const candidates = new Set<string>([
+    normalizeNameForComparison(rawFallback),
+    normalizeNameForComparison(spacedFallback),
+    normalizeNameForComparison(titleFallback),
+  ]);
+
+  return candidates.has(normalizeNameForComparison(normalizedDisplayName));
+}
+
+function resolvePreferredDisplayName(params: {
+  email: string;
+  profileDisplayName?: unknown;
+  authDisplayName?: unknown;
+}): string {
+  const profileDisplayName = sanitizeDisplayName(params.profileDisplayName);
+  const authDisplayName = sanitizeDisplayName(params.authDisplayName);
+
+  if (
+    profileDisplayName &&
+    authDisplayName &&
+    isEmailPrefixFallbackDisplayName(profileDisplayName, params.email)
+  ) {
+    return authDisplayName;
+  }
+
+  return (
+    profileDisplayName ||
+    authDisplayName ||
+    fallbackDisplayNameFromEmail(params.email)
+  );
+}
+
+function syncAuthUserDisplayName(email: string, nextDisplayName?: string): void {
+  if (!nextDisplayName || !globalAuthState.user) {
+    return;
+  }
+
+  if (globalAuthState.user.email.toLowerCase() !== email.toLowerCase()) {
+    return;
+  }
+
+  if (globalAuthState.user.displayName === nextDisplayName) {
+    return;
+  }
+
+  globalAuthState.user = {
+    ...globalAuthState.user,
+    displayName: nextDisplayName,
+  };
+  notifyListeners();
+}
 
 function sanitizeProfileImageUrl(
   value: unknown,
@@ -634,9 +727,10 @@ async function updateUsersCollectionOnly(email: string, profileData: {
 
     const safePhotoURL = sanitizeProfileImageUrl(profileData.photoURL, 'photoURL');
     const safeCustomImageURL = sanitizeProfileImageUrl(profileData.customImageURL, 'customImageURL');
+    const safeDisplayName = sanitizeDisplayName(profileData.displayName);
     
     // Only include fields that are provided
-    if (profileData.displayName) updateData.displayName = profileData.displayName;
+    if (safeDisplayName) updateData.displayName = safeDisplayName;
     if (safePhotoURL) updateData.photoURL = safePhotoURL;
     if (profileData.customImageURL !== undefined) {
       if (profileData.customImageURL) {
@@ -685,6 +779,7 @@ async function updateTenantProfilesForUser(email: string, profileData: {
   const emailKey = sanitizeEmailKey(normalizedEmail);
   const safePhotoURL = sanitizeProfileImageUrl(profileData.photoURL, 'photoURL');
   const safeCustomImageURL = sanitizeProfileImageUrl(profileData.customImageURL, 'customImageURL');
+  const safeDisplayName = sanitizeDisplayName(profileData.displayName);
 
   await Promise.all(
     tenantIds.map(async (tenantId) => {
@@ -694,7 +789,7 @@ async function updateTenantProfilesForUser(email: string, profileData: {
         updatedAt: new Date(),
       };
 
-      if (profileData.displayName !== undefined) payload.displayName = profileData.displayName;
+      if (safeDisplayName) payload.displayName = safeDisplayName;
       if (safePhotoURL) payload.photoURL = safePhotoURL;
       if (profileData.customImageURL !== undefined) {
         if (profileData.customImageURL) {
@@ -737,8 +832,9 @@ async function updateUserProfileSafe(email: string, profileData: {
   subjects?: string[];
 }): Promise<void> {
   try {
+    const safeDisplayName = sanitizeDisplayName(profileData.displayName);
     // Only log 10% of presence updates to reduce noise, but always log profile updates
-    const shouldLog = !profileData.isOnline || profileData.displayName || profileData.photoURL || profileData.customImageURL || Math.random() < 0.1;
+    const shouldLog = !profileData.isOnline || safeDisplayName || profileData.photoURL || profileData.customImageURL || Math.random() < 0.1;
     if (shouldLog) {
       logger.debug('🔄 Safely updating user profile:', { email, profileData });
     }
@@ -750,7 +846,7 @@ async function updateUserProfileSafe(email: string, profileData: {
     // Primary write path: tenantProfiles + tenantPresence (tenant-native stores)
     try {
       await updateTenantProfilesForUser(normalizedEmail, {
-        displayName: profileData.displayName,
+        displayName: safeDisplayName,
         photoURL: safePhotoURL,
         customImageURL: profileData.customImageURL ? safeCustomImageURL : profileData.customImageURL,
         school: profileData.school,
@@ -771,6 +867,9 @@ async function updateUserProfileSafe(email: string, profileData: {
           lastSeen: profileData.lastSeen,
           typingTo: profileData.typingTo,
         });
+      }
+      if (safeDisplayName) {
+        syncAuthUserDisplayName(normalizedEmail, safeDisplayName);
       }
       if (shouldLog) logger.debug('✅ User profile update successful in tenantProfiles/tenantPresence');
       return;
@@ -809,7 +908,7 @@ async function updateUserProfileSafe(email: string, profileData: {
         // Only include fields that are provided
         if (profileData.isOnline !== undefined) updateData.isOnline = profileData.isOnline;
         if (profileData.lastSeen) updateData.lastSeen = profileData.lastSeen;
-        if (profileData.displayName) updateData.displayName = profileData.displayName;
+        if (safeDisplayName) updateData.displayName = safeDisplayName;
         if (safePhotoURL) updateData.photoURL = safePhotoURL;
         if (profileData.customImageURL !== undefined) {
           if (profileData.customImageURL) {
@@ -830,6 +929,9 @@ async function updateUserProfileSafe(email: string, profileData: {
   if (profileData.subjects !== undefined) updateData.subjects = profileData.subjects;
         
   await setDoc(userRef, updateData, { merge: true });
+  if (safeDisplayName) {
+    syncAuthUserDisplayName(normalizedEmail, safeDisplayName);
+  }
   if (shouldLog) logger.debug('✅ User profile update successful in users collection (fallback)');
         return;
       } catch (firestoreError) {
@@ -862,7 +964,7 @@ async function updateUserProfileSafe(email: string, profileData: {
     
     // Fallback 2: For profile data (displayName, photoURL), continue silently
     // These are non-critical for app functionality
-    if ((profileData.displayName || profileData.photoURL) && shouldLog) {
+    if ((safeDisplayName || profileData.photoURL) && shouldLog) {
       logger.debug('ℹ️ Profile data (displayName/photoURL) update deferred - will sync when permissions allow');
     }
   } catch (error) {
@@ -1592,11 +1694,21 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
 
       // Get user profile to fetch customImageURL
       const userProfile = await getUserProfile(user.email);
+      const existingProfileDisplayName = sanitizeDisplayName(userProfile?.displayName);
+      const resolvedDisplayName = resolvePreferredDisplayName({
+        email: user.email,
+        profileDisplayName: existingProfileDisplayName,
+        authDisplayName: user.displayName,
+      });
+      const shouldBootstrapDisplayName =
+        !existingProfileDisplayName ||
+        (sanitizeDisplayName(user.displayName) &&
+          isEmailPrefixFallbackDisplayName(existingProfileDisplayName, user.email));
 
       const authUser: AuthUser = {
         uid: user.uid,
         email: user.email,
-        displayName: user.displayName || user.email.split('@')[0], // Use Google display name or fallback to email prefix
+        displayName: resolvedDisplayName,
         photoURL: user.photoURL || undefined,
         customImageURL: userProfile?.customImageURL || null,
         isAuthorized: true,
@@ -1633,21 +1745,21 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
       // Save/update user profile information safely with latest Google data
       logger.debug('📝 Updating user profile with latest Google data:', {
         email: user.email,
-        displayName: user.displayName,
+        displayName: resolvedDisplayName,
         photoURL: user.photoURL,
-        fallbackDisplayName: user.displayName || user.email.split('@')[0]
+        fallbackDisplayName: fallbackDisplayNameFromEmail(user.email)
       });
 
   // Populate default photo in authorizedEmails if missing
   await ensureAuthorizedEmailHasPhoto(user.email, user.photoURL || null);
       
       await updateUsersCollectionOnly(user.email, {
-        displayName: user.displayName || user.email.split('@')[0],
+        displayName: resolvedDisplayName,
         photoURL: user.photoURL || undefined,
       });
       
       await updateUserProfileSafe(user.email, {
-        displayName: user.displayName || user.email.split('@')[0], // Always provide a meaningful display name
+        ...(shouldBootstrapDisplayName ? { displayName: resolvedDisplayName } : {}),
         isOnline: true,
         lastSeen: new Date().toISOString(),
       });
@@ -1721,11 +1833,21 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
 
         // Get user profile to fetch customImageURL
         const userProfile = await getUserProfile(user.email);
+        const existingProfileDisplayName = sanitizeDisplayName(userProfile?.displayName);
+        const resolvedDisplayName = resolvePreferredDisplayName({
+          email: user.email,
+          profileDisplayName: existingProfileDisplayName,
+          authDisplayName: user.displayName,
+        });
+        const shouldBootstrapDisplayName =
+          !existingProfileDisplayName ||
+          (sanitizeDisplayName(user.displayName) &&
+            isEmailPrefixFallbackDisplayName(existingProfileDisplayName, user.email));
 
         const authUser: AuthUser = {
           uid: user.uid,
           email: user.email,
-          displayName: user.displayName || user.email.split('@')[0], // Use Google display name or fallback to email prefix
+          displayName: resolvedDisplayName,
           photoURL: user.photoURL || undefined,
           customImageURL: userProfile?.customImageURL || null,
           isAuthorized: true,
@@ -1763,21 +1885,21 @@ async function signInWithGoogle(): Promise<{ success: boolean; user?: AuthUser; 
         // Save/update user profile information safely with latest Google data
         logger.debug('📝 Updating user profile with latest Google data (mobile):', {
           email: user.email,
-          displayName: user.displayName,
+          displayName: resolvedDisplayName,
           photoURL: user.photoURL,
-          fallbackDisplayName: user.displayName || user.email.split('@')[0]
+          fallbackDisplayName: fallbackDisplayNameFromEmail(user.email)
         });
 
   // Populate default photo in authorizedEmails if missing
   await ensureAuthorizedEmailHasPhoto(user.email, user.photoURL || null);
         
         await updateUsersCollectionOnly(user.email, {
-          displayName: user.displayName || user.email.split('@')[0],
+          displayName: resolvedDisplayName,
           photoURL: user.photoURL || undefined,
         });
         
         await updateUserProfileSafe(user.email, {
-          displayName: user.displayName || user.email.split('@')[0], // Always provide a meaningful display name
+          ...(shouldBootstrapDisplayName ? { displayName: resolvedDisplayName } : {}),
           isOnline: true,
           lastSeen: new Date().toISOString(),
         });
@@ -2091,11 +2213,16 @@ function initializeAuth() {
         
         // Get user profile to fetch customImageURL
         const userProfile = await getUserProfile(user.email || '');
+        const resolvedDisplayName = resolvePreferredDisplayName({
+          email: user.email || '',
+          profileDisplayName: userProfile?.displayName,
+          authDisplayName: user.displayName,
+        });
         
         const authUser: AuthUser = {
           uid: user.uid,
           email: user.email || '',
-          displayName: user.displayName || (user.email ? user.email.split('@')[0] : ''), // Use Google display name or fallback
+          displayName: resolvedDisplayName,
           photoURL: user.photoURL || undefined,
           customImageURL: userProfile?.customImageURL || null,
           isAuthorized: true,
@@ -2391,15 +2518,19 @@ function onTeamMembersChange(callback: (members: TeamMember[]) => void): () => v
           }
         }
 
-        const nameSource = profile.displayName || membership.displayName || email.split('@')[0];
+        const fallbackName = fallbackDisplayNameFromEmail(email)
+          .replace(/[._-]/g, ' ')
+          .replace(/\b\w/g, (l: string) => l.toUpperCase());
+        const nameSource =
+          sanitizeDisplayName(profile.displayName) ||
+          sanitizeDisplayName(membership.displayName) ||
+          fallbackName;
         const tenantRole = String(membership.role || 'member').toLowerCase() as TenantMembershipRole;
         const role: 'user' | 'admin' = tenantRole === 'owner' || tenantRole === 'admin' ? 'admin' : 'user';
 
         return {
           id: email,
-          name: String(nameSource)
-            .replace(/[._-]/g, ' ')
-            .replace(/\b\w/g, (l: string) => l.toUpperCase()),
+          name: String(nameSource),
           email,
           avatar: email.charAt(0).toUpperCase(),
           photoURL: profile.photoURL,
@@ -2594,9 +2725,9 @@ async function forceRefreshTeamMembers(): Promise<TeamMember[]> {
       }
 
       const displayName =
-        profile.displayName ||
-        membership.displayName ||
-        email.split('@')[0]
+        sanitizeDisplayName(profile.displayName) ||
+        sanitizeDisplayName(membership.displayName) ||
+        fallbackDisplayNameFromEmail(email)
           .replace(/[._-]/g, ' ')
           .replace(/\b\w/g, (l: string) => l.toUpperCase());
 
@@ -2664,6 +2795,7 @@ async function getUserProfile(email: string): Promise<{
 } | null> {
   try {
     const normalizedEmail = email.toLowerCase();
+    const fallbackDisplayName = fallbackDisplayNameFromEmail(normalizedEmail);
     const tenantId = (await tenantService.getCachedSelectedTenant()) || 'legacy-coaching';
     const profileDocId = `${tenantId}_${normalizedEmail.replace(/[@.]/g, '_')}`;
 
@@ -2689,7 +2821,7 @@ async function getUserProfile(email: string): Promise<{
       const role = await getUserRole(normalizedEmail);
       return {
         email: normalizedEmail,
-        displayName: profileData?.displayName || email.split('@')[0],
+        displayName: sanitizeDisplayName(profileData?.displayName) || fallbackDisplayName,
         photoURL: profileData?.photoURL,
         customImageURL: profileData?.customImageURL,
         role,
@@ -2718,7 +2850,7 @@ async function getUserProfile(email: string): Promise<{
         const data = matchedDoc.data();
         return {
           email: data.email || normalizedEmail,
-          displayName: data.displayName || email.split('@')[0],
+          displayName: sanitizeDisplayName(data.displayName) || fallbackDisplayName,
           photoURL: data.photoURL,
           role: await getUserRole(normalizedEmail),
           isOnline: data.isOnline || false,
@@ -2738,7 +2870,7 @@ async function getUserProfile(email: string): Promise<{
     // Final fallback: default role is user
     return {
       email: normalizedEmail,
-      displayName: email.split('@')[0],
+      displayName: fallbackDisplayName,
       photoURL: undefined,
       role: 'user',
       isOnline: false,
@@ -3054,7 +3186,7 @@ async function getAuthorizedUsersWithProfiles(): Promise<Array<{
     // Fallback to basic email list
     return authorizedEmails.map(email => ({
       email,
-      displayName: email.split('@')[0],
+      displayName: fallbackDisplayNameFromEmail(email),
   role: 'user' as const,
     }));
   }

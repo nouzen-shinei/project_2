@@ -83,6 +83,94 @@ const getByteSize = (value: string): number => {
   }
 };
 
+const LEGACY_USER_PROFILE_STORAGE_KEY = 'userProfile';
+const MAX_DISPLAY_NAME_LENGTH = 80;
+
+const normalizeDisplayName = (value: unknown): string => {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim().replace(/\s+/g, ' ').slice(0, MAX_DISPLAY_NAME_LENGTH);
+};
+
+const fallbackDisplayNameFromEmail = (email: string | null | undefined): string => {
+  if (!email) {
+    return '';
+  }
+  const localPart = email.split('@')[0]?.trim() || '';
+  return localPart.slice(0, MAX_DISPLAY_NAME_LENGTH);
+};
+
+const normalizeNameForComparison = (value: string): string =>
+  value.trim().replace(/\s+/g, ' ').toLowerCase();
+
+const isEmailPrefixFallbackDisplayName = (
+  displayName: unknown,
+  email: string | null | undefined
+): boolean => {
+  const normalizedDisplayName = normalizeDisplayName(displayName);
+  if (!normalizedDisplayName || !email) {
+    return false;
+  }
+
+  const localPart = email.split('@')[0]?.trim() || '';
+  if (!localPart) {
+    return false;
+  }
+
+  const rawFallback = localPart.slice(0, MAX_DISPLAY_NAME_LENGTH);
+  const spacedFallback = rawFallback.replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const titleFallback = spacedFallback.replace(/\b\w/g, (letter: string) => letter.toUpperCase());
+
+  const candidates = new Set<string>([
+    normalizeNameForComparison(rawFallback),
+    normalizeNameForComparison(spacedFallback),
+    normalizeNameForComparison(titleFallback),
+  ]);
+
+  return candidates.has(normalizeNameForComparison(normalizedDisplayName));
+};
+
+const resolveDisplayName = (...candidates: unknown[]): string => {
+  for (const candidate of candidates) {
+    const normalized = normalizeDisplayName(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return '';
+};
+
+const resolveDisplayNamePreferringGoogle = (
+  profileDisplayName: unknown,
+  googleDisplayName: unknown,
+  email: string | null | undefined
+): string => {
+  const normalizedProfileDisplayName = normalizeDisplayName(profileDisplayName);
+  const normalizedGoogleDisplayName = normalizeDisplayName(googleDisplayName);
+
+  if (
+    normalizedGoogleDisplayName &&
+    normalizedProfileDisplayName &&
+    isEmailPrefixFallbackDisplayName(normalizedProfileDisplayName, email)
+  ) {
+    return normalizedGoogleDisplayName;
+  }
+
+  return resolveDisplayName(
+    normalizedProfileDisplayName,
+    normalizedGoogleDisplayName,
+    fallbackDisplayNameFromEmail(email)
+  );
+};
+
+const getUserProfileStorageKey = (email: string | null | undefined): string => {
+  if (!email) {
+    return LEGACY_USER_PROFILE_STORAGE_KEY;
+  }
+  return `${LEGACY_USER_PROFILE_STORAGE_KEY}:${email.toLowerCase()}`;
+};
+
 type CacheInsights = {
   totalBytes: number;
   removableBytes: number;
@@ -299,8 +387,9 @@ export default function Settings() {
     );
   }, []);
   const [editingProfile, setEditingProfile] = useState(false);
+  const [hasRemoteProfileLoaded, setHasRemoteProfileLoaded] = useState(false);
   const [profileData, setProfileData] = useState<ProfileFormData>({
-    displayName: user?.displayName || '',
+    displayName: resolveDisplayName(user?.displayName, fallbackDisplayNameFromEmail(user?.email)),
     email: user?.email || '',
     photoURL: user?.photoURL || '',
     phone: '',
@@ -311,7 +400,7 @@ export default function Settings() {
     subjects: [] as string[],
   });
   const [originalProfileData, setOriginalProfileData] = useState<ProfileFormData>({
-    displayName: user?.displayName || '',
+    displayName: resolveDisplayName(user?.displayName, fallbackDisplayNameFromEmail(user?.email)),
     email: user?.email || '',
     photoURL: user?.photoURL || '',
     phone: '',
@@ -334,6 +423,19 @@ export default function Settings() {
   const [savingProfile, setSavingProfile] = useState(false);
   const [selectedImageFileName, setSelectedImageFileName] = useState<string | null>(null);
   const [selectedImageFileSize, setSelectedImageFileSize] = useState<number | null>(null);
+  const resolvedDisplayName = useMemo(
+    () =>
+      resolveDisplayNamePreferringGoogle(
+        profileData.displayName,
+        user?.displayName,
+        user?.email
+      ),
+    [profileData.displayName, user?.displayName, user?.email]
+  );
+  const resolvedDisplayInitial = useMemo(
+    () => (resolvedDisplayName.charAt(0) || 'U').toUpperCase(),
+    [resolvedDisplayName]
+  );
   const hasUnsavedChanges = useMemo(() => {
     if (!editingProfile) return false;
     const fieldsToCheck: (keyof ProfileFormData)[] = ['displayName', 'phone', 'school', 'bio', 'dateOfBirth', 'salutation'];
@@ -388,6 +490,10 @@ export default function Settings() {
   }, [router]);
 
   useEffect(() => {
+    setHasRemoteProfileLoaded(false);
+  }, [user?.email]);
+
+  useEffect(() => {
     const paramValue = Array.isArray(params.downloadReports) ? params.downloadReports[0] : params.downloadReports;
 
     if (paramValue === '1' || paramValue === 'true') {
@@ -408,46 +514,72 @@ export default function Settings() {
       logger.debug('Settings: Auth timeout reached, stopping component loading');
       setComponentLoading(false);
     }, 2000); // 2 second timeout
+
+    let isCancelled = false;
     
     if (!authLoading && user) {
       // Auth is complete and user is available
       clearTimeout(authTimeout);
       setComponentLoading(false);
+
+      if (editingProfile) {
+        return () => {
+          isCancelled = true;
+          clearTimeout(authTimeout);
+        };
+      }
       
       // Update profile data when user becomes available and fetch latest from Firebase
       const loadUserProfile = async () => {
         try {
           const profile = await authService.getUserProfile(user.email);
+          if (isCancelled) {
+            return;
+          }
+          const normalizedDisplayName = resolveDisplayNamePreferringGoogle(
+            profile?.displayName,
+            user.displayName,
+            user.email
+          );
           const updatedProfileData: ProfileFormData = {
-            displayName: profile?.displayName || user.displayName || '',
+            displayName: normalizedDisplayName,
             email: user.email || '',
             photoURL: profile?.photoURL || user.photoURL || '',
-            school: profile?.school || '',
-            bio: profile?.bio || '',
-            phone: profile?.phone || '',
-            dateOfBirth: profile?.dateOfBirth || '',
+            school: typeof profile?.school === 'string' ? profile.school : '',
+            bio: typeof profile?.bio === 'string' ? profile.bio : '',
+            phone: typeof profile?.phone === 'string' ? profile.phone : '',
+            dateOfBirth: typeof profile?.dateOfBirth === 'string' ? profile.dateOfBirth : '',
             salutation: (profile?.salutation as 'Mr.' | 'Ms.' | undefined) || '',
-            subjects: Array.isArray(profile?.subjects) ? (profile?.subjects as string[]) : [],
+            subjects: Array.isArray(profile?.subjects)
+              ? (profile.subjects as string[])
+                  .map((subject) => String(subject || '').trim())
+                  .filter(Boolean)
+              : [],
           };
-          setProfileData(prev => ({
-            ...prev,
-            ...updatedProfileData
-          }));
+          setHasRemoteProfileLoaded(true);
+          setProfileData(updatedProfileData);
+          setOriginalProfileData(updatedProfileData);
           
           // Update current profile picture URL with the actual photoURL from tenant profile collection
           setCurrentProfilePictureURL(profile?.photoURL || user.photoURL || '');
         } catch (error) {
+          if (isCancelled) {
+            return;
+          }
           logger.error('Error loading user profile:', error);
-          setProfileData(prev => ({
-            ...prev,
-            displayName: user.displayName || '',
+          const fallbackProfileData: ProfileFormData = {
+            displayName: resolveDisplayName(user.displayName, fallbackDisplayNameFromEmail(user.email)),
             email: user.email || '',
             photoURL: user.photoURL || '',
             school: '',
             bio: '',
             phone: '',
             dateOfBirth: '',
-          }));
+            salutation: '',
+            subjects: [],
+          };
+          setProfileData(fallbackProfileData);
+          setOriginalProfileData(fallbackProfileData);
           
           // Fallback: use user's photoURL if profile loading fails
           setCurrentProfilePictureURL(user.photoURL || '');
@@ -462,32 +594,76 @@ export default function Settings() {
     }
     
     return () => {
+      isCancelled = true;
       clearTimeout(authTimeout);
     };
-  }, [authLoading, user]);
+  }, [authLoading, user, editingProfile]);
   // Define functions using useCallback to avoid hoisting issues
   const loadSettings = useCallback(async () => {
     try {
-      const profile = await AsyncStorage.getItem('userProfile');
-      if (profile && user) {
-        const parsed = JSON.parse(profile);
+      if (!user || editingProfile || hasRemoteProfileLoaded) {
+        if (user?.customImageURL) {
+          setCustomProfilePicture(user.customImageURL);
+        } else {
+          setCustomProfilePicture(null);
+        }
+        return;
+      }
+
+      const scopedProfileKey = getUserProfileStorageKey(user.email);
+      let cachedProfileRaw = await AsyncStorage.getItem(scopedProfileKey);
+      let loadedFromLegacyKey = false;
+
+      if (!cachedProfileRaw && scopedProfileKey !== LEGACY_USER_PROFILE_STORAGE_KEY) {
+        const legacyProfileRaw = await AsyncStorage.getItem(LEGACY_USER_PROFILE_STORAGE_KEY);
+        if (legacyProfileRaw) {
+          cachedProfileRaw = legacyProfileRaw;
+          loadedFromLegacyKey = true;
+        }
+      }
+
+      if (cachedProfileRaw) {
+        const parsed = JSON.parse(cachedProfileRaw);
+        const parsedEmail = typeof parsed?.email === 'string' ? parsed.email.toLowerCase() : '';
+        const currentEmail = (user.email || '').toLowerCase();
+
+        if (parsedEmail && currentEmail && parsedEmail !== currentEmail) {
+          logger.warn('Ignoring cached profile for a different account', {
+            parsedEmail,
+            currentEmail,
+          });
+        } else {
         const profileData: ProfileFormData = {
-          displayName: parsed.displayName || user.displayName || '',
+          displayName: resolveDisplayNamePreferringGoogle(
+            parsed.displayName,
+            user.displayName,
+            user.email
+          ),
           email: parsed.email || user.email || '',
           photoURL: parsed.photoURL || user.photoURL || '',
-          phone: parsed.phone || '',
-          school: parsed.school || '',
-          bio: parsed.bio || '',
-          dateOfBirth: parsed.dateOfBirth || '',
+          phone: typeof parsed.phone === 'string' ? parsed.phone : '',
+          school: typeof parsed.school === 'string' ? parsed.school : '',
+          bio: typeof parsed.bio === 'string' ? parsed.bio : '',
+          dateOfBirth: typeof parsed.dateOfBirth === 'string' ? parsed.dateOfBirth : '',
           salutation: (parsed.salutation as 'Mr.' | 'Ms.' | '') || '',
-          subjects: Array.isArray(parsed.subjects) ? parsed.subjects : [],
+          subjects: Array.isArray(parsed.subjects)
+            ? parsed.subjects
+                .map((subject: unknown) => String(subject || '').trim())
+                .filter(Boolean)
+            : [],
         };
         setProfileData(profileData);
         setOriginalProfileData(profileData);
+
+          if (loadedFromLegacyKey && scopedProfileKey !== LEGACY_USER_PROFILE_STORAGE_KEY) {
+            await AsyncStorage.setItem(scopedProfileKey, JSON.stringify(profileData));
+            await AsyncStorage.removeItem(LEGACY_USER_PROFILE_STORAGE_KEY);
+          }
+        }
       } else if (user) {
         // If no saved profile but user exists, initialize with user data
         const profileData: ProfileFormData = {
-          displayName: user.displayName || '',
+          displayName: resolveDisplayName(user.displayName, fallbackDisplayNameFromEmail(user.email)),
           email: user.email || '',
           photoURL: user.photoURL || '',
           phone: '',
@@ -510,7 +686,7 @@ export default function Settings() {
     } catch (error) {
       logger.error('Error loading settings:', error);
     }
-  }, [user]);
+  }, [user, editingProfile, hasRemoteProfileLoaded]);
 
   const calculateCacheSize = useCallback(async () => {
     try {
@@ -631,11 +807,14 @@ export default function Settings() {
   //   }
   // }, []);
 
-  // Load settings data once component mounts
+  // Load settings profile cache until remote profile has been hydrated.
   useEffect(() => {
-    loadSettings();
-    calculateCacheSize();
-  }, [loadSettings, calculateCacheSize]); // TODO: Add loadBackups when implemented
+    void loadSettings();
+  }, [loadSettings]); // TODO: Add loadBackups when implemented
+
+  useEffect(() => {
+    void calculateCacheSize();
+  }, [calculateCacheSize]);
 
   // Watch for changes in user's customImageURL from Firestore - simplified
   useEffect(() => {
@@ -782,6 +961,32 @@ export default function Settings() {
   const saveProfile = async () => {
     try {
   setSavingProfile(true);
+      const normalizedDisplayName = resolveDisplayNamePreferringGoogle(
+        profileData.displayName,
+        user?.displayName,
+        user?.email
+      );
+      if (!normalizedDisplayName) {
+        Alert.alert('Display name required', 'Please enter a display name before saving.');
+        return;
+      }
+
+      const normalizedProfileData: ProfileFormData = {
+        ...profileData,
+        displayName: normalizedDisplayName,
+        email: user?.email || profileData.email || '',
+        phone: profileData.phone.trim(),
+        school: profileData.school.trim(),
+        bio: profileData.bio.trim(),
+        subjects: Array.from(
+          new Set((profileData.subjects || []).map((subject) => subject.trim()).filter(Boolean))
+        ),
+      };
+      setProfileData((prev) => ({
+        ...prev,
+        ...normalizedProfileData,
+      }));
+
       const googlePhotoURLRaw = user?.email ? await getOriginalGooglePhotoURL(user.email) : '';
       const fallbackGooglePhotoURL = isRemoteProfileImageUrl(googlePhotoURLRaw)
         ? googlePhotoURLRaw
@@ -794,6 +999,9 @@ export default function Settings() {
       let clearCustomImageUrl = false;
       let showGoogleFallbackNotice = false;
       let uploadedPhotoUrlFromPending: string | undefined;
+      let savedProfileData: ProfileFormData = {
+        ...normalizedProfileData,
+      };
 
       // If there's a pending local image preview and it's selected as current, upload it now
       if (pendingProfilePictureUri && user?.email) {
@@ -838,7 +1046,11 @@ export default function Settings() {
       }
 
       // Save profile data to AsyncStorage
-      await AsyncStorage.setItem('userProfile', JSON.stringify(profileData));
+      const profileStorageKey = getUserProfileStorageKey(user?.email || normalizedProfileData.email);
+      await AsyncStorage.setItem(profileStorageKey, JSON.stringify(normalizedProfileData));
+      if (profileStorageKey !== LEGACY_USER_PROFILE_STORAGE_KEY) {
+        await AsyncStorage.removeItem(LEGACY_USER_PROFILE_STORAGE_KEY);
+      }
       
       // Save custom profile picture to AsyncStorage (if exists)
       const effectiveCustomPhoto = uploadedPhotoUrlFromPending || customProfilePicture || '';
@@ -895,32 +1107,45 @@ export default function Settings() {
         }
 
         await authService.updateUserProfileSafe(user.email, {
-          displayName: profileData.displayName,
+          displayName: normalizedProfileData.displayName,
           ...(photoURLToPersist ? { photoURL: photoURLToPersist } : {}),
           ...(clearCustomImageUrl
             ? { customImageURL: null }
             : (customUrlToSave ? { customImageURL: customUrlToSave } : {})),
-          school: profileData.school,
-          bio: profileData.bio,
-          phone: profileData.phone,
-          dateOfBirth: profileData.dateOfBirth || undefined,
-          salutation: profileData.salutation || undefined,
-          subjects: profileData.subjects || undefined,
+          school: normalizedProfileData.school,
+          bio: normalizedProfileData.bio,
+          phone: normalizedProfileData.phone,
+          dateOfBirth: normalizedProfileData.dateOfBirth || undefined,
+          salutation: normalizedProfileData.salutation || undefined,
+          subjects: normalizedProfileData.subjects || undefined,
         });
         
         // Update profileData with the current photo URL for consistency
         if (photoURLToPersist) {
           setCurrentProfilePictureURL(photoURLToPersist);
-          setProfileData(prev => ({ ...prev, photoURL: photoURLToPersist }));
+          savedProfileData = {
+            ...savedProfileData,
+            photoURL: photoURLToPersist,
+          };
         }
 
         if (clearCustomImageUrl) {
           setCustomProfilePicture(null);
         }
       }
+
+      const latestPhotoURL = getCurrentProfilePictureURL();
+      if (isRemoteProfileImageUrl(latestPhotoURL)) {
+        savedProfileData = {
+          ...savedProfileData,
+          photoURL: latestPhotoURL,
+        };
+      }
       
   // Update original data to current data
-      setOriginalProfileData({...profileData});
+      setProfileData(savedProfileData);
+      setOriginalProfileData(savedProfileData);
+      setHasRemoteProfileLoaded(true);
   // Reset the upload tracking flag since changes are saved
       setNewCustomPictureUploaded(false);
   setEditingProfile(false);
@@ -1631,7 +1856,7 @@ export default function Settings() {
         {
           icon: User,
           title: 'Profile Information',
-          subtitle: profileData.displayName || user?.displayName || 'Update your personal details',
+          subtitle: resolvedDisplayName || 'Update your personal details',
           onPress: () => setShowProfileModal(true),
         },
         {
@@ -1873,14 +2098,14 @@ export default function Settings() {
               />
             ) : (
               <Text style={styles.profileInitial}>
-                {profileData.displayName?.charAt(0) || user?.displayName?.charAt(0) || user?.email?.charAt(0) || 'U'}
+                {resolvedDisplayInitial}
               </Text>
             )}
           </View>
           <View style={styles.profileInfo}>
             <View style={styles.profileNameContainer}>
               <Text style={[styles.profileName, { color: theme.text }]}>
-                {profileData.displayName || user?.displayName || 'Teacher Name'}
+                {resolvedDisplayName || 'Teacher Name'}
               </Text>
               {roleBadge && (
                 <View style={[styles.adminTextBadge, { backgroundColor: roleBadge.backgroundColor }]}>
@@ -2017,7 +2242,7 @@ export default function Settings() {
                   />
                 ) : (
                   <Text style={styles.profileInitialLarge}>
-                    {profileData.displayName?.charAt(0) || user?.displayName?.charAt(0) || 'U'}
+                    {resolvedDisplayInitial}
                   </Text>
                 )}
                 {editingProfile && (
@@ -2185,7 +2410,8 @@ export default function Settings() {
                     placeholder="Enter your name"
                     placeholderTextColor={theme.textSecondary}
                     value={profileData.displayName}
-                    onChangeText={(text) => setProfileData({...profileData, displayName: text})}
+                    maxLength={MAX_DISPLAY_NAME_LENGTH}
+                    onChangeText={(text) => setProfileData((prev) => ({ ...prev, displayName: text }))}
                     editable={true}
                   />
                 ) : (
@@ -2197,7 +2423,7 @@ export default function Settings() {
                     }
                   ]}>
                     <Text style={[styles.readOnlyText, { color: theme.text }]}>
-                      {profileData.displayName || user?.displayName || 'Not set'}
+                      {resolvedDisplayName || 'Not set'}
                     </Text>
                   </View>
                 )}

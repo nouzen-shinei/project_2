@@ -10,7 +10,11 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     return (
       <ThemeProvider>
         <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' }}>
-          <Image source={require('../assets/images/icon.png')} style={{ width: 120, height: 120, marginBottom: 32 }} resizeMode="contain" />
+          <Image
+            source={require('../assets/images/icon.png')}
+            style={{ width: 140, height: 140, marginBottom: 28, borderRadius: 30 }}
+            resizeMode="contain"
+          />
           <ActivityIndicator size="large" color="#888" />
         </View>
       </ThemeProvider>

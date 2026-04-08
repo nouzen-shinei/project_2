@@ -1,9 +1,38 @@
-self.addEventListener('install', () => {
-  self.skipWaiting();
+const FONT_CACHE = 'tm-font-cache-v1';
+const SHELL_CACHE = 'tm-shell-cache-v12';
+const OFFLINE_URL = '/offline.html';
+const SHELL_CACHE_ASSETS = [OFFLINE_URL];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    (async () => {
+      try {
+        const cache = await caches.open(SHELL_CACHE);
+        await cache.addAll(SHELL_CACHE_ASSETS);
+      } catch {
+        // ignore
+      }
+      await self.skipWaiting();
+    })()
+  );
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    (async () => {
+      try {
+        const cacheNames = await caches.keys();
+        await Promise.all(
+          cacheNames
+            .filter((name) => name !== FONT_CACHE && name !== SHELL_CACHE)
+            .map((name) => caches.delete(name))
+        );
+      } catch {
+        // ignore
+      }
+      await self.clients.claim();
+    })()
+  );
 });
 
 self.addEventListener('message', (event) => {
@@ -11,8 +40,6 @@ self.addEventListener('message', (event) => {
     self.skipWaiting();
   }
 });
-
-const FONT_CACHE = 'tm-font-cache-v1';
 
 function isFontRequest(request) {
   if (!request || request.method !== 'GET') {
@@ -35,8 +62,44 @@ function isFontRequest(request) {
   }
 }
 
+function isNavigationRequest(request) {
+  if (!request || request.method !== 'GET') {
+    return false;
+  }
+  return request.mode === 'navigate' || request.destination === 'document';
+}
+
+async function handleNavigationRequest(request) {
+  try {
+    return await fetch(request);
+  } catch {
+    const cache = await caches.open(SHELL_CACHE);
+    const offlineResponse = await cache.match(OFFLINE_URL);
+    if (offlineResponse) {
+      return offlineResponse;
+    }
+
+    return new Response(
+      '<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Offline</title></head><body style="margin:0;background:#111;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh">You\'re offline</body></html>',
+      {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+        },
+      }
+    );
+  }
+}
+
 self.addEventListener('fetch', (event) => {
   const request = event.request;
+
+  if (isNavigationRequest(request)) {
+    event.respondWith(handleNavigationRequest(request));
+    return;
+  }
+
   if (!isFontRequest(request)) {
     return;
   }
