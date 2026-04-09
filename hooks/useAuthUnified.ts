@@ -475,6 +475,8 @@ async function clearUserScopedStorage(): Promise<void> {
     'userToken',
     'notificationPreferences',
     'pendingMessages',
+    'pendingMediaMessages',
+    'pendingAttachmentMessages',
     'notice_reaction_emojis_v1',
     'apiQuoteCache',
     'dashboardData',

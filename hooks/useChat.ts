@@ -1216,7 +1216,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     isActiveConversation,
   ]);
 
-  const sendMessage = async (text: string, isSpecial: boolean = false, recipientId?: string) => {
+  const sendMessage = async (text: string, isSpecial: boolean = false, recipientId?: string): Promise<string> => {
     try {
       if (!user?.email) {
         throw new Error('User not authenticated');
@@ -1230,14 +1230,21 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       });
 
       const timestamp = new Date().toISOString();
-      await triggerRemoteNotification({
-        id: messageId,
-        text,
-        sender: user.email,
-        recipientId,
-        timestamp,
-        isSpecial,
-      } as ChatMessage, recipientId);
+      try {
+        await triggerRemoteNotification({
+          id: messageId,
+          text,
+          sender: user.email,
+          recipientId,
+          timestamp,
+          isSpecial,
+        } as ChatMessage, recipientId);
+      } catch (notificationError) {
+        // Message write already succeeded; don't fail UI send state for push issues.
+        logger.warn('Chat notification dispatch failed after message send:', notificationError);
+      }
+
+      return messageId;
     } catch (err) {
       logger.error('Error in useChat sendMessage:', err);
       throw err; // Don't set error state, let the calling component handle it
@@ -1253,14 +1260,20 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       const messageId = await chatService.sendSpecialMessage(text, user.email, recipientId);
 
       const timestamp = new Date().toISOString();
-      await triggerRemoteNotification({
-        id: messageId,
-        text,
-        sender: user.email,
-        recipientId,
-        timestamp,
-        isSpecial: true,
-      } as ChatMessage, recipientId);
+      try {
+        await triggerRemoteNotification({
+          id: messageId,
+          text,
+          sender: user.email,
+          recipientId,
+          timestamp,
+          isSpecial: true,
+        } as ChatMessage, recipientId);
+      } catch (notificationError) {
+        logger.warn('Chat notification dispatch failed after special message send:', notificationError);
+      }
+
+      return messageId;
     } catch (err) {
       logger.error('Error in useChat sendSpecialMessage:', err);
       throw err; // Don't set error state, let the calling component handle it
@@ -1346,7 +1359,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     recipientId?: string,
     onProgress?: (progress: number) => void,
     options?: UploadSessionOptions
-  ) => {
+  ): Promise<string> => {
     try {
       setError(null);
       if (!user?.email) {
@@ -1392,15 +1405,21 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         fileSize: file.fileSize ?? 0,
       }));
 
-      await triggerRemoteNotification({
-        id: messageId,
-        text,
-        sender: user.email,
-        recipientId,
-        timestamp,
-        isSpecial: false,
-        attachments,
-      } as ChatMessage, recipientId);
+      try {
+        await triggerRemoteNotification({
+          id: messageId,
+          text,
+          sender: user.email,
+          recipientId,
+          timestamp,
+          isSpecial: false,
+          attachments,
+        } as ChatMessage, recipientId);
+      } catch (notificationError) {
+        logger.warn('Chat notification dispatch failed after attachment message send:', notificationError);
+      }
+
+      return messageId;
     } catch (err) {
       logger.error('Error in useChat sendMessageWithFiles:', err);
       throw err;
@@ -1571,7 +1590,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       height?: number;
     },
     recipientId?: string
-  ) => {
+  ): Promise<string> => {
     try {
       setError(null);
       if (!user?.email) {
@@ -1581,15 +1600,21 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       const messageId = await chatService.sendSticker(sticker, user.email, recipientId);
 
       const timestamp = new Date().toISOString();
-      await triggerRemoteNotification({
-        id: messageId,
-        text: '',
-        sender: user.email,
-        recipientId,
-        timestamp,
-        isSpecial: false,
-        sticker,
-      } as ChatMessage, recipientId);
+      try {
+        await triggerRemoteNotification({
+          id: messageId,
+          text: '',
+          sender: user.email,
+          recipientId,
+          timestamp,
+          isSpecial: false,
+          sticker,
+        } as ChatMessage, recipientId);
+      } catch (notificationError) {
+        logger.warn('Chat notification dispatch failed after sticker send:', notificationError);
+      }
+
+      return messageId;
     } catch (err) {
       logger.error('Error in useChat sendSticker:', err);
       throw err;
@@ -1606,7 +1631,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       source?: string;
     },
     recipientId?: string
-  ) => {
+  ): Promise<string> => {
     try {
       setError(null);
       if (!user?.email) {
@@ -1616,15 +1641,21 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       const messageId = await chatService.sendGif(gif, user.email, recipientId);
 
       const timestamp = new Date().toISOString();
-      await triggerRemoteNotification({
-        id: messageId,
-        text: '',
-        sender: user.email,
-        recipientId,
-        timestamp,
-        isSpecial: false,
-        gif,
-      } as ChatMessage, recipientId);
+      try {
+        await triggerRemoteNotification({
+          id: messageId,
+          text: '',
+          sender: user.email,
+          recipientId,
+          timestamp,
+          isSpecial: false,
+          gif,
+        } as ChatMessage, recipientId);
+      } catch (notificationError) {
+        logger.warn('Chat notification dispatch failed after GIF send:', notificationError);
+      }
+
+      return messageId;
     } catch (err) {
       logger.error('Error in useChat sendGif:', err);
       throw err;

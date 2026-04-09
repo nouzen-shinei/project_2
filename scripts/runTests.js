@@ -30,6 +30,10 @@ const {
   reconcileConversationUnreadCount,
   shouldRefreshChatSummariesOnForegroundResume,
 } = require('../lib/chatReceiptState');
+const {
+  normalizePendingMessageStatus,
+  shouldHidePendingMessageDuringTransition,
+} = require('../lib/pendingMessageState');
 
 logger.debug('Running unit tests (basic runner)');
 
@@ -313,6 +317,53 @@ function withEnv(overrides, callback) {
     'A continuously active screen should not be treated as a resume event'
   );
   logger.debug('✓ testForegroundResumeRefreshGate passed');
+})();
+
+(function testPendingMessageStatusNormalization() {
+  assert.strictEqual(normalizePendingMessageStatus('queued'), 'queued', 'Queued status should remain queued');
+  assert.strictEqual(normalizePendingMessageStatus('sending'), 'sending', 'Sending status should remain sending');
+  assert.strictEqual(normalizePendingMessageStatus('sent'), 'sent', 'Sent status should remain sent');
+  assert.strictEqual(normalizePendingMessageStatus('failed'), 'failed', 'Failed status should remain failed');
+  assert.strictEqual(normalizePendingMessageStatus('unknown'), 'queued', 'Unknown status should fall back to queued');
+  assert.strictEqual(normalizePendingMessageStatus(undefined), 'queued', 'Missing status should fall back to queued');
+  logger.debug('✓ testPendingMessageStatusNormalization passed');
+})();
+
+(function testPendingMessageTransitionDeDupe() {
+  const deliveredMessageIds = new Set(['server-123']);
+  const normalize = (value) => (value == null ? '' : String(value).trim());
+
+  assert.strictEqual(
+    shouldHidePendingMessageDuringTransition(
+      { status: 'sent', serverMessageId: 'server-123' },
+      deliveredMessageIds,
+      normalize
+    ),
+    true,
+    'Sent pending message should be hidden once matching server message exists'
+  );
+
+  assert.strictEqual(
+    shouldHidePendingMessageDuringTransition(
+      { status: 'sending', serverMessageId: 'server-123' },
+      deliveredMessageIds,
+      normalize
+    ),
+    false,
+    'Sending pending message should stay visible'
+  );
+
+  assert.strictEqual(
+    shouldHidePendingMessageDuringTransition(
+      { status: 'sent', serverMessageId: 'server-999' },
+      deliveredMessageIds,
+      normalize
+    ),
+    false,
+    'Sent pending message should stay visible when server message has not arrived yet'
+  );
+
+  logger.debug('✓ testPendingMessageTransitionDeDupe passed');
 })();
 
 logger.debug('All basic tests passed');

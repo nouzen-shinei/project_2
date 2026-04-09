@@ -24,9 +24,11 @@ import {
   AppStateStatus,
   InteractionManager,
   Alert,
+  Easing,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import Toast from 'react-native-toast-message';
+import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth, authService } from '../../hooks/useAuthUnified';
 import { useBirthdays } from '../../components/BirthdayProvider';
@@ -38,7 +40,13 @@ import { chatService, ChatRateLimitError, ChatMessageActionError, ChatUploadCanc
 import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
 import { getProfileImageUrl } from '../../lib/profileImage';
 import { FileDownloadUtil } from '../../lib/fileDownloadUtil';
-import { PendingMessage, PendingMessageStorage } from '../../lib/pendingMessageStorage';
+import {
+  PendingMessage,
+  PendingMessageStorage,
+  type PendingMediaMessage,
+  type PendingAttachmentMessage,
+} from '../../lib/pendingMessageStorage';
+import { normalizePendingMessageStatus } from '../../lib/pendingMessageState';
 import {
   EnhancedMessageRenderer,
   MobileChatInput,
@@ -62,7 +70,6 @@ import { chatPreferencesService } from '../../services/chatPreferencesService';
 import type { FileAttachment , ConversationSummary } from '../../services/chatService';
 import { chatCacheService } from '../../services/chatCacheService';
 import type { HydratedAttachment } from '../../services/chatCacheService';
-import RichEditText from '../../components/RichEditText';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useFrameTimingMonitor } from '../../hooks/useFrameTimingMonitor';
 import { getChatPaginationProfile } from '@/lib/chatPaginationConfig';
@@ -81,11 +88,18 @@ import { setEditingMessageId, setMessageReactionsForMessage } from '@/lib/messag
 import { useMessageUiState } from '@/hooks/useMessageUiState';
 
 const CHAT_PRESENCE_MODE = (process.env.EXPO_PUBLIC_PRESENCE_MODE || 'last_seen').toLowerCase();
-const CHAT_PRESENCE_THRESHOLD_MIN = (() => {
+const MESSAGE_TUNE_SOURCE = require('../../assets/sounds/message_tune.mp3');
+const CHAT_OPEN_TONE_COOLDOWN_MS = 500;
+const CHAT_MESSAGE_MAX_CHARS = 500;
+const CHAT_MESSAGE_MAX_WORDS = 100;
+const UNREAD_DIVIDER_AUTO_DISMISS_MS = 2200;
+const UNREAD_DIVIDER_ACTION_DISMISS_MS = 180;
+const resolveChatPresenceThresholdMin = () => {
   const raw = process.env.EXPO_PUBLIC_FIRESTORE_ONLINE_THRESHOLD_MIN;
   const parsed = raw !== undefined ? parseFloat(raw) : NaN;
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0.5;
-})();
+};
+const CHAT_PRESENCE_THRESHOLD_MIN = resolveChatPresenceThresholdMin();
 
 function parsePresenceTimestamp(value: unknown): Date | null {
   try {
@@ -156,6 +170,7 @@ export default function Chat() {
   const [pendingMessages, setPendingMessages] = useState<Map<string, PendingMessage>>(new Map());
   const [pendingMedia, setPendingMedia] = useState<Map<string, PendingMediaItem>>(new Map());
   const [pendingAttachments, setPendingAttachments] = useState<Map<string, PendingAttachmentItem>>(new Map());
+  const [isRetryingAllPending, setIsRetryingAllPending] = useState(false);
   const attachmentUploadCancelMap = useRef<Map<string, () => void | Promise<void>>>(new Map());
   const attachmentFinalizeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const tenantMembersRequestIdRef = useRef(0);
@@ -166,6 +181,18 @@ export default function Chat() {
   const rawProfileSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
   const rawPresenceSnapshotRef = useRef<Map<string, TeamMember>>(new Map());
   const [retryingPendingMessages, setRetryingPendingMessages] = useState<Set<string>>(new Set());
+  const pendingMessageBubbleOpacityRef = useRef<Map<string, Animated.Value>>(new Map());
+  const pendingMessageLastStatusRef = useRef<Map<string, NonNullable<PendingMessage['status']>>>(new Map());
+  const pendingRowAnimationRef = useRef<Map<string, {
+    opacity: Animated.Value;
+    translateX: Animated.Value;
+    scale: Animated.Value;
+    started: boolean;
+  }>>(new Map());
+  const pendingOutboxHydratedRef = useRef(false);
+  const pendingTextSnapshotRef = useRef('');
+  const pendingMediaSnapshotRef = useRef('');
+  const pendingAttachmentSnapshotRef = useRef('');
   const clearAttachmentFinalizeTimer = useCallback((tempId: string) => {
     const timer = attachmentFinalizeTimers.current.get(tempId);
     if (timer) {
@@ -429,7 +456,8 @@ export default function Chat() {
     timestamp: string;
     recipientId: string;
     sender: string;
-    status: 'sending' | 'failed' | 'queued';
+    status: 'sending' | 'failed' | 'queued' | 'sent';
+    serverMessageId?: string;
     mime?: string;
     source?: 'keyboard' | 'picker';
     progress?: number; // 0-100 upload progress for local uploads
@@ -446,7 +474,8 @@ export default function Chat() {
     messageText: string;
     recipientId: string;
     sender: string;
-    status: 'sending' | 'failed' | 'finalizing';
+    status: 'sending' | 'failed' | 'finalizing' | 'sent';
+    serverMessageId?: string;
     progress: number; // 0-100 overall progress
     cancelable?: boolean;
     cancelRequested?: boolean;
@@ -510,7 +539,8 @@ export default function Chat() {
   }, [reconnectChat]);
 
   const [animatedMessages, setAnimatedMessages] = useState<Set<string>>(new Set());
-  const [previousMessageIds, setPreviousMessageIds] = useState<Set<string>>(new Set());
+  const previousMessageIdsRef = useRef<Set<string>>(new Set());
+  const toneBootstrapChatKeyRef = useRef<string | null>(null);
   
   // Special message command state
   const [showSpecialCommand, setShowSpecialCommand] = useState(false);
@@ -523,6 +553,8 @@ export default function Chat() {
   
   // Chat profile modal state
   const [chatProfileModalVisible, setChatProfileModalVisible] = useState(false);
+  const openChatProfileModal = useCallback(() => setChatProfileModalVisible(true), []);
+  const closeChatProfileModal = useCallback(() => setChatProfileModalVisible(false), []);
 
   // Message reactions state with proper typing for any emoji
   const messageReactionsRef = useRef<Map<string, { [key: string]: Set<string> }>>(new Map());
@@ -680,6 +712,129 @@ export default function Chat() {
     return String(id);
   }, []);
 
+  const normalizeParticipantEmail = useCallback((value: unknown): string => {
+    if (typeof value !== 'string') {
+      return '';
+    }
+    return value.trim().toLowerCase();
+  }, []);
+
+  const sanitizeMessageText = useCallback((value: unknown, fallback: string): string => {
+    const raw = typeof value === 'string' ? value : String(value ?? '');
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed === '.') {
+      return fallback;
+    }
+    return raw;
+  }, []);
+
+  const sanitizeAttachmentFileName = useCallback((value: unknown): string => {
+    const safeFileName = String(value || 'File').trim();
+    if (!safeFileName || safeFileName === '.') {
+      return 'File';
+    }
+    return safeFileName;
+  }, []);
+
+  const sanitizeDateSeparatorLabel = useCallback((value: unknown): string => {
+    const safeDate = String(value ?? '').trim();
+    if (!safeDate || safeDate === '.') {
+      return 'Today';
+    }
+    return safeDate;
+  }, []);
+
+  const getSafeDisplayInitial = useCallback((value: unknown): string => {
+    const safeName = String(value ?? '').trim();
+    if (!safeName) {
+      return 'U';
+    }
+    const firstChar = safeName.charAt(0).toUpperCase();
+    if (/^[A-Z0-9]$/i.test(firstChar)) {
+      return firstChar;
+    }
+    return 'U';
+  }, []);
+
+  const normalizePendingMediaStatus = useCallback((status: PendingMediaItem['status'] | undefined): PendingMediaItem['status'] => {
+    if (status === 'queued' || status === 'failed' || status === 'sent') {
+      return status;
+    }
+    // Stale "sending" state from a previous app session should be retryable.
+    return 'queued';
+  }, []);
+
+  const normalizePendingAttachmentStatus = useCallback((
+    item: PendingAttachmentMessage
+  ): PendingAttachmentItem['status'] => {
+    if (item.status === 'failed' || item.status === 'sent' || item.status === 'finalizing') {
+      return item.status;
+    }
+    // If app closed mid-upload, surface as failed so retry is available immediately.
+    return 'failed';
+  }, []);
+
+  const teamMembersByRecipientKey = useMemo(() => {
+    const map = new Map<string, TeamMember>();
+
+    teamMembersWithChatInfo.forEach((member: any) => {
+      const normalizedId = normalizeParticipantEmail(member?.id);
+      const normalizedEmail = normalizeParticipantEmail(member?.email);
+      if (normalizedId && !map.has(normalizedId)) {
+        map.set(normalizedId, member as TeamMember);
+      }
+      if (normalizedEmail && !map.has(normalizedEmail)) {
+        map.set(normalizedEmail, member as TeamMember);
+      }
+    });
+
+    teamMembers.forEach((member: TeamMember) => {
+      const normalizedId = normalizeParticipantEmail(member?.id);
+      const normalizedEmail = normalizeParticipantEmail(member?.email);
+      if (normalizedId && !map.has(normalizedId)) {
+        map.set(normalizedId, member);
+      }
+      if (normalizedEmail && !map.has(normalizedEmail)) {
+        map.set(normalizedEmail, member);
+      }
+    });
+
+    return map;
+  }, [teamMembersWithChatInfo, teamMembers, normalizeParticipantEmail]);
+
+  const resolvePendingRecipientEmail = useCallback((recipientId?: string): string => {
+    const normalizedRecipientId = normalizeParticipantEmail(recipientId);
+    if (!normalizedRecipientId) {
+      return '';
+    }
+
+    const resolvedMember = teamMembersByRecipientKey.get(normalizedRecipientId);
+    if (resolvedMember?.email) {
+      return String(resolvedMember.email);
+    }
+
+    return recipientId || '';
+  }, [teamMembersByRecipientKey, normalizeParticipantEmail]);
+
+  const getIncomingConversationMessages = useCallback((
+    sourceMessages: any[],
+    userEmailRaw?: string | null,
+    senderEmailRaw?: string | null
+  ) => {
+    const userEmail = normalizeParticipantEmail(userEmailRaw);
+    const senderEmail = normalizeParticipantEmail(senderEmailRaw);
+    if (!Array.isArray(sourceMessages) || sourceMessages.length === 0 || !userEmail || !senderEmail) {
+      return [];
+    }
+
+    return sourceMessages.filter((msg: any) => (
+      msg?.id &&
+      !msg?.deleted &&
+      normalizeParticipantEmail(msg?.sender) === senderEmail &&
+      normalizeParticipantEmail(msg?.recipientId) === userEmail
+    ));
+  }, [normalizeParticipantEmail]);
+
   const shouldKeepOptimisticReactions = useCallback(
     (messageId: string) => {
       if (!messageId) return false;
@@ -818,6 +973,38 @@ export default function Chat() {
     return result;
   }, [messages, buildDisplayKey, getMessageRenderSignature]);
 
+  useEffect(() => {
+    const positions = messagePositionsRef.current;
+    const positionIds = Object.keys(positions);
+    if (!positionIds.length) {
+      return;
+    }
+
+    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      messagePositionsRef.current = {};
+      return;
+    }
+
+    // Avoid expensive pruning on every small update; only compact when map has meaningful drift.
+    if (positionIds.length <= displayedMessages.length + 40) {
+      return;
+    }
+
+    const validIds = new Set<string>();
+    displayedMessages.forEach((message: any) => {
+      const id = normalizeMessageId(message?.id);
+      if (id) {
+        validIds.add(id);
+      }
+    });
+
+    positionIds.forEach((id) => {
+      if (!validIds.has(id)) {
+        delete positions[id];
+      }
+    });
+  }, [displayedMessages, normalizeMessageId]);
+
   const getMessageItemType = useCallback((item: any) => {
     if (!item) return 'unknown';
     if (item.sticker) return 'sticker';
@@ -913,53 +1100,117 @@ export default function Chat() {
 
   // Sound throttling state
   const lastSoundPlayedRef = useRef<number>(0);
-  const soundTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const SOUND_THROTTLE_MS = 1000; // Minimum time between sounds
+  const messageTonePlayerRef = useRef<ReturnType<typeof createAudioPlayer> | null>(null);
+  const messageToneInitPromiseRef = useRef<Promise<void> | null>(null);
+  const messageToneAudioModeReadyRef = useRef(false);
+  const messageToneCooldownUntilRef = useRef<number>(0);
+  const messageToneEligibleSinceRef = useRef<number>(Date.now());
+  const SOUND_THROTTLE_MS = 450;
+  const TONE_HISTORICAL_TIMESTAMP_GRACE_MS = 8000;
 
   // Global animation tracking to prevent multiple animations per message
   const globalAnimatedMessages = useRef<Set<string>>(new Set());
 
-  // Simple sound service for web
-  const playMessageSound = () => {
-    if (Platform.OS === 'web') {
-      const now = Date.now();
-      // Throttle sound to prevent multiple plays within 1 second
-      if (now - lastSoundPlayedRef.current < SOUND_THROTTLE_MS) {
+  const ensureMessageTonePlayer = useCallback(async () => {
+    if (messageTonePlayerRef.current) {
+      return messageTonePlayerRef.current;
+    }
+
+    if (messageToneInitPromiseRef.current) {
+      await messageToneInitPromiseRef.current;
+      return messageTonePlayerRef.current;
+    }
+
+    const initializeMessageTonePlayer = async () => {
+      if (!messageToneAudioModeReadyRef.current) {
+        try {
+          await setAudioModeAsync({
+            playsInSilentMode: true,
+            allowsRecording: false,
+            shouldPlayInBackground: false,
+            interruptionMode: 'duckOthers',
+            interruptionModeAndroid: 'duckOthers',
+            shouldRouteThroughEarpiece: false,
+          });
+          messageToneAudioModeReadyRef.current = true;
+        } catch (error) {
+          logger.warn('Chat: failed to configure audio mode for message tone', error);
+        }
+      }
+
+      try {
+        const player = createAudioPlayer(MESSAGE_TUNE_SOURCE, 160);
+        player.loop = false;
+        player.muted = false;
+        player.volume = Platform.OS === 'web' ? 0.7 : 0.62;
+        messageTonePlayerRef.current = player;
+      } catch (error) {
+        logger.warn('Chat: failed to initialize message tone player', error);
+      }
+    };
+
+    messageToneInitPromiseRef.current = initializeMessageTonePlayer().finally(() => {
+      messageToneInitPromiseRef.current = null;
+    });
+
+    await messageToneInitPromiseRef.current;
+    return messageTonePlayerRef.current;
+  }, []);
+
+  const playMessageSoundNow = useCallback(async () => {
+    try {
+      const player = await ensureMessageTonePlayer();
+      if (!player) {
         return;
       }
-      lastSoundPlayedRef.current = now;
-      
-      // Clear any existing sound timeout
-      if (soundTimeoutRef.current) {
-        clearTimeout(soundTimeoutRef.current);
+      try {
+        void player.seekTo(0);
+      } catch {
+        // Ignore seek failures; attempt play anyway.
       }
-      
-      // Debounce the sound to group rapid messages
-      soundTimeoutRef.current = setTimeout(() => {
-        try {
-          // Only use Web Audio API on web platform
-          if (Platform.OS === 'web' && typeof window !== 'undefined' && (window.AudioContext || (window as any).webkitAudioContext)) {
-            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-            const oscillator = audioContext.createOscillator();
-            const gainNode = audioContext.createGain();
-            
-            oscillator.connect(gainNode);
-            gainNode.connect(audioContext.destination);
-            
-            oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
-            oscillator.frequency.setValueAtTime(600, audioContext.currentTime + 0.1);
-            gainNode.gain.setValueAtTime(0.2, audioContext.currentTime); // Reduced volume
-            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.2);
-            
-            oscillator.start(audioContext.currentTime);
-            oscillator.stop(audioContext.currentTime + 0.2); // Shorter sound
-          }
-        } catch (error) {
-          // Fail silently if sound cannot be played
-        }
-      }, 100); // Small delay to group rapid messages
+      player.play();
+    } catch (error) {
+      logger.warn('Chat: message tone playback failed', error);
     }
-  };
+  }, [ensureMessageTonePlayer]);
+
+  const playMessageSound = useCallback(() => {
+    const now = Date.now();
+    if (now - lastSoundPlayedRef.current < SOUND_THROTTLE_MS) {
+      return;
+    }
+    lastSoundPlayedRef.current = now;
+
+    void playMessageSoundNow();
+  }, [playMessageSoundNow]);
+
+  const parseMessageTimestampMs = useCallback((value: unknown): number => {
+    if (value instanceof Date) {
+      const time = value.getTime();
+      return Number.isFinite(time) ? time : 0;
+    }
+
+    if (value && typeof (value as any).toDate === 'function') {
+      try {
+        const parsed = (value as any).toDate();
+        const time = parsed instanceof Date ? parsed.getTime() : new Date(parsed).getTime();
+        return Number.isFinite(time) ? time : 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      const parsed = new Date(value).getTime();
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    return 0;
+  }, []);
 
   // sendMessageNotification is defined after effectiveUser to avoid TDZ
   const [selectedFiles, setSelectedFiles] = useState<any[]>([]);
@@ -985,10 +1236,20 @@ export default function Chat() {
   const [selectedImageUri, setSelectedImageUri] = useState<string>('');
   const [lastViewedRemoteImage, setLastViewedRemoteImage] = useState<string | undefined>(undefined);
   const [brokenFileUrls, setBrokenFileUrls] = useState<Set<string>>(new Set());
+  const brokenFileUrlsRef = useRef<Set<string>>(new Set());
   const [networkErrorUrls, setNetworkErrorUrls] = useState<Set<string>>(new Set());
   const downloadingUrlsRef = useRef<Set<string>>(new Set());
   const [fileValidationCache] = useState<Map<string, number>>(new Map()); // Cache file validation results
+  const fileValidationInFlightRef = useRef(false);
+  const fileValidationLastRunAtRef = useRef(0);
   const [showImageShareModal, setShowImageShareModal] = useState(false);
+  const closeImageViewer = useCallback(() => setImageViewerVisible(false), []);
+  const openImageShareModal = useCallback(() => setShowImageShareModal(true), []);
+  const closeImageShareModal = useCallback(() => setShowImageShareModal(false), []);
+
+  useEffect(() => {
+    brokenFileUrlsRef.current = brokenFileUrls;
+  }, [brokenFileUrls]);
 
   const syncMessageReactions = useCallback(
     (prev: Map<string, { [key: string]: Set<string> }>, next: Map<string, { [key: string]: Set<string> }>) => {
@@ -1042,7 +1303,42 @@ export default function Chat() {
     const email = selectedTeamMember?.email;
     return typeof email === 'string' ? email.toLowerCase() : '';
   }, [selectedTeamMember?.email]);
+
+  const teamMembersByEmail = useMemo(() => {
+    const map = new Map<string, TeamMember>();
+    teamMembers.forEach((member) => {
+      const email = normalizeParticipantEmail(member?.email);
+      if (email && !map.has(email)) {
+        map.set(email, member);
+      }
+    });
+    return map;
+  }, [teamMembers, normalizeParticipantEmail]);
+
+  const teamMembersWithChatInfoByEmail = useMemo(() => {
+    const map = new Map<string, TeamMember>();
+    teamMembersWithChatInfo.forEach((member: any) => {
+      const email = normalizeParticipantEmail(member?.email);
+      if (email && !map.has(email)) {
+        map.set(email, member as TeamMember);
+      }
+    });
+    return map;
+  }, [teamMembersWithChatInfo, normalizeParticipantEmail]);
+
+  const teamMembersWithChatInfoById = useMemo(() => {
+    const map = new Map<string, TeamMember>();
+    teamMembersWithChatInfo.forEach((member: any) => {
+      const id = member?.id != null ? String(member.id) : '';
+      if (id && !map.has(id)) {
+        map.set(id, member as TeamMember);
+      }
+    });
+    return map;
+  }, [teamMembersWithChatInfo]);
+
   const displayedMessagesRef = useRef<any[]>([]);
+  const displayedMessageIndexRef = useRef<Map<string, number>>(new Map());
   useEffect(() => {
     const displayed = displayedMessages;
     if (displayed.length) {
@@ -1050,28 +1346,70 @@ export default function Chat() {
       const userEmail = effectiveUser?.email;
       if (memberId && userEmail) {
         const mediaToWarm: { remoteUrl: string; fileName?: string }[] = [];
-        displayed.forEach((msg: any) => {
-          const addUrl = (url?: string, fileName?: string) => {
-            if (!url) return;
-            if (url.startsWith('file://')) return;
-            mediaToWarm.push({ remoteUrl: url, fileName });
-          };
-          if (Array.isArray(msg.attachments)) {
-            msg.attachments.forEach((att: any) => addUrl(att.url, att.fileName));
+        const seenUrls = new Set<string>();
+        const maxWarmTargets = Platform.OS === 'web' ? 6 : 10;
+        const maxWarmScanMessages = Platform.OS === 'web' ? 40 : 70;
+        const minIndex = Math.max(0, displayed.length - maxWarmScanMessages);
+
+        for (let idx = displayed.length - 1; idx >= minIndex && mediaToWarm.length < maxWarmTargets; idx -= 1) {
+          const msg = displayed[idx];
+          if (!Array.isArray(msg?.attachments)) {
+            continue;
           }
-        });
+
+          for (const attachment of msg.attachments) {
+            const url = typeof attachment?.url === 'string' ? attachment.url : '';
+            if (!url || url.startsWith('file://') || seenUrls.has(url)) {
+              continue;
+            }
+            seenUrls.add(url);
+            mediaToWarm.push({ remoteUrl: url, fileName: attachment?.fileName });
+            if (mediaToWarm.length >= maxWarmTargets) {
+              break;
+            }
+          }
+        }
 
         if (mediaToWarm.length) {
           Promise.allSettled(
-            mediaToWarm.slice(0, 8).map(({ remoteUrl, fileName }) =>
+            mediaToWarm.map(({ remoteUrl, fileName }) =>
               chatCacheService.getMediaForDownload(remoteUrl, fileName, undefined, 'low').catch(() => undefined)
             )
           ).catch(() => undefined);
         }
       }
     }
+
+    const indexMap = new Map<string, number>();
+    displayed.forEach((message: any, index: number) => {
+      const id = normalizeMessageId(message?.id);
+      if (id) {
+        indexMap.set(id, index);
+      }
+    });
+    displayedMessageIndexRef.current = indexMap;
+
     displayedMessagesRef.current = displayed;
-  }, [displayedMessages, selectedTeamMember?.id, effectiveUser?.email]);
+  }, [displayedMessages, selectedTeamMember?.id, effectiveUser?.email, normalizeMessageId]);
+
+  const getDisplayedMessageById = useCallback((messageId?: unknown) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId) {
+      return null;
+    }
+
+    const index = displayedMessageIndexRef.current.get(normalizedMessageId);
+    if (typeof index !== 'number' || index < 0) {
+      return null;
+    }
+
+    const message = displayedMessagesRef.current[index];
+    if (!message) {
+      return null;
+    }
+
+    return normalizeMessageId(message?.id) === normalizedMessageId ? message : null;
+  }, [normalizeMessageId]);
 
   const selectedPartnerEmailRef = useRef<string | null>(null);
   useEffect(() => {
@@ -1135,12 +1473,8 @@ export default function Chat() {
 
   const [stickyDateVisible, setStickyDateVisible] = useState(false);
   const [stickyDateText, setStickyDateText] = useState('');
-  const [messagePositions, setMessagePositions] = useState<{ [key: string]: { y: number; height: number; date: string } }>({});
-  const messagePositionsRef = useRef(messagePositions);
-  useEffect(() => {
-    messagePositionsRef.current = messagePositions;
-  }, [messagePositions]);
-  const [isScrolling, setIsScrolling] = useState(false);
+  const messagePositionsRef = useRef<{ [key: string]: { y: number; height: number; date: string } }>({});
+  const isScrollingRef = useRef(false);
   const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollToBottomRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isAtBottomRef = useRef(true);
@@ -1310,6 +1644,8 @@ export default function Chat() {
     flushConversationReceiptSyncRef.current = flushConversationReceiptSync;
   }, [flushConversationReceiptSync]);
 
+  const lastExpensiveViewabilityWorkAtRef = useRef(0);
+
   useEffect(() => {
     return () => {
       if (receiptSyncTimeoutRef.current) {
@@ -1323,6 +1659,11 @@ export default function Chat() {
   const onViewableItemsChangedRef = useRef(({ viewableItems }: any) => {
     const displayedMessages = displayedMessagesRef.current;
     if (!displayedMessages || displayedMessages.length === 0) return;
+    const nowMs = Date.now();
+    const runExpensiveViewabilityWork = nowMs - lastExpensiveViewabilityWorkAtRef.current >= 120;
+    if (runExpensiveViewabilityWork) {
+      lastExpensiveViewabilityWorkAtRef.current = nowMs;
+    }
     const prefetch = prefetchUriRef.current;
     const resolveSticker = resolveNativeSafeStickerUrlRef.current;
     const resolveGif = resolveOptimizedGifUrlRef.current;
@@ -1330,7 +1671,7 @@ export default function Chat() {
     const gifMap = gifUrlMapRef.current;
     const partnerEmail = selectedPartnerEmailRef.current;
     const userEmail = effectiveUserEmailRef.current;
-    if (partnerEmail && userEmail && Array.isArray(viewableItems)) {
+    if (runExpensiveViewabilityWork && partnerEmail && userEmail && Array.isArray(viewableItems)) {
       const warmTargets: { remoteUrl: string; fileName?: string }[] = [];
       const visibleUnreadIncomingIds: string[] = [];
       viewableItems.forEach((viewable: any) => {
@@ -1385,44 +1726,46 @@ export default function Chat() {
     }
 
     // Prefetch nearby media (stickers/GIFs/images) for smoother scrolling
-    const indices = (viewableItems || [])
-      .map((v: any) => v.index as number)
-      .filter((i: number) => typeof i === 'number') as number[];
-    const candidates = new Set<number>();
-    indices.forEach(i => {
-      for (let d = -2; d <= 4; d++) {
-        const idx = i + d;
-        if (idx >= 0 && idx < displayedMessages.length) candidates.add(idx);
-      }
-    });
-    candidates.forEach((idx) => {
-      const m = displayedMessages[idx];
-      if (!m) return;
-      // Stickers
-      if (m.sticker?.url) {
-        const original = m.sticker.url as string;
-        const display = Platform.OS === 'web' ? original : (stickerMap.get(original) || original);
-        prefetch(display);
-        if (Platform.OS !== 'web') {
-          resolveSticker(original).then((alt: string | null) => { if (alt) prefetch(alt); });
+    if (runExpensiveViewabilityWork) {
+      const indices = (viewableItems || [])
+        .map((v: any) => v.index as number)
+        .filter((i: number) => typeof i === 'number') as number[];
+      const candidates = new Set<number>();
+      indices.forEach(i => {
+        for (let d = -2; d <= 4; d++) {
+          const idx = i + d;
+          if (idx >= 0 && idx < displayedMessages.length) candidates.add(idx);
         }
-      }
-      // GIFs
-      if (m.gif?.url) {
-        const original = m.gif.url as string;
-        const display = Platform.OS === 'web' ? original : (gifMap.get(original) || original);
-        prefetch(display);
-        if (Platform.OS !== 'web') {
-          resolveGif(original).then((alt: string) => { if (alt) prefetch(alt); });
+      });
+      candidates.forEach((idx) => {
+        const m = displayedMessages[idx];
+        if (!m) return;
+        // Stickers
+        if (m.sticker?.url) {
+          const original = m.sticker.url as string;
+          const display = Platform.OS === 'web' ? original : (stickerMap.get(original) || original);
+          prefetch(display);
+          if (Platform.OS !== 'web') {
+            resolveSticker(original).then((alt: string | null) => { if (alt) prefetch(alt); });
+          }
         }
-      }
-      // Image attachments
-      if (m.attachments && Array.isArray(m.attachments)) {
-        m.attachments.forEach((att: any) => {
-          if (att?.url && isImageFile(att.fileType, att.fileName)) prefetch(att.url);
-        });
-      }
-    });
+        // GIFs
+        if (m.gif?.url) {
+          const original = m.gif.url as string;
+          const display = Platform.OS === 'web' ? original : (gifMap.get(original) || original);
+          prefetch(display);
+          if (Platform.OS !== 'web') {
+            resolveGif(original).then((alt: string) => { if (alt) prefetch(alt); });
+          }
+        }
+        // Image attachments
+        if (m.attachments && Array.isArray(m.attachments)) {
+          m.attachments.forEach((att: any) => {
+            if (att?.url && isImageFile(att.fileType, att.fileName)) prefetch(att.url);
+          });
+        }
+      });
+    }
 
     if (Array.isArray(viewableItems) && viewableItems.length) {
 
@@ -1435,10 +1778,23 @@ export default function Chat() {
 
       if (isUnreadVisible) {
         hasAcknowledgedUnreadRef.current = true;
-        if (incomingUnreadCountRef.current === 0) {
-          scheduleUnreadSeparatorDismissRef.current?.(350);
+        unreadSeparatorIsVisibleRef.current = true;
+        if (unreadSeparatorDismissTimeoutRef.current) {
+          clearTimeout(unreadSeparatorDismissTimeoutRef.current);
+          unreadSeparatorDismissTimeoutRef.current = null;
+        }
+      } else {
+        unreadSeparatorIsVisibleRef.current = false;
+        if (
+          hasAcknowledgedUnreadRef.current &&
+          incomingUnreadCountRef.current === 0 &&
+          unreadDividerSeedCountRef.current === 0
+        ) {
+          scheduleUnreadSeparatorDismissRef.current?.(UNREAD_DIVIDER_AUTO_DISMISS_MS);
         }
       }
+    } else {
+      unreadSeparatorIsVisibleRef.current = false;
     }
       let topEntry: any = null;
       let bottomEntry: any = null;
@@ -1568,7 +1924,7 @@ export default function Chat() {
 
         const displayed = displayedMessagesRef.current;
         if (Array.isArray(displayed) && displayed.length) {
-          const fallbackIndex = displayed.findIndex((m: any) => m && String(m.id) === anchor.id);
+          const fallbackIndex = displayedMessageIndexRef.current.get(String(anchor.id)) ?? -1;
           if (fallbackIndex >= 0) {
             try {
               (flatListRef.current as any)?.scrollToIndex?.({
@@ -1703,7 +2059,7 @@ export default function Chat() {
     autoLoadAnchorRef.current = null;
   }, [selectedTeamMember?.id]);
 
-  const scheduleUnreadSeparatorDismiss = useCallback((delay: number = 400) => {
+  const scheduleUnreadSeparatorDismiss = useCallback((delay: number = UNREAD_DIVIDER_AUTO_DISMISS_MS) => {
     if (!showUnreadSeparatorRef.current) {
       return;
     }
@@ -1715,6 +2071,9 @@ export default function Chat() {
     unreadSeparatorDismissTimeoutRef.current = setTimeout(() => {
       setShowUnreadSeparator(false);
       setUnreadSeparatorMessageId(null);
+      unreadSeparatorIsVisibleRef.current = false;
+      unreadDividerSeedCountRef.current = 0;
+      setUnreadDividerSeedCount(0);
       unreadSeparatorDismissTimeoutRef.current = null;
     }, Math.max(0, delay));
   }, []);
@@ -1806,7 +2165,7 @@ export default function Chat() {
     const userEmail = effectiveUser.email;
     
     // Check if this is a special message
-    const message = messages.find(m => normalizeMessageId(m?.id) === normalizedMessageId);
+    const message = getDisplayedMessageById(normalizedMessageId);
     const isSpecialMessage = message?.isSpecial === true;
     
     logger.debug('🎯 Reaction Debug Info:', {
@@ -1988,7 +2347,7 @@ export default function Chat() {
   const handleMessageLongPress = (messageId: string, event: any) => {
     const { pageX, pageY } = event.nativeEvent;
     const normalizedMessageId = normalizeMessageId(messageId);
-    const targetMessage = (messages || []).find((m: any) => m && normalizeMessageId(m.id) === normalizedMessageId) || null;
+    const targetMessage = getDisplayedMessageById(normalizedMessageId);
     setSelectedMessageForReaction(normalizedMessageId);
     setSelectedMessageForAction(targetMessage);
     setReactionPickerPosition({ x: pageX, y: pageY });
@@ -2006,19 +2365,38 @@ export default function Chat() {
     await handleReaction(normalizeMessageId(messageId), '❤️');
   };
 
+  type ReactionStatusSnapshot = {
+    count: number;
+    hasUserReacted: boolean;
+    users: string[];
+  };
+
+  type MessageReactionPill = {
+    emoji: string;
+    count: number;
+    users: string[];
+    hasUserReacted: boolean;
+  };
+
+  const EMPTY_REACTION_STATUS: ReactionStatusSnapshot = {
+    count: 0,
+    hasUserReacted: false,
+    users: [],
+  };
+
   // Get reaction status for a message
   const getReactionStatus = (
     messageId: string,
     reactionType: string,
     reactionsOverride?: { [key: string]: Set<string> }
-  ) => {
+  ): ReactionStatusSnapshot => {
     const normalizedMessageId = normalizeMessageId(messageId);
-    if (!normalizedMessageId || !reactionType) return { count: 0, hasUserReacted: false, users: [] };
+    if (!normalizedMessageId || !reactionType) return EMPTY_REACTION_STATUS;
     const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
-    if (!reactions || !reactions[reactionType]) return { count: 0, hasUserReacted: false, users: [] };
+    if (!reactions || !reactions[reactionType]) return EMPTY_REACTION_STATUS;
     
     const reactionSet = reactions[reactionType];
-    if (!reactionSet) return { count: 0, hasUserReacted: false, users: [] };
+    if (!reactionSet) return EMPTY_REACTION_STATUS;
     
     const users = Array.from(reactionSet);
     const hasUserReacted = effectiveUser?.email ? reactionSet.has(effectiveUser.email) : false;
@@ -2030,80 +2408,75 @@ export default function Chat() {
     };
   };
 
-  // Get the user's current reaction(s) for a message
-  const getUserCurrentReaction = (messageId: string, reactionsOverride?: { [key: string]: Set<string> }) => {
-    if (!effectiveUser?.email) return null;
-    const normalizedMessageId = normalizeMessageId(messageId);
-    if (!normalizedMessageId) return null;
-
-    const message = messages.find(m => normalizeMessageId(m?.id) === normalizedMessageId);
-    const isSpecialMessage = message?.isSpecial === true;
-    const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
-    if (!reactions) return null;
-    
-    // For special messages, return array of all user's reactions
-    if (isSpecialMessage) {
-      const userReactions: string[] = [];
-      for (const [reactionType, users] of Object.entries(reactions)) {
-        if ((users as Set<string>).has(effectiveUser.email)) {
-          userReactions.push(reactionType);
-        }
-      }
-      return userReactions.length > 0 ? userReactions : null;
-    }
-    
-    // For regular messages, return single reaction (existing behavior)
-    for (const [reactionType, users] of Object.entries(reactions)) {
-      if ((users as Set<string>).has(effectiveUser.email)) {
-        return reactionType;
-      }
-    }
-    
-    return null;
-  };
-
-  // Check if both sender and receiver reacted (for glow effect)
-  const shouldGlow = (
-    messageId: string,
-    reactionType: string,
+  const getMessageReactionSummary = useCallback((
+    message: any,
     reactionsOverride?: { [key: string]: Set<string> }
   ) => {
-    const normalizedMessageId = normalizeMessageId(messageId);
-    if (!normalizedMessageId || !reactionType || !selectedTeamMember) return false;
-    
-    const message = messages.find(m => m && normalizeMessageId(m.id) === normalizedMessageId);
-    if (!message) return false;
-    
-    const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
-    if (!reactions || !reactions[reactionType]) return false;
-    
-    const reactionSet = reactions[reactionType];
-    if (!reactionSet) return false;
-    
-    const senderEmail = (message.sender || '').toLowerCase();
-    const recipientEmail = (selectedTeamMember.email || '').toLowerCase();
-    
-    // Check if both sender and recipient have reacted
-    return reactionSet.has(senderEmail) && reactionSet.has(recipientEmail);
-  };
+    const normalizedMessageId = normalizeMessageId(message?.id);
+    if (!normalizedMessageId) {
+      return {
+        pills: [] as MessageReactionPill[],
+        statusByType: new Map<string, ReactionStatusSnapshot>(),
+        glowByType: new Set<string>(),
+      };
+    }
 
-  // Get all reactions for a message
-  const getAllReactions = (messageId: string, reactionsOverride?: { [key: string]: Set<string> }) => {
-    const normalizedMessageId = normalizeMessageId(messageId);
-    if (!normalizedMessageId) return [];
     const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
-    if (!reactions) return [];
-    
-    return Object.entries(reactions)
-      .filter(([_, users]) => users && users.size > 0)
-      .map(([emoji, users]) => ({
-        emoji,
+    if (!reactions) {
+      return {
+        pills: [] as MessageReactionPill[],
+        statusByType: new Map<string, ReactionStatusSnapshot>(),
+        glowByType: new Set<string>(),
+      };
+    }
+
+    const senderEmail = normalizeParticipantEmail(message?.sender);
+    const recipientEmail = normalizeParticipantEmail(selectedTeamMember?.email);
+    const canGlow = Boolean(senderEmail && recipientEmail);
+
+    const pills: MessageReactionPill[] = [];
+    const statusByType = new Map<string, ReactionStatusSnapshot>();
+    const glowByType = new Set<string>();
+
+    Object.entries(reactions).forEach(([emoji, users]) => {
+      if (!users || users.size === 0) {
+        return;
+      }
+
+      const normalizedEmoji = String(emoji || '');
+      if (!normalizedEmoji) {
+        return;
+      }
+
+      const reactionUsers = Array.from(users);
+      const hasUserReacted = effectiveUser?.email ? users.has(effectiveUser.email) : false;
+      const status: ReactionStatusSnapshot = {
         count: users.size,
-        users: Array.from(users),
-        hasUserReacted: effectiveUser?.email ? users.has(effectiveUser.email) : false
-      }))
-      .sort((a, b) => b.count - a.count);
-  };
+        hasUserReacted,
+        users: reactionUsers,
+      };
+
+      statusByType.set(normalizedEmoji, status);
+      pills.push({
+        emoji: normalizedEmoji,
+        count: users.size,
+        users: reactionUsers,
+        hasUserReacted,
+      });
+
+      if (canGlow && users.has(senderEmail) && users.has(recipientEmail)) {
+        glowByType.add(normalizedEmoji);
+      }
+    });
+
+    pills.sort((a, b) => b.count - a.count);
+
+    return {
+      pills,
+      statusByType,
+      glowByType,
+    };
+  }, [effectiveUser?.email, normalizeMessageId, normalizeParticipantEmail, selectedTeamMember?.email]);
 
   const isOwnMessageEmail = useCallback(
     (msg?: any) => {
@@ -2165,11 +2538,19 @@ export default function Chat() {
   // Unread messages separator state management
   const [showUnreadSeparator, setShowUnreadSeparator] = useState(false);
   const [unreadSeparatorMessageId, setUnreadSeparatorMessageId] = useState<string | null>(null);
+  const [unreadDividerSeedCount, setUnreadDividerSeedCount] = useState(0);
   const unreadSeparatorDismissTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const unreadSeparatorMessageIdRef = useRef<string | null>(null);
   const showUnreadSeparatorRef = useRef(false);
+  const unreadSeparatorIsVisibleRef = useRef(false);
   const hasAcknowledgedUnreadRef = useRef(false);
   const incomingUnreadCountRef = useRef(0);
+  const unreadDividerSeedCountRef = useRef(0);
+  const unreadSeedInitializedChatKeyRef = useRef<string | null>(null);
+  const unreadDividerDismissedStateRef = useRef<{
+    anchorMessageId: string;
+    latestIncomingMessageId: string | null;
+  } | null>(null);
   // New messages divider when user is away from bottom
   const [showNewDivider, setShowNewDivider] = useState(false);
   const [newDividerMessageId, setNewDividerMessageId] = useState<string | null>(null);
@@ -2214,48 +2595,113 @@ export default function Chat() {
     return () => subscription?.remove();
   }, []);
 
-  const firstUnreadMessageId = useMemo(() => {
-    const isConversationActive = Boolean(
-      isFocused && isAppActive && selectedTeamMember?.email && effectiveUser?.email
+  const incomingConversationMessages = useMemo(() => {
+    return getIncomingConversationMessages(
+      displayedMessages,
+      effectiveUser?.email,
+      selectedTeamMember?.email
     );
-    if (isConversationActive) return null;
-    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) return null;
-    if (!effectiveUser?.email || !selectedTeamMember?.email) return null;
-    const userEmail = effectiveUser.email.toLowerCase();
-    const senderEmail = selectedTeamMember.email.toLowerCase();
-    const unread = displayedMessages.filter((msg: any) =>
-      msg?.sender?.toLowerCase?.() === senderEmail &&
-      msg?.recipientId?.toLowerCase?.() === userEmail &&
-      !msg?.read &&
-      !msg?.deleted &&
-      msg?.id
-    );
-    if (!unread.length) return null;
-    return normalizeMessageId(unread[0]?.id) || null;
-  }, [displayedMessages, effectiveUser?.email, selectedTeamMember?.email, normalizeMessageId, isFocused, isAppActive]);
+  }, [displayedMessages, effectiveUser?.email, getIncomingConversationMessages, selectedTeamMember?.email]);
 
-  const incomingUnreadCount = useMemo(() => {
-    const isConversationActive = Boolean(
-      isFocused && isAppActive && selectedTeamMember?.email && effectiveUser?.email
-    );
-    if (isConversationActive) return 0;
-    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) return 0;
-    if (!effectiveUser?.email || !selectedTeamMember?.email) return 0;
-    const userEmail = effectiveUser.email.toLowerCase();
-    const senderEmail = selectedTeamMember.email.toLowerCase();
+  const incomingUnreadMessages = useMemo(() => {
+    if (!incomingConversationMessages.length) {
+      return [] as any[];
+    }
 
-    return displayedMessages.reduce((count, msg: any) => {
-      if (
-        msg?.sender?.toLowerCase?.() === senderEmail &&
-        msg?.recipientId?.toLowerCase?.() === userEmail &&
-        !msg?.read &&
-        !msg?.deleted
-      ) {
-        return count + 1;
+    return incomingConversationMessages.filter((msg: any) => !msg?.read);
+  }, [incomingConversationMessages]);
+
+  const incomingUnreadMessageIds = useMemo(() => {
+    if (!incomingUnreadMessages.length) {
+      return [] as string[];
+    }
+
+    const ids: string[] = [];
+    incomingUnreadMessages.forEach((msg: any) => {
+      const id = normalizeMessageId(msg?.id);
+      if (id) {
+        ids.push(id);
       }
-      return count;
-    }, 0);
-  }, [displayedMessages, effectiveUser?.email, selectedTeamMember?.email, isFocused, isAppActive]);
+    });
+
+    return ids;
+  }, [incomingUnreadMessages, normalizeMessageId]);
+
+  const firstUnreadMessageId = useMemo(() => {
+    return incomingUnreadMessageIds.length > 0 ? incomingUnreadMessageIds[0] : null;
+  }, [incomingUnreadMessageIds]);
+
+  const incomingUnreadCount = useMemo(() => incomingUnreadMessageIds.length, [incomingUnreadMessageIds]);
+
+  const latestIncomingMessageId = useMemo(() => {
+    if (!incomingConversationMessages.length) {
+      return null;
+    }
+    return normalizeMessageId(incomingConversationMessages[incomingConversationMessages.length - 1]?.id) || null;
+  }, [
+    incomingConversationMessages,
+    normalizeMessageId,
+  ]);
+
+  const unreadDividerSeedAnchorMessageId = useMemo(() => {
+    if (firstUnreadMessageId) {
+      return null;
+    }
+
+    const seedCount = Math.max(0, Math.trunc(unreadDividerSeedCount || 0));
+    if (seedCount <= 0) {
+      return null;
+    }
+
+    if (!incomingConversationMessages.length) {
+      return normalizeMessageId(displayedMessages?.[0]?.id) || null;
+    }
+
+    const clampedUnreadCount = Math.min(seedCount, incomingConversationMessages.length);
+    const boundaryIndex = Math.max(0, incomingConversationMessages.length - clampedUnreadCount);
+    return normalizeMessageId(incomingConversationMessages[boundaryIndex]?.id) || null;
+  }, [
+    displayedMessages,
+    firstUnreadMessageId,
+    incomingConversationMessages,
+    normalizeMessageId,
+    unreadDividerSeedCount,
+  ]);
+
+  const unreadSeparatorAnchorMessageId = firstUnreadMessageId || unreadDividerSeedAnchorMessageId;
+
+  const unreadDividerDisplayCount = useMemo(() => {
+    const liveCount = Math.max(0, Math.trunc(Number(incomingUnreadCount || 0)));
+    const seedCount = Math.max(0, Math.trunc(Number(unreadDividerSeedCount || 0)));
+    const count = liveCount > 0 ? liveCount : seedCount;
+    return Number.isFinite(count) ? count : 0;
+  }, [incomingUnreadCount, unreadDividerSeedCount]);
+
+  const unreadDividerLabel = useMemo(() => {
+    if (unreadDividerDisplayCount <= 0) {
+      return 'Unread messages';
+    }
+    if (unreadDividerDisplayCount === 1) {
+      return '1 unread message';
+    }
+    if (unreadDividerDisplayCount > 99) {
+      return '99+ unread messages';
+    }
+    return `${unreadDividerDisplayCount} unread messages`;
+  }, [unreadDividerDisplayCount]);
+
+  const dismissUnreadDividerForCurrentBatch = useCallback((delay: number = UNREAD_DIVIDER_ACTION_DISMISS_MS) => {
+    const activeAnchorId = unreadSeparatorAnchorMessageId || unreadSeparatorMessageIdRef.current;
+    if (activeAnchorId) {
+      unreadDividerDismissedStateRef.current = {
+        anchorMessageId: activeAnchorId,
+        latestIncomingMessageId: latestIncomingMessageId || null,
+      };
+    }
+
+    hasAcknowledgedUnreadRef.current = true;
+    scheduleUnreadSeparatorDismissRef.current?.(delay);
+  }, [latestIncomingMessageId, unreadSeparatorAnchorMessageId]);
 
   const liveSelectedConversationSummary = useMemo<ConversationSummary | null>(() => {
     const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
@@ -2264,9 +2710,14 @@ export default function Chat() {
       return null;
     }
 
-    const latestMessage = [...displayedMessages]
-      .reverse()
-      .find((msg: any) => Boolean(msg?.id));
+    let latestMessage: any = null;
+    for (let index = displayedMessages.length - 1; index >= 0; index -= 1) {
+      const candidate = displayedMessages[index];
+      if (candidate?.id) {
+        latestMessage = candidate;
+        break;
+      }
+    }
 
     const toIsoString = (value: any): string => {
       if (typeof value === 'string' && value.trim()) {
@@ -2312,17 +2763,7 @@ export default function Chat() {
       return { text: txt || '📎 Attachment', type: 'text' };
     };
 
-    const unreadCount = displayedMessages.reduce((count, msg: any) => {
-      if (
-        msg?.sender?.toLowerCase?.() === partnerEmail &&
-        msg?.recipientId?.toLowerCase?.() === userEmail &&
-        !msg?.read &&
-        !msg?.deleted
-      ) {
-        return count + 1;
-      }
-      return count;
-    }, 0);
+    const unreadCount = incomingUnreadCount;
 
     const effectiveUnread = isFocused && isAppActive ? 0 : unreadCount;
 
@@ -2357,7 +2798,7 @@ export default function Chat() {
           }
         : undefined,
     };
-  }, [displayedMessages, selectedTeamMember?.email, selectedTeamMember?.id, selectedTeamMember?.name, effectiveUser?.email, activeTenant?.id, isFocused, isAppActive]);
+  }, [displayedMessages, incomingUnreadCount, selectedTeamMember?.email, selectedTeamMember?.id, selectedTeamMember?.name, effectiveUser?.email, activeTenant?.id, isFocused, isAppActive]);
 
   useEffect(() => {
     if (!liveSelectedConversationSummary) {
@@ -2410,29 +2851,15 @@ export default function Chat() {
 
     const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
     const userEmail = effectiveUser?.email?.toLowerCase?.();
-    if (!partnerEmail || !userEmail || !Array.isArray(displayedMessages) || displayedMessages.length === 0) {
-      return;
-    }
-
-    const unreadIncomingIds = displayedMessages
-      .filter((msg: any) => (
-        msg?.id &&
-        !msg?.deleted &&
-        String(msg.sender || '').toLowerCase() === partnerEmail &&
-        String(msg.recipientId || '').toLowerCase() === userEmail &&
-        !msg?.read
-      ))
-      .map((msg: any) => String(msg.id));
-
-    if (!unreadIncomingIds.length) {
+    if (!partnerEmail || !userEmail || !incomingUnreadMessageIds.length) {
       return;
     }
 
     queueConversationReceiptSync({
-      readMessageIds: unreadIncomingIds,
+      readMessageIds: incomingUnreadMessageIds,
       requestConversationDelivered: true,
     });
-  }, [displayedMessages, selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, queueConversationReceiptSync]);
+  }, [incomingUnreadMessageIds, selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, queueConversationReceiptSync]);
 
   useEffect(() => {
     unreadSeparatorMessageIdRef.current = unreadSeparatorMessageId;
@@ -2447,13 +2874,47 @@ export default function Chat() {
   }, [incomingUnreadCount]);
 
   useEffect(() => {
+    unreadDividerSeedCountRef.current = unreadDividerSeedCount;
+  }, [unreadDividerSeedCount]);
+
+  useEffect(() => {
+    if (!showUnreadSeparator || !unreadSeparatorMessageId) {
+      return;
+    }
+
+    const normalizedAnchorId = normalizeMessageId(unreadSeparatorMessageId);
+    const anchorExists = Boolean(
+      normalizedAnchorId && displayedMessageIndexRef.current.has(normalizedAnchorId)
+    );
+    if (anchorExists) {
+      return;
+    }
+
+    if (unreadSeparatorAnchorMessageId) {
+      if (unreadSeparatorAnchorMessageId !== unreadSeparatorMessageId) {
+        setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
+      }
+      return;
+    }
+
+    setShowUnreadSeparator(false);
+    setUnreadSeparatorMessageId(null);
+    unreadSeparatorIsVisibleRef.current = false;
+    unreadDividerDismissedStateRef.current = null;
+    unreadDividerSeedCountRef.current = 0;
+    setUnreadDividerSeedCount(0);
+  }, [displayedMessages, normalizeMessageId, showUnreadSeparator, unreadSeparatorMessageId, unreadSeparatorAnchorMessageId]);
+
+  useEffect(() => {
     const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
     if (!partnerEmail) {
       return;
     }
 
+    const effectiveIncomingUnreadCount = isFocused && isAppActive ? 0 : incomingUnreadCount;
+
     setConversationSummaries((prev) => {
-      return reconcileConversationUnreadCount(prev, partnerEmail, incomingUnreadCount, {
+      return reconcileConversationUnreadCount(prev, partnerEmail, effectiveIncomingUnreadCount, {
         isFocused,
         isAppActive,
         loading,
@@ -2470,24 +2931,60 @@ export default function Chat() {
   const estimatedItemSize = useMemo(() => {
     if (displayedMessages.length === 0) return 112;
 
-    const rawHeights = displayedMessages.map((message: any) => {
-      const id = String(message.id);
-      const pos = messagePositions[id];
-      const height = pos?.height;
-      return typeof height === 'number' && height > 0 ? height : 0;
+    const positions = messagePositionsRef.current;
+    const sampledHeights: number[] = [];
+    const sampleStep = Math.max(1, Math.floor(displayedMessages.length / 24));
+
+    for (let index = displayedMessages.length - 1; index >= 0 && sampledHeights.length < 24; index -= sampleStep) {
+      const message = displayedMessages[index];
+      const id = normalizeMessageId(message?.id);
+      if (!id) {
+        continue;
+      }
+      const height = positions[id]?.height;
+      if (typeof height === 'number' && height > 0) {
+        sampledHeights.push(height);
+      }
+    }
+
+    if (sampledHeights.length >= 6) {
+      sampledHeights.sort((a, b) => a - b);
+      const middleIndex = Math.floor(sampledHeights.length / 2);
+      const median = sampledHeights.length % 2
+        ? sampledHeights[middleIndex]
+        : Math.round((sampledHeights[middleIndex - 1] + sampledHeights[middleIndex]) / 2);
+      return Math.max(72, Math.min(280, median));
+    }
+
+    // Heuristic fallback when row measurements are still sparse.
+    const recentMessages = displayedMessages.slice(Math.max(0, displayedMessages.length - 20));
+    let weightedTotal = 0;
+
+    recentMessages.forEach((message: any) => {
+      if (message?.sticker || message?.gif) {
+        weightedTotal += 196;
+        return;
+      }
+      if (Array.isArray(message?.attachments) && message.attachments.length > 0) {
+        weightedTotal += 172;
+        return;
+      }
+
+      const textLength = typeof message?.text === 'string' ? message.text.trim().length : 0;
+      if (textLength > 240) {
+        weightedTotal += 176;
+      } else if (textLength > 120) {
+        weightedTotal += 152;
+      } else if (textLength > 40) {
+        weightedTotal += 132;
+      } else {
+        weightedTotal += 112;
+      }
     });
 
-    const positiveHeights = rawHeights.filter((value) => value > 0).sort((a, b) => a - b);
-    if (!positiveHeights.length) {
-      return 128;
-    }
-    const median = positiveHeights.length % 2
-      ? positiveHeights[(positiveHeights.length - 1) / 2]
-      : Math.round((positiveHeights[positiveHeights.length / 2 - 1] + positiveHeights[positiveHeights.length / 2]) / 2);
-    const percentile75 = positiveHeights[Math.min(positiveHeights.length - 1, Math.floor(positiveHeights.length * 0.75))];
-    const estimate = Math.max(median, percentile75);
-    return Math.max(72, Math.min(280, estimate));
-  }, [displayedMessages, messagePositions]);
+    const heuristic = Math.round(weightedTotal / Math.max(1, recentMessages.length));
+    return Math.max(96, Math.min(220, heuristic));
+  }, [displayedMessages, normalizeMessageId]);
 
   const estimatedListSize = useMemo(() => {
     return {
@@ -2495,6 +2992,14 @@ export default function Chat() {
       width: Math.max(360, Math.round(screenData.width || Dimensions.get('window').width || 400)),
     };
   }, [screenData.height, screenData.width]);
+
+  const listDrawDistance = useMemo(() => {
+    const baseHeight = estimatedListSize.height;
+    if (Platform.OS === 'web') {
+      return Math.max(Math.round(baseHeight * 1.8), 1200);
+    }
+    return Math.max(Math.round(baseHeight * 1.2), 900);
+  }, [estimatedListSize.height]);
 
   useEffect(() => {
     if (!isFocused) {
@@ -2524,22 +3029,18 @@ export default function Chat() {
       return;
     }
 
-    const matchInTeamMembers = teamMembers.find(member =>
-      normalize(member.email) === targetEmail
-    );
+    const matchInTeamMembers = teamMembersByEmail.get(targetEmail);
 
     const matchInChatInfo = matchInTeamMembers
       ? matchInTeamMembers
-      : teamMembersWithChatInfo.find((member: any) =>
-          normalize(member.email) === targetEmail
-        );
+      : teamMembersWithChatInfoByEmail.get(targetEmail);
 
     if (matchInChatInfo) {
       forceBottomAnchorChatKeyRef.current = String((matchInChatInfo as TeamMember).id || (matchInChatInfo as TeamMember).email || '');
       setSelectedTeamMember(matchInChatInfo as TeamMember);
       notificationService.consumePendingChatNavigationTarget();
     }
-  }, [isFocused, teamMembers, teamMembersWithChatInfo, effectiveUser?.email]);
+  }, [isFocused, teamMembersByEmail, teamMembersWithChatInfoByEmail, effectiveUser?.email]);
 
   useEffect(() => {
     if (!isFocused) {
@@ -2554,11 +3055,8 @@ export default function Chat() {
       return;
     }
 
-    const normalize = (value?: string | null) =>
-      typeof value === 'string' ? value.trim().toLowerCase() : undefined;
-
-    const match = teamMembers.find(member => normalize(member.email) === targetEmail)
-      || teamMembersWithChatInfo.find((member: any) => normalize(member.email) === targetEmail);
+    const match = teamMembersByEmail.get(targetEmail)
+      || teamMembersWithChatInfoByEmail.get(targetEmail);
 
     if (!match) {
       return;
@@ -2567,7 +3065,7 @@ export default function Chat() {
     forceBottomAnchorChatKeyRef.current = String((match as TeamMember).id || (match as TeamMember).email || '');
     setSelectedTeamMember(match as TeamMember);
     router.replace('/(tabs)/chat');
-  }, [isFocused, router, searchParams.senderEmail, teamMembers, teamMembersWithChatInfo]);
+  }, [isFocused, router, searchParams.senderEmail, teamMembersByEmail, teamMembersWithChatInfoByEmail]);
 
   // Wrapper for notifications to keep previous calls working
   const sendMessageNotification = useCallback(
@@ -3369,13 +3867,47 @@ export default function Chat() {
 
   // Detect new messages for animations
   useEffect(() => {
-    if (!messages || messages.length === 0) {
-      setPreviousMessageIds(new Set());
+    const chatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
+    const normalizedPartnerEmail = normalizeParticipantEmail(selectedTeamMember?.email);
+    const normalizedUserEmail = normalizeParticipantEmail(effectiveUser?.email);
+
+    if (!chatKey || !normalizedPartnerEmail || !normalizedUserEmail || !displayedMessages || displayedMessages.length === 0) {
+      previousMessageIdsRef.current = new Set();
       setAnimatedMessages(new Set()); // Clear animations when no messages
       return;
     }
 
-    const currentMessageIds = new Set(messages.map(msg => msg.id).filter((id): id is string => id !== undefined));
+    const selectedConversationMessages: any[] = [];
+    const currentMessageIds = new Set<string>();
+
+    displayedMessages.forEach((msg: any) => {
+      if (!msg?.id || msg?.deleted) {
+        return;
+      }
+
+      const sender = normalizeParticipantEmail(msg?.sender);
+      const recipient = normalizeParticipantEmail(msg?.recipientId);
+      const belongsToSelectedConversation = (
+        (sender === normalizedPartnerEmail && recipient === normalizedUserEmail) ||
+        (sender === normalizedUserEmail && recipient === normalizedPartnerEmail)
+      );
+      if (!belongsToSelectedConversation) {
+        return;
+      }
+
+      selectedConversationMessages.push(msg);
+      currentMessageIds.add(String(msg.id));
+    });
+
+    // On first render for a chat, set baseline IDs and skip tone/animation for existing backlog.
+    if (toneBootstrapChatKeyRef.current !== chatKey) {
+      toneBootstrapChatKeyRef.current = chatKey;
+      previousMessageIdsRef.current = currentMessageIds;
+      setAnimatedMessages(new Set());
+      return;
+    }
+
+    const previousMessageIds = previousMessageIdsRef.current;
     const newMessageIds = new Set<string>();
 
     // Find messages that are in current set but not in previous set
@@ -3388,6 +3920,39 @@ export default function Chat() {
     // Add new messages to animated set (but only if we had previous messages to compare with)
     // This prevents animations during initial load
     if (previousMessageIds.size > 0 && newMessageIds.size > 0) {
+      const canAttemptTone =
+        isFocused &&
+        isAppActive &&
+        !loading &&
+        isInitialAnchorSettled &&
+        Date.now() >= messageToneCooldownUntilRef.current;
+
+      if (canAttemptTone) {
+        const hasFreshIncomingNewMessage = selectedConversationMessages.some((msg: any) => {
+          const messageId = msg?.id != null ? String(msg.id) : '';
+          if (!messageId || !newMessageIds.has(messageId)) {
+            return false;
+          }
+
+          const sender = normalizeParticipantEmail(msg?.sender);
+          const recipient = normalizeParticipantEmail(msg?.recipientId);
+          if (sender !== normalizedPartnerEmail || recipient !== normalizedUserEmail) {
+            return false;
+          }
+
+          const timestampMs = parseMessageTimestampMs(msg?.timestamp);
+          if (timestampMs > 0 && timestampMs < messageToneEligibleSinceRef.current - TONE_HISTORICAL_TIMESTAMP_GRACE_MS) {
+            return false;
+          }
+
+          return true;
+        });
+
+        if (hasFreshIncomingNewMessage) {
+          playMessageSound();
+        }
+      }
+
       setAnimatedMessages(prev => {
         const updated = new Set(prev);
         newMessageIds.forEach(id => updated.add(id));
@@ -3404,8 +3969,20 @@ export default function Chat() {
       }, 1000); // 1 second should be enough for animation
     }
 
-    setPreviousMessageIds(currentMessageIds);
-  }, [messages]);
+    previousMessageIdsRef.current = currentMessageIds;
+  }, [
+    displayedMessages,
+    selectedTeamMember?.id,
+    effectiveUser?.email,
+    isAppActive,
+    isFocused,
+    loading,
+    isInitialAnchorSettled,
+    normalizeParticipantEmail,
+    parseMessageTimestampMs,
+    playMessageSound,
+    selectedTeamMember?.email,
+  ]);
 
   // Use useMemo to properly handle filtering when user or teamMembers change
   const filteredTeamMembers = useMemo(() => {
@@ -3586,7 +4163,12 @@ export default function Chat() {
   const scrollToMessage = (messageId: string, animated: boolean = false) => {
     if (!flatListRef.current) return false;
 
-    const index = displayedMessages.findIndex((m: any) => m.id === messageId);
+    const normalizedTargetId = normalizeMessageId(messageId);
+    if (!normalizedTargetId) {
+      return false;
+    }
+
+    const index = displayedMessageIndexRef.current.get(normalizedTargetId) ?? -1;
     if (index === -1) return false;
 
     try {
@@ -3778,8 +4360,8 @@ export default function Chat() {
     }
     
     // Only update scrolling state if it actually changed
-    if (!isScrolling) {
-      setIsScrolling(true);
+    if (!isScrollingRef.current) {
+      isScrollingRef.current = true;
     }
     
     // Early exit for shallow scrolls to reduce state updates
@@ -3789,17 +4371,7 @@ export default function Chat() {
       }
       // Set timer to turn off scrolling
       scrollTimeoutRef.current = setTimeout(() => {
-        setIsScrolling(false);
-      }, 200);
-      return;
-    }
-    
-    if (scrollY <= 50) {
-      if (stickyDateVisible) {
-        setStickyDateVisible(false);
-      }
-      scrollTimeoutRef.current = setTimeout(() => {
-        setIsScrolling(false);
+        isScrollingRef.current = false;
       }, 200);
       return;
     }
@@ -3808,7 +4380,7 @@ export default function Chat() {
     const topInfo = topVisibleMessageRef.current;
     let currentDate = '';
     if (displayed && displayed.length && topInfo?.id) {
-      const idx = displayed.findIndex((m: any) => m && String(m.id) === String(topInfo.id));
+      const idx = displayedMessageIndexRef.current.get(String(topInfo.id)) ?? -1;
       if (idx >= 0) {
         const msg = displayed[idx];
         const prev = idx > 0 ? displayed[idx - 1] : undefined;
@@ -3829,7 +4401,7 @@ export default function Chat() {
 
     // Set timer to turn off scrolling and hide header
     scrollTimeoutRef.current = setTimeout(() => {
-      setIsScrolling(false);
+      isScrollingRef.current = false;
       if (stickyDateVisible) {
         setStickyDateVisible(false);
       }
@@ -3840,14 +4412,14 @@ export default function Chat() {
     if (!messages || messages.length === 0) return;
     if (hasAnchoredInitialScrollRef.current) return;
 
-    if (firstUnreadMessageId && !scrollToUnreadAttemptedRef.current) {
-      scheduleScrollToUnread(firstUnreadMessageId);
+    if (unreadSeparatorAnchorMessageId && !scrollToUnreadAttemptedRef.current) {
+      scheduleScrollToUnread(unreadSeparatorAnchorMessageId);
       return;
     }
 
     pendingInitialAnchorRef.current = true;
     tryAnchorToBottom();
-  }, [messages, firstUnreadMessageId, selectedTeamMember?.id]);
+  }, [messages, unreadSeparatorAnchorMessageId, selectedTeamMember?.id]);
 
   useEffect(() => {
     if (!messages || messages.length === 0) {
@@ -3892,11 +4464,12 @@ export default function Chat() {
     }
 
     const prevId = lastTailIdRef.current;
-    const idx = messages.findIndex((m: any) => m?.id === prevId);
-    const additional = idx >= 0 ? Math.max(0, messages.length - (idx + 1)) : 1;
+    const displayed = displayedMessagesRef.current;
+    const idx = prevId ? (displayedMessageIndexRef.current.get(String(prevId)) ?? -1) : -1;
+    const additional = idx >= 0 ? Math.max(0, displayed.length - (idx + 1)) : 1;
     setUnseenCount((c) => c + additional);
     setShowScrollToBottom(true);
-    const firstNewId = idx >= 0 ? (messages[idx + 1]?.id ?? lastId) : lastId;
+    const firstNewId = idx >= 0 ? (displayed[idx + 1]?.id ?? lastId) : lastId;
     if (firstNewId) {
       setNewDividerMessageId(firstNewId);
       setShowNewDivider(true);
@@ -3915,12 +4488,25 @@ export default function Chat() {
 
   // Cleanup scroll timeout on unmount
   useEffect(() => {
+    if (!isFocused || !isAppActive || !selectedTeamMember?.id) {
+      return;
+    }
+
+    void ensureMessageTonePlayer();
+  }, [isFocused, isAppActive, selectedTeamMember?.id, ensureMessageTonePlayer]);
+
+  useEffect(() => {
     return () => {
       if (scrollTimeoutRef.current) {
         clearTimeout(scrollTimeoutRef.current);
       }
-      if (soundTimeoutRef.current) {
-        clearTimeout(soundTimeoutRef.current);
+      if (messageTonePlayerRef.current) {
+        try {
+          messageTonePlayerRef.current.remove();
+        } catch {
+          // Ignore cleanup errors.
+        }
+        messageTonePlayerRef.current = null;
       }
       if (userActivityTimeoutRef.current) {
         clearTimeout(userActivityTimeoutRef.current);
@@ -3948,13 +4534,13 @@ export default function Chat() {
 
     // Attempt anchor on next tick once layout/content sizes are known
     setTimeout(() => {
-      if (firstUnreadMessageId) {
-        scheduleScrollToUnread(firstUnreadMessageId);
+      if (unreadSeparatorAnchorMessageId) {
+        scheduleScrollToUnread(unreadSeparatorAnchorMessageId);
       } else {
         tryAnchorToBottom();
       }
     }, 0);
-  }, [isFocused, selectedTeamMember?.id, selectedTeamMember?.email, firstUnreadMessageId]);
+  }, [isFocused, selectedTeamMember?.id, selectedTeamMember?.email, unreadSeparatorAnchorMessageId]);
 
   useEffect(() => {
     if (!selectedTeamMember) {
@@ -3970,7 +4556,7 @@ export default function Chat() {
       return;
     }
 
-    if (firstUnreadMessageId) {
+    if (unreadSeparatorAnchorMessageId) {
       return;
     }
 
@@ -3987,7 +4573,7 @@ export default function Chat() {
     setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
     setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 220);
     forceBottomAnchorChatKeyRef.current = null;
-  }, [selectedTeamMember, displayedMessages, firstUnreadMessageId, markAutoScroll]);
+  }, [selectedTeamMember, displayedMessages, unreadSeparatorAnchorMessageId, markAutoScroll]);
 
   useEffect(() => {
     if (prevLoadingMoreRef.current && !loadingMore) {
@@ -4014,30 +4600,55 @@ export default function Chat() {
   useEffect(() => {
     if (!selectedTeamMember?.email || !effectiveUser?.email) {
       hasAcknowledgedUnreadRef.current = false;
+      unreadDividerDismissedStateRef.current = null;
       if (unreadSeparatorDismissTimeoutRef.current) {
         clearTimeout(unreadSeparatorDismissTimeoutRef.current);
         unreadSeparatorDismissTimeoutRef.current = null;
       }
       setShowUnreadSeparator(false);
       setUnreadSeparatorMessageId(null);
+      unreadSeparatorIsVisibleRef.current = false;
+      unreadDividerSeedCountRef.current = 0;
+      setUnreadDividerSeedCount(0);
       return;
     }
 
-    if (firstUnreadMessageId) {
+    if (unreadSeparatorAnchorMessageId) {
+      const dismissedState = unreadDividerDismissedStateRef.current;
+      const isDismissedBatchStillCurrent = Boolean(
+        dismissedState &&
+          dismissedState.anchorMessageId === unreadSeparatorAnchorMessageId &&
+          dismissedState.latestIncomingMessageId === (latestIncomingMessageId || null)
+      );
+
+      if (isDismissedBatchStillCurrent) {
+        setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
+        setShowUnreadSeparator(false);
+        unreadSeparatorIsVisibleRef.current = false;
+        return;
+      }
+
+      unreadDividerDismissedStateRef.current = null;
+
       if (unreadSeparatorDismissTimeoutRef.current) {
         clearTimeout(unreadSeparatorDismissTimeoutRef.current);
         unreadSeparatorDismissTimeoutRef.current = null;
       }
-      setUnreadSeparatorMessageId(firstUnreadMessageId);
+      if (unreadSeparatorMessageIdRef.current !== unreadSeparatorAnchorMessageId) {
+        hasAcknowledgedUnreadRef.current = false;
+      }
+      setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
       setShowUnreadSeparator(true);
-      hasAcknowledgedUnreadRef.current = false;
       return;
     }
 
     // No unread anchor left: clear stale divider immediately when conversation is fully read.
-    if (incomingUnreadCountRef.current === 0) {
+    if (incomingUnreadCountRef.current === 0 && unreadDividerSeedCountRef.current === 0) {
+      unreadDividerDismissedStateRef.current = null;
       if (hasAcknowledgedUnreadRef.current) {
-        scheduleUnreadSeparatorDismiss(320);
+        if (!unreadSeparatorIsVisibleRef.current) {
+          scheduleUnreadSeparatorDismiss(UNREAD_DIVIDER_AUTO_DISMISS_MS);
+        }
       } else {
         if (unreadSeparatorDismissTimeoutRef.current) {
           clearTimeout(unreadSeparatorDismissTimeoutRef.current);
@@ -4045,9 +4656,17 @@ export default function Chat() {
         }
         setShowUnreadSeparator(false);
         setUnreadSeparatorMessageId(null);
+        unreadDividerSeedCountRef.current = 0;
+        setUnreadDividerSeedCount(0);
       }
     }
-  }, [firstUnreadMessageId, selectedTeamMember?.email, effectiveUser?.email, scheduleUnreadSeparatorDismiss]);
+  }, [
+    unreadSeparatorAnchorMessageId,
+    latestIncomingMessageId,
+    selectedTeamMember?.email,
+    effectiveUser?.email,
+    scheduleUnreadSeparatorDismiss,
+  ]);
 
   useEffect(() => {
     if (!selectedTeamMember?.email || !effectiveUser?.email) {
@@ -4058,34 +4677,39 @@ export default function Chat() {
     const previousCount = previousIncomingUnreadRef.current;
     previousIncomingUnreadRef.current = incomingUnreadCount;
 
-    if (incomingUnreadCount === 0 && hasAcknowledgedUnreadRef.current) {
-      scheduleUnreadSeparatorDismiss(320);
+    if (incomingUnreadCount === 0 && hasAcknowledgedUnreadRef.current && !unreadSeparatorIsVisibleRef.current) {
+      scheduleUnreadSeparatorDismiss(UNREAD_DIVIDER_AUTO_DISMISS_MS);
     }
 
-    if (incomingUnreadCount > previousCount) {
+    if (incomingUnreadCount > previousCount && unreadSeparatorAnchorMessageId) {
+      unreadDividerDismissedStateRef.current = null;
       hasAcknowledgedUnreadRef.current = false;
       if (unreadSeparatorDismissTimeoutRef.current) {
         clearTimeout(unreadSeparatorDismissTimeoutRef.current);
         unreadSeparatorDismissTimeoutRef.current = null;
       }
+      setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
       setShowUnreadSeparator(true);
-      if (firstUnreadMessageId) {
-        setUnreadSeparatorMessageId(firstUnreadMessageId);
-      }
     }
 
-  }, [incomingUnreadCount, selectedTeamMember?.email, effectiveUser?.email, scheduleUnreadSeparatorDismiss, firstUnreadMessageId]);
+  }, [incomingUnreadCount, selectedTeamMember?.email, effectiveUser?.email, scheduleUnreadSeparatorDismiss, unreadSeparatorAnchorMessageId]);
 
   // Reset separator when switching chats
   useEffect(() => {
+    toneBootstrapChatKeyRef.current = null;
     stopAnchorStabilization();
     setShowUnreadSeparator(false);
     setUnreadSeparatorMessageId(null);
+    unreadSeparatorIsVisibleRef.current = false;
+    setUnreadDividerSeedCount(0);
     setShowNewDivider(false);
     setNewDividerMessageId(null);
     hasAcknowledgedUnreadRef.current = false;
+    unreadDividerDismissedStateRef.current = null;
     incomingUnreadCountRef.current = 0;
     previousIncomingUnreadRef.current = 0;
+    unreadDividerSeedCountRef.current = 0;
+    unreadSeedInitializedChatKeyRef.current = null;
     if (unreadSeparatorDismissTimeoutRef.current) {
       clearTimeout(unreadSeparatorDismissTimeoutRef.current);
       unreadSeparatorDismissTimeoutRef.current = null;
@@ -4103,12 +4727,12 @@ export default function Chat() {
     lastScrollOffsetRef.current = 0;
     isAtBottomRef.current = true;
     topVisibleMessageRef.current = null;
-    setMessagePositions({});
+    messagePositionsRef.current = {};
     displayedMessagesRef.current = [];
     lastTailIdRef.current = null;
   // Clear animation states when switching chats
     setAnimatedMessages(new Set());
-    setPreviousMessageIds(new Set());
+    previousMessageIdsRef.current = new Set();
     globalAnimatedMessages.current.clear(); // Clear global animation tracking
     
     // Reset input height when switching chats (but not when sending messages)
@@ -4121,6 +4745,55 @@ export default function Chat() {
     // Note: We DON'T clear reactions when switching chats anymore
     // Reactions are global and should persist across chat switches
   }, [selectedTeamMember?.id]);
+
+  useEffect(() => {
+    const now = Date.now();
+    messageToneEligibleSinceRef.current = now;
+    messageToneCooldownUntilRef.current = now + CHAT_OPEN_TONE_COOLDOWN_MS;
+  }, [selectedTeamMember?.id, selectedTeamMember?.email, isFocused, isAppActive]);
+
+  useEffect(() => {
+    const chatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
+    if (!chatKey) {
+      unreadSeedInitializedChatKeyRef.current = null;
+      unreadDividerSeedCountRef.current = 0;
+      setUnreadDividerSeedCount(0);
+      return;
+    }
+
+    const normalizedPartnerEmail = normalizeParticipantEmail(selectedTeamMember?.email);
+    const summaryUnreadRaw = Number(
+      normalizedPartnerEmail
+        ? conversationSummaries.get(normalizedPartnerEmail)?.unreadCount
+        : 0
+    );
+    const summaryUnread = Number.isFinite(summaryUnreadRaw)
+      ? Math.max(0, Math.trunc(summaryUnreadRaw))
+      : 0;
+
+    const selectedUnreadRaw = Number((selectedTeamMember as any)?.unreadCount);
+    const selectedUnread = Number.isFinite(selectedUnreadRaw)
+      ? Math.max(0, Math.trunc(selectedUnreadRaw))
+      : 0;
+
+    const alreadyInitialized = unreadSeedInitializedChatKeyRef.current === chatKey;
+    const seedCount = alreadyInitialized
+      ? summaryUnread
+      : Math.max(selectedUnread, summaryUnread);
+
+    if (alreadyInitialized) {
+      if (seedCount <= 0) {
+        return;
+      }
+      if (unreadDividerSeedCountRef.current > 0 || showUnreadSeparatorRef.current) {
+        return;
+      }
+    }
+
+    unreadSeedInitializedChatKeyRef.current = chatKey;
+    unreadDividerSeedCountRef.current = seedCount;
+    setUnreadDividerSeedCount(seedCount);
+  }, [selectedTeamMember?.id, selectedTeamMember?.email, conversationSummaries, normalizeParticipantEmail]);
 
   // Helper function to clear input field without affecting keyboard
   const clearInputField = useCallback(() => {
@@ -4333,6 +5006,97 @@ export default function Chat() {
 
   const pendingDeleteId = deleteConfirmState.message?.id;
   const isDeletePending = pendingDeleteId ? isMessageActionPending(pendingDeleteId) : false;
+  const handleDeleteConfirm = useCallback(() => {
+    const target = deleteConfirmState.message;
+    if (target) {
+      void performDeleteMessage(target);
+    } else {
+      setDeleteConfirmState({ visible: false, message: null });
+    }
+  }, [deleteConfirmState.message, performDeleteMessage]);
+
+  const processKeyboardMediaItem = useCallback(
+    async ({
+      fileUri,
+      mime,
+      guessedExt,
+      isGif,
+      tempId,
+      senderEmail,
+      recipientId,
+      recipientEmail,
+    }: {
+      fileUri: string;
+      mime?: string;
+      guessedExt: string;
+      isGif: boolean;
+      tempId: string;
+      senderEmail: string;
+      recipientId: string;
+      recipientEmail: string;
+    }) => {
+      try {
+        const isHttp = /^https?:\/\//i.test(fileUri);
+        let finalUrl = fileUri;
+        if (!isHttp) {
+          const name = `kb_${Date.now()}.${guessedExt}`;
+          const uploadMime = mime || (isGif ? 'image/gif' : 'image/png');
+          const { url } = await chatService.uploadFile(
+            fileUri,
+            name,
+            uploadMime,
+            {
+              senderEmail,
+              recipientEmail,
+            },
+            (progress) => {
+              setPendingMedia(prev => {
+                const next = new Map(prev);
+                const cur = next.get(tempId);
+                if (cur && cur.status === 'sending') {
+                  next.set(tempId, { ...cur, progress });
+                }
+                return next;
+              });
+            }
+          );
+          finalUrl = url;
+        }
+
+        if (isGif) {
+          const serverMessageId = await sendGif({ url: finalUrl, source: 'keyboard' } as any, recipientId);
+          setPendingMedia(prev => {
+            const next = new Map(prev);
+            const cur = next.get(tempId);
+            if (cur) {
+              next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
+            }
+            return next;
+          });
+        } else {
+          const serverMessageId = await sendSticker({ url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as any, recipientId);
+          setPendingMedia(prev => {
+            const next = new Map(prev);
+            const cur = next.get(tempId);
+            if (cur) {
+              next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
+            }
+            return next;
+          });
+        }
+      } catch (error) {
+        attachmentUploadCancelMap.current.delete(tempId);
+        setPendingMedia(prev => {
+          const next = new Map(prev);
+          const cur = next.get(tempId);
+          if (cur) next.set(tempId, { ...cur, status: 'failed' });
+          return next;
+        });
+        Toast.show({ type: 'error', text1: 'Send Failed', text2: 'Could not send media from keyboard', position: 'top' });
+      }
+    },
+    [sendGif, sendSticker]
+  );
 
   // Handle rich content from mobile input
   const handleRichContentFromMobile = useCallback(async (items: any[]) => {
@@ -4367,63 +5131,16 @@ export default function Chat() {
         };
         setPendingMedia(prev => new Map(prev).set(tempId, pendingItem));
 
-        // Background upload + send
-        (async () => {
-          try {
-            const isHttp = /^https?:\/\//i.test(fileUri);
-            const isContent = /^content:\/\//i.test(fileUri);
-            let finalUrl = fileUri;
-            if (!isHttp) {
-              // Derive a sensible filename
-              const name = `kb_${Date.now()}.${guessedExt}`;
-              const uploadMime = mime || (isGif ? 'image/gif' : 'image/png');
-              // Convert content:// to a temp file is handled inside uploadFile expectations
-              const { url } = await chatService.uploadFile(
-                fileUri,
-                name,
-                uploadMime,
-                {
-                  senderEmail: effectiveUser.email,
-                  recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
-                },
-                (progress) => {
-                  setPendingMedia(prev => {
-                    const next = new Map(prev);
-                    const cur = next.get(tempId);
-                    if (cur && cur.status === 'sending') {
-                      next.set(tempId, { ...cur, progress });
-                    }
-                    return next;
-                  });
-                }
-              );
-              finalUrl = url;
-            }
-
-            if (isGif) {
-              await sendGif({ url: finalUrl, source: 'keyboard' } as any, selectedTeamMember.id);
-            } else {
-              await sendSticker({ url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as any, selectedTeamMember.id);
-            }
-
-            // Remove pending once the real message is sent and will arrive via listener
-            setPendingMedia(prev => {
-              const next = new Map(prev);
-              next.delete(tempId);
-              return next;
-            });
-          } catch (error) {
-            attachmentUploadCancelMap.current.delete(tempId);
-            // Mark as failed so user sees an error state
-            setPendingMedia(prev => {
-              const next = new Map(prev);
-              const cur = next.get(tempId);
-              if (cur) next.set(tempId, { ...cur, status: 'failed' });
-              return next;
-            });
-            Toast.show({ type: 'error', text1: 'Send Failed', text2: 'Could not send media from keyboard', position: 'top' });
-          }
-        })();
+        void processKeyboardMediaItem({
+          fileUri,
+          mime,
+          guessedExt,
+          isGif,
+          tempId,
+          senderEmail: effectiveUser.email,
+          recipientId: selectedTeamMember.id,
+          recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
+        });
       } catch (err) {
         logger.error('Error staging keyboard media:', err);
       }
@@ -4434,7 +5151,38 @@ export default function Chat() {
     } else {
       setShowScrollToBottom(true);
     }
-  }, [selectedTeamMember, effectiveUser?.email, sendGif, sendSticker]);
+  }, [effectiveUser?.email, processKeyboardMediaItem, selectedTeamMember]);
+
+  const countMessageWords = useCallback((value?: string | null) => {
+    if (typeof value !== 'string') {
+      return 0;
+    }
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return 0;
+    }
+    return normalized.split(' ').length;
+  }, []);
+
+  const enforceMessageLimits = useCallback((value?: string | null) => {
+    let nextValue = typeof value === 'string' ? value : '';
+
+    if (nextValue.length > CHAT_MESSAGE_MAX_CHARS) {
+      nextValue = nextValue.slice(0, CHAT_MESSAGE_MAX_CHARS);
+    }
+
+    if (!nextValue.trim()) {
+      return nextValue;
+    }
+
+    const compact = nextValue.replace(/\s+/g, ' ').trim();
+    const words = compact.split(' ');
+    if (words.length > CHAT_MESSAGE_MAX_WORDS) {
+      return words.slice(0, CHAT_MESSAGE_MAX_WORDS).join(' ');
+    }
+
+    return nextValue;
+  }, []);
 
   const trimmedMessageValue = useMemo(() => {
     if (typeof message !== 'string') {
@@ -4451,6 +5199,22 @@ export default function Chat() {
   }, []);
 
   const normalizedCurrentMessage = useMemo(() => normalizeMessageValue(message), [message, normalizeMessageValue]);
+
+  const messageCharacterCount = useMemo(() => {
+    if (typeof message !== 'string') {
+      return 0;
+    }
+    return message.length;
+  }, [message]);
+
+  const messageWordCount = useMemo(() => countMessageWords(message), [message, countMessageWords]);
+
+  const showInputLimitCounter = useMemo(() => {
+    return (
+      messageCharacterCount >= Math.floor(CHAT_MESSAGE_MAX_CHARS * 0.8) ||
+      messageWordCount >= Math.floor(CHAT_MESSAGE_MAX_WORDS * 0.8)
+    );
+  }, [messageCharacterCount, messageWordCount]);
 
   const normalizedOriginalMessage = useMemo(
     () => normalizeMessageValue(editingMessageInfo?.originalText ?? ''),
@@ -4481,11 +5245,95 @@ export default function Chat() {
     if (!trimmedMessageValue) return false;
     if (!selectedTeamMember) return false;
     if (processingKeyboardMedia) return false;
+    if (messageCharacterCount > CHAT_MESSAGE_MAX_CHARS) return false;
+    if (messageWordCount > CHAT_MESSAGE_MAX_WORDS) return false;
     if (editingMessageInfo) {
       return hasEditedMessageChanged;
     }
     return true;
-  }, [trimmedMessageValue, selectedTeamMember, processingKeyboardMedia, editingMessageInfo, hasEditedMessageChanged]);
+  }, [
+    trimmedMessageValue,
+    selectedTeamMember,
+    processingKeyboardMedia,
+    messageCharacterCount,
+    messageWordCount,
+    editingMessageInfo,
+    hasEditedMessageChanged,
+  ]);
+
+  const resolvePendingMessageStatus = useCallback((pendingMsg?: PendingMessage): NonNullable<PendingMessage['status']> => {
+    return normalizePendingMessageStatus(pendingMsg?.status);
+  }, []);
+
+  const getPendingMessageBubbleOpacity = useCallback((tempId: string) => {
+    let opacity = pendingMessageBubbleOpacityRef.current.get(tempId);
+    if (!opacity) {
+      opacity = new Animated.Value(0.7);
+      pendingMessageBubbleOpacityRef.current.set(tempId, opacity);
+    }
+    return opacity;
+  }, []);
+
+  const getPendingRowAnimation = useCallback(
+    (rowKey: string, direction: 'incoming' | 'outgoing' = 'outgoing') => {
+      let entry = pendingRowAnimationRef.current.get(rowKey);
+      const isIncoming = direction === 'incoming';
+      const enterOffset = isIncoming ? -12 : 8;
+      const enterScale = isIncoming ? 0.985 : 0.99;
+      const fadeDuration = isIncoming ? 260 : 180;
+      const slideDuration = isIncoming ? 280 : 210;
+      const scaleDuration = isIncoming ? 220 : 170;
+      if (!entry) {
+        entry = {
+          opacity: new Animated.Value(0),
+          translateX: new Animated.Value(enterOffset),
+          scale: new Animated.Value(enterScale),
+          started: false,
+        };
+        pendingRowAnimationRef.current.set(rowKey, entry);
+      }
+
+      if (!entry.started) {
+        entry.started = true;
+        Animated.parallel([
+          Animated.timing(entry.opacity, {
+            toValue: 1,
+            duration: fadeDuration,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: Platform.OS !== 'web',
+          }),
+          Animated.timing(entry.translateX, {
+            toValue: 0,
+            duration: slideDuration,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: Platform.OS !== 'web',
+          }),
+          Animated.timing(entry.scale, {
+            toValue: 1,
+            duration: scaleDuration,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: Platform.OS !== 'web',
+          }),
+        ]).start();
+      }
+
+      return entry;
+    },
+    []
+  );
+
+  useEffect(() => {
+    const activeKeys = new Set<string>();
+    pendingMessages.forEach((_value, tempId) => activeKeys.add(`text:${tempId}`));
+    pendingMedia.forEach((_value, tempId) => activeKeys.add(`media:${tempId}`));
+    pendingAttachments.forEach((_value, tempId) => activeKeys.add(`attachment:${tempId}`));
+
+    for (const key of Array.from(pendingRowAnimationRef.current.keys())) {
+      if (!activeKeys.has(key)) {
+        pendingRowAnimationRef.current.delete(key);
+      }
+    }
+  }, [pendingMessages, pendingMedia, pendingAttachments]);
 
   const handleSendMessage = useCallback(async () => {
     if (sendInFlightRef.current) {
@@ -4563,6 +5411,21 @@ export default function Chat() {
       return;
     }
 
+    if (messageCharacterCount > CHAT_MESSAGE_MAX_CHARS || messageWordCount > CHAT_MESSAGE_MAX_WORDS) {
+      const limited = enforceMessageLimits(message);
+      if (limited !== message) {
+        setMessage(limited);
+        latestMessageRef.current = limited;
+      }
+      Toast.show({
+        type: 'info',
+        text1: 'Message Too Long',
+        text2: `Use up to ${CHAT_MESSAGE_MAX_CHARS} characters and ${CHAT_MESSAGE_MAX_WORDS} words.`,
+        position: 'top',
+      });
+      return;
+    }
+
     if (!canAttemptSend) {
       return;
     }
@@ -4572,15 +5435,23 @@ export default function Chat() {
       return;
     }
 
+    const senderEmail = effectiveUser?.email || user?.email || '';
+    const buildPendingTextMessage = (
+      tempId: string,
+      text: string,
+      status: NonNullable<PendingMessage['status']>
+    ): PendingMessage => ({
+      id: tempId,
+      text,
+      timestamp: new Date().toISOString(),
+      recipientId: recipient.id,
+      sender: senderEmail,
+      status,
+    });
+
     if (isOffline) {
       const tempId = `pending_${Date.now()}_${Math.random()}`;
-      const pendingMessage: PendingMessage = {
-        id: tempId,
-        text: trimmedMessage,
-        timestamp: new Date().toISOString(),
-        recipientId: recipient.id,
-        sender: effectiveUser?.email || user?.email || '',
-      };
+      const pendingMessage = buildPendingTextMessage(tempId, trimmedMessage, 'queued');
 
       setPendingMessages((prev) => {
         const next = new Map(prev);
@@ -4603,6 +5474,8 @@ export default function Chat() {
         position: 'top',
       });
 
+      dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+
       return;
     }
 
@@ -4611,6 +5484,8 @@ export default function Chat() {
     const originalMessage = message;
     const wasShowingSpecialCommand = showSpecialCommand;
     const wasComposingSpecial = isComposingSpecial;
+    let optimisticTempId: string | null = null;
+    let optimisticPendingMessage: PendingMessage | null = null;
 
     clearInputField();
     // Immediately clear the spinner for snappy UI while the send continues in background
@@ -4633,6 +5508,7 @@ export default function Chat() {
         const rich = await handleRichTextInput(messageText);
         if (rich.type === 'sticker' && typeof rich.content === 'object') {
           await handleStickerSelect(rich.content);
+          dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
           if (isAtBottomRef.current) {
               scheduleScrollToBottom();
           } else {
@@ -4657,7 +5533,51 @@ export default function Chat() {
         return;
       }
 
-      await sendMessage(messageText, isSpecialMessage, recipient.id);
+      const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      optimisticTempId = tempId;
+      optimisticPendingMessage = buildPendingTextMessage(tempId, messageText, 'sending');
+
+      setPendingMessages((prev) => {
+        const next = new Map(prev);
+        next.set(tempId, optimisticPendingMessage as PendingMessage);
+        return next;
+      });
+
+      try {
+        await PendingMessageStorage.addPendingMessage(tempId, optimisticPendingMessage);
+      } catch (storageError) {
+        logger.warn('Failed to persist sending pending message:', storageError);
+      }
+
+      const serverMessageId = await sendMessage(messageText, isSpecialMessage, recipient.id);
+
+      if (optimisticTempId) {
+        const idToUpdate = optimisticTempId;
+        const stillSendingPendingMessage: PendingMessage = {
+          ...(optimisticPendingMessage as PendingMessage),
+          status: 'sending',
+          serverMessageId,
+        };
+
+        setPendingMessages((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(idToUpdate);
+          if (existing) {
+            next.set(idToUpdate, {
+              ...existing,
+              status: 'sending',
+              serverMessageId,
+            });
+          }
+          return next;
+        });
+
+        try {
+          await PendingMessageStorage.addPendingMessage(idToUpdate, stillSendingPendingMessage);
+        } catch (storageError) {
+          logger.warn('Failed to persist sending pending message before reconciliation:', storageError);
+        }
+      }
 
       void sendMessageNotification(messageText, isSpecialMessage);
 
@@ -4670,6 +5590,8 @@ export default function Chat() {
         });
       }
 
+      dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+
       if (isAtBottomRef.current) {
         scheduleScrollToBottom({ animated: true, delay: 150 });
       } else {
@@ -4677,6 +5599,30 @@ export default function Chat() {
         setUnseenCount((c) => c + 1);
       }
     } catch (error) {
+      if (optimisticTempId && optimisticPendingMessage) {
+        const failedPending: PendingMessage = {
+          ...optimisticPendingMessage,
+          status: 'failed',
+        };
+
+        const idToUpdate = optimisticTempId;
+        setPendingMessages((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(idToUpdate);
+          next.set(idToUpdate, {
+            ...(existing || optimisticPendingMessage as PendingMessage),
+            status: 'failed',
+          });
+          return next;
+        });
+
+        try {
+          await PendingMessageStorage.addPendingMessage(idToUpdate, failedPending);
+        } catch (storageError) {
+          logger.warn('Failed to persist failed pending message:', storageError);
+        }
+      }
+
       if (error instanceof ChatRateLimitError) {
         const waitMs = Math.max(0, error.retryAfterMs || 0);
         const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
@@ -4687,10 +5633,12 @@ export default function Chat() {
           text2: `Please wait ${waitSeconds}s before sending another message.`,
           position: 'top',
         });
-        setMessage(originalMessage);
-        latestMessageRef.current = originalMessage;
-        setShowSpecialCommand(wasShowingSpecialCommand);
-        setIsComposingSpecial(wasComposingSpecial);
+        if (!optimisticTempId) {
+          setMessage(originalMessage);
+          latestMessageRef.current = originalMessage;
+          setShowSpecialCommand(wasShowingSpecialCommand);
+          setIsComposingSpecial(wasComposingSpecial);
+        }
         return;
       }
 
@@ -4701,10 +5649,12 @@ export default function Chat() {
         text2: 'Failed to send message. Please try again.',
         position: 'top',
       });
-      setMessage(originalMessage);
-      latestMessageRef.current = originalMessage;
-      setShowSpecialCommand(wasShowingSpecialCommand);
-      setIsComposingSpecial(wasComposingSpecial);
+      if (!optimisticTempId) {
+        setMessage(originalMessage);
+        latestMessageRef.current = originalMessage;
+        setShowSpecialCommand(wasShowingSpecialCommand);
+        setIsComposingSpecial(wasComposingSpecial);
+      }
     } finally {
       sendInFlightRef.current = false;
       // No need to restore spinner here; user can continue typing next message
@@ -4723,12 +5673,16 @@ export default function Chat() {
     editChatMessage,
     setMessage,
     message,
+    messageCharacterCount,
+    messageWordCount,
+    enforceMessageLimits,
     showSpecialCommand,
     isComposingSpecial,
     effectiveUserEmail,
     selectedMemberEmail,
     handleRichTextInput,
     handleStickerSelect,
+    dismissUnreadDividerForCurrentBatch,
     isAtBottomRef,
     scrollToBottom,
     sendMessage,
@@ -4737,20 +5691,22 @@ export default function Chat() {
   ]);
 
   const handleTyping = useCallback((text: string) => {
-    if (text === latestMessageRef.current) {
+    const limitedText = enforceMessageLimits(text);
+
+    if (limitedText === latestMessageRef.current) {
       return;
     }
 
     // Only update input; conversion to sticker happens on send
-    setMessage(text);
-    latestMessageRef.current = text;
+    setMessage(limitedText);
+    latestMessageRef.current = limitedText;
     
     // Check for /special command
-    if (text.startsWith('/special')) {
-      if (text === '/special') {
+    if (limitedText.startsWith('/special')) {
+      if (limitedText === '/special') {
         setShowSpecialCommand(true);
         setIsComposingSpecial(false);
-      } else if (text.startsWith('/special ')) {
+      } else if (limitedText.startsWith('/special ')) {
         setShowSpecialCommand(false);
         setIsComposingSpecial(true);
       } else {
@@ -4765,15 +5721,15 @@ export default function Chat() {
     // Calculate height based on text content for better responsiveness
     const lineHeight = 20; // Approximate line height
     const padding = 20; // Top and bottom padding
-    const lines = text.split('\n').length;
+    const lines = limitedText.split('\n').length;
     const estimatedHeight = Math.max(40, Math.min(120, (lines * lineHeight) + padding));
     setInputHeight(estimatedHeight);
     
     // Remember the height when user is actively typing (non-empty text)
     // Reset to minimum height if user manually clears all text
-    if (text.trim().length > 0) {
+    if (limitedText.trim().length > 0) {
       setLastTypingHeight(estimatedHeight);
-    } else if (text.length === 0) {
+    } else if (limitedText.length === 0) {
       setLastTypingHeight(40);
     }
 
@@ -4795,21 +5751,23 @@ export default function Chat() {
       chatService.setTypingStatus(effectiveUserEmail, selectedMemberEmail, false);
       typingTimeoutRef.current = null;
     }, 1000);
-  }, [effectiveUserEmail, selectedMemberEmail]);
+  }, [effectiveUserEmail, selectedMemberEmail, enforceMessageLimits]);
 
   // Handle special command selection
   const handleSpecialCommandSelect = useCallback(() => {
-    setMessage('/special ');
-    latestMessageRef.current = '/special ';
-    setShowSpecialCommand(false);
-    setIsComposingSpecial(true);
-  }, []);
+    handleTyping('/special ');
+  }, [handleTyping]);
 
   const resetFilePreviewModal = useCallback(() => {
     setFilePreviewVisible(false);
     setSelectedFiles([]);
     selectedFilesRef.current = [];
     setSkippedPreviewFiles([]);
+  }, []);
+
+  const handleBackToChatList = useCallback(() => {
+    Keyboard.dismiss();
+    setSelectedTeamMember(null);
   }, []);
 
   // Android hardware back handling: close overlays first, otherwise go from chat detail back to chat list
@@ -4819,10 +5777,10 @@ export default function Chat() {
         if (emojiPickerVisible) { closeEmojiPicker(); return true; }
         if (stickerGifPickerVisible) { closeStickerGifPicker(); return true; }
         if (attachmentModalVisible) { closeAttachmentModal(); return true; }
-        if (imageViewerVisible) { setImageViewerVisible(false); return true; }
+        if (imageViewerVisible) { closeImageViewer(); return true; }
         if (filePreviewVisible) { resetFilePreviewModal(); return true; }
-        if (chatProfileModalVisible) { setChatProfileModalVisible(false); return true; }
-        if (selectedTeamMember) { Keyboard.dismiss(); setSelectedTeamMember(null); return true; }
+        if (chatProfileModalVisible) { closeChatProfileModal(); return true; }
+        if (selectedTeamMember) { handleBackToChatList(); return true; }
         return false;
       };
       const sub = BackHandler.addEventListener('hardwareBackPress', onBackPress);
@@ -4837,7 +5795,10 @@ export default function Chat() {
       selectedTeamMember,
       closeStickerGifPicker,
       closeAttachmentModal,
+      closeImageViewer,
+      closeChatProfileModal,
       closeEmojiPicker,
+      handleBackToChatList,
       resetFilePreviewModal,
     ])
   );
@@ -5203,13 +6164,12 @@ export default function Chat() {
     };
   }, [buildWebDroppedFiles, isFocused, isOffline, previewSelectedFiles, selectedTeamMember]);
 
-  const handleFileSelection = async (type: 'image' | 'camera' | 'document' | 'video' | 'videoCamera') => {
-  closeAttachmentModal();
-    
-    // Check if offline
+  const handleFileSelection = useCallback(async (type: 'image' | 'camera' | 'document' | 'video' | 'videoCamera') => {
+    closeAttachmentModal();
+
     if (isOffline) {
       Toast.show({
-          type: 'info',
+        type: 'info',
         text1: 'Offline',
         text2: 'You cannot send files while offline. Please reconnect to the internet and try again.',
         position: 'top',
@@ -5219,35 +6179,29 @@ export default function Chat() {
 
     try {
       let result = null;
-      
+
       if (type === 'image') {
-        result = await MediaPickerUtil.selectImage(true); // Allow multiple selection
+        result = await MediaPickerUtil.selectImage(true);
       } else if (type === 'camera') {
         result = await MediaPickerUtil.captureImageNoEdit();
       } else if (type === 'video') {
-        result = await MediaPickerUtil.selectVideo(true); // Allow multiple selection
+        result = await MediaPickerUtil.selectVideo(true);
       } else if (type === 'videoCamera') {
         result = await MediaPickerUtil.captureVideo();
       } else if (type === 'document') {
-        result = await MediaPickerUtil.selectDocument('*/*', true); // Allow multiple selection
+        result = await MediaPickerUtil.selectDocument('*/*', true);
       }
-      
-      // Handle both expo image picker format and web format
+
       if (result && selectedTeamMember) {
         const resultObj = result as any;
         let files: any[] = [];
-        
-        // Check if it's expo format (has 'canceled' property)
+
         if (resultObj.canceled === false && resultObj.assets && resultObj.assets.length > 0) {
           files = resultObj.assets;
-        }
-        // Check if it's document picker format (has 'type' property)
-        else if (resultObj.type === 'success') {
+        } else if (resultObj.type === 'success') {
           if (resultObj.files) {
-            // Multiple files from web
             files = resultObj.files;
           } else {
-            // Single file
             files = [{
               uri: resultObj.uri,
               name: resultObj.name,
@@ -5256,18 +6210,15 @@ export default function Chat() {
               fileSize: resultObj.size
             }];
           }
-        }
-        // Check if it's web format (has uri directly)
-        else if (resultObj.uri) {
+        } else if (resultObj.uri) {
           files = [resultObj];
         }
-        
+
         if (files.length > 0) {
           previewSelectedFiles(files);
         }
       }
     } catch (error: any) {
-      // Show error toast for camera capture on web, do not fallback to image selection
       if (
         typeof error?.message === 'string' &&
         error.message.includes('Camera capture is not available on web')
@@ -5280,8 +6231,7 @@ export default function Chat() {
         });
         return;
       }
-      
-      // Special handling for different error types
+
       if (error.message?.includes('Permission')) {
         Toast.show({
           type: 'error',
@@ -5291,7 +6241,7 @@ export default function Chat() {
         });
         return;
       }
-      
+
       Toast.show({
         type: 'error',
         text1: 'Error',
@@ -5299,7 +6249,27 @@ export default function Chat() {
         position: 'top',
       });
     }
-  };
+  }, [closeAttachmentModal, isOffline, previewSelectedFiles, selectedTeamMember]);
+
+  const handleSelectImageAttachment = useCallback(() => {
+    void handleFileSelection('image');
+  }, [handleFileSelection]);
+
+  const handleSelectCameraAttachment = useCallback(() => {
+    void handleFileSelection('camera');
+  }, [handleFileSelection]);
+
+  const handleSelectVideoAttachment = useCallback(() => {
+    void handleFileSelection('video');
+  }, [handleFileSelection]);
+
+  const handleSelectVideoCameraAttachment = useCallback(() => {
+    void handleFileSelection('videoCamera');
+  }, [handleFileSelection]);
+
+  const handleSelectDocumentAttachment = useCallback(() => {
+    void handleFileSelection('document');
+  }, [handleFileSelection]);
 
   const handleSendWithFiles = async () => {
     if (!selectedTeamMember || selectedFiles.length === 0) return;
@@ -5340,7 +6310,7 @@ export default function Chat() {
       }));
 
       // Upload all files in a single message with progress tracking
-      await sendMessageWithFiles(
+      const serverMessageId = await sendMessageWithFiles(
         message.trim(), // Send the message text with all files
         filesToUpload,
         selectedTeamMember.id,
@@ -5385,6 +6355,7 @@ export default function Chat() {
             progress: 100,
             cancelable: false,
             cancelRequested: false,
+            serverMessageId,
           });
         } else {
           next.delete(tempId);
@@ -5734,11 +6705,13 @@ export default function Chat() {
         source: 'picker',
       }));
 
-      await sendSticker(sticker, selectedTeamMember.id);
-      // Remove pending on success
+      const serverMessageId = await sendSticker(sticker, selectedTeamMember.id);
       setPendingMedia(prev => {
         const next = new Map(prev);
-        next.delete(tempId);
+        const cur = next.get(tempId);
+        if (cur) {
+          next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
+        }
         return next;
       });
       
@@ -5826,11 +6799,13 @@ export default function Chat() {
         source: 'picker',
       }));
 
-      await sendGif(gif, selectedTeamMember.id);
-      // Remove pending on success
+      const serverMessageId = await sendGif(gif, selectedTeamMember.id);
       setPendingMedia(prev => {
         const next = new Map(prev);
-        next.delete(tempId);
+        const cur = next.get(tempId);
+        if (cur) {
+          next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
+        }
         return next;
       });
       
@@ -5984,49 +6959,65 @@ export default function Chat() {
 
   // Validate file URLs when messages change (optimized to reduce console spam)
   useEffect(() => {
-    if (Platform.OS === 'web' && messages.length > 0 && selectedTeamMember && effectiveUser?.email) {
-      const validateFiles = async () => {
-        // Only check files that haven't been checked recently
-        const now = Date.now();
-        
-        // Filter messages to only include the current conversation
-        const userEmail = effectiveUser.email.toLowerCase();
-        const recipientEmail = selectedTeamMember.email.toLowerCase();
-        
-        const conversationMessages = messages.filter(msg => {
-          const senderLower = msg.sender.toLowerCase();
-          const recipientIdLower = (msg.recipientId || '').toLowerCase();
-          const fromMeToThem = senderLower === userEmail && recipientIdLower === recipientEmail;
-          const fromThemToMe = senderLower === recipientEmail && recipientIdLower === userEmail;
-          return fromMeToThem || fromThemToMe;
-        });
-        
-        const fileUrls = conversationMessages
-          .flatMap(msg => {
+    if (!(Platform.OS === 'web' && messages.length > 0 && selectedTeamMember && effectiveUser?.email)) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const validateFiles = async () => {
+      const now = Date.now();
+      const MIN_VALIDATION_INTERVAL_MS = 12_000;
+      if (fileValidationInFlightRef.current) {
+        return;
+      }
+      if (now - fileValidationLastRunAtRef.current < MIN_VALIDATION_INTERVAL_MS) {
+        return;
+      }
+
+      fileValidationInFlightRef.current = true;
+      try {
+        // Validate only the most recent slice to avoid scanning entire histories repeatedly.
+        const recentConversationMessages = displayedMessagesRef.current.slice(-120);
+
+        const fileUrls = recentConversationMessages
+          .flatMap((msg) => {
             if (!Array.isArray(msg.attachments)) {
               return [];
             }
             return msg.attachments
-              .map(att => att?.url)
-              .filter((url): url is string => typeof url === 'string' && url.length > 0 && !brokenFileUrls.has(url));
+              .map((att: any) => att?.url)
+              .filter(
+                (url: any): url is string =>
+                  typeof url === 'string' &&
+                  url.length > 0 &&
+                  !brokenFileUrlsRef.current.has(url)
+              );
           })
-          .filter(url => {
+          .filter((url) => {
             // Skip validation if checked within last 5 minutes
             const lastChecked = fileValidationCache.get(url);
-            if (lastChecked && (now - lastChecked) < 300000) return false;
+            if (lastChecked && now - lastChecked < 300000) return false;
             return true;
           })
-          .filter((url, index, self) => self.indexOf(url) === index); // Remove duplicates
+          .filter((url, index, self) => self.indexOf(url) === index) // Remove duplicates
+          .slice(0, 18);
 
-        if (fileUrls.length === 0) return;
+        if (fileUrls.length === 0 || cancelled) {
+          return;
+        }
 
         // Process in smaller batches to avoid overwhelming the network
         const batchSize = 3;
         const brokenUrls: string[] = [];
-        
+
         for (let i = 0; i < fileUrls.length; i += batchSize) {
+          if (cancelled) {
+            return;
+          }
+
           const batch = fileUrls.slice(i, i + batchSize);
-          
+
           const results = await Promise.allSettled(
             batch.map(async (url) => {
               const availability = await checkFileAvailability(url);
@@ -6037,7 +7028,11 @@ export default function Chat() {
             })
           );
 
-          results.forEach(result => {
+          if (cancelled) {
+            return;
+          }
+
+          results.forEach((result) => {
             if (result.status !== 'fulfilled') return;
             if (result.value.availability === 'missing') {
               brokenUrls.push(result.value.url);
@@ -6050,29 +7045,67 @@ export default function Chat() {
 
           // Small delay between batches to be nice to the server
           if (i + batchSize < fileUrls.length) {
-            await new Promise(resolve => setTimeout(resolve, 100));
+            await new Promise((resolve) => setTimeout(resolve, 100));
           }
         }
 
-        if (brokenUrls.length > 0) {
-          setBrokenFileUrls(prev => new Set([...prev, ...brokenUrls]));
+        if (!cancelled && brokenUrls.length > 0) {
+          setBrokenFileUrls((prev) => new Set([...prev, ...brokenUrls]));
         }
-      };
 
-      // Debounce the validation to avoid too many requests
-      const timeout = setTimeout(validateFiles, 2000);
-      return () => clearTimeout(timeout);
-    }
-  }, [messages, brokenFileUrls, selectedTeamMember?.email, effectiveUser?.email, clearNetworkError]);
+        fileValidationLastRunAtRef.current = Date.now();
+      } finally {
+        fileValidationInFlightRef.current = false;
+      }
+    };
 
-  const removeSelectedFile = (index: number) => {
+    // Debounce the validation to avoid too many requests
+    const timeout = setTimeout(() => {
+      void validateFiles();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [messages, selectedTeamMember?.email, effectiveUser?.email, clearNetworkError, fileValidationCache]);
+
+  const removeSelectedFile = useCallback((index: number) => {
     const newFiles = selectedFiles.filter((_, i) => i !== index);
     setSelectedFiles(newFiles);
     selectedFilesRef.current = newFiles;
     if (newFiles.length === 0) {
       resetFilePreviewModal();
     }
-  };
+  }, [selectedFiles, resetFilePreviewModal]);
+
+  const removeSelectedFileRef = useRef(removeSelectedFile);
+  useEffect(() => {
+    removeSelectedFileRef.current = removeSelectedFile;
+  }, [removeSelectedFile]);
+
+  const removeSelectedFilePressHandlersRef = useRef<Map<number, () => void>>(new Map());
+  const getRemoveSelectedFilePressHandler = useCallback((index: number) => {
+    const cached = removeSelectedFilePressHandlersRef.current.get(index);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      removeSelectedFileRef.current(index);
+    };
+    removeSelectedFilePressHandlersRef.current.set(index, handler);
+    return handler;
+  }, []);
+
+  useEffect(() => {
+    const handlers = removeSelectedFilePressHandlersRef.current;
+    for (const index of Array.from(handlers.keys())) {
+      if (index < 0 || index >= selectedFiles.length) {
+        handlers.delete(index);
+      }
+    }
+  }, [selectedFiles.length]);
 
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 B';
@@ -6095,60 +7128,84 @@ export default function Chat() {
     isIncomingMessage?: boolean;
   }) {
     const fadeAnim = useRef(new Animated.Value(1)).current; // Start as visible
-    const slideAnim = useRef(new Animated.Value(0)).current; // Start in position
+    const slideYAnim = useRef(new Animated.Value(0)).current; // Start in position
+    const slideXAnim = useRef(new Animated.Value(0)).current; // Start in position
     const scaleAnim = useRef(new Animated.Value(1)).current; // Start at normal size
 
     useEffect(() => {
       // FlashList recycles rows; reset transforms for rows that should not animate.
       if (!isNewMessage || !isFocused) {
         fadeAnim.setValue(1);
-        slideAnim.setValue(0);
+        slideYAnim.setValue(0);
+        slideXAnim.setValue(0);
         scaleAnim.setValue(1);
       }
-    }, [isNewMessage, isFocused, fadeAnim, slideAnim, scaleAnim]);
+    }, [isNewMessage, isFocused, fadeAnim, slideYAnim, slideXAnim, scaleAnim]);
 
     useEffect(() => {
       // Check if this message should be animated
       if (isNewMessage && !globalAnimatedMessages.current.has(messageId)) {
         globalAnimatedMessages.current.add(messageId);
+        const enterOffsetX = isIncomingMessage ? -12 : 10;
+        const enterOffsetY = isIncomingMessage ? 6 : 4;
+        const enterScale = isIncomingMessage ? 0.985 : 0.99;
+        const fadeDuration = isIncomingMessage ? 320 : 220;
+        const slideXDuration = isIncomingMessage ? 340 : 240;
+        const slideYDuration = isIncomingMessage ? 320 : 220;
+        const scaleDuration = isIncomingMessage ? 270 : 190;
         
         // Reset animation values for entrance animation
         fadeAnim.setValue(0);
-        slideAnim.setValue(50);
-        scaleAnim.setValue(0.8);
-        
-        // Only play sound for incoming messages (not your own messages)
-        if (isIncomingMessage && isFocused) {
-          playMessageSound();
-        }
+        slideYAnim.setValue(enterOffsetY);
+        slideXAnim.setValue(enterOffsetX);
+        scaleAnim.setValue(enterScale);
         
         // Animate the message entrance
         Animated.parallel([
           Animated.timing(fadeAnim, {
             toValue: 1,
-            duration: 400,
+            duration: fadeDuration,
+            easing: Easing.out(Easing.cubic),
             useNativeDriver: Platform.OS !== 'web',
           }),
-          Animated.timing(slideAnim, {
+          Animated.timing(slideXAnim, {
             toValue: 0,
-            duration: 450,
+            duration: slideXDuration,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: Platform.OS !== 'web',
+          }),
+          Animated.timing(slideYAnim, {
+            toValue: 0,
+            duration: slideYDuration,
+            easing: Easing.out(Easing.cubic),
             useNativeDriver: Platform.OS !== 'web',
           }),
           Animated.timing(scaleAnim, {
             toValue: 1,
-            duration: 350,
+            duration: scaleDuration,
+            easing: Easing.out(Easing.cubic),
             useNativeDriver: Platform.OS !== 'web',
           }),
         ]).start();
       }
-    }, [isNewMessage, messageId, fadeAnim, slideAnim, scaleAnim, isIncomingMessage, isFocused]);
+    }, [
+      isNewMessage,
+      messageId,
+      fadeAnim,
+      slideXAnim,
+      slideYAnim,
+      scaleAnim,
+      isIncomingMessage,
+      isFocused,
+    ]);
 
     return (
       <Animated.View
         style={{
           opacity: fadeAnim,
           transform: [
-            { translateY: slideAnim },
+            { translateX: slideXAnim },
+            { translateY: slideYAnim },
             { scale: scaleAnim }
           ],
         }}
@@ -6160,19 +7217,226 @@ export default function Chat() {
 
   AnimatedMessageWrapper.displayName = 'AnimatedMessageWrapper';
 
-  const MessageRow = React.memo(({ item }: { item: any }) => {
-    const messageId = typeof item?.id === 'string' ? item.id : String(item?.id ?? '');
-    const uiState = useMessageUiState(messageId);
-    const renderedMessage = renderMessage(item, uiState.reactions, uiState.isEditing);
-    if (typeof renderedMessage === 'string') {
-      logger.warn('⚠️ renderMessage returned string:', JSON.stringify(renderedMessage));
-      logger.warn('⚠️ Message object:', JSON.stringify(item, null, 2));
-      return null;
-    }
-    return renderedMessage;
-  });
+  const renderMessageRef = useRef(
+    (
+      _msg: any,
+      _reactionsOverride?: { [key: string]: Set<string> },
+      _isEditingOverride?: boolean
+    ) => null as React.ReactNode
+  );
 
-  MessageRow.displayName = 'MessageRow';
+  const MessageRow = useMemo(() => {
+    const Row = ({ item }: { item: any }) => {
+      const messageId = typeof item?.id === 'string' ? item.id : String(item?.id ?? '');
+      const uiState = useMessageUiState(messageId);
+      const renderedMessage = renderMessageRef.current(item, uiState.reactions, uiState.isEditing);
+      if (typeof renderedMessage === 'string') {
+        logger.warn('⚠️ renderMessage returned string:', JSON.stringify(renderedMessage));
+        logger.warn('⚠️ Message object:', JSON.stringify(item, null, 2));
+        return null;
+      }
+      return renderedMessage;
+    };
+
+    Row.displayName = 'MessageRow';
+    return Row;
+  }, []);
+
+  const noopPressHandler = useCallback(() => {}, []);
+  const handleReactionRef = useRef(handleReaction);
+  useEffect(() => {
+    handleReactionRef.current = handleReaction;
+  }, [handleReaction]);
+  const handleQuickReactionRef = useRef(handleQuickReaction);
+  useEffect(() => {
+    handleQuickReactionRef.current = handleQuickReaction;
+  }, [handleQuickReaction]);
+
+  const reactionPressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const getReactionPressHandler = useCallback((messageId: unknown, reactionType: string) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId || !reactionType) {
+      return noopPressHandler;
+    }
+
+    const cacheKey = `${normalizedMessageId}::${reactionType}`;
+    const cached = reactionPressHandlersRef.current.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void handleReactionRef.current(normalizedMessageId, reactionType);
+    };
+    reactionPressHandlersRef.current.set(cacheKey, handler);
+    return handler;
+  }, [normalizeMessageId, noopPressHandler]);
+
+  useEffect(() => {
+    const visibleMessageIds = new Set<string>();
+    displayedMessages.forEach((message: any) => {
+      const id = normalizeMessageId(message?.id);
+      if (id) {
+        visibleMessageIds.add(id);
+      }
+    });
+
+    const handlers = reactionPressHandlersRef.current;
+    for (const key of Array.from(handlers.keys())) {
+      const separatorIndex = key.indexOf('::');
+      const messageId = separatorIndex >= 0 ? key.slice(0, separatorIndex) : '';
+      if (!visibleMessageIds.has(messageId)) {
+        handlers.delete(key);
+      }
+    }
+  }, [displayedMessages, normalizeMessageId]);
+
+  const lastTapByMessageIdRef = useRef<Map<string, number>>(new Map());
+  const quickTapReactionHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const getQuickTapReactionHandler = useCallback((messageId: unknown) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId) {
+      return noopPressHandler;
+    }
+
+    const cached = quickTapReactionHandlersRef.current.get(normalizedMessageId);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      const now = Date.now();
+      const lastTap = lastTapByMessageIdRef.current.get(normalizedMessageId) || 0;
+      const isDoubleTap = now - lastTap < 300;
+      lastTapByMessageIdRef.current.set(normalizedMessageId, isDoubleTap ? 0 : now);
+      if (isDoubleTap) {
+        void handleQuickReactionRef.current(normalizedMessageId);
+      }
+    };
+
+    quickTapReactionHandlersRef.current.set(normalizedMessageId, handler);
+    return handler;
+  }, [normalizeMessageId, noopPressHandler]);
+
+  useEffect(() => {
+    const visibleMessageIds = new Set<string>();
+    displayedMessages.forEach((message: any) => {
+      const id = normalizeMessageId(message?.id);
+      if (id) {
+        visibleMessageIds.add(id);
+      }
+    });
+
+    const handlers = quickTapReactionHandlersRef.current;
+    for (const messageId of Array.from(handlers.keys())) {
+      if (!visibleMessageIds.has(messageId)) {
+        handlers.delete(messageId);
+      }
+    }
+
+    const tapState = lastTapByMessageIdRef.current;
+    for (const messageId of Array.from(tapState.keys())) {
+      if (!visibleMessageIds.has(messageId)) {
+        tapState.delete(messageId);
+      }
+    }
+  }, [displayedMessages, normalizeMessageId]);
+
+  const handleImageViewRef = useRef(handleImageView);
+  useEffect(() => {
+    handleImageViewRef.current = handleImageView;
+  }, [handleImageView]);
+
+  const handleDownloadFileRef = useRef(handleDownloadFile);
+  useEffect(() => {
+    handleDownloadFileRef.current = handleDownloadFile;
+  }, [handleDownloadFile]);
+
+  const attachmentImagePressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const attachmentDownloadPressHandlersRef = useRef<Map<string, () => void>>(new Map());
+
+  const getAttachmentPressKey = useCallback((attachment: HydratedAttachment) => {
+    const url = String(attachment?.url || '');
+    const resolvedUrl = String(attachment?.resolvedUrl || '');
+    const fileName = String(attachment?.fileName || '');
+    return `${url}::${resolvedUrl}::${fileName}`;
+  }, []);
+
+  const getAttachmentImageViewPressHandler = useCallback((attachment: HydratedAttachment) => {
+    const cacheKey = getAttachmentPressKey(attachment);
+    const cached = attachmentImagePressHandlersRef.current.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void handleImageViewRef.current(
+        attachment.resolvedUrl || attachment.url,
+        attachment.url,
+        attachment.fileName
+      );
+    };
+
+    attachmentImagePressHandlersRef.current.set(cacheKey, handler);
+    return handler;
+  }, [getAttachmentPressKey]);
+
+  const getAttachmentDownloadPressHandler = useCallback((
+    attachment: HydratedAttachment,
+    fallbackFileName?: string
+  ) => {
+    const downloadName = fallbackFileName || attachment.fileName || 'File';
+    const baseKey = getAttachmentPressKey(attachment);
+    const cacheKey = `${baseKey}::download::${downloadName}`;
+    const cached = attachmentDownloadPressHandlersRef.current.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void handleDownloadFileRef.current(
+        attachment.url,
+        downloadName,
+        attachment.resolvedUrl
+      );
+    };
+
+    attachmentDownloadPressHandlersRef.current.set(cacheKey, handler);
+    return handler;
+  }, [getAttachmentPressKey]);
+
+  useEffect(() => {
+    const activeAttachmentBaseKeys = new Set<string>();
+
+    displayedMessages.forEach((message: any) => {
+      if (!Array.isArray(message?.attachments)) {
+        return;
+      }
+
+      (message.attachments as HydratedAttachment[]).forEach((attachment) => {
+        if (!attachment?.url) {
+          return;
+        }
+        activeAttachmentBaseKeys.add(getAttachmentPressKey(attachment));
+      });
+    });
+
+    const imageHandlers = attachmentImagePressHandlersRef.current;
+    for (const key of Array.from(imageHandlers.keys())) {
+      if (!activeAttachmentBaseKeys.has(key)) {
+        imageHandlers.delete(key);
+      }
+    }
+
+    const downloadHandlers = attachmentDownloadPressHandlersRef.current;
+    for (const key of Array.from(downloadHandlers.keys())) {
+      const separatorIndex = key.indexOf('::download::');
+      const baseKey = separatorIndex >= 0 ? key.slice(0, separatorIndex) : key;
+      if (!activeAttachmentBaseKeys.has(baseKey)) {
+        downloadHandlers.delete(key);
+      }
+    }
+  }, [displayedMessages, getAttachmentPressKey]);
 
   const renderMessage = (
     msg: any,
@@ -6215,16 +7479,15 @@ export default function Chat() {
       (typeof msg.attachmentCount === 'number' && msg.attachmentCount > 0)
     );
     const shouldRenderAttachmentSection = hasAttachmentContent || attachmentsHydrating;
-    const attachmentHydrationLabel = (() => {
-      if (!attachmentsHydrating) {
-        return '';
+    let attachmentHydrationLabel = '';
+    if (attachmentsHydrating) {
+      const attachmentCount = typeof msg.attachmentCount === 'number' ? msg.attachmentCount : null;
+      if (attachmentCount && attachmentCount > 0) {
+        attachmentHydrationLabel = `Loading ${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}...`;
+      } else {
+        attachmentHydrationLabel = 'Loading attachments...';
       }
-      const count = typeof msg.attachmentCount === 'number' ? msg.attachmentCount : null;
-      if (count && count > 0) {
-        return `Loading ${count} attachment${count > 1 ? 's' : ''}...`;
-      }
-      return 'Loading attachments...';
-    })();
+    }
     const skeletonBackgroundColor = isOwnMessage ? 'rgba(255, 255, 255, 0.12)' : theme.surface;
     const skeletonBorderColor = isOwnMessage ? 'rgba(255, 255, 255, 0.25)' : theme.border;
     const skeletonTextColor = isOwnMessage ? 'rgba(255, 255, 255, 0.95)' : theme.text;
@@ -6292,9 +7555,32 @@ export default function Chat() {
         </AnimatedMessageWrapper>
       );
     }
-    
+
+    const messageTimestampLabel = formatMessageTimestamp(msg.timestamp);
+    const reactionSummary = getMessageReactionSummary(msg.id, reactionsOverride);
+    const messageReactionPills = reactionSummary.pills;
+    const hasMessageReactionPills = messageReactionPills.length > 0;
+    const rawMessageText = typeof msg.text === 'string' ? msg.text : '';
+    const trimmedMessageText = rawMessageText.trim();
+    const shouldRenderRegularText = trimmedMessageText.length > 0 && trimmedMessageText !== '.';
+    const regularMessageText = shouldRenderRegularText
+      ? sanitizeMessageText(rawMessageText, 'Message')
+      : 'Message';
+
     if (msg.isSpecial) {
       const senderName = isOwnMessage ? 'You' : selectedTeamMember?.name || 'Someone';
+      const specialMessageText = sanitizeMessageText(msg.text, 'Special message');
+      const heartReactionStatus = reactionSummary.statusByType.get('heart') ?? EMPTY_REACTION_STATUS;
+      const starReactionStatus = reactionSummary.statusByType.get('star') ?? EMPTY_REACTION_STATUS;
+      const smileReactionStatus = reactionSummary.statusByType.get('smile') ?? EMPTY_REACTION_STATUS;
+      const heartShouldGlow = reactionSummary.glowByType.has('heart');
+      const starShouldGlow = reactionSummary.glowByType.has('star');
+      const smileShouldGlow = reactionSummary.glowByType.has('smile');
+      const specialReactionStatuses = [
+        { type: 'heart', status: heartReactionStatus },
+        { type: 'star', status: starReactionStatus },
+        { type: 'smile', status: smileReactionStatus },
+      ].filter((entry) => entry.status.count > 0);
       
       return (
         <AnimatedMessageWrapper 
@@ -6319,14 +7605,7 @@ export default function Chat() {
                 <Star size={20} color={theme.warning} />
               </View>
               <StyledText
-                text={(() => {
-                  const safeText = String(msg.text || '');
-                  // Prevent periods or empty text from being rendered
-                  if (!safeText || safeText.trim() === '.' || safeText.trim().length === 0) {
-                    return 'Special message';
-                  }
-                  return safeText;
-                })()}
+                text={specialMessageText}
                 style={[styles.specialMessageText, { color: theme.text }]}
                 linkStyle={{
                   color: theme.primary,
@@ -6334,24 +7613,24 @@ export default function Chat() {
                 }}
               />
               <Text style={[styles.specialMessageTime, { color: theme.textSecondary }]}>
-                {formatMessageTimestamp(msg.timestamp)}
+                {messageTimestampLabel}
               </Text>
               <View style={styles.specialReactions}>
                 <TouchableOpacity 
                   style={[
                     styles.reactionButton, 
                     { backgroundColor: theme.background },
-                    shouldGlow(msg.id, 'heart') && styles.glowingReaction
+                    heartShouldGlow && styles.glowingReaction
                   ]}
-                  onPress={() => handleReaction(msg.id, 'heart')}
+                  onPress={getReactionPressHandler(msg.id, 'heart')}
                 >
                   <Heart 
                     size={20} 
-                    color={getReactionStatus(msg.id, 'heart').hasUserReacted ? '#ef4444' : theme.textSecondary}
+                    color={heartReactionStatus.hasUserReacted ? '#ef4444' : theme.textSecondary}
                   />
-                  {getReactionStatus(msg.id, 'heart', reactionsOverride).count > 0 && (
+                  {heartReactionStatus.count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {getReactionStatus(msg.id, 'heart', reactionsOverride).count}
+                      {heartReactionStatus.count}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -6359,17 +7638,17 @@ export default function Chat() {
                   style={[
                     styles.reactionButton, 
                     { backgroundColor: theme.background },
-                    shouldGlow(msg.id, 'star') && styles.glowingReaction
+                    starShouldGlow && styles.glowingReaction
                   ]}
-                  onPress={() => handleReaction(msg.id, 'star')}
+                  onPress={getReactionPressHandler(msg.id, 'star')}
                 >
                   <Star 
                     size={20} 
-                    color={getReactionStatus(msg.id, 'star').hasUserReacted ? '#fbbf24' : theme.textSecondary}
+                    color={starReactionStatus.hasUserReacted ? '#fbbf24' : theme.textSecondary}
                   />
-                  {getReactionStatus(msg.id, 'star', reactionsOverride).count > 0 && (
+                  {starReactionStatus.count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {getReactionStatus(msg.id, 'star', reactionsOverride).count}
+                      {starReactionStatus.count}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -6377,17 +7656,17 @@ export default function Chat() {
                   style={[
                     styles.reactionButton, 
                     { backgroundColor: theme.background },
-                    shouldGlow(msg.id, 'smile', reactionsOverride) && styles.glowingReaction
+                    smileShouldGlow && styles.glowingReaction
                   ]}
-                  onPress={() => handleReaction(msg.id, 'smile')}
+                  onPress={getReactionPressHandler(msg.id, 'smile')}
                 >
                   <Smile 
                     size={20} 
-                    color={getReactionStatus(msg.id, 'smile', reactionsOverride).hasUserReacted ? '#1e1c1cff' : theme.textSecondary}
+                    color={smileReactionStatus.hasUserReacted ? '#1e1c1cff' : theme.textSecondary}
                   />
-                  {getReactionStatus(msg.id, 'smile', reactionsOverride).count > 0 && (
+                  {smileReactionStatus.count > 0 && (
                     <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {getReactionStatus(msg.id, 'smile', reactionsOverride).count}
+                      {smileReactionStatus.count}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -6395,21 +7674,7 @@ export default function Chat() {
               
               {/* Profile pictures of users who reacted */}
               <View style={styles.reactionProfilePics}>
-                {['heart', 'star', 'smile']
-                  .filter((reactionType) => {
-                    const reactionStatus = getReactionStatus(
-                      msg.id,
-                      reactionType as 'heart' | 'star' | 'smile',
-                      reactionsOverride
-                    );
-                    return reactionStatus.count > 0;
-                  })
-                  .map((reactionType) => {
-                  const reactionStatus = getReactionStatus(
-                    msg.id,
-                    reactionType as 'heart' | 'star' | 'smile',
-                    reactionsOverride
-                  );
+                {specialReactionStatuses.map(({ type: reactionType, status: reactionStatus }) => {
                   
                   return (
                     <View key={reactionType} style={styles.reactionTypeContainer}>
@@ -6422,8 +7687,8 @@ export default function Chat() {
                           .filter((userEmail) => userEmail && typeof userEmail === 'string')
                           .map((userEmail, index) => {
                           // Find the team member for this email
-                          const teamMember = teamMembers.find(member => 
-                            member.email && member.email.toLowerCase() === userEmail.toLowerCase()
+                          const teamMember = teamMembersByEmail.get(
+                            normalizeParticipantEmail(userEmail)
                           );
                           const profileUrl = getProfilePictureURL(teamMember);
                           
@@ -6443,17 +7708,7 @@ export default function Chat() {
                               ) : (
                                 <View style={[styles.miniProfilePicPlaceholder, { backgroundColor: theme.primary }]}>
                                   <Text style={styles.miniProfilePicText}>
-                                    {(() => {
-                                      const rawName = teamMember?.name || userEmail || 'U';
-                                      const safeName = String(rawName).trim();
-                                      if (!safeName) return 'U';
-                                      const firstChar = safeName.charAt(0).toUpperCase();
-                                      // Ensure we never return problematic characters like periods
-                                      if (/^[A-Z0-9]$/i.test(firstChar)) {
-                                        return firstChar;
-                                      }
-                                      return 'U';
-                                    })()}
+                                    {getSafeDisplayInitial(teamMember?.name || userEmail || 'U')}
                                   </Text>
                                 </View>
                               )}
@@ -6480,6 +7735,15 @@ export default function Chat() {
 
     // Handle sticker messages
     if (msg.sticker) {
+      const originalStickerUrl = msg.sticker.url;
+      const stickerDisplayUrl =
+        Platform.OS === 'web'
+          ? originalStickerUrl
+          : (stickerUrlMap.get(originalStickerUrl) || originalStickerUrl);
+      const stickerIsUnavailable =
+        brokenFileUrls.has(stickerDisplayUrl) ||
+        (msg.sticker.pack === 'system' && !originalStickerUrl);
+
       return (
         <AnimatedMessageWrapper 
           key={`sticker-${msg.id}`}
@@ -6501,33 +7765,11 @@ export default function Chat() {
                 isOwnMessage ? styles.ownSticker : styles.friendSticker
               ]}
               onLongPress={(event) => handleMessageLongPress(msg.id, event)}
-              onPress={() => {
-                const now = Date.now();
-                const lastTap = msg.lastTap || 0;
-                const timeDiff = now - lastTap;
-                
-                if (timeDiff < 300) {
-                  // Double tap detected - add reaction and prevent image view
-                  handleQuickReaction(msg.id);
-                  msg.lastTap = 0; // Reset to prevent triple tap issues
-                } else {
-                  // Single tap - set timestamp and delay image view to check for double tap
-                  msg.lastTap = now;
-                  setTimeout(() => {
-                    // Do not open stickers in full screen per request
-                  }, 300);
-                }
-              }}
+              onPress={getQuickTapReactionHandler(msg.id)}
               delayLongPress={500}
               disabled={actionPending}
             >
-              {(() => {
-                const originalUrl = msg.sticker.url;
-                const displayUrl = Platform.OS === 'web' ? originalUrl : (stickerUrlMap.get(originalUrl) || originalUrl);
-                const isBroken = brokenFileUrls.has(displayUrl);
-                const isSystemNoUrl = (msg.sticker.pack === 'system' && !originalUrl);
-                return isBroken || isSystemNoUrl;
-              })() ? (
+              {stickerIsUnavailable ? (
                 // Show emoji text for system emoji stickers or placeholder for broken stickers
                 msg.sticker.pack === 'system' ? (
                   <View style={styles.emojiStickerContainer}>
@@ -6549,30 +7791,24 @@ export default function Chat() {
                   </View>
                 )
               ) : (
-                (() => {
-                  const originalUrl = msg.sticker.url;
-                  const displayUrl = Platform.OS === 'web' ? originalUrl : (stickerUrlMap.get(originalUrl) || originalUrl);
-                  return (
-                    <ProgressiveImage
-                      uri={displayUrl}
-                      style={[
-                        styles.stickerImage,
-                        {
-                          width: Math.min(msg.sticker.width || 200, 200),
-                          height: Math.min(msg.sticker.height || 200, 200),
-                        },
-                      ]}
-                      resizeMode="contain"
-                      onError={async () => {
-                        if (Platform.OS !== 'web') {
-                          const alt = await resolveNativeSafeStickerUrl(originalUrl);
-                          if (alt && alt !== displayUrl) return;
-                        }
-                        handleImageError(displayUrl);
-                      }}
-                    />
-                  );
-                })()
+                <ProgressiveImage
+                  uri={stickerDisplayUrl}
+                  style={[
+                    styles.stickerImage,
+                    {
+                      width: Math.min(msg.sticker.width || 200, 200),
+                      height: Math.min(msg.sticker.height || 200, 200),
+                    },
+                  ]}
+                  resizeMode="contain"
+                  onError={async () => {
+                    if (Platform.OS !== 'web') {
+                      const alt = await resolveNativeSafeStickerUrl(originalStickerUrl);
+                      if (alt && alt !== stickerDisplayUrl) return;
+                    }
+                    handleImageError(stickerDisplayUrl);
+                  }}
+                />
               )}
               
               {/* Sticker timestamp and status */}
@@ -6584,7 +7820,7 @@ export default function Chat() {
                   styles.stickerTime,
                   { color: theme.textSecondary }
                 ]}>
-                  {formatMessageTimestamp(msg.timestamp)}
+                  {messageTimestampLabel}
                 </Text>
                 {/* Show status ticks only for own stickers */}
                 {isOwnMessage && (
@@ -6603,12 +7839,12 @@ export default function Chat() {
             </TouchableOpacity>
             
             {/* Sticker reactions display */}
-            {getAllReactions(msg.id, reactionsOverride).length > 0 && (
+            {hasMessageReactionPills && (
               <View style={[
                 styles.messageReactions,
                 isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
               ]}>
-                {getAllReactions(msg.id, reactionsOverride).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
+                {messageReactionPills.map((reaction, index) => (
                   <TouchableOpacity
                     key={index}
                     style={[
@@ -6616,7 +7852,7 @@ export default function Chat() {
                       { backgroundColor: theme.background, borderColor: theme.border },
                       reaction.hasUserReacted && [styles.selectedMessageReaction, { backgroundColor: theme.primary + '20', borderColor: theme.primary }]
                     ]}
-                    onPress={() => handleReaction(msg.id, reaction.emoji)}
+                    onPress={getReactionPressHandler(msg.id, reaction.emoji)}
                   >
                     <Text style={styles.messageReactionEmoji}>{reaction.emoji ? String(reaction.emoji) : '❤️'}</Text>
                     <Text style={[styles.messageReactionCount, { color: reaction.hasUserReacted ? theme.primary : theme.textSecondary }]}>
@@ -6633,6 +7869,13 @@ export default function Chat() {
 
     // Handle GIF messages (similar to stickers)
     if (msg.gif) {
+      const originalGifUrl = msg.gif.url;
+      const gifDisplayUrl =
+        Platform.OS === 'web'
+          ? originalGifUrl
+          : (gifUrlMap.get(originalGifUrl) || originalGifUrl);
+      const gifIsUnavailable = brokenFileUrls.has(originalGifUrl);
+
       return (
         <AnimatedMessageWrapper 
           key={`gif-${msg.id}`}
@@ -6654,27 +7897,11 @@ export default function Chat() {
                 isOwnMessage ? styles.ownSticker : styles.friendSticker
               ]}
               onLongPress={(event) => handleMessageLongPress(msg.id, event)}
-              onPress={() => {
-                const now = Date.now();
-                const lastTap = msg.lastTap || 0;
-                const timeDiff = now - lastTap;
-                
-                if (timeDiff < 300) {
-                  // Double tap detected - add reaction and prevent image view
-                  handleQuickReaction(msg.id);
-                  msg.lastTap = 0; // Reset to prevent triple tap issues
-                } else {
-                  // Single tap - set timestamp and delay image view to check for double tap
-                  msg.lastTap = now;
-                  setTimeout(() => {
-                    // Do not open GIFs in full screen per request
-                  }, 300);
-                }
-              }}
+              onPress={getQuickTapReactionHandler(msg.id)}
               delayLongPress={500}
               disabled={actionPending}
             >
-              {brokenFileUrls.has(msg.gif.url) ? (
+              {gifIsUnavailable ? (
                 // Show placeholder for broken/missing GIFs
                 <View style={[styles.deletedStickerPlaceholder, { backgroundColor: theme.background, borderColor: theme.border }]}>
                   <AlertCircle size={32} color={theme.textSecondary} />
@@ -6683,30 +7910,24 @@ export default function Chat() {
                   </Text>
                 </View>
               ) : (
-                (() => {
-                  const originalUrl = msg.gif.url;
-                  const displayUrl = Platform.OS === 'web' ? originalUrl : (gifUrlMap.get(originalUrl) || originalUrl);
-                  return (
-                    <ProgressiveImage
-                      uri={displayUrl}
-                      style={[
-                        styles.stickerImage,
-                        {
-                          width: Math.min(msg.gif.width || 200, 200),
-                          height: Math.min(msg.gif.height || 200, 200),
-                        },
-                      ]}
-                      resizeMode="contain"
-                      onError={async () => {
-                        if (Platform.OS !== 'web') {
-                          const alt = await resolveOptimizedGifUrl(originalUrl);
-                          if (alt && alt !== displayUrl) return;
-                        }
-                        handleImageError(originalUrl);
-                      }}
-                    />
-                  );
-                })()
+                <ProgressiveImage
+                  uri={gifDisplayUrl}
+                  style={[
+                    styles.stickerImage,
+                    {
+                      width: Math.min(msg.gif.width || 200, 200),
+                      height: Math.min(msg.gif.height || 200, 200),
+                    },
+                  ]}
+                  resizeMode="contain"
+                  onError={async () => {
+                    if (Platform.OS !== 'web') {
+                      const alt = await resolveOptimizedGifUrl(originalGifUrl);
+                      if (alt && alt !== gifDisplayUrl) return;
+                    }
+                    handleImageError(originalGifUrl);
+                  }}
+                />
               )}
               
               {/* GIF timestamp and status */}
@@ -6718,7 +7939,7 @@ export default function Chat() {
                   styles.stickerTime,
                   { color: theme.textSecondary }
                 ]}>
-                  {formatMessageTimestamp(msg.timestamp)}
+                  {messageTimestampLabel}
                 </Text>
                 {/* Show status ticks only for own GIFs */}
                 {isOwnMessage && (
@@ -6737,12 +7958,12 @@ export default function Chat() {
             </TouchableOpacity>
             
             {/* GIF reactions display */}
-            {getAllReactions(msg.id, reactionsOverride).length > 0 && (
+            {hasMessageReactionPills && (
               <View style={[
                 styles.messageReactions,
                 isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
               ]}>
-                {getAllReactions(msg.id, reactionsOverride).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
+                {messageReactionPills.map((reaction, index) => (
                   <TouchableOpacity
                     key={index}
                     style={[
@@ -6750,7 +7971,7 @@ export default function Chat() {
                       { backgroundColor: theme.background, borderColor: theme.border },
                       reaction.hasUserReacted && [styles.selectedMessageReaction, { backgroundColor: theme.primary + '20', borderColor: theme.primary }]
                     ]}
-                    onPress={() => handleReaction(msg.id, reaction.emoji)}
+                    onPress={getReactionPressHandler(msg.id, reaction.emoji)}
                   >
                     <Text style={styles.messageReactionEmoji}>{reaction.emoji ? String(reaction.emoji) : '❤️'}</Text>
                     <Text style={[styles.messageReactionCount, { color: reaction.hasUserReacted ? theme.primary : theme.textSecondary }]}>
@@ -6797,15 +8018,7 @@ export default function Chat() {
               isEditingTarget && styles.editingMessageGlow,
             ]}
             onLongPress={(event) => handleMessageLongPress(msg.id, event)}
-            onPress={() => {
-              // Double tap for quick heart reaction
-              const now = Date.now();
-              const lastTap = msg.lastTap || 0;
-              if (now - lastTap < 300) {
-                handleQuickReaction(msg.id);
-              }
-              msg.lastTap = now;
-            }}
+            onPress={getQuickTapReactionHandler(msg.id)}
             delayLongPress={500}
             disabled={actionPending}
           >
@@ -6846,12 +8059,7 @@ export default function Chat() {
                             <AlertCircle size={24} color={theme.textSecondary} />
                             <View style={styles.fileInfo}>
                               <Text style={[styles.fileName, { color: theme.textSecondary }]} numberOfLines={1}>
-                                {(() => {
-                                  const safeFileName = String(attachment.fileName || 'File').trim();
-                                  // Ensure file names don't start with problematic characters
-                                  if (!safeFileName || safeFileName === '.' || safeFileName.length === 0) return 'File';
-                                  return safeFileName;
-                                })()}
+                                {sanitizeAttachmentFileName(attachment.fileName)}
                               </Text>
                               <Text style={[styles.fileSize, { color: theme.textSecondary }]}> 
                                 File no longer available
@@ -6864,13 +8072,13 @@ export default function Chat() {
                             fileName={attachment.fileName || 'Video File'}
                             fileType={attachment.fileType}
                             fileSize={attachment.fileSize}
-                            onDownload={() => handleDownloadFile(attachment.url, attachment.fileName, attachment.resolvedUrl)}
+                            onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'Video File')}
                             downloadKey={getDownloadKey(attachment.url)}
                             remoteFileUrl={attachment.url}
                             // Use FileViewer's built-in ShareModal
                           />
                         ) : isImageFile(attachment.fileType, attachment.fileName) ? (
-                          <TouchableOpacity onPress={() => { void handleImageView(attachment.resolvedUrl || attachment.url, attachment.url, attachment.fileName); }}>
+                          <TouchableOpacity onPress={getAttachmentImageViewPressHandler(attachment)}>
                             <ProgressiveImage
                               uri={attachment.resolvedUrl || attachment.url}
                               style={styles.imageAttachment}
@@ -6886,7 +8094,7 @@ export default function Chat() {
                             fileName={attachment.fileName}
                             fileType={attachment.fileType}
                             fileSize={attachment.fileSize}
-                            onDownload={() => handleDownloadFile(attachment.url, attachment.fileName, attachment.resolvedUrl)}
+                            onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'File')}
                             downloadKey={getDownloadKey(attachment.url)}
                             remoteFileUrl={attachment.url}
                             // Use FileViewer's built-in ShareModal
@@ -6900,7 +8108,7 @@ export default function Chat() {
                             </View>
                             <TouchableOpacity
                               style={[styles.networkErrorRetryButton, { borderColor: theme.primary }]}
-                              onPress={() => handleDownloadFile(attachment.url, attachment.fileName || 'File', attachment.resolvedUrl)}
+                              onPress={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'File')}
                             >
                               <RotateCcw size={14} color={theme.primary} />
                               <Text style={[styles.networkErrorRetryText, { color: theme.primary }]}>Retry</Text>
@@ -6915,16 +8123,9 @@ export default function Chat() {
             )}
             
             {/* Message text */}
-            {msg.text && typeof msg.text === 'string' && msg.text.trim().length > 0 && (
+            {shouldRenderRegularText && (
               <StyledText
-                text={(() => {
-                  const safeText = String(msg.text || '');
-                  // Prevent periods or problematic text from being rendered
-                  if (!safeText || safeText.trim() === '.' || safeText.trim().length === 0) {
-                    return 'Message';
-                  }
-                  return safeText;
-                })()}
+                text={regularMessageText}
                 style={[
                   styles.messageText,
                   isOwnMessage ? styles.ownMessageText : [styles.friendMessageText, { color: theme.text }]
@@ -6955,7 +8156,7 @@ export default function Chat() {
                 styles.messageTime,
                 isOwnMessage ? styles.ownMessageTime : [styles.friendMessageTime, { color: theme.textSecondary }]
               ]}>
-                {formatMessageTimestamp(msg.timestamp)}
+                {messageTimestampLabel}
               </Text>
               {/* Show status ticks only for own messages */}
               {isOwnMessage && (
@@ -6974,12 +8175,12 @@ export default function Chat() {
           </TouchableOpacity>
           
           {/* Message reactions display */}
-          {getAllReactions(msg.id, reactionsOverride).length > 0 && (
+          {hasMessageReactionPills && (
             <View style={[
               styles.messageReactions,
               isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
             ]}>
-              {getAllReactions(msg.id, reactionsOverride).filter(reaction => reaction && reaction.emoji).map((reaction, index) => (
+              {messageReactionPills.map((reaction, index) => (
                 <TouchableOpacity
                   key={index}
                   style={[
@@ -6987,7 +8188,7 @@ export default function Chat() {
                     { backgroundColor: theme.background, borderColor: theme.border },
                     reaction.hasUserReacted && [styles.selectedMessageReaction, { backgroundColor: theme.primary + '20', borderColor: theme.primary }]
                   ]}
-                  onPress={() => handleReaction(msg.id, reaction.emoji)}
+                  onPress={getReactionPressHandler(msg.id, reaction.emoji)}
                 >
                   <Text style={styles.messageReactionEmoji}>{reaction.emoji ? String(reaction.emoji) : '❤️'}</Text>
                   <Text style={[styles.messageReactionCount, { color: reaction.hasUserReacted ? theme.primary : theme.textSecondary }]}>
@@ -7001,6 +8202,8 @@ export default function Chat() {
       </AnimatedMessageWrapper>
     );
   };
+
+  renderMessageRef.current = renderMessage;
 
   const renderMessageItem = useCallback(
     ({ item, index }: { item: any; index: number }) => {
@@ -7017,38 +8220,36 @@ export default function Chat() {
 
       return (
         <View
-          onLayout={(event) => {
-            const { y, height } = event.nativeEvent.layout;
-            const currentDate = getMessageDate(item, previousMsg);
-            if (item.id) {
-              const messageId = String(item.id);
-              const newPosition = { y, height, date: currentDate || '' };
-              setMessagePositions(prev => {
-                const existingPosition = prev[messageId];
-                if (
-                  existingPosition &&
-                  existingPosition.y === newPosition.y &&
-                  existingPosition.height === newPosition.height &&
-                  existingPosition.date === newPosition.date
-                ) {
-                  return prev;
+          onLayout={shouldUseManualAnchorPreservation
+            ? (event) => {
+                const { y, height } = event.nativeEvent.layout;
+                if (!item?.id) {
+                  return;
                 }
-                const next = { ...prev };
-                next[messageId] = newPosition;
-                return next;
-              });
-            }
-          }}
+
+                const currentDate = getMessageDate(item, previousMsg);
+                const messageId = String(item.id);
+                const newPosition = { y, height, date: currentDate || '' };
+                const existing = messagePositionsRef.current[messageId];
+
+                if (
+                  existing &&
+                  existing.y === newPosition.y &&
+                  existing.height === newPosition.height &&
+                  existing.date === newPosition.date
+                ) {
+                  return;
+                }
+
+                messagePositionsRef.current[messageId] = newPosition;
+              }
+            : undefined}
         >
           {dateSeparator && typeof dateSeparator === 'string' && dateSeparator.trim().length > 0 && (
             <View style={styles.dateSeparatorContainer}>
               <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
               <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.textSecondary }]}>
-                {(() => {
-                  const safeDate = String(dateSeparator).trim();
-                  if (!safeDate || safeDate === '.' || safeDate.length === 0) return 'Today';
-                  return safeDate;
-                })()}
+                {sanitizeDateSeparatorLabel(dateSeparator)}
               </Text>
               <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
             </View>
@@ -7058,7 +8259,7 @@ export default function Chat() {
             <View style={styles.dateSeparatorContainer}>
               <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
               <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: isDarkMode ? '#FF4444' : '#FF0000', fontWeight: '600' }]}> 
-                Unread messages
+                {unreadDividerLabel}
               </Text>
               <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
             </View>
@@ -7086,24 +8287,28 @@ export default function Chat() {
       newDividerMessageId,
       showNewDivider,
       showUnreadSeparator,
+      unreadDividerLabel,
       unreadSeparatorMessageId,
       normalizeMessageId,
       theme.border,
       theme.background,
       theme.textSecondary,
       theme.primary,
+      shouldUseManualAnchorPreservation,
     ]
   );
 
   // Retry a failed pending media item (re-uploads if needed and re-sends)
-  const retryPendingMedia = useCallback(async (tempId: string) => {
+  const retryPendingMedia = useCallback(async (tempId: string, options?: { silent?: boolean }): Promise<boolean> => {
     if (isOffline) {
-      Toast.show({ type: 'info', text1: 'Offline', text2: 'Reconnect to retry media.', position: 'top' });
-      return;
+      if (!options?.silent) {
+        Toast.show({ type: 'info', text1: 'Offline', text2: 'Reconnect to retry media.', position: 'top' });
+      }
+      return false;
     }
 
     const item = pendingMedia.get(tempId);
-    if (!item || !selectedTeamMember) return;
+    if (!item || !selectedTeamMember) return false;
     try {
       // Mark as sending
       setPendingMedia(prev => {
@@ -7142,18 +8347,41 @@ export default function Chat() {
         finalUrl = url;
       }
 
-      if (item.kind === 'gif') {
-        await sendGif({ url: finalUrl, source: item.source || 'keyboard' } as any, selectedTeamMember.id);
-      } else {
-        await sendSticker({ url: finalUrl, name: item.nameOrTitle || 'Sticker', pack: 'keyboard' } as any, selectedTeamMember.id);
-      }
+      // Warm local cache immediately for newly uploaded media to avoid a re-download during reconciliation.
+      void chatCacheService.getMediaForDownload(finalUrl, item.nameOrTitle || undefined, undefined, 'low').catch(() => undefined);
 
-      // Remove pending on success
-      setPendingMedia(prev => {
-        const next = new Map(prev);
-        next.delete(tempId);
-        return next;
-      });
+      if (item.kind === 'gif') {
+        const serverMessageId = await sendGif({ url: finalUrl, source: item.source || 'keyboard' } as any, selectedTeamMember.id);
+        setPendingMedia(prev => {
+          const next = new Map(prev);
+          const cur = next.get(tempId);
+          if (cur) {
+            next.set(tempId, {
+              ...cur,
+              status: 'sent',
+              serverMessageId,
+              progress: 100,
+            });
+          }
+          return next;
+        });
+      } else {
+        const serverMessageId = await sendSticker({ url: finalUrl, name: item.nameOrTitle || 'Sticker', pack: 'keyboard' } as any, selectedTeamMember.id);
+        setPendingMedia(prev => {
+          const next = new Map(prev);
+          const cur = next.get(tempId);
+          if (cur) {
+            next.set(tempId, {
+              ...cur,
+              status: 'sent',
+              serverMessageId,
+              progress: 100,
+            });
+          }
+          return next;
+        });
+      }
+      return true;
     } catch (err) {
       logger.error('Retry send failed:', err);
       setPendingMedia(prev => {
@@ -7162,20 +8390,25 @@ export default function Chat() {
         if (cur) next.set(tempId, { ...cur, status: 'failed' });
         return next;
       });
-      Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend media', position: 'top' });
+      if (!options?.silent) {
+        Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend media', position: 'top' });
+      }
+      return false;
     }
   }, [isOffline, pendingMedia, selectedTeamMember, sendGif, sendSticker]);
 
   const retryPendingAttachment = useCallback(
-    async (tempId: string) => {
+    async (tempId: string, options?: { silent?: boolean }): Promise<boolean> => {
       if (isOffline) {
-        Toast.show({ type: 'info', text1: 'Offline', text2: 'Reconnect to retry attachments.', position: 'top' });
-        return;
+        if (!options?.silent) {
+          Toast.show({ type: 'info', text1: 'Offline', text2: 'Reconnect to retry attachments.', position: 'top' });
+        }
+        return false;
       }
 
       const entry = pendingAttachments.get(tempId);
       if (!entry || !selectedTeamMember || entry.recipientId !== selectedTeamMember.id) {
-        return;
+        return false;
       }
 
       clearAttachmentFinalizeTimer(tempId);
@@ -7199,7 +8432,7 @@ export default function Chat() {
       });
 
       try {
-        await sendMessageWithFiles(
+        const serverMessageId = await sendMessageWithFiles(
           entry.messageText,
           entry.files,
           entry.recipientId,
@@ -7238,6 +8471,7 @@ export default function Chat() {
               progress: 100,
               cancelable: false,
               cancelRequested: false,
+              serverMessageId,
             });
           }
           return next;
@@ -7246,7 +8480,10 @@ export default function Chat() {
         scheduleAttachmentFinalizeCleanup(tempId);
         attachmentUploadCancelMap.current.delete(tempId);
 
-        Toast.show({ type: 'success', text1: 'Files Sent', text2: 'Attachment message delivered.', position: 'top' });
+        if (!options?.silent) {
+          Toast.show({ type: 'success', text1: 'Files Sent', text2: 'Attachment message delivered.', position: 'top' });
+        }
+        return true;
       } catch (error) {
         clearAttachmentFinalizeTimer(tempId);
         attachmentUploadCancelMap.current.delete(tempId);
@@ -7270,10 +8507,15 @@ export default function Chat() {
           return next;
         });
         if (error instanceof ChatUploadCanceledError) {
-          Toast.show({ type: 'info', text1: 'Upload Canceled', text2: 'Attachment upload was canceled.', position: 'top' });
+          if (!options?.silent) {
+            Toast.show({ type: 'info', text1: 'Upload Canceled', text2: 'Attachment upload was canceled.', position: 'top' });
+          }
         } else {
-          Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend attachments.', position: 'top' });
+          if (!options?.silent) {
+            Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend attachments.', position: 'top' });
+          }
         }
+        return false;
       } finally {
         clearAttachmentFinalizeTimer(tempId);
         attachmentUploadCancelMap.current.delete(tempId);
@@ -7309,16 +8551,123 @@ export default function Chat() {
     }
   }, []);
 
+  const retryPendingMediaRef = useRef(retryPendingMedia);
+  useEffect(() => {
+    retryPendingMediaRef.current = retryPendingMedia;
+  }, [retryPendingMedia]);
+
+  const retryPendingMediaPressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const getRetryPendingMediaPressHandler = useCallback((tempId: string) => {
+    const cached = retryPendingMediaPressHandlersRef.current.get(tempId);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void retryPendingMediaRef.current(tempId);
+    };
+    retryPendingMediaPressHandlersRef.current.set(tempId, handler);
+    return handler;
+  }, []);
+
+  useEffect(() => {
+    const activeIds = new Set<string>(Array.from(pendingMedia.keys()));
+    const handlers = retryPendingMediaPressHandlersRef.current;
+    for (const tempId of Array.from(handlers.keys())) {
+      if (!activeIds.has(tempId)) {
+        handlers.delete(tempId);
+      }
+    }
+  }, [pendingMedia]);
+
+  const retryPendingAttachmentRef = useRef(retryPendingAttachment);
+  useEffect(() => {
+    retryPendingAttachmentRef.current = retryPendingAttachment;
+  }, [retryPendingAttachment]);
+
+  const cancelPendingAttachmentRef = useRef(cancelPendingAttachment);
+  useEffect(() => {
+    cancelPendingAttachmentRef.current = cancelPendingAttachment;
+  }, [cancelPendingAttachment]);
+
+  const retryPendingAttachmentPressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const getRetryPendingAttachmentPressHandler = useCallback((tempId: string) => {
+    const cached = retryPendingAttachmentPressHandlersRef.current.get(tempId);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void retryPendingAttachmentRef.current(tempId);
+    };
+    retryPendingAttachmentPressHandlersRef.current.set(tempId, handler);
+    return handler;
+  }, []);
+
+  const cancelPendingAttachmentPressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const getCancelPendingAttachmentPressHandler = useCallback((tempId: string) => {
+    const cached = cancelPendingAttachmentPressHandlersRef.current.get(tempId);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void cancelPendingAttachmentRef.current(tempId);
+    };
+    cancelPendingAttachmentPressHandlersRef.current.set(tempId, handler);
+    return handler;
+  }, []);
+
+  useEffect(() => {
+    const activeIds = new Set<string>(Array.from(pendingAttachments.keys()));
+
+    const retryHandlers = retryPendingAttachmentPressHandlersRef.current;
+    for (const tempId of Array.from(retryHandlers.keys())) {
+      if (!activeIds.has(tempId)) {
+        retryHandlers.delete(tempId);
+      }
+    }
+
+    const cancelHandlers = cancelPendingAttachmentPressHandlersRef.current;
+    for (const tempId of Array.from(cancelHandlers.keys())) {
+      if (!activeIds.has(tempId)) {
+        cancelHandlers.delete(tempId);
+      }
+    }
+  }, [pendingAttachments]);
+
   // Render pending rich media (stickers/GIFs) with a clock icon until sent
   const renderPendingMedia = (tempId: string, item: PendingMediaItem) => {
     if (!selectedTeamMember || item.recipientId !== selectedTeamMember.id) return null;
+    if (item.serverMessageId && isDeliveredServerMessage(item.serverMessageId)) {
+      return null;
+    }
+
+    const rowAnim = getPendingRowAnimation(`media:${tempId}`, 'outgoing');
+    const mediaStatus = item.status;
+    const statusLabel =
+      mediaStatus === 'sending'
+        ? 'Sending...'
+        : mediaStatus === 'sent'
+          ? 'Sent'
+          : mediaStatus === 'queued'
+            ? 'Queued'
+            : 'Not sent';
+    const canRetry = mediaStatus === 'failed' || (mediaStatus === 'queued' && !isOffline);
     const isSticker = item.kind === 'sticker';
     const size = {
       width: Math.min(item.width || 200, 200),
       height: Math.min(item.height || 200, 200),
     };
     return (
-      <View key={tempId} style={[styles.messageContainer, styles.ownMessage]}>
+      <Animated.View
+        key={tempId}
+        style={{
+          opacity: rowAnim.opacity,
+          transform: [{ translateX: rowAnim.translateX }, { scale: rowAnim.scale }],
+        }}
+      >
+      <View style={[styles.messageContainer, styles.ownMessage]}>
         <View style={[styles.stickerContainer, styles.ownSticker]}>
           {isSticker && (!item.previewUri || item.previewUri.trim().length === 0) ? (
             <View style={styles.emojiStickerContainer}>
@@ -7361,16 +8710,20 @@ export default function Chat() {
 
           <View style={[styles.stickerFooter, styles.ownStickerFooter, { alignItems: 'center' }]}>
             <Text style={[styles.stickerTime, { color: theme.textSecondary }]}>
-              {item.status === 'sending' ? 'Sending...' : 'Failed'}
+              {statusLabel}
             </Text>
             {item.status === 'sending' ? (
+              <Clock size={12} color={theme.textSecondary} />
+            ) : item.status === 'sent' ? (
+              <CheckCircle2 size={12} color={theme.textSecondary} />
+            ) : item.status === 'queued' ? (
               <Clock size={12} color={theme.textSecondary} />
             ) : (
               <AlertCircle size={12} color={theme.error} />
             )}
-            {item.status === 'failed' && (
+            {canRetry && (
               <TouchableOpacity
-                onPress={() => retryPendingMedia(tempId)}
+                onPress={getRetryPendingMediaPressHandler(tempId)}
                 disabled={isOffline}
                 style={{
                   marginLeft: 8,
@@ -7391,14 +8744,29 @@ export default function Chat() {
           </View>
         </View>
       </View>
+      </Animated.View>
     );
   };
 
   // Render pending file attachments message (optimistic bubble)
   const renderPendingAttachments = (tempId: string, item: PendingAttachmentItem) => {
     if (!selectedTeamMember || item.recipientId !== selectedTeamMember.id) return null;
+    if (item.serverMessageId && isDeliveredServerMessage(item.serverMessageId)) {
+      return null;
+    }
+
+    const rowAnim = getPendingRowAnimation(`attachment:${tempId}`, 'outgoing');
+    const showRetry = item.status === 'failed';
+
     return (
-      <View key={tempId} style={[styles.messageContainer, styles.ownMessage]}>        
+      <Animated.View
+        key={tempId}
+        style={{
+          opacity: rowAnim.opacity,
+          transform: [{ translateX: rowAnim.translateX }, { scale: rowAnim.scale }],
+        }}
+      >
+      <View style={[styles.messageContainer, styles.ownMessage]}>        
         <View style={[styles.messageBubble, styles.ownBubble, { backgroundColor: theme.primary }]}>          
           {item.messageText ? (
             <StyledText
@@ -7430,7 +8798,7 @@ export default function Chat() {
                 </Text>
                 {item.cancelable && !item.cancelRequested && (
                   <TouchableOpacity
-                    onPress={() => cancelPendingAttachment(tempId)}
+                    onPress={getCancelPendingAttachmentPressHandler(tempId)}
                     style={{
                       marginLeft: 10,
                       paddingHorizontal: 8,
@@ -7461,7 +8829,7 @@ export default function Chat() {
             <View style={{ marginTop: 8 }}>
               <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
                 <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 12, fontWeight: '600' }}>
-                  Finishing up...
+                  Sent
                 </Text>
                 <CheckCircle2 size={14} color={'#fff'} />
               </View>
@@ -7476,8 +8844,12 @@ export default function Chat() {
               <Text style={{ marginLeft: 6, color: 'rgba(255,255,255,0.9)' }}>
                 {item.failureReason === 'canceled' ? 'Canceled' : 'Failed'}
               </Text>
+            </View>
+          )}
+          {showRetry && (
+            <View style={{ marginTop: 8, flexDirection: 'row', alignItems: 'center' }}>
               <TouchableOpacity
-                onPress={() => retryPendingAttachment(tempId)}
+                onPress={getRetryPendingAttachmentPressHandler(tempId)}
                 disabled={isOffline}
                 style={{
                   marginLeft: 10,
@@ -7497,6 +8869,7 @@ export default function Chat() {
           )}
         </View>
       </View>
+      </Animated.View>
     );
   };
 
@@ -7518,7 +8891,7 @@ export default function Chat() {
           
           <TouchableOpacity
             style={styles.attachmentOption}
-            onPress={() => handleFileSelection('image')}
+            onPress={handleSelectImageAttachment}
           >
             <ImageIcon size={24} color={theme.primary} />
             <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Photo Library</Text>
@@ -7526,7 +8899,7 @@ export default function Chat() {
           
           <TouchableOpacity
             style={styles.attachmentOption}
-            onPress={() => handleFileSelection('camera')}
+            onPress={handleSelectCameraAttachment}
           >
             <Camera size={24} color={theme.primary} />
             <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Camera</Text>
@@ -7534,7 +8907,7 @@ export default function Chat() {
           
           <TouchableOpacity
             style={styles.attachmentOption}
-            onPress={() => handleFileSelection('video')}
+            onPress={handleSelectVideoAttachment}
           >
             <Play size={24} color={theme.primary} />
             <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Video Library</Text>
@@ -7542,7 +8915,7 @@ export default function Chat() {
           
           <TouchableOpacity
             style={styles.attachmentOption}
-            onPress={() => handleFileSelection('videoCamera')}
+            onPress={handleSelectVideoCameraAttachment}
           >
             <Camera size={24} color={theme.primary} />
             <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Record Video</Text>
@@ -7550,7 +8923,7 @@ export default function Chat() {
           
           <TouchableOpacity
             style={styles.attachmentOption}
-            onPress={() => handleFileSelection('document')}
+            onPress={handleSelectDocumentAttachment}
           >
             <FileIcon size={24} color={theme.primary} />
             <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Document</Text>
@@ -7645,13 +9018,10 @@ export default function Chat() {
           >
             {selectedFiles.map((file, index) => {
               const mimeType = String(file.mimeType || file.type || file.fileType || '').toLowerCase();
-              const safePreviewName = (() => {
-                const candidate = String(file.fileName || file.name || 'Unknown file').trim();
-                if (!candidate || candidate === '.') {
-                  return 'Unknown file';
-                }
-                return candidate;
-              })();
+              const safePreviewNameCandidate = String(file.fileName || file.name || 'Unknown file').trim();
+              const safePreviewName = !safePreviewNameCandidate || safePreviewNameCandidate === '.'
+                ? 'Unknown file'
+                : safePreviewNameCandidate;
               const fileSizeValue = file.fileSize || file.size;
               const isImage = isImageFile(mimeType, safePreviewName);
               const isVideo = isVideoFile(mimeType, safePreviewName);
@@ -7691,7 +9061,7 @@ export default function Chat() {
                     </View>
                   </View>
                   <TouchableOpacity
-                    onPress={() => removeSelectedFile(index)}
+                    onPress={getRemoveSelectedFilePressHandler(index)}
                     style={styles.removeFileButton}
                   >
                     <Trash2 size={20} color={theme.error} />
@@ -7709,12 +9079,12 @@ export default function Chat() {
                 color: theme.text 
               }]}
               value={message}
-              onChangeText={setMessage}
+              onChangeText={handleTyping}
               placeholder="Add a message (optional)..."
               placeholderTextColor={theme.textSecondary}
               multiline
               numberOfLines={3}
-              maxLength={500}
+              maxLength={CHAT_MESSAGE_MAX_CHARS}
             />
             
             {isUploading ? (
@@ -7752,50 +9122,69 @@ export default function Chat() {
     </Modal>
   );
 
-  const ImageViewerDownloadButton = React.memo(
-    ({ sourceUri, localHint }: { sourceUri: string; localHint?: string }) => {
-      const downloadKey = getDownloadKey(sourceUri);
-      const downloadState = useDownloadState(downloadKey);
-      const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadState.progress ?? 0)));
-      const downloadLabel = downloadState.isDownloading
-        ? `Downloading ${normalizedProgress}%`
-        : 'Download';
+  const ImageViewerDownloadButtonBase = ({ sourceUri, localHint }: { sourceUri: string; localHint?: string }) => {
+    const downloadKey = getDownloadKey(sourceUri);
+    const downloadState = useDownloadState(downloadKey);
+    const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadState.progress ?? 0)));
+    const downloadLabel = downloadState.isDownloading
+      ? `Downloading ${normalizedProgress}%`
+      : 'Download';
+    const handleDownloadPress = useCallback(() => {
+      const derived = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
+      const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
+      handleDownloadFile(sourceUri, downloadName, localHint);
+    }, [handleDownloadFile, localHint, sourceUri]);
 
-      return (
-        <TouchableOpacity
-          style={[styles.imageViewerActionButton, { opacity: downloadState.isDownloading ? 0.7 : 1 }]}
-          onPress={() => {
-            const derived = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
-            const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
-            handleDownloadFile(sourceUri, downloadName, localHint);
-          }}
-          disabled={downloadState.isDownloading}
-        >
-          <Download size={20} color="#ffffff" />
-          <Text style={styles.imageViewerButtonText}>{downloadLabel}</Text>
-        </TouchableOpacity>
-      );
-    }
-  );
+    return (
+      <TouchableOpacity
+        style={[styles.imageViewerActionButton, { opacity: downloadState.isDownloading ? 0.7 : 1 }]}
+        onPress={handleDownloadPress}
+        disabled={downloadState.isDownloading}
+      >
+        <Download size={20} color="#ffffff" />
+        <Text style={styles.imageViewerButtonText}>{downloadLabel}</Text>
+      </TouchableOpacity>
+    );
+  };
+
+  ImageViewerDownloadButtonBase.displayName = 'ImageViewerDownloadButtonBase';
+  const ImageViewerDownloadButton = React.memo(ImageViewerDownloadButtonBase);
+  ImageViewerDownloadButton.displayName = 'ImageViewerDownloadButton';
 
   const renderImageViewerModal = () => {
     const sourceUri = lastViewedRemoteImage || selectedImageUri;
+    const activeImageUri = sourceUri;
+    const isSelectedImageBroken = brokenFileUrls.has(selectedImageUri);
+    const hasActiveImageNetworkError = networkErrorUrls.has(activeImageUri);
+    const derivedSharedImageFileName = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
+    const sharedImageFileName =
+      derivedSharedImageFileName && derivedSharedImageFileName !== 'file'
+        ? derivedSharedImageFileName
+        : 'image.jpg';
+    const retryActiveImage = () => {
+      clearNetworkError(activeImageUri);
+      setSelectedImageUri(activeImageUri);
+    };
+    const downloadSharedImage = () => {
+      const src = lastViewedRemoteImage || selectedImageUri;
+      handleDownloadFile(src, sharedImageFileName, selectedImageUri);
+    };
 
     return (
       <Modal
         visible={imageViewerVisible}
         transparent
         animationType="fade"
-        onRequestClose={() => setImageViewerVisible(false)}
+        onRequestClose={closeImageViewer}
       >
         <View style={styles.imageViewerOverlay}>
           <TouchableOpacity
             style={styles.imageViewerCloseButton}
-            onPress={() => setImageViewerVisible(false)}
+            onPress={closeImageViewer}
           >
             <X size={30} color="#ffffff" />
           </TouchableOpacity>
-          {brokenFileUrls.has(selectedImageUri) ? (
+          {isSelectedImageBroken ? (
             <View style={styles.brokenImageContainer}>
               <AlertCircle size={64} color="#ffffff" />
               <Text style={styles.brokenImageText}>
@@ -7811,16 +9200,12 @@ export default function Chat() {
                 uri={selectedImageUri}
                 style={styles.fullScreenImage}
                 resizeMode="contain"
-                onError={() => handleImageError(lastViewedRemoteImage || selectedImageUri)}
+                onError={() => handleImageError(activeImageUri)}
               />
-              {networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+              {hasActiveImageNetworkError && (
                 <TouchableOpacity
                   style={styles.imageRetryBadge}
-                  onPress={() => {
-                    const retryUri = lastViewedRemoteImage || selectedImageUri;
-                    clearNetworkError(retryUri);
-                    setSelectedImageUri(retryUri);
-                  }}
+                  onPress={retryActiveImage}
                 >
                   <RotateCcw size={14} color="#ffffff" />
                   <Text style={styles.imageRetryText}>Retry</Text>
@@ -7828,7 +9213,7 @@ export default function Chat() {
               )}
             </View>
           )}
-          {!brokenFileUrls.has(selectedImageUri) && networkErrorUrls.has(lastViewedRemoteImage || selectedImageUri) && (
+          {!isSelectedImageBroken && hasActiveImageNetworkError && (
             <View style={[styles.imageViewerNetworkError, { backgroundColor: 'rgba(0, 0, 0, 0.55)', borderColor: 'rgba(255, 255, 255, 0.2)' }]}> 
               <View style={styles.networkErrorInfo}>
                 <AlertCircle size={16} color="#ffffff" />
@@ -7836,11 +9221,7 @@ export default function Chat() {
               </View>
               <TouchableOpacity
                 style={[styles.networkErrorRetryButton, { borderColor: '#ffffff' }]}
-                onPress={() => {
-                  const retryUri = lastViewedRemoteImage || selectedImageUri;
-                  clearNetworkError(retryUri);
-                  setSelectedImageUri(retryUri);
-                }}
+                onPress={retryActiveImage}
               >
                 <RotateCcw size={14} color="#ffffff" />
                 <Text style={[styles.networkErrorRetryText, { color: '#ffffff' }]}>Retry</Text>
@@ -7848,12 +9229,12 @@ export default function Chat() {
             </View>
           )}
           {/* Action buttons positioned at the bottom with proper spacing */}
-          {!brokenFileUrls.has(selectedImageUri) && (
+          {!isSelectedImageBroken && (
             <View style={styles.imageViewerButtonContainer}>
               <ImageViewerDownloadButton sourceUri={sourceUri} localHint={selectedImageUri} />
               <TouchableOpacity
                 style={styles.imageViewerActionButton}
-                onPress={() => setShowImageShareModal(true)}
+                onPress={openImageShareModal}
               >
                 <Share size={20} color="#ffffff" />
                 <Text style={styles.imageViewerButtonText}>Share</Text>
@@ -7862,19 +9243,10 @@ export default function Chat() {
           )}
           <ShareModal
             visible={showImageShareModal}
-            onClose={() => setShowImageShareModal(false)}
+            onClose={closeImageShareModal}
             fileUrl={lastViewedRemoteImage || selectedImageUri}
-            fileName={(() => {
-              const src = lastViewedRemoteImage || selectedImageUri;
-              const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
-              return derived && derived !== 'file' ? derived : 'image.jpg';
-            })()}
-            onDownload={() => {
-              const src = lastViewedRemoteImage || selectedImageUri;
-              const derived = normalizeSharedFileName({ fileUrl: src, fileName: '' });
-              const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
-              handleDownloadFile(src, downloadName, selectedImageUri);
-            }}
+            fileName={sharedImageFileName}
+            onDownload={downloadSharedImage}
           />
         </View>
       </Modal>
@@ -7884,16 +9256,14 @@ export default function Chat() {
   // Emoji picker modal for message reactions
   const renderEmojiPickerModal = () => {
     const fallbackMessage = selectedMessageForReaction
-      ? (messages || []).find((m: any) => m && m.id === selectedMessageForReaction) || null
+      ? getDisplayedMessageById(selectedMessageForReaction)
       : null;
     const targetMessage = selectedMessageForAction ?? fallbackMessage;
 
-    const extraActions = (() => {
-      if (!targetMessage) return [];
-      const actions: { label: string; onPress: () => void; icon?: React.ReactNode; variant?: 'default' | 'primary' | 'danger'; disabled?: boolean }[] = [];
-
+    const extraActions: { label: string; onPress: () => void; icon?: React.ReactNode; variant?: 'default' | 'primary' | 'danger'; disabled?: boolean }[] = [];
+    if (targetMessage) {
       if (canEditMessage(targetMessage)) {
-        actions.push({
+        extraActions.push({
           label: 'Edit',
           onPress: () => {
             closeEmojiPicker();
@@ -7906,7 +9276,7 @@ export default function Chat() {
 
       if (canDeleteMessage(targetMessage)) {
         const pending = isMessageActionPending(targetMessage.id);
-        actions.push({
+        extraActions.push({
           label: pending ? 'Deleting…' : 'Delete',
           onPress: () => {
             closeEmojiPicker();
@@ -7917,9 +9287,18 @@ export default function Chat() {
           disabled: pending,
         });
       }
+    }
 
-      return actions;
-    })();
+    let pickerCopyText: string | undefined;
+    if (selectedMessageForReaction) {
+      const reactionMessage = getDisplayedMessageById(selectedMessageForReaction);
+      const reactionMessageText = reactionMessage && typeof reactionMessage.text === 'string'
+        ? reactionMessage.text.trim()
+        : '';
+      if (reactionMessageText.length > 0) {
+        pickerCopyText = reactionMessageText;
+      }
+    }
 
     return (
       <EnhancedEmojiPicker
@@ -7935,16 +9314,7 @@ export default function Chat() {
         selectedMessageId={selectedMessageForReaction}
         getReactionStatus={getReactionStatus}
         theme={theme}
-        copyText={(() => {
-          try {
-            if (!selectedMessageForReaction) return undefined;
-            const msg = (messages || []).find((m: any) => m && m.id === selectedMessageForReaction);
-            const txt = msg && typeof msg.text === 'string' ? msg.text : '';
-            return txt && txt.trim().length > 0 ? txt : undefined;
-          } catch {
-            return undefined;
-          }
-        })()}
+        copyText={pickerCopyText}
         extraActions={extraActions}
       />
     );
@@ -7952,9 +9322,9 @@ export default function Chat() {
 
   // Animated Typing Indicator Component
   const AnimatedTypingIndicator: React.FC<{ color: string }> = ({ color }) => {
-    const dot1 = useRef(new Animated.Value(0)).current;
-    const dot2 = useRef(new Animated.Value(0)).current;
-    const dot3 = useRef(new Animated.Value(0)).current;
+    const dot1 = useRef(new Animated.Value(0.35)).current;
+    const dot2 = useRef(new Animated.Value(0.35)).current;
+    const dot3 = useRef(new Animated.Value(0.35)).current;
 
     useEffect(() => {
       const animateDot = (animatedValue: Animated.Value, delay: number) => {
@@ -7963,14 +9333,15 @@ export default function Chat() {
             Animated.delay(delay),
             Animated.timing(animatedValue, {
               toValue: 1,
-              duration: 500,
+              duration: 260,
               useNativeDriver: Platform.OS !== 'web',
             }),
             Animated.timing(animatedValue, {
-              toValue: 0,
-              duration: 500,
+              toValue: 0.35,
+              duration: 260,
               useNativeDriver: Platform.OS !== 'web',
             }),
+            Animated.delay(120),
           ])
         );
       };
@@ -7990,9 +9361,15 @@ export default function Chat() {
       opacity: animatedValue,
       transform: [
         {
+          translateY: animatedValue.interpolate({
+            inputRange: [0.35, 1],
+            outputRange: [0, -2],
+          }),
+        },
+        {
           scale: animatedValue.interpolate({
-            inputRange: [0, 1],
-            outputRange: [0.5, 1],
+            inputRange: [0.35, 1],
+            outputRange: [0.9, 1.1],
           }),
         },
       ],
@@ -8009,8 +9386,11 @@ export default function Chat() {
 
   // Update selected team member when team members list changes (for real-time status updates)
   useEffect(() => {
-    if (selectedTeamMember && teamMembersWithChatInfo.length > 0) {
-      const updatedMember = teamMembersWithChatInfo.find(member => member.id === selectedTeamMember.id) as TeamMember | undefined;
+    if (selectedTeamMember && teamMembersWithChatInfoById.size > 0) {
+      const selectedId = selectedTeamMember.id != null ? String(selectedTeamMember.id) : '';
+      const updatedMember = selectedId
+        ? teamMembersWithChatInfoById.get(selectedId)
+        : undefined;
       if (updatedMember) {
         // Check if any relevant properties have changed
         const hasStatusChanged = (
@@ -8026,43 +9406,326 @@ export default function Chat() {
         }
       }
     }
-  }, [teamMembersWithChatInfo, selectedTeamMember]);
+  }, [teamMembersWithChatInfoById, selectedTeamMember]);
+
+  const deliveredMessageIds = useMemo(() => {
+    return new Set(
+      displayedMessages
+        .map((msg: any) => normalizeMessageId(msg?.id))
+        .filter((id: string) => Boolean(id))
+    );
+  }, [displayedMessages, normalizeMessageId]);
+
+  const isDeliveredServerMessage = useCallback((serverMessageId: unknown) => {
+    const normalizedServerMessageId = normalizeMessageId(serverMessageId);
+    return Boolean(normalizedServerMessageId && deliveredMessageIds.has(normalizedServerMessageId));
+  }, [deliveredMessageIds, normalizeMessageId]);
+
+  const buildPendingTextMatchKey = useCallback((
+    sender: string,
+    recipient: string,
+    text: string
+  ) => `${sender}|${recipient}|${text}`, []);
+
+  const pendingTextMessageCandidatesByKey = useMemo(() => {
+    const candidatesByKey = new Map<string, { id: string; timestampMs: number }[]>();
+
+    displayedMessages.forEach((msg: any) => {
+      if (!msg || msg.deleted) {
+        return;
+      }
+
+      const candidateId = normalizeMessageId(msg?.id);
+      if (!candidateId) {
+        return;
+      }
+
+      const candidateSender = normalizeParticipantEmail(msg?.sender);
+      const candidateRecipient = normalizeParticipantEmail(msg?.recipientId);
+      const candidateText = normalizeMessageValue(String(msg?.text || ''));
+      if (!candidateSender || !candidateRecipient || !candidateText) {
+        return;
+      }
+
+      const matchKey = buildPendingTextMatchKey(candidateSender, candidateRecipient, candidateText);
+      const bucket = candidatesByKey.get(matchKey);
+      const entry = {
+        id: candidateId,
+        timestampMs: parseMessageTimestampMs(msg?.timestamp),
+      };
+
+      if (bucket) {
+        bucket.push(entry);
+      } else {
+        candidatesByKey.set(matchKey, [entry]);
+      }
+    });
+
+    return candidatesByKey;
+  }, [
+    displayedMessages,
+    normalizeMessageId,
+    normalizeParticipantEmail,
+    normalizeMessageValue,
+    buildPendingTextMatchKey,
+    parseMessageTimestampMs,
+  ]);
+
+  const findLikelyServerMessageIdForPendingText = useCallback((pendingMsg?: PendingMessage): string => {
+    if (!pendingMsg) {
+      return '';
+    }
+
+    const pendingStatus = resolvePendingMessageStatus(pendingMsg);
+    if (pendingStatus !== 'sending' && pendingStatus !== 'sent') {
+      return '';
+    }
+
+    const normalizedPendingText = normalizeMessageValue(String(pendingMsg.text || ''));
+    if (!normalizedPendingText) {
+      return '';
+    }
+
+    const normalizedSender = normalizeParticipantEmail(
+      pendingMsg.sender || effectiveUser?.email || user?.email || ''
+    );
+    const normalizedRecipient = normalizeParticipantEmail(pendingMsg.recipientId);
+    if (!normalizedSender || !normalizedRecipient) {
+      return '';
+    }
+
+    const pendingTimestamp = parseMessageTimestampMs(pendingMsg.timestamp);
+    const matchKey = buildPendingTextMatchKey(
+      normalizedSender,
+      normalizedRecipient,
+      normalizedPendingText
+    );
+    const candidates = pendingTextMessageCandidatesByKey.get(matchKey);
+    if (!candidates || candidates.length === 0) {
+      return '';
+    }
+
+    let bestMatchId = '';
+    let bestMatchDelta = Number.POSITIVE_INFINITY;
+
+    for (const candidate of candidates) {
+      const candidateTimestamp = candidate.timestampMs;
+      if (Number.isFinite(pendingTimestamp) && Number.isFinite(candidateTimestamp)) {
+        const delta = Math.abs(candidateTimestamp - pendingTimestamp);
+        if (delta > 12000) {
+          continue;
+        }
+
+        if (delta < bestMatchDelta) {
+          bestMatchDelta = delta;
+          bestMatchId = candidate.id;
+        }
+        continue;
+      }
+
+      if (!bestMatchId) {
+        bestMatchId = candidate.id;
+      }
+    }
+
+    return bestMatchId;
+  }, [
+    resolvePendingMessageStatus,
+    normalizeMessageValue,
+    normalizeParticipantEmail,
+    effectiveUser?.email,
+    user?.email,
+    parseMessageTimestampMs,
+    buildPendingTextMatchKey,
+    pendingTextMessageCandidatesByKey,
+  ]);
+
+  useEffect(() => {
+    if (pendingMessages.size === 0) {
+      return;
+    }
+
+    const updates: { tempId: string; serverMessageId: string; pendingMsg: PendingMessage }[] = [];
+    for (const [tempId, pendingMsg] of pendingMessages.entries()) {
+      const status = resolvePendingMessageStatus(pendingMsg);
+      if (status !== 'sending') {
+        continue;
+      }
+
+      const existingServerMessageId = normalizeMessageId(pendingMsg.serverMessageId);
+      if (existingServerMessageId) {
+        continue;
+      }
+
+      const guessedServerMessageId = findLikelyServerMessageIdForPendingText(pendingMsg);
+      if (!guessedServerMessageId) {
+        continue;
+      }
+
+      updates.push({ tempId, serverMessageId: guessedServerMessageId, pendingMsg });
+    }
+
+    if (updates.length === 0) {
+      return;
+    }
+
+    setPendingMessages((prev) => {
+      const next = new Map(prev);
+      updates.forEach(({ tempId, serverMessageId }) => {
+        const current = next.get(tempId);
+        if (current) {
+          next.set(tempId, {
+            ...current,
+            status: 'sending',
+            serverMessageId,
+          });
+        }
+      });
+      return next;
+    });
+
+    void Promise.all(
+      updates.map(({ tempId, serverMessageId, pendingMsg }) =>
+        PendingMessageStorage.addPendingMessage(tempId, {
+          ...pendingMsg,
+          status: 'sending',
+          serverMessageId,
+        })
+      )
+    ).catch((error) => {
+      logger.warn('Failed to persist inferred server ids for pending messages:', error);
+    });
+  }, [
+    pendingMessages,
+    resolvePendingMessageStatus,
+    normalizeMessageId,
+    findLikelyServerMessageIdForPendingText,
+  ]);
+
+  useEffect(() => {
+    const activePendingIds = new Set<string>();
+
+    for (const [tempId, pendingMsg] of pendingMessages.entries()) {
+      activePendingIds.add(tempId);
+      const status = resolvePendingMessageStatus(pendingMsg);
+      const opacity = getPendingMessageBubbleOpacity(tempId);
+      const previousStatus = pendingMessageLastStatusRef.current.get(tempId);
+      const targetOpacity = status === 'sent' ? 0.52 : 0.7;
+
+      if (!previousStatus) {
+        opacity.setValue(targetOpacity);
+      } else if (previousStatus !== status) {
+        Animated.timing(opacity, {
+          toValue: targetOpacity,
+          duration: status === 'sent' ? 170 : 120,
+          useNativeDriver: true,
+        }).start();
+      }
+
+      pendingMessageLastStatusRef.current.set(tempId, status);
+    }
+
+    const opacityEntries = Array.from(pendingMessageBubbleOpacityRef.current.keys());
+    for (const tempId of opacityEntries) {
+      if (!activePendingIds.has(tempId)) {
+        pendingMessageBubbleOpacityRef.current.delete(tempId);
+        pendingMessageLastStatusRef.current.delete(tempId);
+      }
+    }
+  }, [pendingMessages, resolvePendingMessageStatus, getPendingMessageBubbleOpacity]);
 
   // Retry pending messages when back online
   const retryPendingMessages = async () => {
     if (pendingMessages.size === 0 || isOffline) return;
 
-    const messagesToRetry = Array.from(pendingMessages.entries());
+    const messagesToRetry = Array.from(pendingMessages.entries()).filter(([, pendingMsg]) => {
+      return resolvePendingMessageStatus(pendingMsg) === 'queued';
+    });
+
+    if (messagesToRetry.length === 0) {
+      return;
+    }
+
     const successfulMessages: string[] = [];
+    const sentMessagesToPersist: { tempId: string; message: PendingMessage }[] = [];
 
     for (const [tempId, pendingMsg] of messagesToRetry) {
+      setPendingMessages((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(tempId);
+        if (existing) {
+          next.set(tempId, {
+            ...existing,
+            status: 'sending',
+          });
+        }
+        return next;
+      });
+
       try {
-        await sendMessage(
+        const serverMessageId = await sendMessage(
           pendingMsg.text,
           false,
           pendingMsg.recipientId
         );
         successfulMessages.push(tempId);
+
+        const sentPendingMessage: PendingMessage = {
+          ...pendingMsg,
+          status: 'sent',
+          serverMessageId,
+        };
+        sentMessagesToPersist.push({ tempId, message: sentPendingMessage });
+
+        setPendingMessages((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(tempId);
+          if (existing) {
+            next.set(tempId, {
+              ...existing,
+              status: 'sent',
+              serverMessageId,
+            });
+          }
+          return next;
+        });
       } catch (error) {
         logger.error('❌ Failed to retry message:', tempId, error);
-        // Keep failed messages in pending queue
+
+        const failedPending: PendingMessage = {
+          ...pendingMsg,
+          status: 'failed',
+        };
+
+        setPendingMessages((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(tempId);
+          next.set(tempId, {
+            ...(existing || pendingMsg),
+            status: 'failed',
+          });
+          return next;
+        });
+
+        try {
+          await PendingMessageStorage.addPendingMessage(tempId, failedPending);
+        } catch (storageError) {
+          logger.warn('Failed to persist queued message retry failure:', storageError);
+        }
       }
     }
 
-    // Remove successfully sent messages from both state and storage
+    // Persist successfully retried messages as sent.
+    // They remain in storage until realtime reconciliation confirms delivery.
     if (successfulMessages.length > 0) {
-      
-      setPendingMessages(prev => {
-        const newMap = new Map(prev);
-        successfulMessages.forEach(id => newMap.delete(id));
-        return newMap;
-      });
-
       try {
-        // Remove from persistent storage
-        await PendingMessageStorage.removePendingMessages(successfulMessages);
+        await Promise.all(
+          sentMessagesToPersist.map(({ tempId, message }) =>
+            PendingMessageStorage.addPendingMessage(tempId, message)
+          )
+        );
       } catch (error) {
-        logger.error('❌ Failed to remove messages from storage:', error);
+        logger.error('❌ Failed to persist sent retried messages:', error);
       }
 
       if (successfulMessages.length === messagesToRetry.length) {
@@ -8076,7 +9739,7 @@ export default function Chat() {
         Toast.show({
           type: 'info',
           text1: 'Partial Success',
-          text2: `${successfulMessages.length} of ${messagesToRetry.length} messages were sent. Others will retry automatically.`,
+          text2: `${successfulMessages.length} of ${messagesToRetry.length} messages were sent. Retry the rest manually.`,
           position: 'top',
         });
       }
@@ -8084,15 +9747,22 @@ export default function Chat() {
   };
 
   const retryPendingMessage = useCallback(
-    async (tempId: string) => {
+    async (tempId: string, options?: { silent?: boolean }): Promise<boolean> => {
       if (isOffline) {
-        Toast.show({ type: 'info', text1: 'Offline', text2: 'Reconnect to retry this message.', position: 'top' });
-        return;
+        if (!options?.silent) {
+          Toast.show({ type: 'info', text1: 'Offline', text2: 'Reconnect to retry this message.', position: 'top' });
+        }
+        return false;
       }
 
       const pendingMsg = pendingMessages.get(tempId) as PendingMessage | undefined;
       if (!pendingMsg || !selectedTeamMember || pendingMsg.recipientId !== selectedTeamMember.id) {
-        return;
+        return false;
+      }
+
+      const currentStatus = resolvePendingMessageStatus(pendingMsg);
+      if (currentStatus === 'sending' || currentStatus === 'sent') {
+        return false;
       }
 
       setRetryingPendingMessages((prev) => {
@@ -8102,25 +9772,78 @@ export default function Chat() {
         return next;
       });
 
+      setPendingMessages((prev) => {
+        const next = new Map(prev);
+        const current = next.get(tempId);
+        if (current) {
+          next.set(tempId, {
+            ...current,
+            status: 'sending',
+          });
+        }
+        return next;
+      });
+
       try {
-        await sendMessage(pendingMsg.text, false, pendingMsg.recipientId);
+        const serverMessageId = await sendMessage(pendingMsg.text, false, pendingMsg.recipientId);
+
+        const sentPendingMessage: PendingMessage = {
+          ...pendingMsg,
+          status: 'sent',
+          serverMessageId,
+        };
 
         setPendingMessages((prev) => {
           const next = new Map(prev);
-          next.delete(tempId);
+          const current = next.get(tempId);
+          if (current) {
+            next.set(tempId, {
+              ...current,
+              status: 'sent',
+              serverMessageId,
+            });
+          }
           return next;
         });
 
         try {
-          await PendingMessageStorage.removePendingMessage(tempId);
+          await PendingMessageStorage.addPendingMessage(tempId, sentPendingMessage);
         } catch (error) {
-          logger.warn('Failed to remove pending message after retry:', error);
+          logger.warn('Failed to persist sent pending message after retry:', error);
         }
 
-        Toast.show({ type: 'success', text1: 'Message Sent', text2: 'Pending message delivered.', position: 'top' });
+        if (!options?.silent) {
+          Toast.show({ type: 'success', text1: 'Message Sent', text2: 'Pending message delivered.', position: 'top' });
+        }
+        return true;
       } catch (error) {
         logger.error('Retry pending message failed:', error);
-        Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend this message.', position: 'top' });
+
+        const failedPending: PendingMessage = {
+          ...pendingMsg,
+          status: 'failed',
+        };
+
+        setPendingMessages((prev) => {
+          const next = new Map(prev);
+          const current = next.get(tempId);
+          next.set(tempId, {
+            ...(current || pendingMsg),
+            status: 'failed',
+          });
+          return next;
+        });
+
+        try {
+          await PendingMessageStorage.addPendingMessage(tempId, failedPending);
+        } catch (storageError) {
+          logger.warn('Failed to persist pending message retry failure:', storageError);
+        }
+
+        if (!options?.silent) {
+          Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend this message.', position: 'top' });
+        }
+        return false;
       } finally {
         setRetryingPendingMessages((prev) => {
           if (!prev.has(tempId)) return prev;
@@ -8130,8 +9853,142 @@ export default function Chat() {
         });
       }
     },
-    [isOffline, pendingMessages, selectedTeamMember, sendMessage]
+    [isOffline, pendingMessages, selectedTeamMember, sendMessage, resolvePendingMessageStatus]
   );
+
+  const pendingConversationDerived = useMemo(() => {
+    if (!selectedTeamMember?.id) {
+      return {
+        mediaEntries: [] as [string, PendingMediaItem][],
+        messageEntries: [] as [string, PendingMessage][],
+        attachmentEntries: [] as [string, PendingAttachmentItem][],
+        retryableTextIds: [] as string[],
+        retryableMediaIds: [] as string[],
+        retryableAttachmentIds: [] as string[],
+        retryAllCount: 0,
+      };
+    }
+
+    const selectedMemberId = selectedTeamMember.id;
+    const mediaEntries: [string, PendingMediaItem][] = [];
+    const messageEntries: [string, PendingMessage][] = [];
+    const attachmentEntries: [string, PendingAttachmentItem][] = [];
+    const retryableTextIds: string[] = [];
+    const retryableMediaIds: string[] = [];
+    const retryableAttachmentIds: string[] = [];
+
+    pendingMessages.forEach((pendingMsg, tempId) => {
+      if (!pendingMsg || pendingMsg.recipientId !== selectedMemberId) {
+        return;
+      }
+      messageEntries.push([tempId, pendingMsg]);
+      const status = resolvePendingMessageStatus(pendingMsg);
+      if (status === 'failed' || status === 'queued') {
+        retryableTextIds.push(tempId);
+      }
+    });
+
+    pendingMedia.forEach((item, tempId) => {
+      if (!item || item.recipientId !== selectedMemberId) {
+        return;
+      }
+      mediaEntries.push([tempId, item]);
+      if (item.status === 'failed' || item.status === 'queued') {
+        retryableMediaIds.push(tempId);
+      }
+    });
+
+    pendingAttachments.forEach((item, tempId) => {
+      if (!item || item.recipientId !== selectedMemberId) {
+        return;
+      }
+      attachmentEntries.push([tempId, item]);
+      if (item.status === 'failed') {
+        retryableAttachmentIds.push(tempId);
+      }
+    });
+
+    return {
+      mediaEntries,
+      messageEntries,
+      attachmentEntries,
+      retryableTextIds,
+      retryableMediaIds,
+      retryableAttachmentIds,
+      retryAllCount: retryableTextIds.length + retryableMediaIds.length + retryableAttachmentIds.length,
+    };
+  }, [pendingMessages, pendingMedia, pendingAttachments, selectedTeamMember?.id, resolvePendingMessageStatus]);
+
+  const retryAllPendingCount = pendingConversationDerived.retryAllCount;
+
+  const retryAllPendingSends = useCallback(async () => {
+    if (!selectedTeamMember?.id) {
+      return;
+    }
+
+    if (isOffline) {
+      Toast.show({
+        type: 'info',
+        text1: 'Offline',
+        text2: 'Reconnect to retry pending messages.',
+        position: 'top',
+      });
+      return;
+    }
+
+    const {
+      retryableTextIds: textIds,
+      retryableMediaIds: mediaIds,
+      retryableAttachmentIds: attachmentIds,
+    } = pendingConversationDerived;
+    const total = textIds.length + mediaIds.length + attachmentIds.length;
+
+    if (total === 0 || isRetryingAllPending) {
+      return;
+    }
+
+    setIsRetryingAllPending(true);
+
+    try {
+      const retryPromises: Promise<boolean>[] = [];
+      textIds.forEach((tempId) => retryPromises.push(retryPendingMessage(tempId, { silent: true })));
+      mediaIds.forEach((tempId) => retryPromises.push(retryPendingMedia(tempId, { silent: true })));
+      attachmentIds.forEach((tempId) => retryPromises.push(retryPendingAttachment(tempId, { silent: true })));
+
+      const settled = await Promise.allSettled(retryPromises);
+      const successCount = settled.reduce((count, result) => {
+        if (result.status === 'fulfilled' && result.value === true) {
+          return count + 1;
+        }
+        return count;
+      }, 0);
+
+      if (successCount === total) {
+        Toast.show({
+          type: 'success',
+          text1: 'Retry Complete',
+          text2: 'All pending items were sent.',
+          position: 'top',
+        });
+      } else if (successCount > 0) {
+        Toast.show({
+          type: 'info',
+          text1: 'Partial Retry Success',
+          text2: `${successCount} of ${total} pending items were sent.`,
+          position: 'top',
+        });
+      } else {
+        Toast.show({
+          type: 'error',
+          text1: 'Retry Failed',
+          text2: 'Could not resend pending items. Please try again.',
+          position: 'top',
+        });
+      }
+    } finally {
+      setIsRetryingAllPending(false);
+    }
+  }, [selectedTeamMember?.id, isOffline, pendingConversationDerived, isRetryingAllPending, retryPendingMessage, retryPendingMedia, retryPendingAttachment]);
 
   // Effect to retry pending messages when connection is restored
   useEffect(() => {
@@ -8144,32 +10001,177 @@ export default function Chat() {
     }
   }, [isOffline, pendingMessages.size]);
 
+  // Clear optimistic text rows once their server message shows up in conversation data.
+  useEffect(() => {
+    if (pendingMessages.size === 0 || deliveredMessageIds.size === 0) {
+      return;
+    }
+
+    const resolvedPendingIds: string[] = [];
+    for (const [tempId, pendingMsg] of pendingMessages.entries()) {
+      const status = resolvePendingMessageStatus(pendingMsg);
+      if (status !== 'sending' && status !== 'sent') {
+        continue;
+      }
+      const serverMessageId = normalizeMessageId(pendingMsg.serverMessageId);
+      if (serverMessageId && isDeliveredServerMessage(serverMessageId)) {
+        resolvedPendingIds.push(tempId);
+      }
+    }
+
+    if (resolvedPendingIds.length === 0) {
+      return;
+    }
+
+    setPendingMessages((prev) => {
+      const next = new Map(prev);
+      resolvedPendingIds.forEach((tempId) => next.delete(tempId));
+      return next;
+    });
+
+    void PendingMessageStorage.removePendingMessages(resolvedPendingIds).catch((error) => {
+      logger.warn('Failed to remove reconciled pending messages from storage:', error);
+    });
+  }, [deliveredMessageIds, pendingMessages, normalizeMessageId, resolvePendingMessageStatus, isDeliveredServerMessage]);
+
+  // Clear optimistic media rows once matching server message is present.
+  useEffect(() => {
+    if (pendingMedia.size === 0 || deliveredMessageIds.size === 0) {
+      return;
+    }
+
+    const resolvedIds: string[] = [];
+    for (const [tempId, item] of pendingMedia.entries()) {
+      if (item.status !== 'sent') {
+        continue;
+      }
+      const serverMessageId = normalizeMessageId(item.serverMessageId);
+      if (serverMessageId && isDeliveredServerMessage(serverMessageId)) {
+        resolvedIds.push(tempId);
+      }
+    }
+
+    if (resolvedIds.length === 0) {
+      return;
+    }
+
+    setPendingMedia((prev) => {
+      const next = new Map(prev);
+      resolvedIds.forEach((tempId) => next.delete(tempId));
+      return next;
+    });
+  }, [pendingMedia, deliveredMessageIds, normalizeMessageId, isDeliveredServerMessage]);
+
+  // Clear optimistic attachment rows once matching server message is present.
+  useEffect(() => {
+    if (pendingAttachments.size === 0 || deliveredMessageIds.size === 0) {
+      return;
+    }
+
+    const resolvedIds: string[] = [];
+    for (const [tempId, item] of pendingAttachments.entries()) {
+      if (item.status !== 'finalizing' && item.status !== 'sent') {
+        continue;
+      }
+      const serverMessageId = normalizeMessageId(item.serverMessageId);
+      if (serverMessageId && isDeliveredServerMessage(serverMessageId)) {
+        resolvedIds.push(tempId);
+      }
+    }
+
+    if (resolvedIds.length === 0) {
+      return;
+    }
+
+    setPendingAttachments((prev) => {
+      const next = new Map(prev);
+      resolvedIds.forEach((tempId) => {
+        clearAttachmentFinalizeTimer(tempId);
+        next.delete(tempId);
+      });
+      return next;
+    });
+  }, [pendingAttachments, deliveredMessageIds, normalizeMessageId, clearAttachmentFinalizeTimer, isDeliveredServerMessage]);
+
+  const retryPendingMessageRef = useRef(retryPendingMessage);
+  useEffect(() => {
+    retryPendingMessageRef.current = retryPendingMessage;
+  }, [retryPendingMessage]);
+
+  const retryPendingMessagePressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const getRetryPendingMessagePressHandler = useCallback((tempId: string) => {
+    const cached = retryPendingMessagePressHandlersRef.current.get(tempId);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      void retryPendingMessageRef.current(tempId);
+    };
+    retryPendingMessagePressHandlersRef.current.set(tempId, handler);
+    return handler;
+  }, []);
+
+  useEffect(() => {
+    const activeIds = new Set<string>(Array.from(pendingMessages.keys()));
+    const handlers = retryPendingMessagePressHandlersRef.current;
+    for (const tempId of Array.from(handlers.keys())) {
+      if (!activeIds.has(tempId)) {
+        handlers.delete(tempId);
+      }
+    }
+  }, [pendingMessages]);
+
   // Render pending messages with visual indicators
   const renderPendingMessage = (tempId: string, pendingMsg: PendingMessage) => {
     // Only show pending messages for the currently selected team member
     if (!selectedTeamMember || pendingMsg.recipientId !== selectedTeamMember.id) return null;
-  const isRetrying = retryingPendingMessages.has(tempId);
-  const statusLabel = isRetrying ? 'Retrying...' : isOffline ? 'Sending...' : 'Failed';
+    const baseStatus = resolvePendingMessageStatus(pendingMsg);
+    let normalizedServerMessageId = normalizeMessageId(pendingMsg.serverMessageId);
+    if (!normalizedServerMessageId && (baseStatus === 'sending' || baseStatus === 'sent')) {
+      normalizedServerMessageId = findLikelyServerMessageIdForPendingText(pendingMsg);
+    }
+    if (
+      normalizedServerMessageId &&
+      deliveredMessageIds.has(normalizedServerMessageId) &&
+      (baseStatus === 'sending' || baseStatus === 'sent')
+    ) {
+      return null;
+    }
+
+    const rowAnim = getPendingRowAnimation(`text:${tempId}`, 'outgoing');
+    const isRetrying = retryingPendingMessages.has(tempId);
+    const effectiveStatus: NonNullable<PendingMessage['status']> = isRetrying ? 'sending' : baseStatus;
+    const bubbleOpacity = getPendingMessageBubbleOpacity(tempId);
+    const statusLabel =
+      effectiveStatus === 'sending'
+        ? (isRetrying ? 'Retrying...' : 'Sending...')
+        : effectiveStatus === 'sent'
+          ? 'Sent'
+          : effectiveStatus === 'failed'
+            ? 'Not sent'
+            : 'Queued';
+    const canRetry = !isRetrying && (effectiveStatus === 'failed' || (effectiveStatus === 'queued' && !isOffline));
     
     return (
-      <View key={tempId} style={[
+      <Animated.View
+        key={tempId}
+        style={{
+          opacity: rowAnim.opacity,
+          transform: [{ translateX: rowAnim.translateX }, { scale: rowAnim.scale }],
+        }}
+      >
+      <View style={[
         styles.messageContainer,
         styles.ownMessage
       ]}>
-        <View style={[
+        <Animated.View style={[
           styles.messageBubble,
           styles.ownBubble,
-          { backgroundColor: theme.primary, opacity: 0.7 }
+          { backgroundColor: theme.primary, opacity: bubbleOpacity }
         ]}>
           <StyledText
-            text={(() => {
-              const safeText = String(pendingMsg.text || '');
-              // Prevent periods or problematic text from being rendered in pending messages
-              if (!safeText || safeText.trim() === '.' || safeText.trim().length === 0) {
-                return 'Sending message...';
-              }
-              return safeText;
-            })()}
+            text={sanitizeMessageText(pendingMsg.text, 'Sending message...')}
             style={[
               styles.messageText,
               styles.ownMessageText
@@ -8189,17 +10191,19 @@ export default function Chat() {
               {statusLabel}
             </Text>
             <View style={{ marginLeft: 6 }}>
-              {isRetrying ? (
-                <ActivityIndicator size="small" color="#ffffff" />
-              ) : isOffline ? (
-                <Clock size={12} color="rgba(255, 255, 255, 0.85)" />
+              {effectiveStatus === 'sending' ? (
+                <Clock size={12} color="rgba(255, 255, 255, 0.9)" />
+              ) : effectiveStatus === 'sent' ? (
+                <CheckCircle2 size={12} color="rgba(255, 255, 255, 0.9)" />
+              ) : effectiveStatus === 'failed' ? (
+                <AlertCircle size={12} color="rgba(255, 255, 255, 0.95)" />
               ) : (
-                <AlertCircle size={12} color={theme.error} />
+                <Clock size={12} color="rgba(255, 255, 255, 0.85)" />
               )}
             </View>
-            {!isOffline && (
+            {canRetry && (
               <TouchableOpacity
-                onPress={() => retryPendingMessage(tempId)}
+                onPress={getRetryPendingMessagePressHandler(tempId)}
                 disabled={isRetrying}
                 style={{
                   marginLeft: 10,
@@ -8217,8 +10221,9 @@ export default function Chat() {
               </TouchableOpacity>
             )}
           </View>
-        </View>
+        </Animated.View>
       </View>
+      </Animated.View>
     );
   };
 
@@ -8232,39 +10237,178 @@ export default function Chat() {
           selectedTeamMember.id,
           senderEmail
         );
-        
-        setPendingMessages(storedPendingMessages);
+
+        const normalizedPendingMessages = new Map<string, PendingMessage>();
+        for (const [id, message] of storedPendingMessages.entries()) {
+          normalizedPendingMessages.set(id, {
+            ...message,
+            status: resolvePendingMessageStatus(message),
+          });
+        }
+
+        setPendingMessages(normalizedPendingMessages);
       } else {
         setPendingMessages(new Map<string, PendingMessage>());
       }
     };
 
     loadPendingMessages();
-  }, [selectedTeamMember, effectiveUser?.email, user?.email]);
+  }, [selectedTeamMember, effectiveUser?.email, user?.email, resolvePendingMessageStatus]);
 
-  // Also load pending messages on initial mount regardless of other dependencies
-  useEffect(() => {
-    const loadInitialPendingMessages = async () => {
-      // Load all pending messages and let the filtering happen in render
-      const allPendingMessages = await PendingMessageStorage.loadPendingMessages();
-      
-      // Only set if we have a selected team member and user
-      if (selectedTeamMember && (effectiveUser?.email || user?.email)) {
-        const senderEmail = effectiveUser?.email || user?.email || '';
-        const filteredMessages = new Map<string, PendingMessage>();
-        
-        for (const [id, message] of allPendingMessages.entries()) {
-          if (message.recipientId === selectedTeamMember.id && message.sender === senderEmail) {
-            filteredMessages.set(id, message);
-          }
+  const messagesContentContainerStyle = useMemo(
+    () => StyleSheet.flatten([styles.messagesContent, { paddingBottom: bottomVisibilityPadding }]),
+    [bottomVisibilityPadding]
+  );
+
+  const scrollToBottomButtonStyle = useMemo(
+    () => ({
+      position: 'absolute' as const,
+      right: 12,
+      bottom: 12 + Math.max(0, (inputHeight || 40) - 40),
+      backgroundColor: theme.surface,
+      borderColor: theme.border,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: 20,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      flexDirection: 'row' as const,
+      alignItems: 'center' as const,
+      shadowColor: '#000',
+      shadowOpacity: 0.1,
+      shadowRadius: 4,
+      shadowOffset: { width: 0, height: 2 },
+      elevation: 2,
+    }),
+    [inputHeight, theme.border, theme.surface]
+  );
+
+  const unseenCountBadgeStyle = useMemo(
+    () => ({
+      marginLeft: 8,
+      minWidth: 22,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: 10,
+      backgroundColor: theme.primary,
+    }),
+    [theme.primary]
+  );
+
+  const handleScrollToBottomPress = useCallback(() => {
+    setUnseenCount(0);
+    setShowScrollToBottom(false);
+    setShowNewDivider(false);
+    setNewDividerMessageId(null);
+    dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+    scrollToBottom();
+  }, [dismissUnreadDividerForCurrentBatch, scrollToBottom]);
+
+  const handleSpecialIndicatorClose = useCallback(() => {
+    clearInputField();
+  }, [clearInputField]);
+
+  const handleRetryAllPendingPress = useCallback(() => {
+    void retryAllPendingSends();
+  }, [retryAllPendingSends]);
+
+  const appendFormattingText = useCallback((suffix: string) => {
+    const baseText = typeof latestMessageRef.current === 'string' ? latestMessageRef.current : '';
+    handleTyping(`${baseText}${suffix}`);
+  }, [handleTyping]);
+
+  const handleQuickFormatExtraBold = useCallback(() => {
+    appendFormattingText('***extra bold***');
+  }, [appendFormattingText]);
+
+  const handleQuickFormatBold = useCallback(() => {
+    appendFormattingText('**bold**');
+  }, [appendFormattingText]);
+
+  const handleQuickFormatItalic = useCallback(() => {
+    appendFormattingText('*italic*');
+  }, [appendFormattingText]);
+
+  const handleQuickFormatUnderline = useCallback(() => {
+    appendFormattingText('__underline__');
+  }, [appendFormattingText]);
+
+  const handleQuickFormatStrike = useCallback(() => {
+    appendFormattingText('~~strike~~');
+  }, [appendFormattingText]);
+
+  const handleQuickFormatCode = useCallback(() => {
+    appendFormattingText('`code`');
+  }, [appendFormattingText]);
+
+  const handleQuickFormatSpecial = useCallback(() => {
+    appendFormattingText('/special ');
+  }, [appendFormattingText]);
+
+  const handleSelectTeamMemberFromList = useCallback((member: TeamMember) => {
+    forceBottomAnchorChatKeyRef.current = String(member.id || member.email || '');
+    setSelectedTeamMember(member);
+    setTimeout(() => {
+      if (Platform.OS === 'ios' && textInputRef.current) {
+        textInputRef.current.focus();
+      } else if (Platform.OS === 'android' && richTextInputRef.current) {
+        try {
+          richTextInputRef.current.focus?.();
+        } catch (e) {
+          logger.debug('Android focus not available');
         }
-        
-        setPendingMessages(filteredMessages);
       }
-    };
+    }, 500);
+  }, []);
 
-    loadInitialPendingMessages();
-  }, []); // Run only once on mount
+  const handleSelectTeamMemberFromListRef = useRef(handleSelectTeamMemberFromList);
+  useEffect(() => {
+    handleSelectTeamMemberFromListRef.current = handleSelectTeamMemberFromList;
+  }, [handleSelectTeamMemberFromList]);
+
+  const teamMemberSelectPressHandlersRef = useRef<Map<string, () => void>>(new Map());
+  const teamMemberByPressKeyRef = useRef<Map<string, TeamMember>>(new Map());
+  const getTeamMemberPressKey = useCallback((member: TeamMember) => {
+    return String(member?.id || member?.email || '');
+  }, []);
+
+  const getTeamMemberSelectPressHandler = useCallback((member: TeamMember) => {
+    const key = getTeamMemberPressKey(member);
+    if (!key) {
+      return noopPressHandler;
+    }
+
+    teamMemberByPressKeyRef.current.set(key, member);
+    const cached = teamMemberSelectPressHandlersRef.current.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const handler = () => {
+      const latestMember = teamMemberByPressKeyRef.current.get(key) || member;
+      handleSelectTeamMemberFromListRef.current(latestMember);
+    };
+    teamMemberSelectPressHandlersRef.current.set(key, handler);
+    return handler;
+  }, [getTeamMemberPressKey, noopPressHandler]);
+
+  useEffect(() => {
+    const nextMembers = new Map<string, TeamMember>();
+    filteredTeamMembers.forEach((member) => {
+      const key = getTeamMemberPressKey(member as TeamMember);
+      if (key) {
+        nextMembers.set(key, member as TeamMember);
+      }
+    });
+
+    teamMemberByPressKeyRef.current = nextMembers;
+
+    const handlers = teamMemberSelectPressHandlersRef.current;
+    for (const key of Array.from(handlers.keys())) {
+      if (!nextMembers.has(key)) {
+        handlers.delete(key);
+      }
+    }
+  }, [filteredTeamMembers, getTeamMemberPressKey]);
 
   // Safe early return after all hooks/effects are registered
   if (tenantLoading && !activeTenant?.id) {
@@ -8330,6 +10474,29 @@ export default function Chat() {
         </SafeAreaView>
       );
     }
+
+    const userListOptionActions = (!longPressedMember || !user?.email)
+      ? []
+      : [
+          {
+            text: pinnedChats[chatPreferencesService.sanitizeEmailKey(longPressedMember.email)] ? 'Unpin chat' : 'Pin chat',
+            onPress: async () => {
+              const key = chatPreferencesService.sanitizeEmailKey(longPressedMember.email);
+              const isPinned = !!pinnedChats[key];
+              try {
+                if (isPinned) {
+                  await chatPreferencesService.unpinChat(user.email, longPressedMember.email);
+                } else {
+                  await chatPreferencesService.pinChat(user.email, longPressedMember.email);
+                }
+              } catch (e) {
+                Toast.show({ type: 'error', text1: 'Failed to update pin' });
+              }
+            },
+            style: 'primary',
+            icon: <Star size={16} color={'#ffffff'} />,
+          },
+        ] as any;
     
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -8358,25 +10525,16 @@ export default function Chat() {
           data={filteredTeamMembers}
           keyExtractor={(item) => item.id}
           renderItem={({ item }) => {
+            const userAvatarInitial = getSafeDisplayInitial(item.name || 'U');
+            const lastMessagePreviewText = item.lastMessage
+              ? sanitizeMessageText(item.lastMessage.text, '📎 Attachment').trim()
+              : '';
+            const presenceLabel = formatOnlineStatus(item.isOnline, item.lastSeen);
+
             return (
             <TouchableOpacity
               style={[styles.userListItem, { backgroundColor: theme.background }]}
-              onPress={() => {
-                forceBottomAnchorChatKeyRef.current = String(item.id || item.email || '');
-                setSelectedTeamMember(item);
-                // Auto-focus input when selecting a chat
-                setTimeout(() => {
-                  if (Platform.OS === 'ios' && textInputRef.current) {
-                    textInputRef.current.focus();
-                  } else if (Platform.OS === 'android' && richTextInputRef.current) {
-                    try {
-                      richTextInputRef.current.focus?.();
-                    } catch (e) {
-                      logger.debug('Android focus not available');
-                    }
-                  }
-                }, 500); // Delay to ensure chat is loaded
-              }}
+              onPress={getTeamMemberSelectPressHandler(item)}
               activeOpacity={0.7}
               onLongPress={() => {
                 setLongPressedMember(item);
@@ -8392,17 +10550,7 @@ export default function Chat() {
                   />
                 ) : (
                   <Text style={styles.userAvatarText}>
-                    {(() => {
-                      const rawName = item.name || 'U';
-                      const safeName = String(rawName).trim();
-                      if (!safeName) return 'U';
-                      const firstChar = safeName.charAt(0).toUpperCase();
-                      // Ensure we never return problematic characters like periods
-                      if (/^[A-Z0-9]$/i.test(firstChar)) {
-                        return firstChar;
-                      }
-                      return 'U';
-                    })()}
+                    {userAvatarInitial}
                   </Text>
                 )}
                 {/* Online status indicator */}
@@ -8474,23 +10622,14 @@ export default function Chat() {
                         ]} 
                         numberOfLines={1}
                       >
-                        {(() => {
-                          const safeMessageText = String(item.lastMessage.text || '📎 Attachment').trim();
-                          // Ensure message text isn't just a period or empty
-                          if (!safeMessageText || safeMessageText === '.' || safeMessageText.length === 0) return '📎 Attachment';
-                          return safeMessageText;
-                        })()}
+                        {lastMessagePreviewText}
                       </Text>
                     </View>
-                  ) : (() => {
-                    const presenceLabel = formatOnlineStatus(item.isOnline, item.lastSeen);
-                    if (!presenceLabel) return null;
-                    return (
-                      <Text style={[styles.userStatus, { color: theme.textSecondary }]} numberOfLines={1}>
-                        {presenceLabel}
-                      </Text>
-                    );
-                  })()}
+                  ) : presenceLabel ? (
+                    <Text style={[styles.userStatus, { color: theme.textSecondary }]} numberOfLines={1}>
+                      {presenceLabel}
+                    </Text>
+                  ) : null}
                 </View>
               </View>
 
@@ -8540,26 +10679,7 @@ export default function Chat() {
           visible={userListOptionsVisible && !!longPressedMember}
           onClose={() => { setUserListOptionsVisible(false); setLongPressedMember(null); }}
           title={longPressedMember?.name || 'Chat options'}
-          actions={(() => {
-            if (!longPressedMember || !user?.email) return [];
-            const key = chatPreferencesService.sanitizeEmailKey(longPressedMember.email);
-            const isPinned = !!pinnedChats[key];
-            return [
-              {
-                text: isPinned ? 'Unpin chat' : 'Pin chat',
-                onPress: async () => {
-                  try {
-                    if (isPinned) await chatPreferencesService.unpinChat(user.email, longPressedMember.email);
-                    else await chatPreferencesService.pinChat(user.email, longPressedMember.email);
-                  } catch (e) {
-                    Toast.show({ type: 'error', text1: 'Failed to update pin' });
-                  }
-                },
-                style: 'primary',
-                icon: <Star size={16} color={'#ffffff'} />,
-              },
-            ] as any;
-          })()}
+          actions={userListOptionActions}
         />
       </SafeAreaView>
     );
@@ -8590,6 +10710,119 @@ export default function Chat() {
     );
   }
 
+  const getComposerPlaceholder = (): string => {
+    if (isOffline) {
+      return 'Offline - messages will be queued';
+    }
+    if (isComposingSpecial) {
+      return 'Type your special message here...';
+    }
+    if (isSmallScreen) {
+      return 'Message';
+    }
+
+    const rawName = selectedTeamMember?.name;
+    const safeName = typeof rawName === 'string' ? rawName.trim() : '';
+    if (!safeName || safeName === '.') {
+      return 'Message team member...';
+    }
+    return `Message ${safeName}...`;
+  };
+
+  const messagePreviewText = sanitizeMessageText(message, 'Message preview');
+  const shouldShowFormatPreview =
+    typeof message === 'string' &&
+    message.trim().length > 0 &&
+    !message.includes('/special') &&
+    (message.includes('***') ||
+      message.includes('**') ||
+      message.includes('*') ||
+      message.includes('__') ||
+      message.includes('~~') ||
+      message.includes('`'));
+
+  const alignMessageListAnchors = (hasLayout: boolean, hasContent: boolean) => {
+    const forceChatKey = forceBottomAnchorChatKeyRef.current;
+    const selectedChatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
+    const canForceBottomAnchor =
+      forceChatKey &&
+      selectedChatKey &&
+      forceChatKey === selectedChatKey &&
+      !unreadSeparatorAnchorMessageId &&
+      hasLayout &&
+      hasContent;
+
+    if (canForceBottomAnchor) {
+      userInteractedRef.current = false;
+      markAutoScroll(320);
+      tryAnchorToBottom(true);
+      scheduleScrollToBottom({ animated: false, delay: 0 });
+      setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
+      forceBottomAnchorChatKeyRef.current = null;
+    }
+
+    if (shouldUseManualAnchorPreservation && pendingPrependAnchorRef.current) {
+      restorePrependAnchorIfNeeded();
+      if (pendingPrependAnchorRef.current) {
+        return;
+      }
+    }
+
+    if (anchoredTargetRef.current) {
+      ensureAnchorPosition();
+      if (anchoredTargetRef.current) {
+        return;
+      }
+    }
+
+    if (hasAnchoredInitialScrollRef.current) {
+      return;
+    }
+
+    if (unreadSeparatorAnchorMessageId && !scrollToUnreadAttemptedRef.current) {
+      scheduleScrollToUnread(unreadSeparatorAnchorMessageId);
+    } else if (pendingInitialAnchorRef.current) {
+      tryAnchorToBottom();
+    }
+  };
+
+  const handleMessageListContentSizeChange = (_w: number, h: number) => {
+    contentHeightRef.current = h;
+    alignMessageListAnchors(layoutHeightRef.current > 0, h > 0);
+  };
+
+  const handleMessageListLayout = (e: any) => {
+    const height = e?.nativeEvent?.layout?.height ?? 0;
+    layoutHeightRef.current = height;
+    alignMessageListAnchors(height > 0, contentHeightRef.current > 0);
+  };
+
+  const handleMessageListScroll = (e: any) => {
+    handleScroll(e);
+    try {
+      const y = e.nativeEvent.contentOffset?.y ?? 0;
+      const contentH = e.nativeEvent.contentSize?.height ?? 0;
+      const layoutH = e.nativeEvent.layoutMeasurement?.height ?? 0;
+      const bottomBuffer = bottomVisibilityPadding;
+      const distanceFromBottom = Math.max(0, contentH - (y + layoutH));
+      const nearBottomThreshold = bottomBuffer + 32;
+      const nearBottom = distanceFromBottom <= nearBottomThreshold;
+      isAtBottomRef.current = nearBottom;
+      if (nearBottom) {
+        setShowScrollToBottom(false);
+        setUnseenCount(0);
+        setShowNewDivider(false);
+        setNewDividerMessageId(null);
+        if (showUnreadSeparatorRef.current && unreadSeparatorAnchorMessageId) {
+          dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+        }
+      } else {
+        // Always show the FAB when user is not at the bottom
+        setShowScrollToBottom(true);
+      }
+    } catch {}
+  };
+
   return (
     <KeyboardAvoidingView 
       style={[styles.container, { backgroundColor: theme.background }]}
@@ -8606,10 +10839,7 @@ export default function Chat() {
   {/* Header with User Selection */}
   <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
         <TouchableOpacity 
-          onPress={() => {
-            Keyboard.dismiss(); // Manually hide keyboard when going back
-            setSelectedTeamMember(null);
-          }} 
+          onPress={handleBackToChatList}
           style={styles.backButton}
         >
           <ArrowLeft size={24} color={theme.text} />
@@ -8617,7 +10847,7 @@ export default function Chat() {
         
         <TouchableOpacity 
           style={styles.friendInfo}
-          onPress={() => setChatProfileModalVisible(true)}
+          onPress={openChatProfileModal}
           activeOpacity={0.7}
         >
           <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
@@ -8628,17 +10858,7 @@ export default function Chat() {
     />
   ) : (
     <Text style={styles.avatarText}>
-      {(() => {
-        const rawName = selectedTeamMember?.name || 'T';
-        const safeName = String(rawName).trim();
-        if (!safeName) return 'T';
-        const firstChar = safeName.charAt(0).toUpperCase();
-        // Ensure we never return problematic characters like periods
-        if (/^[A-Z0-9]$/i.test(firstChar)) {
-          return firstChar;
-        }
-        return 'T';
-      })()}
+      {getSafeDisplayInitial(selectedTeamMember?.name || 'T')}
     </Text>
   )}
 </View>
@@ -8653,23 +10873,27 @@ export default function Chat() {
               )}
             </View>
             <View style={styles.friendStatusContainer}>
-              {selectedTeamMember?.isOnline !== undefined && (
-                <View style={[
-                  styles.statusDot,
-                  { backgroundColor: selectedTeamMember.isOnline ? theme.success : theme.textSecondary }
-                ]} />
-              )}
-              <Text allowFontScaling={false} style={[styles.friendStatus, { color: theme.textSecondary }]}>
-                {isTyping ? (
-                  <Text allowFontScaling={false} style={{ color: theme.primary, fontStyle: 'italic' }}>
+              {isTyping ? (
+                <View style={styles.friendTypingRow}>
+                  <Text allowFontScaling={false} style={[styles.friendStatus, styles.friendTypingText, { color: theme.primary }]}>
                     typing...
                   </Text>
-                ) : (
-                  formatOnlineStatus(selectedTeamMember?.isOnline, selectedTeamMember?.lastSeen)
-                )}
-              </Text>
-              {isTyping && (
-                <AnimatedTypingIndicator color={theme.primary} />
+                  <View style={{ marginLeft: 6 }}>
+                    <AnimatedTypingIndicator color={theme.primary} />
+                  </View>
+                </View>
+              ) : (
+                <>
+                  {selectedTeamMember?.isOnline !== undefined && (
+                    <View style={[
+                      styles.statusDot,
+                      { backgroundColor: selectedTeamMember.isOnline ? theme.success : theme.textSecondary }
+                    ]} />
+                  )}
+                  <Text allowFontScaling={false} style={[styles.friendStatus, { color: theme.textSecondary }]}>
+                    {formatOnlineStatus(selectedTeamMember?.isOnline, selectedTeamMember?.lastSeen)}
+                  </Text>
+                </>
               )}
             </View>
           </View>
@@ -8688,11 +10912,7 @@ export default function Chat() {
               ...(Platform.OS === 'web' ? {} : { shadowColor: theme.text })
             }]}> 
               <Text style={[styles.stickyDateText, { color: theme.textSecondary }]}> 
-                {(() => {
-                  const safeDate = typeof stickyDateText === 'string' ? stickyDateText.trim() : '';
-                  if (!safeDate || safeDate === '.' || safeDate.length === 0) return 'Today';
-                  return safeDate;
-                })()}
+                {sanitizeDateSeparatorLabel(stickyDateText)}
               </Text>
             </View>
           </View>
@@ -8708,96 +10928,19 @@ export default function Chat() {
             estimatedItemSize={estimatedItemSize}
             keyExtractor={getMessageKey}
             estimatedListSize={estimatedListSize}
-            drawDistance={Math.max(estimatedListSize.height * 2, 1600)}
+            drawDistance={listDrawDistance}
             onViewableItemsChanged={onViewableItemsChangedRef.current}
             viewabilityConfig={viewabilityConfigRef.current}
             getItemType={getMessageItemType}
             overrideItemLayout={overrideMessageLayout}
             renderItem={renderMessageItem}
-            contentContainerStyle={StyleSheet.flatten([
-              styles.messagesContent,
-              { paddingBottom: bottomVisibilityPadding },
-            ])}
+            removeClippedSubviews={Platform.OS !== 'web'}
+            contentContainerStyle={messagesContentContainerStyle}
             showsVerticalScrollIndicator={false}
-            onScroll={(e) => {
-            handleScroll(e);
-            try {
-              const y = e.nativeEvent.contentOffset?.y ?? 0;
-              const contentH = e.nativeEvent.contentSize?.height ?? 0;
-              const layoutH = e.nativeEvent.layoutMeasurement?.height ?? 0;
-              const bottomBuffer = bottomVisibilityPadding;
-              const distanceFromBottom = Math.max(0, contentH - (y + layoutH));
-              const nearBottomThreshold = bottomBuffer + 32;
-              const nearBottom = distanceFromBottom <= nearBottomThreshold;
-              isAtBottomRef.current = nearBottom;
-              if (nearBottom) {
-                setShowScrollToBottom(false);
-                setUnseenCount(0);
-                setShowNewDivider(false);
-                setNewDividerMessageId(null);
-              } else {
-                // Always show the FAB when user is not at the bottom
-                setShowScrollToBottom(true);
-              }
-            } catch {}
-          }}
+            onScroll={handleMessageListScroll}
             scrollEventThrottle={32}
-            onContentSizeChange={(_w, h) => {
-            contentHeightRef.current = h;
-            const forceChatKey = forceBottomAnchorChatKeyRef.current;
-            const selectedChatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
-            if (forceChatKey && selectedChatKey && forceChatKey === selectedChatKey && !firstUnreadMessageId && layoutHeightRef.current > 0) {
-              userInteractedRef.current = false;
-              markAutoScroll(320);
-              tryAnchorToBottom(true);
-              scheduleScrollToBottom({ animated: false, delay: 0 });
-              setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
-              forceBottomAnchorChatKeyRef.current = null;
-            }
-            if (shouldUseManualAnchorPreservation && pendingPrependAnchorRef.current) {
-              restorePrependAnchorIfNeeded();
-              if (pendingPrependAnchorRef.current) return;
-            }
-            if (anchoredTargetRef.current) {
-              ensureAnchorPosition();
-              if (anchoredTargetRef.current) return;
-            }
-            if (hasAnchoredInitialScrollRef.current) return;
-
-            if (firstUnreadMessageId && !scrollToUnreadAttemptedRef.current) {
-              scheduleScrollToUnread(firstUnreadMessageId);
-            } else if (pendingInitialAnchorRef.current) {
-              tryAnchorToBottom();
-            }
-          }}
-            onLayout={(e) => {
-            layoutHeightRef.current = e.nativeEvent.layout.height;
-            const forceChatKey = forceBottomAnchorChatKeyRef.current;
-            const selectedChatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
-            if (forceChatKey && selectedChatKey && forceChatKey === selectedChatKey && !firstUnreadMessageId && contentHeightRef.current > 0) {
-              userInteractedRef.current = false;
-              markAutoScroll(320);
-              tryAnchorToBottom(true);
-              scheduleScrollToBottom({ animated: false, delay: 0 });
-              setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
-              forceBottomAnchorChatKeyRef.current = null;
-            }
-            if (shouldUseManualAnchorPreservation && pendingPrependAnchorRef.current) {
-              restorePrependAnchorIfNeeded();
-              if (pendingPrependAnchorRef.current) return;
-            }
-            if (anchoredTargetRef.current) {
-              ensureAnchorPosition();
-              if (anchoredTargetRef.current) return;
-            }
-            if (hasAnchoredInitialScrollRef.current) return;
-
-            if (firstUnreadMessageId && !scrollToUnreadAttemptedRef.current) {
-              scheduleScrollToUnread(firstUnreadMessageId);
-            } else if (pendingInitialAnchorRef.current) {
-              tryAnchorToBottom();
-            }
-          }}
+            onContentSizeChange={handleMessageListContentSizeChange}
+            onLayout={handleMessageListLayout}
             maintainVisibleContentPosition={maintainVisibleContentPositionConfig}
             ListHeaderComponent={(
               <View style={{ alignItems: 'center', marginVertical: 8 }}>
@@ -8813,15 +10956,15 @@ export default function Chat() {
             ListFooterComponent={(
               <View>
                 {/* Optimistic pending media (stickers/GIFs) */}
-                {pendingMedia && Array.from(pendingMedia.entries()).map(([tempId, item]) => {
+                {pendingConversationDerived.mediaEntries.map(([tempId, item]) => {
                   if (!tempId || !item) return null;
                   const rendered = renderPendingMedia(tempId, item);
                   if (typeof rendered === 'string') return null;
                   return rendered;
                 })}
 
-                {/* Offline pending text messages */}
-                {pendingMessages && Array.from(pendingMessages.entries()).map(([tempId, pendingMsg]) => {
+                {/* Pending text messages (queued/sending/sent/failed) */}
+                {pendingConversationDerived.messageEntries.map(([tempId, pendingMsg]) => {
                   if (!tempId || !pendingMsg) return null;
                   const renderedPending = renderPendingMessage(tempId, pendingMsg);
                   if (typeof renderedPending === 'string') {
@@ -8832,7 +10975,7 @@ export default function Chat() {
                 })}
 
                 {/* Optimistic pending file attachments */}
-                {pendingAttachments && Array.from(pendingAttachments.entries()).map(([tempId, item]) => {
+                {pendingConversationDerived.attachmentEntries.map(([tempId, item]) => {
                   if (!tempId || !item) return null;
                   const rendered = renderPendingAttachments(tempId, item);
                   if (typeof rendered === 'string') return null;
@@ -8841,16 +10984,14 @@ export default function Chat() {
 
                 {/* Typing indicator */}
                 {isTyping && selectedTeamMember && (
-                  <View style={[styles.typingIndicator, { backgroundColor: theme.surface }]}> 
-                    <View style={[styles.typingDots, { backgroundColor: theme.primary }]}> 
-                      <Text style={styles.typingText}> 
-                        {(() => {
-                          const rawName = selectedTeamMember?.name || 'Someone';
-                          const safeName = typeof rawName === 'string' ? rawName.trim() : 'Someone';
-                          if (!safeName || safeName === '.' || safeName.length === 0) return 'Someone';
-                          return safeName;
-                        })()} is typing...
-                      </Text>
+                  <View style={[styles.messageContainer, styles.friendMessage, styles.typingIndicator]}> 
+                    <View style={[
+                      styles.messageBubble,
+                      styles.friendBubble,
+                      styles.typingBubble,
+                      { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border },
+                    ]}> 
+                      <AnimatedTypingIndicator color={theme.textSecondary} />
                     </View>
                   </View>
                 )}
@@ -8859,7 +11000,7 @@ export default function Chat() {
                 <View style={{ height: 20 }} />
               </View>
             )}
-            ListEmptyComponent={(() => {
+            ListEmptyComponent={() => {
               const hasPending =
                 (pendingMedia && pendingMedia.size > 0) ||
                 (pendingMessages && pendingMessages.size > 0) ||
@@ -8878,7 +11019,7 @@ export default function Chat() {
                     return (
                       <View style={styles.emptyState}>
                         <View style={[styles.reconnectCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
-                          <Text style={[styles.reconnectTitle, { color: theme.text }]}>Couldn't load messages</Text>
+                          <Text style={[styles.reconnectTitle, { color: theme.text }]}>Could not load messages</Text>
                           <Text style={[styles.reconnectSubtext, { color: theme.textSecondary }]}>
                             {isOffline
                               ? "You're offline right now. Reconnect to the internet, then try again."
@@ -8904,85 +11045,40 @@ export default function Chat() {
                 }
                 return null;
               }
+
+              const emptyStateTitle = selectedTeamMember ? 'No messages yet' : 'Select a team member';
+              const safeConversationName = selectedTeamMember
+                ? sanitizeMessageText(
+                    typeof selectedTeamMember.name === 'string' ? selectedTeamMember.name : '',
+                    'someone'
+                  ).trim()
+                : '';
+              const emptyStateSubtext = selectedTeamMember
+                ? `Start a conversation with ${safeConversationName || 'someone'}!`
+                : 'Choose a team member from the list to start chatting';
+
               return (
                 <View style={styles.emptyState}>
                   <Text style={[styles.emptyStateText, { color: theme.text }]}> 
-                    {(() => {
-                      const safeText = selectedTeamMember ? 'No messages yet' : 'Select a team member';
-                      if (typeof safeText !== 'string' || safeText.trim() === '.' || safeText.trim().length === 0) {
-                        return 'No messages';
-                      }
-                      return safeText;
-                    })()}
+                    {emptyStateTitle}
                   </Text>
                   <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}> 
-                    {(() => {
-                      const safeName = (() => {
-                        if (!selectedTeamMember) return '';
-                        const rawName = selectedTeamMember.name;
-                        if (typeof rawName !== 'string') return 'someone';
-                        const trimmed = rawName.trim();
-                        if (!trimmed || trimmed === '.' || trimmed.length === 0) return 'someone';
-                        return trimmed;
-                      })();
-                      const safeSubtext = selectedTeamMember 
-                        ? `Start a conversation with ${safeName}!`
-                        : 'Choose a team member from the list to start chatting';
-                      if (
-                        typeof safeSubtext !== 'string' ||
-                        safeSubtext.trim() === '.' ||
-                        safeSubtext.trim().length === 0 ||
-                        React.isValidElement(safeSubtext)
-                      ) {
-                        return <Text style={{ color: theme.textSecondary }}>Start a conversation!</Text>;
-                      }
-                      return safeSubtext;
-                    })()}
+                    {emptyStateSubtext}
                   </Text>
                 </View>
               );
-            })()}
+            }}
           />
         </View>
         {showScrollToBottom && (
           <TouchableOpacity
-            onPress={() => {
-              setUnseenCount(0);
-              setShowScrollToBottom(false);
-                setShowNewDivider(false);
-                setNewDividerMessageId(null);
-              scrollToBottom();
-            }}
+            onPress={handleScrollToBottomPress}
             activeOpacity={0.8}
-            style={{
-              position: 'absolute',
-              right: 12,
-              bottom: 12 + Math.max(0, (inputHeight || 40) - 40),
-              backgroundColor: theme.surface,
-              borderColor: theme.border,
-              borderWidth: StyleSheet.hairlineWidth,
-              borderRadius: 20,
-              paddingHorizontal: 12,
-              paddingVertical: 10,
-              flexDirection: 'row',
-              alignItems: 'center',
-              shadowColor: '#000',
-              shadowOpacity: 0.1,
-              shadowRadius: 4,
-              shadowOffset: { width: 0, height: 2 },
-              elevation: 2,
-            }}
+            style={scrollToBottomButtonStyle}
           >
             <ChevronDown size={18} color={theme.text} />
             {unseenCount > 0 && (
-              <View style={{
-                marginLeft: 8,
-                minWidth: 22,
-                paddingHorizontal: 6,
-                paddingVertical: 2,
-                borderRadius: 10,
-                backgroundColor: theme.primary,
-              }}>
+              <View style={unseenCountBadgeStyle}>
                 <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600', textAlign: 'center' }}>{unseenCount}</Text>
               </View>
             )}
@@ -9017,9 +11113,7 @@ export default function Chat() {
           <Star size={16} color="#ffffff" />
           <Text style={styles.specialIndicatorText}>Composing Special Message</Text>
           <TouchableOpacity 
-            onPress={() => {
-              clearInputField(); // Use helper function to clear input
-            }}
+            onPress={handleSpecialIndicatorClose}
             style={styles.specialIndicatorClose}
           >
             <X size={16} color="#ffffff" />
@@ -9042,55 +11136,37 @@ export default function Chat() {
             <View style={styles.quickFormatButtons}>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={() => {
-                  const newText = message + '***extra bold***';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatExtraBold}
               >
                 <Text style={[styles.quickFormatButtonText, { color: theme.text, fontWeight: '900' }]}>B+</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={() => {
-                  const newText = message + '**bold**';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatBold}
               >
                 <Text style={[styles.quickFormatButtonText, { color: theme.text, fontWeight: 'bold' }]}>B</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={() => {
-                  const newText = message + '*italic*';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatItalic}
               >
                 <Text style={[styles.quickFormatButtonText, { color: theme.text, fontStyle: 'italic' }]}>I</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={() => {
-                  const newText = message + '__underline__';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatUnderline}
               >
                 <Text style={[styles.quickFormatButtonText, { color: theme.text, textDecorationLine: 'underline' }]}>U</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={() => {
-                  const newText = message + '~~strike~~';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatStrike}
               >
                 <Text style={[styles.quickFormatButtonText, { color: theme.text, textDecorationLine: 'line-through' }]}>S</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={() => {
-                  const newText = message + '`code`';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatCode}
               >
                 <Text style={[styles.quickFormatButtonText, { 
                   color: theme.text, 
@@ -9099,10 +11175,7 @@ export default function Chat() {
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.quickFormatButton, { backgroundColor: '#FFF7CC', borderColor: '#FFD24C' }]}
-                onPress={() => {
-                  const newText = message + '/special';
-                  setMessage(newText);
-                }}
+                onPress={handleQuickFormatSpecial}
               >
                 <Text style={[styles.quickFormatButtonText, { color: '#B8860B', fontWeight: 'bold' }]}>⭐</Text>
               </TouchableOpacity>
@@ -9157,6 +11230,44 @@ export default function Chat() {
               }]}>✨special text✨</Text>
             </View>
           </View>
+        </View>
+      )}
+      {selectedTeamMember && retryAllPendingCount > 0 && (
+        <View
+          style={[
+            styles.retryAllBanner,
+            {
+              backgroundColor: isDarkMode ? theme.surface : '#f5f8ff',
+              borderColor: theme.border,
+            },
+          ]}
+        >
+          <View style={styles.retryAllBannerLeft}>
+            <AlertCircle size={14} color={theme.warning} />
+            <Text style={[styles.retryAllBannerText, { color: theme.text }]}>
+              {retryAllPendingCount} pending {retryAllPendingCount === 1 ? 'item' : 'items'} not sent
+            </Text>
+          </View>
+          <TouchableOpacity
+            onPress={handleRetryAllPendingPress}
+            disabled={isRetryingAllPending || isOffline}
+            style={[
+              styles.retryAllBannerButton,
+              {
+                backgroundColor: theme.primary,
+                opacity: isRetryingAllPending || isOffline ? 0.65 : 1,
+              },
+            ]}
+          >
+            {isRetryingAllPending ? (
+              <ActivityIndicator size="small" color="#ffffff" />
+            ) : (
+              <RotateCcw size={14} color="#ffffff" />
+            )}
+            <Text style={styles.retryAllBannerButtonText}>
+              {isRetryingAllPending ? 'Retrying...' : 'Retry all'}
+            </Text>
+          </TouchableOpacity>
         </View>
       )}
       {/* Input Area - Mobile vs Web */}
@@ -9219,84 +11330,32 @@ export default function Chat() {
             >
               <Edit3 size={18} color={showFormattingGuide ? theme.primary : theme.textSecondary} />
             </TouchableOpacity>
-            {Platform.OS === 'web' ? (
-              <TextInput
-                ref={textInputRef}
-                style={[styles.textInput, { color: theme.text, height: inputHeight }]}
-                value={message}
-                onChangeText={handleTyping}
-                onContentSizeChange={handleInputSizeChange}
-                underlineColorAndroid="transparent"
-                placeholder={
-                  (() => {
-                    if (isOffline) return 'Offline - messages will be queued';
-                    if (isComposingSpecial) return 'Type your special message here...';
-                    if (isSmallScreen) return 'Message';
-                    const rawName = selectedTeamMember?.name || 'team member';
-                    const safeName = typeof rawName === 'string' ? rawName.trim() : 'team member';
-                    if (!safeName || safeName === '.' || safeName.length === 0) return 'Message team member...';
-                    return `Message ${safeName}...`;
-                  })()
-                }
-                placeholderTextColor={isOffline ? theme.warning : theme.textSecondary}
-                multiline={true}
-                numberOfLines={1}
-                textAlignVertical="top"
-                maxLength={500}
-                editable={!!selectedTeamMember}
-                blurOnSubmit={false}
-                enablesReturnKeyAutomatically={false}
-                returnKeyType="send"
-                onSubmitEditing={handleSendMessage}
-              />
-            ) : (
-              <RichEditText
-                // @ts-ignore - RichEditText ref handling
-                ref={richTextInputRef}
-                style={[styles.textInput, { color: theme.text, height: inputHeight }]}
-                value={message}
-                onChangeText={handleTyping}
-                onContentSizeChange={handleInputSizeChange}
-                underlineColorAndroid="transparent"
-                placeholder={
-                  (() => {
-                    if (processingKeyboardMedia) return 'Processing media from keyboard...';
-                    if (isOffline) return 'Offline - messages will be queued';
-                    if (isComposingSpecial) return 'Type your special message here...';
-                    if (isSmallScreen) return 'Message';
-                    const rawName = selectedTeamMember?.name || 'team member';
-                    const safeName = typeof rawName === 'string' ? rawName.trim() : 'team member';
-                    if (!safeName || safeName === '.' || safeName.length === 0) return 'Message team member...';
-                    return `Message ${safeName}...`;
-                  })()
-                }
-                placeholderTextColor={processingKeyboardMedia ? theme.primary : (isOffline ? theme.warning : theme.textSecondary)}
-                multiline={true}
-                numberOfLines={1}
-                textAlignVertical="top"
-                maxLength={500}
-                editable={!!selectedTeamMember && !processingKeyboardMedia}
-                blurOnSubmit={false}
-                enablesReturnKeyAutomatically={false}
-                returnKeyType="send"
-                onSubmitEditing={handleSendMessage}
-                onRichContent={handleRichContentFromMobile}
-              />
-            )}
+            <TextInput
+              ref={textInputRef}
+              style={[styles.textInput, { color: theme.text, height: inputHeight }]}
+              value={message}
+              onChangeText={handleTyping}
+              onContentSizeChange={handleInputSizeChange}
+              underlineColorAndroid="transparent"
+              placeholder={getComposerPlaceholder()}
+              placeholderTextColor={isOffline ? theme.warning : theme.textSecondary}
+              multiline={true}
+              numberOfLines={1}
+              textAlignVertical="top"
+              maxLength={CHAT_MESSAGE_MAX_CHARS}
+              editable={!!selectedTeamMember}
+              blurOnSubmit={false}
+              enablesReturnKeyAutomatically={false}
+              returnKeyType="send"
+              onSubmitEditing={handleSendMessage}
+            />
             
             {/* Format Preview */}
-            {message && typeof message === 'string' && message.trim().length > 0 && (message.includes('***') || message.includes('**') || message.includes('*') || message.includes('__') || message.includes('~~') || message.includes('`')) && !message.includes('/special') && (
+            {shouldShowFormatPreview && (
               <View style={[styles.formatPreview, { backgroundColor: theme.background, borderColor: theme.border }]}>
                 <Text style={[styles.formatPreviewLabel, { color: theme.textSecondary }]}>Preview:</Text>
                 <StyledText
-                  text={(() => {
-                    const safeMessage = String(message || '');
-                    // Prevent periods or problematic text from being rendered in preview
-                    if (!safeMessage || safeMessage.trim() === '.' || safeMessage.trim().length === 0) {
-                      return 'Message preview';
-                    }
-                    return safeMessage;
-                  })()}
+                  text={messagePreviewText}
                   style={[styles.formatPreviewText, { color: theme.text }]}
                   linkStyle={{ color: theme.primary }}
                 />
@@ -9345,10 +11404,29 @@ export default function Chat() {
           onRichContent={handleRichContentFromMobile}
           showFormattingGuide={showFormattingGuide}
           onFormattingToggle={toggleFormattingGuide}
-          maxLength={500}
+          maxLength={CHAT_MESSAGE_MAX_CHARS}
+          showCharacterCount={false}
           isSendingMessage={isSendingMessage}
           canSend={canAttemptSend}
         />
+      )}
+
+      {showInputLimitCounter && (
+        <View style={styles.inputLimitCounter}>
+          <Text
+            style={[
+              styles.inputLimitCounterText,
+              {
+                color:
+                  messageCharacterCount >= CHAT_MESSAGE_MAX_CHARS || messageWordCount >= CHAT_MESSAGE_MAX_WORDS
+                    ? theme.error
+                    : theme.textSecondary,
+              },
+            ]}
+          >
+            {messageCharacterCount}/{CHAT_MESSAGE_MAX_CHARS} chars · {messageWordCount}/{CHAT_MESSAGE_MAX_WORDS} words
+          </Text>
+        </View>
       )}
 
       {Platform.OS === 'web' && isChatDropActive && selectedTeamMember && (
@@ -9382,14 +11460,7 @@ export default function Chat() {
         statusMessage={deleteConfirmationPreview || undefined}
         statusType="error"
         icon={<Trash2 size={28} color={theme.error} />}
-        onConfirm={() => {
-          const target = deleteConfirmState.message;
-          if (target) {
-            void performDeleteMessage(target);
-          } else {
-            setDeleteConfirmState({ visible: false, message: null });
-          }
-        }}
+        onConfirm={handleDeleteConfirm}
       />
 
   {/* Sticker and GIF Picker (Mobile) */}
@@ -9403,7 +11474,7 @@ export default function Chat() {
       {/* Chat Profile Modal */}
       <ChatProfileModal
         visible={chatProfileModalVisible}
-        onClose={() => setChatProfileModalVisible(false)}
+        onClose={closeChatProfileModal}
         teamMember={selectedTeamMember}
         theme={theme}
       />
@@ -10141,6 +12212,16 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     minHeight: 64,
   },
+  inputLimitCounter: {
+    paddingHorizontal: 22,
+    paddingTop: 2,
+    paddingBottom: 6,
+    alignItems: 'flex-end',
+  },
+  inputLimitCounterText: {
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+  },
   inputWrapper: {
     flexDirection: 'row',
     alignItems: 'flex-end',
@@ -10205,41 +12286,74 @@ const styles = StyleSheet.create({
     fontFamily: 'Inter-Medium',
   },
   typingIndicator: {
-    padding: 16,
-    marginHorizontal: 20,
-    marginBottom: 16,
-    marginTop: 8,
-    borderRadius: 12,
-    alignSelf: 'flex-start',
-    maxWidth: '80%',
+    marginTop: 0,
+    marginBottom: 0,
   },
-  typingDots: {
-    padding: 12,
-    borderRadius: 8,
-  },
-  typingText: {
-    fontSize: 14,
-    fontFamily: 'Inter-Regular',
-    color: '#ffffff',
-    fontStyle: 'italic',
+  typingBubble: {
+    minWidth: 56,
+    minHeight: 44,
+    justifyContent: 'center',
   },
   typingIndicatorSmall: {
     flexDirection: 'row',
     alignItems: 'center',
   },
   typingDot: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    marginRight: 2,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    marginRight: 4,
   },
   friendStatusContainer: {
     flexDirection: 'row',
     alignItems: 'center',
   },
+  friendTypingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  friendTypingText: {
+    fontFamily: 'Inter-Medium',
+    fontStyle: 'italic',
+  },
   pendingMessagesContainer: {
     paddingHorizontal: 16,
     paddingBottom: 20,
+  },
+  retryAllBanner: {
+    marginHorizontal: 12,
+    marginBottom: 8,
+    borderRadius: 14,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  retryAllBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 10,
+  },
+  retryAllBannerText: {
+    marginLeft: 8,
+    fontSize: 13,
+    fontFamily: 'Inter-Medium',
+  },
+  retryAllBannerButton: {
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  retryAllBannerButtonText: {
+    marginLeft: 6,
+    color: '#ffffff',
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
   },
   editingBanner: {
     flexDirection: 'row',

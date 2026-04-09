@@ -606,6 +606,143 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
         continue;
       }
 
+      const isWebDevice = (deviceData.deviceType || '').toLowerCase() === 'web';
+      if (isWebDevice) {
+        const timezoneRaw = typeof deviceData.timezone === 'string' ? deviceData.timezone.trim() : '';
+        const timezone = timezoneRaw || DEFAULT_TIMEZONE;
+
+        const due = evaluateDeliveryWindow(now, timezone, deviceData, requestedTimeOfDay);
+        if (!due) {
+          stats.skipped.outsideWindow += 1;
+          if (debugMatch) {
+            const local = resolveLocalTime(now, timezone);
+            const localMinutes = local.hour * 60 + local.minute;
+            const morningTarget = MORNING_HOUR * 60 + MORNING_MINUTE;
+            const eveningTarget = EVENING_HOUR * 60 + EVENING_MINUTE;
+            console.log('[daily_quote_job] debug skipped outsideWindow', {
+              userEmail,
+              deviceId,
+              token: expoPushTokenRaw,
+              timezone,
+              requestedTimeOfDay,
+              local,
+              localMinutes,
+              morningDiff: localMinutes - morningTarget,
+              eveningDiff: localMinutes - eveningTarget,
+              windowMinutes: WINDOW_MINUTES,
+              lastMorning: deviceData.lastDailyQuoteMorningDateKey,
+              lastEvening: deviceData.lastDailyQuoteEveningDateKey,
+            });
+          }
+          continue;
+        }
+
+        stats.eligibleDevices += 1;
+        stats.attemptedDeliveries += 1;
+        stats.timeOfDayBreakdown[due.timeOfDay].attempted += 1;
+
+        if (stats.recipientsSample.length < 20) {
+          stats.recipientsSample.push({
+            userEmail,
+            deviceId,
+            timeOfDay: due.timeOfDay,
+            timezone,
+          });
+        }
+
+        const body = composeQuoteBody(quote);
+        const dataPayload = {
+          type: 'daily_quote',
+          time: due.timeOfDay,
+          category: quote.category,
+          author: quote.author,
+          source: quote.source ?? 'local',
+          quote: quote.text,
+          deepLink: '/(tabs)',
+        };
+
+        const devicePath = `user_devices/${userEmail}/devices/${deviceId}`;
+        const notificationId = createDailyQuoteNotificationId(userEmail, deviceId, due.timeOfDay, due.dateKey);
+        const payloadData = {
+          ...dataPayload,
+          notificationId,
+          deviceId,
+          userEmail,
+        };
+        const webPushSubscription = sanitizeWebPushSubscription(deviceData.webPushSubscription);
+
+        if (webPushSubscription && isWebPushConfigured()) {
+          webPushNotifications.push({
+            deviceId,
+            userEmail,
+            subscription: webPushSubscription,
+            payload: {
+              title: 'Daily Quote',
+              body,
+              tag: `daily-quote:${deviceId}:${due.timeOfDay}`,
+              requireInteraction: true,
+              clickUrl: '/(tabs)',
+              data: payloadData,
+            },
+            delivery: {
+              ref: deviceDoc.ref,
+              devicePath,
+              timeOfDay: due.timeOfDay,
+              dateKey: due.dateKey,
+            },
+            meta: { timeOfDay: due.timeOfDay, userEmail, deviceId, timezone },
+          });
+
+          if (debugMatch) {
+            console.log('[daily_quote_job] queued web push daily quote', {
+              userEmail,
+              deviceId,
+              notificationId,
+              timeOfDay: due.timeOfDay,
+              timezone,
+            });
+          }
+
+          continue;
+        }
+
+        webQueuedNotifications.push({
+          deviceId,
+          userEmail,
+          notificationData: {
+            title: 'Daily Quote',
+            body,
+            data: {
+              ...payloadData,
+            },
+            deviceId,
+            userEmail,
+            timestamp: startedAt.toISOString(),
+            id: notificationId,
+            type: 'daily_quote',
+          },
+          delivery: {
+            ref: deviceDoc.ref,
+            devicePath,
+            timeOfDay: due.timeOfDay,
+            dateKey: due.dateKey,
+          },
+          meta: { timeOfDay: due.timeOfDay, userEmail, deviceId, timezone },
+        });
+
+        if (debugMatch) {
+          console.log('[daily_quote_job] queued web daily quote', {
+            userEmail,
+            deviceId,
+            notificationId,
+            timeOfDay: due.timeOfDay,
+            timezone,
+          });
+        }
+
+        continue;
+      }
+
       if (!expoPushTokenRaw) {
         stats.skipped.missingToken += 1;
         if (debugMatch) {
@@ -729,88 +866,6 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
       };
 
       const devicePath = `user_devices/${userEmail}/devices/${deviceId}`;
-
-      if ((deviceData.deviceType || '').toLowerCase() === 'web') {
-        const notificationId = createDailyQuoteNotificationId(userEmail, deviceId, due.timeOfDay, due.dateKey);
-        const payloadData = {
-          ...dataPayload,
-          notificationId,
-          deviceId,
-          userEmail,
-        };
-        const webPushSubscription = sanitizeWebPushSubscription(deviceData.webPushSubscription);
-
-        if (webPushSubscription && isWebPushConfigured()) {
-          webPushNotifications.push({
-            deviceId,
-            userEmail,
-            subscription: webPushSubscription,
-            payload: {
-              title: 'Daily Quote',
-              body,
-              tag: `daily-quote:${deviceId}:${due.timeOfDay}`,
-              requireInteraction: true,
-              clickUrl: '/(tabs)',
-              data: payloadData,
-            },
-            delivery: {
-              ref: deviceDoc.ref,
-              devicePath,
-              timeOfDay: due.timeOfDay,
-              dateKey: due.dateKey,
-            },
-            meta: { timeOfDay: due.timeOfDay, userEmail, deviceId, timezone },
-          });
-
-          if (debugMatch) {
-            console.log('[daily_quote_job] queued web push daily quote', {
-              userEmail,
-              deviceId,
-              notificationId,
-              timeOfDay: due.timeOfDay,
-              timezone,
-            });
-          }
-
-          continue;
-        }
-
-        webQueuedNotifications.push({
-          deviceId,
-          userEmail,
-          notificationData: {
-            title: 'Daily Quote',
-            body,
-            data: {
-              ...payloadData,
-            },
-            deviceId,
-            userEmail,
-            timestamp: startedAt.toISOString(),
-            id: notificationId,
-            type: 'daily_quote',
-          },
-          delivery: {
-            ref: deviceDoc.ref,
-            devicePath,
-            timeOfDay: due.timeOfDay,
-            dateKey: due.dateKey,
-          },
-          meta: { timeOfDay: due.timeOfDay, userEmail, deviceId, timezone },
-        });
-
-        if (debugMatch) {
-          console.log('[daily_quote_job] queued web daily quote', {
-            userEmail,
-            deviceId,
-            notificationId,
-            timeOfDay: due.timeOfDay,
-            timezone,
-          });
-        }
-
-        continue;
-      }
 
       const message: ExpoPushMessage = {
         to: expoPushTokenRaw,

@@ -7,17 +7,69 @@ export interface PendingMessage {
   timestamp: string;
   recipientId: string;
   sender: string;
+  status?: 'queued' | 'sending' | 'sent' | 'failed';
+  serverMessageId?: string;
+}
+
+export interface PendingMediaMessage {
+  id: string;
+  kind: 'gif' | 'sticker';
+  previewUri: string;
+  width?: number;
+  height?: number;
+  nameOrTitle?: string;
+  timestamp: string;
+  recipientId: string;
+  sender: string;
+  status: 'sending' | 'failed' | 'queued' | 'sent';
+  serverMessageId?: string;
+  mime?: string;
+  source?: 'keyboard' | 'picker';
+  progress?: number;
+}
+
+export interface PendingAttachmentMessage {
+  id: string;
+  files: {
+    uri: string;
+    fileName: string;
+    fileType: string;
+    fileSize?: number;
+  }[];
+  messageText: string;
+  recipientId: string;
+  sender: string;
+  status: 'sending' | 'failed' | 'finalizing' | 'sent';
+  serverMessageId?: string;
+  progress: number;
+  cancelable?: boolean;
+  cancelRequested?: boolean;
+  failureReason?: 'error' | 'canceled';
 }
 
 const PENDING_MESSAGES_KEY = 'pendingMessages';
+const PENDING_MEDIA_KEY = 'pendingMediaMessages';
+const PENDING_ATTACHMENTS_KEY = 'pendingAttachmentMessages';
 
 export class PendingMessageStorage {
+  private static async saveMap<T>(key: string, messages: Map<string, T>): Promise<void> {
+    const messagesArray = Array.from(messages.entries());
+    await AsyncStorage.setItem(key, JSON.stringify(messagesArray));
+  }
+
+  private static async loadMap<T>(key: string): Promise<Map<string, T>> {
+    const stored = await AsyncStorage.getItem(key);
+    if (!stored) {
+      return new Map<string, T>();
+    }
+    const messagesArray: [string, T][] = JSON.parse(stored);
+    return new Map(messagesArray);
+  }
   
   // Save pending messages to storage
   static async savePendingMessages(messages: Map<string, PendingMessage>): Promise<void> {
     try {
-      const messagesArray = Array.from(messages.entries());
-      await AsyncStorage.setItem(PENDING_MESSAGES_KEY, JSON.stringify(messagesArray));
+      await this.saveMap(PENDING_MESSAGES_KEY, messages);
     } catch (error) {
       logger.error('Error saving pending messages:', error);
     }
@@ -27,10 +79,8 @@ export class PendingMessageStorage {
   static async loadPendingMessages(): Promise<Map<string, PendingMessage>> {
     try {
       logger.debug('📂 Loading pending messages from storage...');
-      const stored = await AsyncStorage.getItem(PENDING_MESSAGES_KEY);
-      if (stored) {
-        const messagesArray: [string, PendingMessage][] = JSON.parse(stored);
-        const messages = new Map(messagesArray);
+      const messages = await this.loadMap<PendingMessage>(PENDING_MESSAGES_KEY);
+      if (messages.size > 0) {
         logger.debug('📂 Loaded', messages.size, 'pending messages from storage');
         return messages;
       } else {
@@ -126,6 +176,56 @@ export class PendingMessageStorage {
       }
     } catch (error) {
       logger.error('❌ Error debugging pending messages:', error);
+    }
+  }
+
+  static async savePendingMediaMessages(messages: Map<string, PendingMediaMessage>): Promise<void> {
+    try {
+      await this.saveMap(PENDING_MEDIA_KEY, messages);
+    } catch (error) {
+      logger.error('Error saving pending media messages:', error);
+    }
+  }
+
+  static async loadPendingMediaMessages(): Promise<Map<string, PendingMediaMessage>> {
+    try {
+      return await this.loadMap<PendingMediaMessage>(PENDING_MEDIA_KEY);
+    } catch (error) {
+      logger.error('Error loading pending media messages:', error);
+      return new Map<string, PendingMediaMessage>();
+    }
+  }
+
+  static async savePendingAttachmentMessages(messages: Map<string, PendingAttachmentMessage>): Promise<void> {
+    try {
+      await this.saveMap(PENDING_ATTACHMENTS_KEY, messages);
+    } catch (error) {
+      logger.error('Error saving pending attachment messages:', error);
+    }
+  }
+
+  static async loadPendingAttachmentMessages(): Promise<Map<string, PendingAttachmentMessage>> {
+    try {
+      return await this.loadMap<PendingAttachmentMessage>(PENDING_ATTACHMENTS_KEY);
+    } catch (error) {
+      logger.error('Error loading pending attachment messages:', error);
+      return new Map<string, PendingAttachmentMessage>();
+    }
+  }
+
+  static async clearAllPendingMediaMessages(): Promise<void> {
+    try {
+      await AsyncStorage.removeItem(PENDING_MEDIA_KEY);
+    } catch (error) {
+      logger.error('Error clearing pending media messages:', error);
+    }
+  }
+
+  static async clearAllPendingAttachmentMessages(): Promise<void> {
+    try {
+      await AsyncStorage.removeItem(PENDING_ATTACHMENTS_KEY);
+    } catch (error) {
+      logger.error('Error clearing pending attachment messages:', error);
     }
   }
 }

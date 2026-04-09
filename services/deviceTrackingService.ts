@@ -7,6 +7,10 @@ import { authService } from '../hooks/useAuthUnified';
 import { internalTokenManager } from './internalTokenManager';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 import { runtimeEndpoints } from './runtimeEndpoints';
+import {
+  confirmInboundChatDeliveryFromNotificationData,
+  flushPendingInboundChatDeliveryReceipts,
+} from './chatReceiptSync';
 // Lazy-load notificationService to avoid import cycle (typed)
 type NotificationServiceType = typeof import('./notificationService').notificationService;
 // Contract interface (subset) to decouple compile-time dependency
@@ -371,6 +375,7 @@ class DeviceTrackingService {
   private readonly DEVICE_ID_SOURCE_KEY_SUFFIX = '_source';
   private readonly HEARTBEAT_INTERVAL = 30000; // 30 seconds
   private readonly OFFLINE_THRESHOLD = 120000; // 2 minutes
+  private readonly ACTIVE_CHAT_SUPPRESSION_WINDOW_MS = 120000; // 2 minutes
   private lastKnownExpoPushToken: string | null = null;
   private pushTokenRefreshInFlight = false;
   private hasPushTokenRefreshMonitor = false;
@@ -868,6 +873,27 @@ class DeviceTrackingService {
         this.readWebPushDiagnostic<Record<string, any>>('lastPushReceipt'),
         this.readWebPushDiagnostic<Record<string, any>>('lastSubscriptionSync'),
       ]);
+
+      const receiptNotificationData =
+        lastPushReceipt && typeof lastPushReceipt.notificationData === 'object' && lastPushReceipt.notificationData
+          ? { ...(lastPushReceipt.notificationData as Record<string, any>) }
+          : undefined;
+
+      if (receiptNotificationData) {
+        try {
+          await confirmInboundChatDeliveryFromNotificationData(receiptNotificationData, 'received', {
+            currentUserEmail,
+          });
+          await flushPendingInboundChatDeliveryReceipts({
+            currentUserEmail,
+            maxBatchSize: 15,
+          });
+        } catch (error) {
+          logger.debug('Failed to confirm web push inbound delivery receipt from stored diagnostics', {
+            error,
+          });
+        }
+      }
 
       const updates: Record<string, any> = {};
 
@@ -2889,6 +2915,67 @@ class DeviceTrackingService {
     }
   }
 
+  private normalizeEmailValue(value: unknown): string {
+    if (typeof value !== 'string') {
+      return '';
+    }
+    return value.trim().toLowerCase();
+  }
+
+  private resolveTimestampMs(value: unknown): number {
+    if (!value) {
+      return 0;
+    }
+
+    try {
+      const resolved = DeviceTrackingService.resolveTimestamp(value);
+      const time = resolved.getTime();
+      return Number.isFinite(time) ? time : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private isDeviceActivelyViewingChat(device: UserDevice, senderEmail: string, activeWindowMs: number): boolean {
+    const normalizedSender = this.normalizeEmailValue(senderEmail);
+    if (!normalizedSender || device.activeChatIsFocused !== true) {
+      return false;
+    }
+
+    const activePartner = this.normalizeEmailValue(device.activeChatPartner);
+    const activePartnerId = this.normalizeEmailValue(device.activeChatPartnerId);
+    const partnerMatches = activePartner === normalizedSender || activePartnerId === normalizedSender;
+    if (!partnerMatches) {
+      return false;
+    }
+
+    const activityCandidates = [
+      this.resolveTimestampMs(device.activeChatLastSeenAt),
+      this.resolveTimestampMs(device.lastTenantPingAt),
+      this.resolveTimestampMs(device.lastSeen),
+      this.resolveTimestampMs(device.updatedAt),
+    ].filter((value) => value > 0);
+
+    if (!activityCandidates.length) {
+      return false;
+    }
+
+    const lastActiveMs = Math.max(...activityCandidates);
+    return Date.now() - lastActiveMs <= Math.max(0, activeWindowMs);
+  }
+
+  private findActiveChatViewerDevice(devices: UserDevice[], senderEmail: string, activeWindowMs: number): UserDevice | null {
+    for (const device of devices) {
+      if (!device || device.isDeleted) {
+        continue;
+      }
+      if (this.isDeviceActivelyViewingChat(device, senderEmail, activeWindowMs)) {
+        return device;
+      }
+    }
+    return null;
+  }
+
   /**
    * Send notification to specific device
    */
@@ -2952,7 +3039,6 @@ class DeviceTrackingService {
       const senderEmail = typeof notification?.data?.senderEmail === 'string'
         ? notification.data.senderEmail.toLowerCase()
         : null;
-      const ACTIVE_CHAT_SUPPRESSION_WINDOW_MS = 45_000;
 
       if (!allowWhenDisabled) {
         if (device.notificationsEnabled === false) {
@@ -2996,34 +3082,13 @@ class DeviceTrackingService {
         }
       }
 
-      if (device.isOnline === true && isChatNotification && senderEmail) {
-        const activePartner = typeof device.activeChatPartner === 'string'
-          ? device.activeChatPartner.toLowerCase()
-          : null;
-
-        if (activePartner && activePartner === senderEmail && device.activeChatIsFocused === true) {
-          let lastSeenAt: Date | null = null;
-          try {
-            if (device.activeChatLastSeenAt instanceof Date) {
-              lastSeenAt = device.activeChatLastSeenAt;
-            } else if (device.activeChatLastSeenAt) {
-              lastSeenAt = DeviceTrackingService.resolveTimestamp(device.activeChatLastSeenAt);
-            }
-          } catch {}
-
-          const now = Date.now();
-          const lastSeenMs = lastSeenAt ? lastSeenAt.getTime() : 0;
-          const isRecentlyActive = lastSeenMs > 0 && now - lastSeenMs <= ACTIVE_CHAT_SUPPRESSION_WINDOW_MS;
-
-          if (isRecentlyActive) {
-            logger.debug('Skipping device notification: user actively viewing chat on this device (direct send)', {
-              userEmail,
-              deviceId,
-              senderEmail,
-            });
-            return { delivered: false, deliverySource: 'unknown' };
-          }
-        }
+      if (isChatNotification && senderEmail && this.isDeviceActivelyViewingChat(device, senderEmail, this.ACTIVE_CHAT_SUPPRESSION_WINDOW_MS)) {
+        logger.debug('Skipping device notification: user actively viewing chat on this device (direct send)', {
+          userEmail,
+          deviceId,
+          senderEmail,
+        });
+        return { delivered: false, deliverySource: 'unknown' };
       }
 
       // Handle web browser devices and mobile devices differently using notification service
@@ -3430,7 +3495,34 @@ class DeviceTrackingService {
       const senderEmail = typeof notification?.data?.senderEmail === 'string'
         ? notification.data.senderEmail.toLowerCase()
         : null;
-      const ACTIVE_CHAT_SUPPRESSION_WINDOW_MS = 45_000;
+
+      if (isChatNotification && senderEmail) {
+        const activeViewerDevice = this.findActiveChatViewerDevice(
+          cleanupResult.devices,
+          senderEmail,
+          this.ACTIVE_CHAT_SUPPRESSION_WINDOW_MS
+        );
+
+        if (activeViewerDevice) {
+          logger.debug('Skipping chat notification fan-out: recipient actively viewing this conversation', {
+            userEmail,
+            senderEmail,
+            deviceId: activeViewerDevice.deviceId,
+          });
+          return {
+            success: 0,
+            failed: 0,
+            deliverableDeviceCount: 0,
+            onlineDeliverableCount: 0,
+            presenceDeliveredCount: 0,
+            pushAcceptedCount: 0,
+            mobilePushAcceptedCount: 0,
+            webPushAcceptedCount: 0,
+            staleWebPushSubscriptionsCleaned: cleanupResult.staleCleanedCount,
+            deduplicatedWebPushSubscriptionsCleaned: cleanupResult.deduplicatedCount,
+          };
+        }
+      }
 
       const targetDevices = cleanupResult.devices.filter(device => {
         if (device.isDeleted) {
@@ -3487,34 +3579,13 @@ class DeviceTrackingService {
           return false;
         }
 
-        if (device.isOnline === true && isChatNotification && senderEmail) {
-          const activePartner = typeof device.activeChatPartner === 'string'
-            ? device.activeChatPartner.toLowerCase()
-            : null;
-
-          if (activePartner && activePartner === senderEmail && device.activeChatIsFocused === true) {
-            let lastSeenAt: Date | null = null;
-            try {
-              if (device.activeChatLastSeenAt instanceof Date) {
-                lastSeenAt = device.activeChatLastSeenAt;
-              } else if (device.activeChatLastSeenAt) {
-                lastSeenAt = DeviceTrackingService.resolveTimestamp(device.activeChatLastSeenAt);
-              }
-            } catch {}
-
-            const now = Date.now();
-            const lastSeenMs = lastSeenAt ? lastSeenAt.getTime() : 0;
-            const isRecentlyActive = lastSeenMs > 0 && now - lastSeenMs <= ACTIVE_CHAT_SUPPRESSION_WINDOW_MS;
-
-            if (isRecentlyActive) {
-              logger.debug('Skipping device notification: user actively viewing chat on this device', {
-                userEmail,
-                deviceId: device.deviceId,
-                senderEmail,
-              });
-              return false;
-            }
-          }
+        if (isChatNotification && senderEmail && this.isDeviceActivelyViewingChat(device, senderEmail, this.ACTIVE_CHAT_SUPPRESSION_WINDOW_MS)) {
+          logger.debug('Skipping device notification: user actively viewing chat on this device', {
+            userEmail,
+            deviceId: device.deviceId,
+            senderEmail,
+          });
+          return false;
         }
 
         return true;
@@ -6080,7 +6151,30 @@ class DeviceTrackingService {
           }
 
           if (event.data?.type === 'tm:web-push-received') {
-            void this.syncStoredWebPushDiagnostics('push_message');
+            void (async () => {
+              const notificationData =
+                event.data && typeof event.data.notificationData === 'object' && event.data.notificationData
+                  ? { ...(event.data.notificationData as Record<string, any>) }
+                  : undefined;
+
+              if (notificationData) {
+                try {
+                  await confirmInboundChatDeliveryFromNotificationData(notificationData, 'received', {
+                    currentUserEmail: this.currentUserEmail,
+                  });
+                  await flushPendingInboundChatDeliveryReceipts({
+                    currentUserEmail: this.currentUserEmail,
+                    maxBatchSize: 15,
+                  });
+                } catch (error) {
+                  logger.debug('Failed to confirm inbound chat delivery from service-worker receipt message', {
+                    error,
+                  });
+                }
+              }
+
+              await this.syncStoredWebPushDiagnostics('push_message');
+            })();
           }
         });
       }

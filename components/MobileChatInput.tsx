@@ -48,6 +48,7 @@ interface MobileChatInputProps {
   onFormattingToggle: () => void;
   placeholder?: string;
   maxLength?: number;
+  showCharacterCount?: boolean;
   isSendingMessage: boolean;
   canSend?: boolean;
 }
@@ -67,6 +68,7 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
   onFormattingToggle,
   placeholder,
   maxLength = 500,
+  showCharacterCount = true,
   isSendingMessage,
   canSend = true,
 }, ref) {
@@ -474,7 +476,7 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
         </View>
         
         {/* Character Count (shown when near limit) */}
-        {message.length > maxLength * 0.8 && (
+        {showCharacterCount && message.length > maxLength * 0.8 && (
           <View style={styles.characterCount}>
             <Text style={[
               styles.characterCountText, 

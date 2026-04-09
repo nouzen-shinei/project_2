@@ -225,6 +225,19 @@ self.addEventListener('push', (event) => {
   const payload = parsePushPayload(event);
   event.waitUntil(
     (async () => {
+      const rawNotificationData = payload && payload.data && typeof payload.data === 'object'
+        ? payload.data
+        : {};
+      const receiptNotificationData = {
+        type: typeof rawNotificationData.type === 'string' ? rawNotificationData.type : null,
+        messageId: typeof rawNotificationData.messageId === 'string' ? rawNotificationData.messageId : null,
+        senderEmail: typeof rawNotificationData.senderEmail === 'string' ? rawNotificationData.senderEmail : null,
+        recipientEmail: typeof rawNotificationData.recipientEmail === 'string' ? rawNotificationData.recipientEmail : null,
+        tenantId: typeof rawNotificationData.tenantId === 'string' ? rawNotificationData.tenantId : null,
+        chatId: typeof rawNotificationData.chatId === 'string' ? rawNotificationData.chatId : null,
+        timestamp: typeof rawNotificationData.timestamp === 'string' ? rawNotificationData.timestamp : null,
+      };
+
       const diagnostic = {
         receivedAt: new Date().toISOString(),
         title: payload.title,
@@ -232,10 +245,15 @@ self.addEventListener('push', (event) => {
         clickUrl: payload.clickUrl || null,
         type: typeof payload.data?.type === 'string' ? payload.data.type : null,
         notificationId: typeof payload.data?.notificationId === 'string' ? payload.data.notificationId : null,
+        notificationData: receiptNotificationData,
       };
 
       await writeDiagnostic('lastPushReceipt', diagnostic);
-      await notifyClients({ type: 'tm:web-push-received', payload: diagnostic });
+      await notifyClients({
+        type: 'tm:web-push-received',
+        payload: diagnostic,
+        notificationData: receiptNotificationData,
+      });
 
       await self.registration.showNotification(payload.title, {
         body: payload.body,

@@ -2345,10 +2345,14 @@ class NotificationService {
         return;
       }
 
-      const normalizedRecipient = recipientEmail.toLowerCase();
-      const sender = message.sender?.toLowerCase();
+      const normalizedRecipient = recipientEmail.trim().toLowerCase();
+      const sender = typeof message.sender === 'string' ? message.sender.trim().toLowerCase() : '';
 
-      if (sender && sender === normalizedRecipient) {
+      if (!normalizedRecipient || !sender) {
+        return;
+      }
+
+      if (sender === normalizedRecipient) {
         return;
       }
 
@@ -2360,7 +2364,7 @@ class NotificationService {
       const notificationContent = this.buildTeamChatNotificationContent(message, senderName);
       const tenantFilterOptions = await this.resolveTenantFilterOptions(true);
       const deliveryResult = await getDeviceTrackingService().sendNotificationToUser(
-        recipientEmail,
+        normalizedRecipient,
         {
           title: notificationContent.title,
           body: notificationContent.body,
@@ -2368,8 +2372,8 @@ class NotificationService {
             type: 'chat_message',
             messageId: message.id,
             senderEmail: message.sender,
-            recipientEmail,
-            chatId: `${message.sender}_${recipientEmail}`,
+            recipientEmail: normalizedRecipient,
+            chatId: `${message.sender}_${normalizedRecipient}`,
             timestamp: message.timestamp || new Date().toISOString(),
             isSpecial: message.isSpecial || false,
             tenantId: tenantFilterOptions?.tenantId,
@@ -2380,12 +2384,53 @@ class NotificationService {
         tenantFilterOptions
       );
       if (deliveryResult.pushAcceptedCount > 0) {
-        logger.debug('Push accepted for chat notification; waiting for explicit recipient receipt to mark delivered', {
-          recipientEmail,
-          pushAcceptedCount: deliveryResult.pushAcceptedCount,
-          mobileAcceptedCount: deliveryResult.mobilePushAcceptedCount,
-          webAcceptedCount: deliveryResult.webPushAcceptedCount,
-        });
+        const messageId = typeof message.id === 'string' ? message.id.trim() : '';
+        const currentUserEmail =
+          typeof this.currentUserEmail === 'string' ? this.currentUserEmail.trim().toLowerCase() : '';
+        const senderMatchesCurrentUser = Boolean(currentUserEmail) && currentUserEmail === sender;
+
+        if (messageId && senderMatchesCurrentUser) {
+          const deliveredAt = new Date().toISOString();
+          void chatService.confirmOutboundDelivery(normalizedRecipient, [messageId], {
+            tenantId: tenantFilterOptions?.tenantId,
+            provenance: {
+              sources: ['push'],
+              lastSource: 'push',
+              lastUpdatedAt: deliveredAt,
+              push: {
+                deliveredAt,
+                acceptedDeviceCount: deliveryResult.pushAcceptedCount,
+                mobileAcceptedCount: deliveryResult.mobilePushAcceptedCount,
+                webAcceptedCount: deliveryResult.webPushAcceptedCount,
+              },
+            },
+          })
+            .then((result) => {
+              logger.debug('Marked outbound chat message delivered via push acceptance fallback', {
+                messageId,
+                recipientEmail: normalizedRecipient,
+                deliveredCount: result.deliveredCount,
+                pushAcceptedCount: deliveryResult.pushAcceptedCount,
+                mobileAcceptedCount: deliveryResult.mobilePushAcceptedCount,
+                webAcceptedCount: deliveryResult.webPushAcceptedCount,
+              });
+            })
+            .catch((confirmError) => {
+              logger.warn('Push acceptance fallback delivery confirmation failed', {
+                messageId,
+                recipientEmail: normalizedRecipient,
+                error: confirmError,
+              });
+            });
+        } else {
+          logger.debug('Push accepted for chat notification; skipped outbound-delivered fallback', {
+            messageId,
+            sender,
+            currentUserEmail,
+            recipientEmail: normalizedRecipient,
+            pushAcceptedCount: deliveryResult.pushAcceptedCount,
+          });
+        }
       }
     } catch (error) {
       logger.error('Failed to send remote chat notification:', error);
