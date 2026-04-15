@@ -293,7 +293,7 @@ export const MediaPickerUtil = {
 
   // Web-specific implementations
   async selectImageWeb(allowsMultipleSelection: boolean = false) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = 'image/*';
@@ -302,54 +302,26 @@ export const MediaPickerUtil = {
       input.onchange = (event: any) => {
         const files = Array.from(event.target.files || []) as File[];
         if (files.length > 0) {
-          if (allowsMultipleSelection) {
-            // Handle multiple files
-            const assets: any[] = [];
-            let processedCount = 0;
-            
-            files.forEach((file, index) => {
-              const reader = new FileReader();
-              reader.onload = (e) => {
-                assets.push({
-                  uri: e.target?.result as string,
-                  width: 0,
-                  height: 0,
-                  type: 'image',
-                  mimeType: file.type,
-                  fileSize: file.size,
-                  fileName: file.name
-                });
-                
-                processedCount++;
-                if (processedCount === files.length) {
-                  resolve({
-                    canceled: false,
-                    assets: assets
-                  });
-                }
-              };
-              reader.readAsDataURL(file);
-            });
-          } else {
-            // Handle single file
-            const file = files[0];
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              resolve({
-                canceled: false,
-                assets: [{
-                  uri: e.target?.result as string,
-                  width: 0,
-                  height: 0,
-                  type: 'image',
-                  mimeType: file.type,
-                  fileSize: file.size,
-                  fileName: file.name
-                }]
-              });
+          const assets = files.map((file) => {
+            const objectUrl = URL.createObjectURL(file);
+            return {
+              uri: objectUrl,
+              previewUri: objectUrl,
+              width: 0,
+              height: 0,
+              type: 'image',
+              mimeType: file.type,
+              fileSize: file.size,
+              fileName: file.name,
+              file,
+              webFile: file,
             };
-            reader.readAsDataURL(file);
-          }
+          });
+
+          resolve({
+            canceled: false,
+            assets: allowsMultipleSelection ? assets : assets.slice(0, 1),
+          });
         } else {
           resolve({ canceled: true, assets: [] });
         }
@@ -364,7 +336,7 @@ export const MediaPickerUtil = {
   },
 
   async selectDocumentWeb(type: string = '*/*', allowsMultipleSelection: boolean = false) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = type;
@@ -381,7 +353,8 @@ export const MediaPickerUtil = {
               size: file.size,
               uri: URL.createObjectURL(file),
               mimeType: file.type,
-              file: file
+              file,
+              webFile: file,
             }));
             resolve({ type: 'success', files: results });
           } else {
@@ -393,7 +366,8 @@ export const MediaPickerUtil = {
               size: file.size,
               uri: URL.createObjectURL(file),
               mimeType: file.type,
-              file: file
+              file,
+              webFile: file,
             });
           }
         } else {
@@ -410,7 +384,7 @@ export const MediaPickerUtil = {
   },
 
   async selectVideoWeb(allowsMultipleSelection: boolean = false) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = 'video/*';
@@ -419,56 +393,27 @@ export const MediaPickerUtil = {
       input.onchange = (event: any) => {
         const files = Array.from(event.target.files || []) as File[];
         if (files.length > 0) {
-          if (allowsMultipleSelection) {
-            // Handle multiple files
-            const assets: any[] = [];
-            let processedCount = 0;
-            
-            files.forEach((file, index) => {
-              const reader = new FileReader();
-              reader.onload = (e) => {
-                assets.push({
-                  uri: e.target?.result as string,
-                  width: 0,
-                  height: 0,
-                  type: 'video',
-                  mimeType: file.type,
-                  fileSize: file.size,
-                  fileName: file.name,
-                  duration: 0
-                });
-                
-                processedCount++;
-                if (processedCount === files.length) {
-                  resolve({
-                    canceled: false,
-                    assets: assets
-                  });
-                }
-              };
-              reader.readAsDataURL(file);
-            });
-          } else {
-            // Handle single file
-            const file = files[0];
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              resolve({
-                canceled: false,
-                assets: [{
-                  uri: e.target?.result as string,
-                  width: 0,
-                  height: 0,
-                  type: 'video',
-                  mimeType: file.type,
-                  fileSize: file.size,
-                  fileName: file.name,
-                  duration: 0
-                }]
-              });
+          const assets = files.map((file) => {
+            const objectUrl = URL.createObjectURL(file);
+            return {
+              uri: objectUrl,
+              previewUri: objectUrl,
+              width: 0,
+              height: 0,
+              type: 'video',
+              mimeType: file.type,
+              fileSize: file.size,
+              fileName: file.name,
+              duration: 0,
+              file,
+              webFile: file,
             };
-            reader.readAsDataURL(file);
-          }
+          });
+
+          resolve({
+            canceled: false,
+            assets: allowsMultipleSelection ? assets : assets.slice(0, 1),
+          });
         } else {
           resolve({ canceled: true, assets: [] });
         }

@@ -71,10 +71,59 @@ function buildUploadUrl(
   return url.toString();
 }
 
+function buildUploadPreflightUrl(baseUrl: string, args: { tenantId: string; bytes: number }): string {
+  const url = new URL(`${baseUrl}/storage/upload/preflight`);
+  url.searchParams.set('tenantId', args.tenantId);
+  url.searchParams.set('bytes', String(Math.max(0, Math.floor(args.bytes))));
+  return url.toString();
+}
+
 function buildReconcileUrl(baseUrl: string, args: { tenantId: string }): string {
   const url = new URL(`${baseUrl}/storage/reconcile`);
   url.searchParams.set('tenantId', args.tenantId);
   return url.toString();
+}
+
+async function ensureUploadPreflight(args: {
+  baseUrl: string;
+  tenantId: string;
+  bytes: number;
+  suppressStorageLimitAlert?: boolean;
+  context: string;
+}): Promise<void> {
+  const bytes = Number(args.bytes);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return;
+  }
+
+  const url = buildUploadPreflightUrl(args.baseUrl, {
+    tenantId: args.tenantId,
+    bytes,
+  });
+
+  let headers = await buildAuthHeaders(args.baseUrl);
+  let response = await fetch(url, {
+    method: 'GET',
+    headers,
+  });
+
+  if (response.status === 401) {
+    await internalTokenManager.forceRefresh(args.baseUrl);
+    headers = await buildAuthHeaders(args.baseUrl);
+    response = await fetch(url, {
+      method: 'GET',
+      headers,
+    });
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    maybeShowMaintenanceAlertFromRaw(response.status, text);
+    if (!args.suppressStorageLimitAlert) {
+      maybeShowStorageLimitReachedAlert(text, args.context, { incrementBytes: bytes });
+    }
+    throw new Error(text || `upload_preflight_failed_${response.status}`);
+  }
 }
 
 export async function reconcileTenantStorageUsageViaBackend(args: {
@@ -148,6 +197,15 @@ export async function uploadBlobViaBackend(args: {
 
   const contentType = (args.contentType || (args.blob as any)?.type || 'application/octet-stream').toString();
 
+  const preflightBytes = Number((args.blob as any)?.size || 0);
+  await ensureUploadPreflight({
+    baseUrl,
+    tenantId,
+    bytes: preflightBytes,
+    suppressStorageLimitAlert: args.suppressStorageLimitAlert,
+    context: 'uploadBlobViaBackend(preflight)',
+  });
+
   let headers = await buildAuthHeaders(baseUrl);
   headers['Content-Type'] = contentType;
 
@@ -194,10 +252,8 @@ export async function uploadBlobViaBackend(args: {
 
     if (result.status !== 200) {
       maybeShowMaintenanceAlertFromRaw(result.status, result.responseText);
-      if (result.status === 409) {
-        if (!args.suppressStorageLimitAlert) {
-          maybeShowStorageLimitReachedAlert(result.responseText, 'uploadBlobViaBackend');
-        }
+      if (!args.suppressStorageLimitAlert) {
+        maybeShowStorageLimitReachedAlert(result.responseText, 'uploadBlobViaBackend');
       }
       throw new Error(result.responseText || `upload_failed_${result.status}`);
     }
@@ -240,10 +296,8 @@ export async function uploadBlobViaBackend(args: {
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     maybeShowMaintenanceAlertFromRaw(response.status, text);
-    if (response.status === 409) {
-      if (!args.suppressStorageLimitAlert) {
-        maybeShowStorageLimitReachedAlert(text, 'uploadBlobViaBackend');
-      }
+    if (!args.suppressStorageLimitAlert) {
+      maybeShowStorageLimitReachedAlert(text, 'uploadBlobViaBackend');
     }
     throw new Error(text || `upload_failed_${response.status}`);
   }

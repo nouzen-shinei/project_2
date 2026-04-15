@@ -75,32 +75,11 @@ const WINDOW_MINUTES = normalizeNumericEnv(process.env.DAILY_QUOTES_WINDOW_MINUT
 const WINDOW_EARLY_GRACE_SECONDS = normalizeNumericEnv(process.env.DAILY_QUOTES_WINDOW_EARLY_GRACE_SECONDS, 10, 0, 300);
 const SCHEDULER_INTERVAL_MS = normalizeNumericEnv(process.env.DAILY_QUOTES_INTERVAL_MS, 5 * 60_000, 60_000, 6 * 60 * 60 * 1000);
 const API_TIMEOUT_MS = normalizeNumericEnv(process.env.DAILY_QUOTES_API_TIMEOUT_MS, 5000, 1000, 20000);
-const IS_TEST_PROCESS = process.env.TEST_MODE === '1' || process.argv.includes('--test');
-const CATCHUP_ON_START =
-  !IS_TEST_PROCESS && (process.env.DAILY_QUOTES_CATCHUP_ON_START ?? 'true').toLowerCase() === 'true';
-const CATCHUP_DELAY_MS = normalizeNumericEnv(process.env.DAILY_QUOTES_CATCHUP_DELAY_MS, 10_000, 0, 120_000);
 const SCHEDULER_MODE: 'interval' | 'time_of_day' = (process.env.DAILY_QUOTES_SCHEDULER_MODE ?? 'time_of_day').toLowerCase() === 'interval'
   ? 'interval'
   : 'time_of_day';
 type ScheduledSlot = Extract<DailyQuoteTimeOfDay, 'morning' | 'evening'>;
 const SLOT_SEQUENCE: ScheduledSlot[] = ['morning', 'evening'];
-
-function detectCatchupSlot(now: Date, timezone: string): ScheduledSlot | null {
-  const local = resolveLocalTime(now, timezone);
-  const localSeconds = local.hour * 60 * 60 + local.minute * 60 + local.second;
-  const windows: { key: ScheduledSlot; hour: number; minute: number }[] = [
-    { key: 'morning', hour: MORNING_HOUR, minute: MORNING_MINUTE },
-    { key: 'evening', hour: EVENING_HOUR, minute: EVENING_MINUTE },
-  ];
-
-  for (const window of windows) {
-    const targetSeconds = window.hour * 60 * 60 + window.minute * 60;
-    if (isWithinWindowSeconds(localSeconds, targetSeconds, WINDOW_MINUTES, WINDOW_EARLY_GRACE_SECONDS)) {
-      return window.key;
-    }
-  }
-  return null;
-}
 
 let schedulerStarted = false;
 let schedulerTimer: NodeJS.Timeout | null = null;
@@ -160,26 +139,6 @@ export function startDailyQuoteScheduler(): void {
       });
     }, startDelayRaw);
     timer.unref?.();
-  }
-
-  if (!runOnStart && CATCHUP_ON_START && SCHEDULER_MODE === 'time_of_day') {
-    const now = new Date();
-    const catchupSlot = detectCatchupSlot(now, DEFAULT_TIMEZONE);
-    if (catchupSlot) {
-      console.log('[daily_quote_job] scheduling catch-up run on start', {
-        slot: catchupSlot,
-        now: now.toISOString(),
-        timezone: DEFAULT_TIMEZONE,
-        windowMinutes: WINDOW_MINUTES,
-        delayMs: CATCHUP_DELAY_MS,
-      });
-      const timer = setTimeout(() => {
-        runDailyQuoteJob({ reason: `catchup:${catchupSlot}`, timeOfDay: catchupSlot }).catch(err => {
-          console.error('[daily_quote_job] catch-up run failed', err);
-        });
-      }, CATCHUP_DELAY_MS);
-      timer.unref?.();
-    }
   }
 
   if (SCHEDULER_MODE === 'interval') {

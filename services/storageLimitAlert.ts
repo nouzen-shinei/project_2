@@ -39,7 +39,7 @@ function tryParseJson(text: string): any | null {
   }
 }
 
-export function tryExtractStorageLimitReachedInfo(input: unknown): StorageLimitReachedInfo | null {
+function tryExtractStorageErrorPayload(input: unknown): Record<string, unknown> | null {
   if (!input) return null;
 
   // Common patterns: Error(message=JSON string), raw JSON string, or already-parsed object.
@@ -57,6 +57,12 @@ export function tryExtractStorageLimitReachedInfo(input: unknown): StorageLimitR
             : null;
 
   if (!maybeObj || typeof maybeObj !== 'object') return null;
+  return maybeObj as Record<string, unknown>;
+}
+
+export function tryExtractStorageLimitReachedInfo(input: unknown): StorageLimitReachedInfo | null {
+  const maybeObj = tryExtractStorageErrorPayload(input);
+  if (!maybeObj) return null;
 
   const errCode = String((maybeObj as any).error || '');
   if (errCode !== 'storage_limit_reached') return null;
@@ -80,17 +86,26 @@ export function tryExtractStorageLimitReachedInfo(input: unknown): StorageLimitR
   return info;
 }
 
+function isStorageQuotaCheckFailed(input: unknown): boolean {
+  const maybeObj = tryExtractStorageErrorPayload(input);
+  if (!maybeObj) return false;
+  return String((maybeObj as any).error || '') === 'storage_quota_check_failed';
+}
+
 export function maybeShowStorageLimitReachedAlert(
   input: unknown,
   context?: string,
   options?: StorageLimitAlertOptions,
 ): boolean {
-  const info = tryExtractStorageLimitReachedInfo(input);
-  if (!info) return false;
+  const quotaCheckFailed = isStorageQuotaCheckFailed(input);
+  const info = quotaCheckFailed ? null : tryExtractStorageLimitReachedInfo(input);
+  if (!info && !quotaCheckFailed) return false;
 
   // Include extra lines in dedup key so different contextual alerts show (e.g., notice upload vs receipt upload).
   const extraKey = Array.isArray(options?.extraMessageLines) ? options!.extraMessageLines.join('|') : '';
-  const key = `${info.usedBytes}|${info.limitBytes}|${info.incrementBytes ?? ''}|${extraKey}`;
+  const key = quotaCheckFailed
+    ? `storage_quota_check_failed|${extraKey}`
+    : `${info!.usedBytes}|${info!.limitBytes}|${info!.incrementBytes ?? ''}|${extraKey}`;
   const now = Date.now();
   if (key === lastShownKey && now - lastShownAt < 5000) {
     return true;
@@ -99,44 +114,57 @@ export function maybeShowStorageLimitReachedAlert(
   lastShownKey = key;
   lastShownAt = now;
 
-  const used = bytesToMB(info.usedBytes);
-  const limit = bytesToMB(info.limitBytes);
-  const resolvedIncrementBytes =
-    typeof options?.incrementBytes === 'number' && Number.isFinite(options.incrementBytes)
-      ? options.incrementBytes
-      : info.incrementBytes;
-  const inc = typeof resolvedIncrementBytes === 'number' ? bytesToMB(resolvedIncrementBytes) : null;
+  const title = quotaCheckFailed ? 'Upload temporarily unavailable' : 'Storage limit reached';
 
-  const messageLines = [
-    `Your storage is full (${used} MB used of ${limit} MB).`,
-    inc ? `This upload needs about ${inc} MB.` : null,
-    'Please delete some existing uploads (receipts/images/files) and try again.',
-    'You can also upgrade your plan for more storage.',
-    ...(Array.isArray(options?.extraMessageLines) ? options!.extraMessageLines.filter(Boolean) : []),
-  ].filter(Boolean) as string[];
+  const message = (() => {
+    if (quotaCheckFailed) {
+      return [
+        'We could not verify your storage quota right now, so the upload was blocked.',
+        'Please try again in a minute.',
+        ...(Array.isArray(options?.extraMessageLines) ? options!.extraMessageLines.filter(Boolean) : []),
+      ].join('\n');
+    }
 
-  const message = messageLines.join('\n');
+    const used = bytesToMB(info!.usedBytes);
+    const limit = bytesToMB(info!.limitBytes);
+    const resolvedIncrementBytes =
+      typeof options?.incrementBytes === 'number' && Number.isFinite(options.incrementBytes)
+        ? options.incrementBytes
+        : info!.incrementBytes;
+    const inc = typeof resolvedIncrementBytes === 'number' ? bytesToMB(resolvedIncrementBytes) : null;
+
+    const messageLines = [
+      `Your storage is full (${used} MB used of ${limit} MB).`,
+      inc ? `This upload needs about ${inc} MB.` : null,
+      'Please delete some existing uploads (receipts/images/files) and try again.',
+      'You can also upgrade your plan for more storage.',
+      ...(Array.isArray(options?.extraMessageLines) ? options!.extraMessageLines.filter(Boolean) : []),
+    ].filter(Boolean) as string[];
+
+    return messageLines.join('\n');
+  })();
 
   try {
     const shown = tryPresentModalAlert({
-      title: 'Storage limit reached',
+      title,
       message,
       buttons: [{ text: 'OK', style: 'primary' }],
       variant: 'warning',
     });
 
     if (!shown) {
-      Alert.alert('Storage limit reached', message, [{ text: 'OK' }]);
+      Alert.alert(title, message, [{ text: 'OK' }]);
     }
   } catch (error) {
     logger.warn('[storageLimitAlert] Failed to present alert', { error, context });
   }
 
-  logger.warn('[storageLimitAlert] storage_limit_reached', {
+  logger.warn('[storageLimitAlert] storage_upload_blocked', {
     context,
-    limitBytes: info.limitBytes,
-    usedBytes: info.usedBytes,
-    incrementBytes: info.incrementBytes,
+    errorCode: quotaCheckFailed ? 'storage_quota_check_failed' : 'storage_limit_reached',
+    limitBytes: info?.limitBytes,
+    usedBytes: info?.usedBytes,
+    incrementBytes: info?.incrementBytes,
   });
 
   return true;

@@ -1355,6 +1355,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       fileName: string;
       fileType: string;
       fileSize?: number;
+      webFile?: Blob;
     }>,
     recipientId?: string,
     onProgress?: (progress: number) => void,

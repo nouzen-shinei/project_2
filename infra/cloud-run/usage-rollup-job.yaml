@@ -15,7 +15,7 @@ spec:
           maxRetries: 0
           timeoutSeconds: 3600
           containers:
-            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
+            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:00220a4b07dd505495e5504f4da2485c6c89c17ba4772553c1b6c98417ef13a0
               command: ["npm"]
               args: ["run", "usage:rollup:scheduled"]
               resources:
@@ -43,6 +43,8 @@ spec:
                   value: ""
                 - name: USAGE_ROLLUP_DRY_RUN
                   value: "0"
+                - name: USAGE_ROLLUP_REQUIRE_WRITE
+                  value: "1"
                 - name: USAGE_ROLLUP_VERBOSE
                   value: "0"
                 - name: USAGE_ROLLUP_SKIP_REMINDERS

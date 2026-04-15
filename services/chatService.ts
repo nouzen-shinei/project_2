@@ -2,7 +2,7 @@ import { logger } from '@/lib/logger';
 import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chatUploadUtils';
 import { sharedFileService } from '@/services/sharedFileService';
 import { database, storage, auth } from '@/config/firebase';
-import { Platform } from 'react-native';
+import { Alert, Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import { ref, push, set, get, onValue, onChildAdded, onChildChanged, off, query, orderByChild, child, update, endAt, limitToLast, runTransaction, equalTo } from 'firebase/database';
 import { ref as storageRef, deleteObject } from 'firebase/storage';
@@ -19,6 +19,7 @@ function getAuthService(): AuthServiceType {
 import { internalTokenManager } from './internalTokenManager';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 import { maybeShowStorageLimitReachedAlert } from './storageLimitAlert';
+import { tryPresentModalAlert } from './modalAlertService';
 import { chatRealtimeStream, type ChatRealtimeCallbacks } from './chatRealtimeStream';
 import { tenantService } from './tenantService';
 import { runtimeEndpoints } from './runtimeEndpoints';
@@ -311,6 +312,8 @@ class ChatService {
   private serverDeltasEnabled = this.parseEnvFlag(process.env.EXPO_PUBLIC_CHAT_DELTAS_ENABLED, true);
   private realtimeStreamEnabled = this.parseEnvFlag(process.env.EXPO_PUBLIC_CHAT_STREAM_ENABLED, true);
   private static readonly ENABLE_CHAT_UPLOAD_DEBUG = false;
+  private static readonly NETWORK_ALERT_COOLDOWN_MS = 5000;
+  private lastUploadNetworkAlertAt = 0;
 
   private requireTenantId(value: string | null | undefined): string {
     const normalized = typeof value === 'string' ? value.trim() : '';
@@ -1946,13 +1949,132 @@ class ChatService {
     return () => {};
   }
 
+  private isFetchNetworkError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error || '');
+    return /failed to fetch|network request failed|load failed/i.test(message);
+  }
+
+  private maybeShowUploadNetworkErrorAlert(context: string): void {
+    const now = Date.now();
+    if (now - this.lastUploadNetworkAlertAt < ChatService.NETWORK_ALERT_COOLDOWN_MS) {
+      return;
+    }
+    this.lastUploadNetworkAlertAt = now;
+
+    const title = 'Upload failed';
+    const message = 'We could not reach the upload service. Please check your internet connection and try again.';
+
+    try {
+      const shown = tryPresentModalAlert({
+        title,
+        message,
+        buttons: [{ text: 'OK', style: 'primary' }],
+        variant: 'warning',
+      });
+      if (!shown) {
+        Alert.alert(title, message, [{ text: 'OK' }]);
+      }
+    } catch {
+      // ignore alert failures
+    }
+
+    logger.warn('chat.upload.network_error', { context });
+  }
+
+  private buildUploadPreflightUrl(baseUrl: string, tenantId: string, bytes: number): string {
+    const url = new URL(`${baseUrl}/storage/upload/preflight`);
+    url.searchParams.set('tenantId', tenantId);
+    url.searchParams.set('bytes', String(Math.max(0, Math.floor(bytes))));
+    return url.toString();
+  }
+
+  private async ensureUploadPreflight(
+    baseUrl: string,
+    tenantId: string,
+    bytes: number,
+    context: string,
+    authToken?: string,
+  ): Promise<void> {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      return;
+    }
+
+    const preflightUrl = this.buildUploadPreflightUrl(baseUrl, tenantId, bytes);
+    const runRequest = async (token?: string) =>
+      await fetch(preflightUrl, {
+        method: 'GET',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+
+    let response: Response;
+    try {
+      response = await runRequest(authToken);
+    } catch (error) {
+      if (this.isFetchNetworkError(error)) {
+        this.maybeShowUploadNetworkErrorAlert(`${context}:network`);
+      }
+      throw error;
+    }
+
+    if (response.status === 401) {
+      try {
+        await internalTokenManager.forceRefresh(baseUrl);
+      } catch {}
+      const retryToken = await internalTokenManager.getToken(baseUrl);
+      try {
+        response = await runRequest(retryToken || undefined);
+      } catch (error) {
+        if (this.isFetchNetworkError(error)) {
+          this.maybeShowUploadNetworkErrorAlert(`${context}:network-retry`);
+        }
+        throw error;
+      }
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      maybeShowMaintenanceAlertFromRaw(response.status, text);
+      maybeShowStorageLimitReachedAlert(text, context, { incrementBytes: bytes });
+      throw new Error(text || `upload_preflight_failed_${response.status}`);
+    }
+  }
+
+  private async resolveWebUploadBlob(uri: string, sourceBlob?: Blob): Promise<Blob> {
+    if (sourceBlob && typeof (sourceBlob as any).size === 'number') {
+      return sourceBlob;
+    }
+
+    const normalizedUri = String(uri || '').trim();
+    const isBlobSource = /^blob:/i.test(normalizedUri);
+
+    try {
+      const response = await fetch(normalizedUri);
+      if (!response.ok) {
+        throw new Error(`Failed to read file data from URI: ${normalizedUri}`);
+      }
+      return await response.blob();
+    } catch (error) {
+      if (isBlobSource) {
+        // Blob URLs can be revoked/expired locally; this is not a network outage.
+        const localSourceError = new Error('local_file_reference_unavailable');
+        (localSourceError as any).cause = error;
+        throw localSourceError;
+      }
+      if (this.isFetchNetworkError(error)) {
+        this.maybeShowUploadNetworkErrorAlert('chatService.uploadFile(web source)');
+      }
+      throw error;
+    }
+  }
+
   async uploadFile(
     uri: string,
     fileName: string,
     fileType: string,
     participants: ChatUploadParticipants,
     onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions
+    options?: UploadSessionOptions,
+    sourceBlob?: Blob
   ): Promise<{ url: string; size: number }> {
     try {
       const conversationFolder = resolveChatUploadFolder(participants);
@@ -1975,11 +2097,8 @@ class ChatService {
 
       // Web: XHR for progress support
       if (Platform.OS === 'web') {
-        const response = await fetch(uri);
-        if (!response.ok) {
-          throw new Error(`Failed to read file data from URI: ${uri}`);
-        }
-        const blob = await response.blob();
+        const blob = await this.resolveWebUploadBlob(uri, sourceBlob);
+        await this.ensureUploadPreflight(baseUrl, tenantId, blob.size, 'chatService.uploadFile(preflight web)', token);
 
         return await new Promise<{ url: string; size: number }>((resolve, reject) => {
           let cancelled = false;
@@ -2003,11 +2122,16 @@ class ChatService {
                 reject(new ChatUploadCanceledError());
                 return;
               }
-              reject(new Error('upload_failed'));
+              this.maybeShowUploadNetworkErrorAlert('chatService.uploadFile(web)');
+              reject(new Error('upload_failed_network'));
             };
 
             xhr.onload = async () => {
               if (!xhr) return;
+              if (cancelled) {
+                reject(new ChatUploadCanceledError());
+                return;
+              }
               if (xhr.status === 401 && !retried) {
                 retried = true;
                 try {
@@ -2026,14 +2150,28 @@ class ChatService {
                   if (!evt.lengthComputable) return;
                   onProgress((evt.loaded / evt.total) * 100);
                 };
-                xhr.onerror = () => reject(new Error('upload_failed'));
+                xhr.onerror = () => {
+                  if (cancelled) {
+                    reject(new ChatUploadCanceledError());
+                    return;
+                  }
+                  this.maybeShowUploadNetworkErrorAlert('chatService.uploadFile(web retry)');
+                  reject(new Error('upload_failed_network'));
+                };
                 xhr.onload = () => {
                   if (!xhr) return;
+                  if (cancelled) {
+                    reject(new ChatUploadCanceledError());
+                    return;
+                  }
                   if (xhr.status !== 200) {
-                    maybeShowMaintenanceAlertFromRaw(xhr.status, xhr.responseText || '');
-                    if (xhr.status === 409) {
-                      maybeShowStorageLimitReachedAlert(xhr.responseText, 'chatService.uploadFile(web retry)');
+                    if (xhr.status === 0) {
+                      this.maybeShowUploadNetworkErrorAlert('chatService.uploadFile(web retry)');
+                      reject(new Error('upload_failed_network'));
+                      return;
                     }
+                    maybeShowMaintenanceAlertFromRaw(xhr.status, xhr.responseText || '');
+                    maybeShowStorageLimitReachedAlert(xhr.responseText, 'chatService.uploadFile(web retry)');
                     reject(new Error(xhr.responseText || `upload_failed_${xhr.status}`));
                     return;
                   }
@@ -2058,10 +2196,13 @@ class ChatService {
               }
 
               if (xhr.status !== 200) {
-                maybeShowMaintenanceAlertFromRaw(xhr.status, xhr.responseText || '');
-                if (xhr.status === 409) {
-                  maybeShowStorageLimitReachedAlert(xhr.responseText, 'chatService.uploadFile(web)');
+                if (xhr.status === 0) {
+                  this.maybeShowUploadNetworkErrorAlert('chatService.uploadFile(web)');
+                  reject(new Error('upload_failed_network'));
+                  return;
                 }
+                maybeShowMaintenanceAlertFromRaw(xhr.status, xhr.responseText || '');
+                maybeShowStorageLimitReachedAlert(xhr.responseText, 'chatService.uploadFile(web)');
                 reject(new Error(xhr.responseText || `upload_failed_${xhr.status}`));
                 return;
               }
@@ -2114,6 +2255,9 @@ class ChatService {
       const sizeFromSource = info ? ((info as any)?.size as number | undefined) : undefined;
       if (typeof sizeFromSource === 'number' && sizeFromSource > MAX_SIZE_BYTES) {
         throw new Error(`File exceeds the 50 MB limit (size=${sizeFromSource} bytes)`);
+      }
+      if (typeof sizeFromSource === 'number' && sizeFromSource > 0) {
+        await this.ensureUploadPreflight(baseUrl, tenantId, sizeFromSource, 'chatService.uploadFile(preflight native)', token);
       }
 
       let cancelled = false;
@@ -2174,9 +2318,7 @@ class ChatService {
       if (result.status !== 200) {
         const bodyText = typeof result.body === 'string' ? result.body : '';
         maybeShowMaintenanceAlertFromRaw(result.status, bodyText);
-        if (result.status === 409) {
-          maybeShowStorageLimitReachedAlert(bodyText, 'chatService.uploadFile(native)');
-        }
+        maybeShowStorageLimitReachedAlert(bodyText, 'chatService.uploadFile(native)');
         throw new Error(bodyText || `upload_failed_${result.status}`);
       }
 
@@ -2202,6 +2344,9 @@ class ChatService {
           logger.info('Upload canceled by user');
         }
         throw error;
+      }
+      if (this.isFetchNetworkError(error)) {
+        this.maybeShowUploadNetworkErrorAlert('chatService.uploadFile');
       }
       logger.error('Error uploading file:', error);
       throw error;
@@ -2234,6 +2379,7 @@ class ChatService {
           throw new Error(`Failed to read file data from URI: ${uri}`);
         }
         const blob = await response.blob();
+        await this.ensureUploadPreflight(baseUrl, tenantId, blob.size, 'chatService.uploadProfilePicture(preflight web)', token);
 
         return await new Promise<string>((resolve, reject) => {
           let retried = false;
@@ -2262,11 +2408,7 @@ class ChatService {
               }
               if (xhr.status !== 200) {
                 maybeShowMaintenanceAlertFromRaw(xhr.status, xhr.responseText || '');
-                if (xhr.status === 409) {
-                  reject(new Error(xhr.responseText || `upload_failed_${xhr.status}`));
-                  maybeShowStorageLimitReachedAlert(xhr.responseText, 'chatService.uploadProfilePicture(web)');
-                  return;
-                }
+                maybeShowStorageLimitReachedAlert(xhr.responseText, 'chatService.uploadProfilePicture(web)');
                 reject(new Error(xhr.responseText || `upload_failed_${xhr.status}`));
                 return;
               }
@@ -2297,6 +2439,12 @@ class ChatService {
         const tempPath = `${FileSystem.cacheDirectory}pp_${timestamp}.jpg`;
         const dl = await FileSystem.downloadAsync(uri, tempPath);
         sourcePath = dl.uri;
+      }
+
+      const sourceInfo = await FileSystem.getInfoAsync(sourcePath, { size: true });
+      const sourceSize = sourceInfo ? ((sourceInfo as any)?.size as number | undefined) : undefined;
+      if (typeof sourceSize === 'number' && sourceSize > 0) {
+        await this.ensureUploadPreflight(baseUrl, tenantId, sourceSize, 'chatService.uploadProfilePicture(preflight native)', token);
       }
 
       const uploadOnce = async (authHeader?: string) => {
@@ -2338,9 +2486,7 @@ class ChatService {
       if (result.status !== 200) {
         const bodyText = typeof result.body === 'string' ? result.body : '';
         maybeShowMaintenanceAlertFromRaw(result.status, bodyText);
-        if (result.status === 409) {
-          maybeShowStorageLimitReachedAlert(bodyText, 'chatService.uploadProfilePicture(native)');
-        }
+        maybeShowStorageLimitReachedAlert(bodyText, 'chatService.uploadProfilePicture(native)');
         throw new Error(bodyText || `upload_failed_${result.status}`);
       }
 
@@ -2594,6 +2740,9 @@ class ChatService {
       if (error instanceof ChatRateLimitError) {
         throw error;
       }
+      if (this.isFetchNetworkError(error)) {
+        this.maybeShowUploadNetworkErrorAlert('chatService.sendMessageViaBackend');
+      }
       throw error;
     }
   }
@@ -2648,6 +2797,7 @@ class ChatService {
       fileName: string;
       fileType: string;
       fileSize?: number;
+      webFile?: Blob;
     }>,
     sender: string,
     recipientId?: string,
@@ -2715,7 +2865,8 @@ class ChatService {
             registerCancel: (fn: () => void | Promise<void>) => {
               cancelFns[index] = fn;
             },
-          }
+          },
+          file.webFile
         )
       );
       

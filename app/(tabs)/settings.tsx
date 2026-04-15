@@ -2104,7 +2104,11 @@ export default function Settings() {
           </View>
           <View style={styles.profileInfo}>
             <View style={styles.profileNameContainer}>
-              <Text style={[styles.profileName, { color: theme.text }]}>
+              <Text
+                numberOfLines={1}
+                ellipsizeMode="tail"
+                style={[styles.profileName, { color: theme.text }]}
+              >
                 {resolvedDisplayName || 'Teacher Name'}
               </Text>
               {roleBadge && (
@@ -4666,6 +4670,7 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontFamily: 'Poppins-SemiBold',
     marginBottom: 4,
+    flexShrink: 1,
   },
   profileEmail: {
     fontSize: 14,
@@ -5273,6 +5278,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     marginBottom: 4,
+    minWidth: 0,
   },
   adminTextBadge: {
     marginLeft: 8,

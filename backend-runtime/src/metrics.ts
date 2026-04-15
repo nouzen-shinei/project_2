@@ -106,6 +106,14 @@ export const metricNames = {
   messageStatus: 'wa_message_status_total',
   cspViolation: 'wa_csp_violation_total',
   cspViolationPersistFailure: 'wa_csp_violation_persist_failure_total',
-  cspViolationPruned: 'wa_csp_violation_pruned_total'
+  cspViolationPruned: 'wa_csp_violation_pruned_total',
+  storageUploadPreflightRequests: 'storage_upload_preflight_requests_total',
+  storageUploadPreflightAllowed: 'storage_upload_preflight_allowed_total',
+  storageUploadPreflightBlocked: 'storage_upload_preflight_blocked_total',
+  storageUploadPreflightQuotaCheckFailed: 'storage_upload_preflight_quota_check_failed_total',
+  storageUploadRejected: 'storage_upload_rejected_total',
+  storageUploadQuotaCheckFailed: 'storage_upload_quota_check_failed_total',
+  storageUploadAccepted: 'storage_upload_accepted_total',
+  storageUploadFailed: 'storage_upload_failed_total'
 };
 export { successCount, failedCount };

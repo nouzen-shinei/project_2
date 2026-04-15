@@ -1103,10 +1103,153 @@ class TenantStorageLimitError extends Error {
 
   constructor(limitBytes: number, usedBytes: number, incrementBytes: number) {
     super('tenant_storage_limit_reached');
+    this.name = 'TenantStorageLimitError';
+    Object.setPrototypeOf(this, new.target.prototype);
     this.limitBytes = limitBytes;
     this.usedBytes = usedBytes;
     this.incrementBytes = incrementBytes;
   }
+}
+
+type TenantStorageLimitErrorLike = {
+  limitBytes: number;
+  usedBytes: number;
+  incrementBytes: number;
+};
+
+function tryExtractTenantStorageLimitError(input: unknown): TenantStorageLimitErrorLike | null {
+  const parseFromText = (text: string): TenantStorageLimitErrorLike | null => {
+    const raw = String(text || '');
+    if (!raw) return null;
+
+    const message = raw.toLowerCase();
+    const hasStorageMarker =
+      message.includes('tenant_storage_limit_reached') ||
+      message.includes('tenantstoragelimiterror');
+
+    const limitMatch = raw.match(/limitBytes["']?\s*[:=]\s*([0-9]+)/i);
+    const usedMatch = raw.match(/usedBytes["']?\s*[:=]\s*([0-9]+)/i);
+    const incrementMatch = raw.match(/incrementBytes["']?\s*[:=]\s*([0-9]+)/i);
+
+    if (!limitMatch || !usedMatch || !incrementMatch) {
+      return null;
+    }
+
+    const limitBytes = Number(limitMatch[1]);
+    const usedBytes = Number(usedMatch[1]);
+    const incrementBytes = Number(incrementMatch[1]);
+
+    if (!Number.isFinite(limitBytes) || !Number.isFinite(usedBytes) || !Number.isFinite(incrementBytes)) {
+      return null;
+    }
+
+    const deterministicOverLimit = limitBytes > 0 && usedBytes + incrementBytes > limitBytes;
+    if (!hasStorageMarker && !deterministicOverLimit) {
+      return null;
+    }
+
+    return { limitBytes, usedBytes, incrementBytes };
+  };
+
+  const parseCandidate = (candidate: unknown): TenantStorageLimitErrorLike | null => {
+    if (!candidate) return null;
+
+    if (typeof candidate === 'string') {
+      return parseFromText(candidate);
+    }
+
+    if (typeof candidate !== 'object') {
+      return null;
+    }
+
+    const asAny = candidate as any;
+    const message = String(asAny?.message || '').toLowerCase();
+    const name = String(asAny?.name || '').toLowerCase();
+    const code = String(asAny?.code || '').toLowerCase();
+    const errorCode = String(asAny?.error || '').toLowerCase();
+
+    const looksLikeStorageLimitError =
+      message.includes('tenant_storage_limit_reached') ||
+      name.includes('tenantstoragelimiterror') ||
+      code.includes('tenant_storage_limit_reached') ||
+      errorCode.includes('tenant_storage_limit_reached');
+
+    const limitBytes = Number(asAny?.limitBytes);
+    const usedBytes = Number(asAny?.usedBytes);
+    const incrementBytes = Number(asAny?.incrementBytes);
+
+    if (!Number.isFinite(limitBytes) || !Number.isFinite(usedBytes) || !Number.isFinite(incrementBytes)) {
+      return null;
+    }
+
+    const deterministicOverLimit = limitBytes > 0 && usedBytes + incrementBytes > limitBytes;
+    if (!looksLikeStorageLimitError && !deterministicOverLimit) {
+      // Some Firestore transaction errors flatten details into message/stack strings.
+      const textParsed = parseFromText(`${String(asAny?.message || '')}\n${String(asAny?.stack || '')}`);
+      if (textParsed) {
+        return textParsed;
+      }
+      return null;
+    }
+
+    return { limitBytes, usedBytes, incrementBytes };
+  };
+
+  if (!input) return null;
+
+  if (typeof input === 'string') {
+    const directFromText = parseFromText(input);
+    if (directFromText) {
+      return directFromText;
+    }
+  }
+
+  const queue: unknown[] = [input];
+  const seen = new Set<unknown>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+
+    const parsed = parseCandidate(current);
+    if (parsed) {
+      return parsed;
+    }
+
+    if (typeof current !== 'object') {
+      continue;
+    }
+
+    const asAny = current as any;
+    const nestedCandidates: unknown[] = [
+      asAny?.cause,
+      asAny?.originalError,
+      asAny?.innerError,
+      asAny?.details,
+      asAny?.reason,
+      asAny?.metadata,
+      asAny?.error,
+    ];
+
+    for (const nested of nestedCandidates) {
+      if (nested && !seen.has(nested)) {
+        queue.push(nested);
+      }
+    }
+
+    if (Array.isArray(asAny?.errors)) {
+      for (const nested of asAny.errors) {
+        if (nested && !seen.has(nested)) {
+          queue.push(nested);
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 type StorageUploadPurpose =
@@ -11298,6 +11441,108 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  app.get('/storage/upload/preflight', requireStaffTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    const parsed = z
+      .object({
+        tenantId: z.string().min(1),
+        bytes: z.coerce.number().int().positive(),
+      })
+      .safeParse({
+        tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+        bytes: typeof req.query.bytes === 'string' ? req.query.bytes : Number.NaN,
+      });
+
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedTenantId = tenantAccess.tenantId;
+    const providedTenantId = parsed.data.tenantId.trim();
+    if (providedTenantId !== normalizedTenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    inc(metricNames.storageUploadPreflightRequests);
+
+    const incrementBytes = parsed.data.bytes;
+    const MAX_BYTES = 50 * 1024 * 1024;
+    if (incrementBytes > MAX_BYTES) {
+      return res.status(413).json({ error: 'file_too_large', maxBytes: MAX_BYTES });
+    }
+
+    ensureFirebase();
+    const bucketConfigured = typeof admin.app().options.storageBucket === 'string';
+    if (!bucketConfigured) {
+      return res.status(501).json({ error: 'storage_bucket_not_configured' });
+    }
+    const bucket = admin.storage().bucket();
+    const db = getFirestoreImpl();
+
+    const reconcileUsageBytes = async (): Promise<number> => {
+      const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+      await db.collection('tenantStorageUsage').doc(normalizedTenantId).set(
+        {
+          tenantId: normalizedTenantId,
+          bytes: reconciled,
+          estimatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+      return reconciled;
+    };
+
+    const planLimits = await resolveTenantPlanLimitsForEnforcement(db, normalizedTenantId);
+    const limitBytes =
+      typeof planLimits.storageBytes === 'number' && Number.isFinite(planLimits.storageBytes)
+        ? planLimits.storageBytes
+        : 0;
+
+    let usedBytes = 0;
+    try {
+      usedBytes = await loadOrInitTenantStorageUsage(db, bucket, normalizedTenantId);
+    } catch (error) {
+      console.warn('[storage_upload_preflight] unable to init storage usage; failing closed', error);
+      inc(metricNames.storageUploadPreflightQuotaCheckFailed, { stage: 'init_usage' });
+      return res.status(503).json({ error: 'storage_quota_check_failed' });
+    }
+
+    if (limitBytes > 0 && usedBytes + incrementBytes > limitBytes) {
+      try {
+        usedBytes = await reconcileUsageBytes();
+      } catch (error) {
+        console.warn('[storage_upload_preflight] reconcile failed', error);
+        inc(metricNames.storageUploadPreflightQuotaCheckFailed, { stage: 'reconcile' });
+        return res.status(503).json({ error: 'storage_quota_check_failed' });
+      }
+
+      if (usedBytes + incrementBytes > limitBytes) {
+        inc(metricNames.storageUploadPreflightBlocked);
+        return res.status(409).json({
+          error: 'storage_limit_reached',
+          limitBytes,
+          usedBytes,
+          incrementBytes,
+        });
+      }
+    }
+
+    inc(metricNames.storageUploadPreflightAllowed);
+    return res.json({
+      ok: true,
+      tenantId: normalizedTenantId,
+      limitBytes,
+      usedBytes,
+      incrementBytes,
+      availableBytes: limitBytes > 0 ? Math.max(0, limitBytes - usedBytes) : null,
+    });
+  });
+
   app.post('/storage/upload', requireStaffTenantAccessFromQuery, express.raw({ type: '*/*', limit: '55mb' }), async (req, res) => {
     const tenantAccess = req.tenantAccess;
     if (!tenantAccess) {
@@ -11332,6 +11577,9 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(403).json({ error: 'tenant_mismatch' });
     }
 
+    const uploadPurpose: StorageUploadPurpose = parsed.data.purpose;
+    const uploadMetricLabels = { purpose: uploadPurpose };
+
     ensureFirebase();
     const bucketConfigured = typeof admin.app().options.storageBucket === 'string';
     if (!bucketConfigured) {
@@ -11358,12 +11606,49 @@ export function createApp(options: CreateAppOptions = {}){
         ? planLimits.storageBytes
         : 0;
 
+    const reconcileUsageBytes = async (): Promise<number> => {
+      const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+      await db.collection('tenantStorageUsage').doc(normalizedTenantId).set(
+        {
+          tenantId: normalizedTenantId,
+          bytes: reconciled,
+          estimatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+      return reconciled;
+    };
+
     // Initialize usage doc from live bucket estimate on first use.
+    let knownUsedBytes = 0;
     try {
-      await loadOrInitTenantStorageUsage(db, bucket, normalizedTenantId);
+      knownUsedBytes = await loadOrInitTenantStorageUsage(db, bucket, normalizedTenantId);
     } catch (error) {
       console.warn('[storage_upload] unable to init storage usage; failing closed', error);
+      inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'init_usage' });
       return res.status(503).json({ error: 'storage_quota_check_failed' });
+    }
+
+    // Deterministic pre-check: if definitely over-limit, return 409 directly.
+    if (limitBytes > 0 && knownUsedBytes + bytes > limitBytes) {
+      try {
+        knownUsedBytes = await reconcileUsageBytes();
+      } catch (error) {
+        console.warn('[storage_upload] precheck reconcile failed', error);
+        inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'precheck_reconcile' });
+        return res.status(503).json({ error: 'storage_quota_check_failed' });
+      }
+
+      if (knownUsedBytes + bytes > limitBytes) {
+        inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'precheck' });
+        return res.status(409).json({
+          error: 'storage_limit_reached',
+          limitBytes,
+          usedBytes: knownUsedBytes,
+          incrementBytes: bytes,
+        });
+      }
     }
 
     // Reserve bytes transactionally to avoid concurrency overruns.
@@ -11371,31 +11656,60 @@ export function createApp(options: CreateAppOptions = {}){
       await reserveTenantStorageBytes(db, normalizedTenantId, bytes, limitBytes);
       invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
     } catch (error) {
-      if (error instanceof TenantStorageLimitError) {
+      const limitError =
+        error instanceof TenantStorageLimitError
+          ? {
+              limitBytes: error.limitBytes,
+              usedBytes: error.usedBytes,
+              incrementBytes: error.incrementBytes,
+            }
+          : tryExtractTenantStorageLimitError(error);
+
+      if (limitError) {
         // Reconcile once (deletions might have happened) and retry.
         try {
-          const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId);
-          await db.collection('tenantStorageUsage').doc(normalizedTenantId).set(
-            {
-              tenantId: normalizedTenantId,
-              bytes: reconciled,
-              estimatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
-          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+          const reconciled = await reconcileUsageBytes();
+          if (limitBytes > 0 && reconciled + bytes > limitBytes) {
+            inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'reserve_reconcile' });
+            return res.status(409).json({
+              error: 'storage_limit_reached',
+              limitBytes,
+              usedBytes: reconciled,
+              incrementBytes: bytes,
+            });
+          }
           await reserveTenantStorageBytes(db, normalizedTenantId, bytes, limitBytes);
           invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
-        } catch {
+        } catch (reconcileOrRetryError) {
+          const retryLimitError = tryExtractTenantStorageLimitError(reconcileOrRetryError);
+          inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'reserve_retry' });
           return res.status(409).json({
             error: 'storage_limit_reached',
-            limitBytes: error.limitBytes,
-            usedBytes: error.usedBytes,
-            incrementBytes: error.incrementBytes,
+            limitBytes: retryLimitError?.limitBytes ?? limitError.limitBytes ?? limitBytes,
+            usedBytes: retryLimitError?.usedBytes ?? limitError.usedBytes,
+            incrementBytes: retryLimitError?.incrementBytes ?? limitError.incrementBytes ?? bytes,
           });
         }
       }
+
+      // Last-chance deterministic check for unclassified reserve failures.
+      try {
+        const reconciled = await reconcileUsageBytes();
+        if (limitBytes > 0 && reconciled + bytes > limitBytes) {
+          inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'last_chance' });
+          return res.status(409).json({
+            error: 'storage_limit_reached',
+            limitBytes,
+            usedBytes: reconciled,
+            incrementBytes: bytes,
+          });
+        }
+      } catch {
+        // Keep original 503 fallback when reconciliation itself is unavailable.
+      }
+
       console.warn('[storage_upload] reserve failed', error);
+      inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'reserve_unknown' });
       return res.status(503).json({ error: 'storage_quota_check_failed' });
     }
 
@@ -11417,7 +11731,7 @@ export function createApp(options: CreateAppOptions = {}){
     };
 
     let objectPath = '';
-    const purpose: StorageUploadPurpose = parsed.data.purpose;
+    const purpose = uploadPurpose;
     if (purpose === 'chat') {
       const rawConversationFolder = sanitizeStorageSegment(parsed.data.conversationFolder || 'unassigned') || 'unassigned';
       const conversationFolder = normalizeConversationFolder(rawConversationFolder);
@@ -11524,11 +11838,13 @@ export function createApp(options: CreateAppOptions = {}){
         console.warn('[storage_upload] unable to precreate share token', error);
       }
 
+      inc(metricNames.storageUploadAccepted, uploadMetricLabels);
       return res.json({ url, path: objectPath, bytes, contentType, ...(shareToken ? { shareToken } : {}) });
     } catch (error) {
       await releaseTenantStorageBytes(db, normalizedTenantId, bytes).catch(() => undefined);
       invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
       console.error('[storage_upload] upload failed', error);
+      inc(metricNames.storageUploadFailed, { ...uploadMetricLabels, stage: 'save' });
       return res.status(500).json({ error: 'upload_failed' });
     }
   });

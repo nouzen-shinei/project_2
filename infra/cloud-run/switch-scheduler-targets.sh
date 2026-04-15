@@ -3,12 +3,16 @@ set -euo pipefail
 
 # Switch Cloud Scheduler HTTP targets between prod and dev Cloud Run jobs.
 # Usage:
-#   ./switch-scheduler-targets.sh            # defaults to dev
 #   ./switch-scheduler-targets.sh dev
 #   ./switch-scheduler-targets.sh prod
 #   PROJECT_ID=tution-app-6c0c3 REGION=asia-south1 ./switch-scheduler-targets.sh prod
 
-MODE="${1:-dev}"
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <prod|dev>"
+  exit 1
+fi
+
+MODE="${1}"
 if [[ "${MODE}" != "prod" && "${MODE}" != "dev" ]]; then
   echo "Usage: $0 <prod|dev>"
   exit 1

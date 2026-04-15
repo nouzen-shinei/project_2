@@ -470,6 +470,7 @@ export default function Chat() {
       fileName: string;
       fileType: string;
       fileSize?: number;
+      webFile?: Blob;
     }[];
     messageText: string;
     recipientId: string;
@@ -5758,12 +5759,43 @@ export default function Chat() {
     handleTyping('/special ');
   }, [handleTyping]);
 
+  const revokeWebObjectUrls = useCallback((filesToRevoke: any[]) => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    if (typeof URL === 'undefined' || typeof URL.revokeObjectURL !== 'function') {
+      return;
+    }
+
+    const seen = new Set<string>();
+    for (const file of filesToRevoke || []) {
+      const candidates = [file?.uri, file?.previewUri];
+      for (const candidate of candidates) {
+        const value = typeof candidate === 'string' ? candidate.trim() : '';
+        if (!value || !value.startsWith('blob:') || seen.has(value)) {
+          continue;
+        }
+        seen.add(value);
+        try {
+          URL.revokeObjectURL(value);
+        } catch {}
+      }
+    }
+  }, []);
+
   const resetFilePreviewModal = useCallback(() => {
+    revokeWebObjectUrls(selectedFilesRef.current);
     setFilePreviewVisible(false);
     setSelectedFiles([]);
     selectedFilesRef.current = [];
     setSkippedPreviewFiles([]);
-  }, []);
+  }, [revokeWebObjectUrls]);
+
+  useEffect(() => {
+    return () => {
+      revokeWebObjectUrls(selectedFilesRef.current);
+    };
+  }, [revokeWebObjectUrls]);
 
   const handleBackToChatList = useCallback(() => {
     Keyboard.dismiss();
@@ -5838,19 +5870,7 @@ export default function Chat() {
             ? URL.createObjectURL(file)
             : null;
 
-        let previewUri: string | null = null;
-        if (isLikelyImage && typeof FileReader !== 'undefined') {
-          try {
-            previewUri = await new Promise<string>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(String(reader.result || ''));
-              reader.onerror = () => reject(reader.error);
-              reader.readAsDataURL(file);
-            });
-          } catch {
-            previewUri = null;
-          }
-        }
+        const previewUri: string | null = isLikelyImage ? objectUrl : null;
 
         const uri = objectUrl || previewUri;
         if (typeof uri !== 'string' || uri.length === 0) {
@@ -5867,6 +5887,8 @@ export default function Chat() {
           fileSize: file?.size,
           size: file?.size,
           lastModified: Number(file?.lastModified || 0) || undefined,
+          file,
+          webFile: file,
         };
       })
     );
@@ -6284,6 +6306,14 @@ export default function Chat() {
         next.set(tempId, {
           id: tempId,
           files: selectedFiles.map(f => ({
+            ...(() => {
+              const candidate = (f as any)?.webFile ?? (f as any)?.file;
+              const webFile =
+                Platform.OS === 'web' && typeof Blob !== 'undefined' && candidate instanceof Blob
+                  ? candidate
+                  : undefined;
+              return webFile ? { webFile } : {};
+            })(),
             uri: f.uri,
             fileName: f.fileName || f.name || 'file',
             fileType: f.mimeType || 'application/octet-stream',
@@ -6303,6 +6333,14 @@ export default function Chat() {
 
       // Prepare files for batch upload
       const filesToUpload = selectedFiles.map(file => ({
+        ...(() => {
+          const candidate = (file as any)?.webFile ?? (file as any)?.file;
+          const webFile =
+            Platform.OS === 'web' && typeof Blob !== 'undefined' && candidate instanceof Blob
+              ? candidate
+              : undefined;
+          return webFile ? { webFile } : {};
+        })(),
         uri: file.uri,
         fileName: file.fileName || file.name || 'file',
         fileType: file.mimeType || 'application/octet-stream',
@@ -6376,6 +6414,7 @@ export default function Chat() {
     } catch (error) {
   clearAttachmentFinalizeTimer(tempId);
   attachmentUploadCancelMap.current.delete(tempId);
+      resetFilePreviewModal();
       // Mark pending optimistic bubble as failed
       setPendingAttachments(prev => {
         const next = new Map(prev);
@@ -7071,13 +7110,17 @@ export default function Chat() {
   }, [messages, selectedTeamMember?.email, effectiveUser?.email, clearNetworkError, fileValidationCache]);
 
   const removeSelectedFile = useCallback((index: number) => {
+    const removedFile = selectedFiles[index];
+    if (removedFile) {
+      revokeWebObjectUrls([removedFile]);
+    }
     const newFiles = selectedFiles.filter((_, i) => i !== index);
     setSelectedFiles(newFiles);
     selectedFilesRef.current = newFiles;
     if (newFiles.length === 0) {
       resetFilePreviewModal();
     }
-  }, [selectedFiles, resetFilePreviewModal]);
+  }, [selectedFiles, revokeWebObjectUrls, resetFilePreviewModal]);
 
   const removeSelectedFileRef = useRef(removeSelectedFile);
   useEffect(() => {
@@ -8487,6 +8530,8 @@ export default function Chat() {
       } catch (error) {
         clearAttachmentFinalizeTimer(tempId);
         attachmentUploadCancelMap.current.delete(tempId);
+        const localSourceUnavailable =
+          error instanceof Error && error.message === 'local_file_reference_unavailable';
         if (error instanceof ChatUploadCanceledError) {
           logger.info('Attachment upload retry canceled by user', { tempId });
         } else {
@@ -8512,7 +8557,14 @@ export default function Chat() {
           }
         } else {
           if (!options?.silent) {
-            Toast.show({ type: 'error', text1: 'Retry Failed', text2: 'Could not resend attachments.', position: 'top' });
+            Toast.show({
+              type: 'error',
+              text1: 'Retry Failed',
+              text2: localSourceUnavailable
+                ? 'Original file is no longer available. Please attach it again.'
+                : 'Could not resend attachments.',
+              position: 'top'
+            });
           }
         }
         return false;

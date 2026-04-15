@@ -127,6 +127,21 @@ interface ExistingAlertRecord {
   acknowledgedAt?: string | null;
 }
 
+export function shouldReopenUsageAlertAfterQuotaChange(options: {
+  existingAlert?: { acknowledgedAt?: string | null; type?: string | null; limit?: unknown } | null;
+  nextType: 'warning' | 'critical';
+  nextLimit: number;
+}): boolean {
+  const acknowledgedAt = options.existingAlert?.acknowledgedAt;
+  if (typeof acknowledgedAt !== 'string' || !acknowledgedAt) {
+    return false;
+  }
+
+  const previousType = options.existingAlert?.type;
+  const previousLimit = Number(options.existingAlert?.limit);
+  return previousType !== options.nextType || !Number.isFinite(previousLimit) || previousLimit !== options.nextLimit;
+}
+
 export function initFirebase(): void {
   if (admin.apps.length > 0) {
     return;
@@ -1056,6 +1071,12 @@ async function evaluateAlerts(
         }
       }
 
+      const shouldReopenAcknowledgedAlert = shouldReopenUsageAlertAfterQuotaChange({
+        existingAlert: existingData,
+        nextType: threshold,
+        nextLimit: entry.limit,
+      });
+
       const previousFingerprint =
         existingData && typeof existingData.notificationFingerprint === 'string'
           ? String(existingData.notificationFingerprint)
@@ -1097,6 +1118,16 @@ async function evaluateAlerts(
               ratio,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
               updatedAtIso: new Date().toISOString(),
+              ...(shouldReopenAcknowledgedAlert
+                ? {
+                    acknowledgedAt: admin.firestore.FieldValue.delete(),
+                    acknowledgedBy: admin.firestore.FieldValue.delete(),
+                    acknowledgedByEmail: admin.firestore.FieldValue.delete(),
+                    'notifications.ack.pending': admin.firestore.FieldValue.delete(),
+                    'notifications.ack.closedAt': admin.firestore.FieldValue.delete(),
+                    'notifications.ack.closedAtTimestamp': admin.firestore.FieldValue.delete(),
+                  }
+                : {}),
             }),
             { merge: true }
           );

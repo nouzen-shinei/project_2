@@ -43,6 +43,8 @@ spec:
                   value: ""
                 - name: USAGE_ROLLUP_DRY_RUN
                   value: "1"
+                - name: USAGE_ROLLUP_REQUIRE_WRITE
+                  value: "1"
                 - name: USAGE_ROLLUP_VERBOSE
                   value: "0"
                 - name: USAGE_ROLLUP_SKIP_REMINDERS

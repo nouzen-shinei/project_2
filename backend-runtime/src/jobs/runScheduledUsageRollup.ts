@@ -6,6 +6,7 @@ type RollupJobConfig = {
   month: string | null;
   backfill: number;
   dryRun: boolean;
+  requireWrite: boolean;
   verbose: boolean;
   jobLabel: string;
 };
@@ -47,6 +48,7 @@ function loadConfig(): RollupJobConfig {
     month: monthEnv && monthEnv.length > 0 ? monthEnv : null,
     backfill: parseBackfill(process.env.USAGE_ROLLUP_BACKFILL),
     dryRun: parseBoolean(process.env.USAGE_ROLLUP_DRY_RUN),
+    requireWrite: parseBoolean(process.env.USAGE_ROLLUP_REQUIRE_WRITE),
     verbose: parseBoolean(process.env.USAGE_ROLLUP_VERBOSE),
     jobLabel: process.env.USAGE_ROLLUP_JOB_LABEL?.trim() || 'usage_rollup_scheduler',
   };
@@ -62,6 +64,9 @@ function log(message: string, extra?: Record<string, unknown>): void {
 
 async function runScheduledRollup(): Promise<void> {
   const config = loadConfig();
+  if (config.requireWrite && config.dryRun) {
+    throw new Error('USAGE_ROLLUP_REQUIRE_WRITE is enabled but USAGE_ROLLUP_DRY_RUN resolved true. Refusing to run.');
+  }
   const targets = config.tenantIds.length > 0 ? config.tenantIds : [null];
   const startedAt = new Date().toISOString();
   log('job started', {
@@ -71,6 +76,7 @@ async function runScheduledRollup(): Promise<void> {
     month: config.month,
     backfill: config.backfill,
     dryRun: config.dryRun,
+    requireWrite: config.requireWrite,
     verbose: config.verbose,
   });
 

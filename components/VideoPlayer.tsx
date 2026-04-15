@@ -2566,6 +2566,13 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
     });
   }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed, player]);
 
+  const handleShare = useCallback(() => {
+    handleClose();
+    setTimeout(() => {
+      onSharePress();
+    }, 0);
+  }, [handleClose, onSharePress]);
+
   const shouldShowLoading = isLoading || !(effectiveDuration > 0);
   const shouldShowControls = showControls && !shouldShowLoading;
   const disableSpeedControl = shouldShowLoading;
@@ -2625,7 +2632,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                     style={styles.fullscreenControlButton}
                     onPress={(event) => {
                       event.stopPropagation?.();
-                      onSharePress(event);
+                      handleShare();
                     }}
                   >
                     <Share2 size={20} color="white" />
@@ -3050,6 +3057,13 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
     });
   }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed]);
 
+  const handleShare = useCallback(() => {
+    handleClose();
+    setTimeout(() => {
+      onSharePress();
+    }, 0);
+  }, [handleClose, onSharePress]);
+
   const shouldShowLoading = !(duration > 0);
   const shouldShowControls = showControls && !shouldShowLoading;
   const formattedProgressLabel = useMemo(() => {
@@ -3127,7 +3141,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                     style={styles.fullscreenControlButton}
                     onPress={(event) => {
                       event.stopPropagation?.();
-                      onSharePress(event);
+                      handleShare();
                     }}
                   >
                     <Share2 size={20} color="white" />
