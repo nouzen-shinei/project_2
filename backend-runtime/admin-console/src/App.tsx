@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { Suspense, lazy, useState, type ComponentType } from 'react';
 import clsx from 'clsx';
-import { BarChart3, Building2, CreditCard, GaugeCircle, MessageCircle, MessageSquareDashed, Megaphone, PhoneCall, Settings2, type LucideIcon } from 'lucide-react';
+import { BarChart3, Building2, CreditCard, GaugeCircle, MessageCircle, MessageSquareDashed, Megaphone, PhoneCall, Server, Settings2, type LucideIcon } from 'lucide-react';
 import { AuthConfigPanel } from './features/settings/AuthConfigPanel';
 import { RuntimeEndpointsPanel } from './features/settings/RuntimeEndpointsPanel';
 import { MaintenanceModePanel } from './features/settings/MaintenanceModePanel';
@@ -22,8 +22,13 @@ import { UsageAnalyticsPanel } from './features/tenants/UsageAnalyticsPanel';
 import { BillingCatalogPanel } from './features/billing/BillingCatalogPanel';
 import { BillingOpsPanel } from './features/billing/BillingOpsPanel';
 
-type PanelComponent = () => JSX.Element;
-type TabId = 'overview' | 'queue' | 'broadcasts' | 'telephony' | 'chat' | 'tenants' | 'usage' | 'billing' | 'settings';
+const RuntimeMetricsPanel = lazy(async () => {
+  const module = await import('./features/metrics/RuntimeMetricsPanel');
+  return { default: module.RuntimeMetricsPanel };
+});
+
+type PanelComponent = ComponentType;
+type TabId = 'overview' | 'metrics' | 'queue' | 'broadcasts' | 'telephony' | 'chat' | 'tenants' | 'usage' | 'billing' | 'settings';
 
 interface TabDefinition {
   id: TabId;
@@ -40,6 +45,13 @@ const TAB_CONFIG: TabDefinition[] = [
     description: 'Runtime health, queue depth, and failure telemetry.',
     icon: GaugeCircle,
     panels: [OverviewPanel, DiagnosticsPanel],
+  },
+  {
+    id: 'metrics',
+    label: 'Metrics',
+    description: 'Production telemetry for API health, latency, memory, and scheduler freshness.',
+    icon: Server,
+    panels: [RuntimeMetricsPanel],
   },
   {
     id: 'queue',
@@ -117,6 +129,7 @@ export default function App() {
     const normalized = (raw || '').trim().toLowerCase();
     if (
       normalized === 'overview' ||
+      normalized === 'metrics' ||
       normalized === 'queue' ||
       normalized === 'broadcasts' ||
       normalized === 'telephony' ||
@@ -189,10 +202,16 @@ export default function App() {
             })}
           </nav>
         </div>
-        <div className={clsx('page-grid', { 'page-grid--single': activeConfig.id === 'billing' || activeConfig.id === 'broadcasts' })}>
-          {activeConfig.panels.map((PanelComponent, index) => (
-            <PanelComponent key={`${activeConfig.id}-${index}`} />
-          ))}
+        <div
+          className={clsx('page-grid', {
+            'page-grid--single': activeConfig.id === 'billing' || activeConfig.id === 'broadcasts' || activeConfig.id === 'metrics',
+          })}
+        >
+          <Suspense fallback={<section className="section-card"><p className="muted">Loading panel…</p></section>}>
+            {activeConfig.panels.map((PanelComponent, index) => (
+              <PanelComponent key={`${activeConfig.id}-${index}`} />
+            ))}
+          </Suspense>
         </div>
       </main>
     </div>

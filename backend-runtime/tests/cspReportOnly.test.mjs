@@ -9,24 +9,26 @@ import path from 'path';
 const manifestPath = path.join(process.cwd(), 'temp-hashes.json');
 fs.writeFileSync(manifestPath, JSON.stringify({ style: ["'sha256-deadbeef'"], script: ["'sha256-cafebabe'"] }));
 
-// Direct function coverage for buildCsp with reportOnly true
-const ro = buildCsp({ hashManifestPath: manifestPath, reportOnly: true });
-assert.equal(ro.headerName, 'Content-Security-Policy-Report-Only');
-assert(ro.policy.includes("'sha256-cafebabe'"), 'Script hash should appear');
-assert(!ro.policy.includes("'unsafe-inline'"), 'unsafe-inline should be dropped when style hashes present');
+try {
+  // Direct function coverage for buildCsp with reportOnly true
+  const ro = buildCsp({ hashManifestPath: manifestPath, reportOnly: true });
+  assert.equal(ro.headerName, 'Content-Security-Policy-Report-Only');
+  assert(ro.policy.includes("'sha256-cafebabe'"), 'Script hash should appear');
+  const styleSrc = ro.policy.split('; ').find((part) => part.startsWith('style-src ')) || '';
+  assert(styleSrc.includes("'sha256-deadbeef'"), 'Style hash should appear in style-src');
+  assert(!styleSrc.includes("'unsafe-inline'"), 'unsafe-inline should be dropped from style-src when style hashes are present');
 
-// Middleware coverage: enableReportOnlyHeader + accept header gating
-const app = express();
-app.use(cspMiddleware({ enableReportOnlyHeader: true, hashManifestPath: manifestPath }));
-app.get('/test', (req,res)=> res.send('<html><body>ok</body></html>'));
+  // Middleware coverage: enableReportOnlyHeader + accept header gating
+  const app = express();
+  app.use(cspMiddleware({ enableReportOnlyHeader: true, hashManifestPath: manifestPath }));
+  app.get('/test', (req,res)=> res.send('<html><body>ok</body></html>'));
 
-// A second app instance to cover env-driven report-only branch without enableReportOnlyHeader
-const appEnv = express();
-appEnv.use((req,res,next)=>{ process.env.CSP_REPORT_ONLY_MODE = '1'; next(); });
-appEnv.use(cspMiddleware({ hashManifestPath: manifestPath }));
-appEnv.get('/test', (req,res)=> res.send('<html><body>ok2</body></html>'));
+  // A second app instance to cover env-driven report-only branch without enableReportOnlyHeader
+  const appEnv = express();
+  appEnv.use((req,res,next)=>{ process.env.CSP_REPORT_ONLY_MODE = '1'; next(); });
+  appEnv.use(cspMiddleware({ hashManifestPath: manifestPath }));
+  appEnv.get('/test', (req,res)=> res.send('<html><body>ok2</body></html>'));
 
-(async () => {
   const server = http.createServer(app);
   await new Promise(r=>server.listen(0,r));
   const port = server.address().port;
@@ -45,5 +47,8 @@ appEnv.get('/test', (req,res)=> res.send('<html><body>ok2</body></html>'));
   assert(headersEnv['content-security-policy'], 'CSP header expected (env branch)');
   assert(headersEnv['content-security-policy-report-only'], 'Report-Only header expected via env variable');
   serverEnv.close();
-  fs.unlinkSync(manifestPath);
-})();
+} finally {
+  if (fs.existsSync(manifestPath)) {
+    fs.unlinkSync(manifestPath);
+  }
+}

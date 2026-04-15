@@ -4,6 +4,7 @@ import * as admin from 'firebase-admin';
 import crypto from 'crypto';
 import fetch from 'node-fetch';
 import { createGzip } from 'node:zlib';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { enqueueReminder, enqueueCustomMessage, enqueuePaymentConfirmation, getJobStatus, listJobStatus, getInMemoryQueueSnapshot, shutdownQueue } from './queueProvider';
 import { sendSMS as backendSendSMS, sendVoiceCall as backendSendVoiceCall } from './twilio';
 import { metricsText, inc, metricNames, getFailureRate, getWindowCount } from './metrics';
@@ -20,6 +21,7 @@ import { startBillingBackfillScheduler, getBillingBackfillSchedulerStatus } from
 import { startPlayBillingReconcileScheduler, getPlayBillingReconcileSchedulerStatus } from './playBillingReconcileJob';
 import {
   decodeInternalToken,
+  getConversationWatchStats,
   getConversationKey,
   normalizeEmail,
   verifyInternalToken,
@@ -5510,6 +5512,120 @@ export interface CreateAppOptions {
 export function createApp(options: CreateAppOptions = {}){
   const app = express();
   const isTestProcess = process.env.TEST_MODE === '1' || process.argv.includes('--test');
+  const eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
+  if (!isTestProcess) {
+    eventLoopDelayMonitor.enable();
+  }
+
+  let inFlightHttpRequests = 0;
+  let peakInFlightHttpRequests = 0;
+  type HttpDurationSample = { ts: number; value: number };
+  const httpDurationSamples: HttpDurationSample[] = [];
+  const HTTP_DURATION_RETENTION_MS = 60 * 60 * 1000;
+  const HTTP_DURATION_SAMPLE_HARD_CAP = 50_000;
+
+  const pruneHttpDurationSamples = (nowMs: number): void => {
+    const cutoff = nowMs - HTTP_DURATION_RETENTION_MS;
+    let drop = 0;
+    while (drop < httpDurationSamples.length && httpDurationSamples[drop].ts < cutoff) {
+      drop += 1;
+    }
+    if (drop > 0) {
+      httpDurationSamples.splice(0, drop);
+    }
+
+    if (httpDurationSamples.length > HTTP_DURATION_SAMPLE_HARD_CAP) {
+      httpDurationSamples.splice(0, httpDurationSamples.length - HTTP_DURATION_SAMPLE_HARD_CAP);
+    }
+  };
+
+  const recordHttpDurationSample = (durationMs: number): void => {
+    if (!Number.isFinite(durationMs) || durationMs < 0) {
+      return;
+    }
+    const nowMs = Date.now();
+    httpDurationSamples.push({ ts: nowMs, value: durationMs });
+    pruneHttpDurationSamples(nowMs);
+  };
+
+  const getHttpDurationWindowStats = (
+    windowMs: number,
+  ): { count: number; avg: number; p95: number; p99: number; max: number } | null => {
+    if (!Number.isFinite(windowMs) || windowMs <= 0 || httpDurationSamples.length === 0) {
+      return null;
+    }
+
+    const nowMs = Date.now();
+    pruneHttpDurationSamples(nowMs);
+    const cutoff = nowMs - Math.trunc(windowMs);
+    const values: number[] = [];
+    let sum = 0;
+    let max = 0;
+
+    for (let i = httpDurationSamples.length - 1; i >= 0; i -= 1) {
+      const sample = httpDurationSamples[i];
+      if (sample.ts < cutoff) {
+        break;
+      }
+      values.push(sample.value);
+      sum += sample.value;
+      if (sample.value > max) {
+        max = sample.value;
+      }
+    }
+
+    if (values.length === 0) {
+      return null;
+    }
+
+    values.sort((a, b) => a - b);
+    const readPercentile = (percent: number): number => {
+      const idx = Math.max(0, Math.min(values.length - 1, Math.ceil((percent / 100) * values.length) - 1));
+      return values[idx];
+    };
+
+    return {
+      count: values.length,
+      avg: sum / values.length,
+      p95: readPercentile(95),
+      p99: readPercentile(99),
+      max,
+    };
+  };
+
+  const secondsSinceIso = (value: string | null | undefined): number | null => {
+    const iso = (value || '').trim();
+    if (!iso) {
+      return null;
+    }
+    const timestamp = Date.parse(iso);
+    if (Number.isNaN(timestamp)) {
+      return null;
+    }
+    return Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  };
+
+  const secondsUntilIso = (value: string | null | undefined): number | null => {
+    const iso = (value || '').trim();
+    if (!iso) {
+      return null;
+    }
+    const timestamp = Date.parse(iso);
+    if (Number.isNaN(timestamp)) {
+      return null;
+    }
+    return Math.max(0, Math.floor((timestamp - Date.now()) / 1000));
+  };
+
+  const readOptionalNumberEnv = (name: string): number | null => {
+    const raw = (process.env[name] ?? '').trim();
+    if (!raw) {
+      return null;
+    }
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+  };
+
   const sendChatMessageImpl = options.overrides?.sendChatMessage ?? sendChatMessage;
   const syncChatConversationReceiptsImpl =
     options.overrides?.syncChatConversationReceipts ?? syncChatConversationReceipts;
@@ -5760,6 +5876,58 @@ export function createApp(options: CreateAppOptions = {}){
     next();
   });
   /* c8 ignore stop */
+
+  app.use((req, res, next) => {
+    if (req.path === '/metrics') {
+      return next();
+    }
+
+    inFlightHttpRequests += 1;
+    if (inFlightHttpRequests > peakInFlightHttpRequests) {
+      peakInFlightHttpRequests = inFlightHttpRequests;
+    }
+
+    const startedAt = process.hrtime.bigint();
+    let finalized = false;
+
+    const finalize = () => {
+      if (finalized) {
+        return;
+      }
+      finalized = true;
+
+      inFlightHttpRequests = Math.max(0, inFlightHttpRequests - 1);
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      recordHttpDurationSample(durationMs);
+
+      const statusCode = Number(res.statusCode || 0);
+      inc(metricNames.httpRequestsTotal);
+      inc(metricNames.httpResponsesTotal);
+
+      if (statusCode >= 400) {
+        inc(metricNames.httpResponsesErrorTotal);
+        if (statusCode < 500) {
+          inc(metricNames.httpResponses4xxTotal);
+        } else {
+          inc(metricNames.httpResponses5xxTotal);
+        }
+      }
+
+      if (statusCode === 401 || statusCode === 403) {
+        inc(metricNames.httpAuthUnauthorizedTotal);
+      }
+      if (statusCode === 429) {
+        inc(metricNames.httpRateLimitedTotal);
+      }
+      if (statusCode === 503) {
+        inc(metricNames.httpMaintenanceBlockedTotal);
+      }
+    };
+
+    res.once('finish', finalize);
+    res.once('close', finalize);
+    next();
+  });
 
   // ----- Auth helpers -----
   function signInternalToken(sub: string, ttlSec=300, email?: string){ const secret=process.env.INTERNAL_API_KEY!; const exp=Math.floor(Date.now()/1000)+ttlSec; const payloadData: Record<string, unknown> = {sub,exp}; if(email){ payloadData.email = email; } const payload=Buffer.from(JSON.stringify(payloadData)).toString('base64url'); const sig=crypto.createHmac('sha256',secret).update(payload).digest('base64url'); return `${payload}.${sig}`; }
@@ -17053,6 +17221,9 @@ export function createApp(options: CreateAppOptions = {}){
       }
     };
 
+    req.on('close', closeStream);
+    req.on('aborted', closeStream);
+
     try {
       cleanup = await watchConversationRealtime(tenantId, conversationKey, {
         onMessage: (message) => send({ type: 'message', payload: message }),
@@ -17060,15 +17231,18 @@ export function createApp(options: CreateAppOptions = {}){
         onMessageUpdate: (message) => send({ type: 'message_update', payload: message }),
         onMessageDelete: (message) => send({ type: 'message_delete', payload: message }),
       });
+
+      if (closed) {
+        cleanup();
+        cleanup = null;
+        return;
+      }
     } catch (error) {
       console.error('[chat-stream] watch failed', error);
       send({ type: 'status', payload: { error: 'internal_error' } });
       closeStream();
       return;
     }
-
-    req.on('close', closeStream);
-    req.on('aborted', closeStream);
   });
 
   app.post('/chat/delta', requireMemberTenantAccess, async (req, res) => {
@@ -17361,6 +17535,111 @@ export function createApp(options: CreateAppOptions = {}){
     const metrics = metricsText(base);
     const lines = [metrics.trim()];
 
+    const memoryUsage = process.memoryUsage();
+    const cpuUsage = process.cpuUsage();
+    lines.push(`wa_runtime_uptime_seconds ${Math.floor(process.uptime())}`);
+    lines.push(`wa_runtime_memory_rss_bytes ${memoryUsage.rss}`);
+    lines.push(`wa_runtime_memory_heap_used_bytes ${memoryUsage.heapUsed}`);
+    lines.push(`wa_runtime_memory_heap_total_bytes ${memoryUsage.heapTotal}`);
+    lines.push(`wa_runtime_memory_external_bytes ${memoryUsage.external}`);
+    if (typeof memoryUsage.arrayBuffers === 'number') {
+      lines.push(`wa_runtime_memory_array_buffers_bytes ${memoryUsage.arrayBuffers}`);
+    }
+    lines.push(`wa_runtime_cpu_user_seconds_total ${(cpuUsage.user / 1_000_000).toFixed(4)}`);
+    lines.push(`wa_runtime_cpu_system_seconds_total ${(cpuUsage.system / 1_000_000).toFixed(4)}`);
+
+    if (!isTestProcess) {
+      const lagMeanMs = eventLoopDelayMonitor.mean / 1_000_000;
+      const lagP95Ms = eventLoopDelayMonitor.percentile(95) / 1_000_000;
+      const lagP99Ms = eventLoopDelayMonitor.percentile(99) / 1_000_000;
+      const lagMaxMs = eventLoopDelayMonitor.max / 1_000_000;
+
+      if (Number.isFinite(lagMeanMs)) {
+        lines.push(`wa_runtime_event_loop_lag_mean_ms ${lagMeanMs.toFixed(2)}`);
+      }
+      if (Number.isFinite(lagP95Ms)) {
+        lines.push(`wa_runtime_event_loop_lag_p95_ms ${lagP95Ms.toFixed(2)}`);
+      }
+      if (Number.isFinite(lagP99Ms)) {
+        lines.push(`wa_runtime_event_loop_lag_p99_ms ${lagP99Ms.toFixed(2)}`);
+      }
+      if (Number.isFinite(lagMaxMs)) {
+        lines.push(`wa_runtime_event_loop_lag_max_ms ${lagMaxMs.toFixed(2)}`);
+      }
+    }
+
+    lines.push(`wa_http_requests_in_flight ${inFlightHttpRequests}`);
+    lines.push(`wa_http_requests_in_flight_peak ${peakInFlightHttpRequests}`);
+
+    const chatWatchStats = getConversationWatchStats();
+    lines.push(`wa_chat_realtime_watches_active ${chatWatchStats.activeWatches}`);
+    lines.push(`wa_chat_realtime_watch_subscribers ${chatWatchStats.totalSubscribers}`);
+
+    const chatWatchThreshold = readOptionalNumberEnv('ALERT_CHAT_REALTIME_WATCHES_ACTIVE');
+    if (chatWatchThreshold !== null) {
+      lines.push(`wa_alert_chat_realtime_watches_active_exceeded ${chatWatchStats.activeWatches > chatWatchThreshold ? 1 : 0}`);
+    }
+
+    const chatSubscriberThreshold = readOptionalNumberEnv('ALERT_CHAT_REALTIME_WATCH_SUBSCRIBERS');
+    if (chatSubscriberThreshold !== null) {
+      lines.push(`wa_alert_chat_realtime_watch_subscribers_exceeded ${chatWatchStats.totalSubscribers > chatSubscriberThreshold ? 1 : 0}`);
+    }
+
+    const window5m = 5 * 60 * 1000;
+    const window15m = 15 * 60 * 1000;
+    const window24h = 24 * 60 * 60 * 1000;
+
+    const requests5m = getWindowCount(metricNames.httpRequestsTotal, window5m);
+    const errors5m = getWindowCount(metricNames.httpResponsesErrorTotal, window5m);
+    const clientErrors5m = getWindowCount(metricNames.httpResponses4xxTotal, window5m);
+    const serverErrors5m = getWindowCount(metricNames.httpResponses5xxTotal, window5m);
+    const unauthorized5m = getWindowCount(metricNames.httpAuthUnauthorizedTotal, window5m);
+    const rateLimited5m = getWindowCount(metricNames.httpRateLimitedTotal, window5m);
+    const maintenanceBlocked5m = getWindowCount(metricNames.httpMaintenanceBlockedTotal, window5m);
+    const errorRate5m = requests5m > 0 ? errors5m / requests5m : 0;
+
+    lines.push(`wa_http_requests_5m ${requests5m}`);
+    lines.push(`wa_http_errors_5m ${errors5m}`);
+    lines.push(`wa_http_4xx_5m ${clientErrors5m}`);
+    lines.push(`wa_http_5xx_5m ${serverErrors5m}`);
+    lines.push(`wa_http_unauthorized_5m ${unauthorized5m}`);
+    lines.push(`wa_http_rate_limited_5m ${rateLimited5m}`);
+    lines.push(`wa_http_maintenance_blocked_5m ${maintenanceBlocked5m}`);
+    lines.push(`wa_http_error_rate_5m ${errorRate5m.toFixed(4)}`);
+
+    const httpDuration5m = getHttpDurationWindowStats(window5m);
+    if (httpDuration5m) {
+      lines.push(`wa_http_request_duration_count_5m ${httpDuration5m.count}`);
+      lines.push(`wa_http_request_duration_avg_ms_5m ${httpDuration5m.avg.toFixed(2)}`);
+      lines.push(`wa_http_request_duration_p95_ms_5m ${httpDuration5m.p95.toFixed(2)}`);
+      lines.push(`wa_http_request_duration_p99_ms_5m ${httpDuration5m.p99.toFixed(2)}`);
+      lines.push(`wa_http_request_duration_max_ms_5m ${httpDuration5m.max.toFixed(2)}`);
+    }
+
+    const httpErrorRateThreshold = readOptionalNumberEnv('ALERT_HTTP_ERROR_RATE_5M');
+    if (httpErrorRateThreshold !== null) {
+      const exceeded = requests5m > 0 ? errorRate5m > httpErrorRateThreshold : false;
+      lines.push(`wa_alert_http_error_rate_5m_exceeded ${exceeded ? 1 : 0}`);
+    }
+
+    const http5xxThreshold = readOptionalNumberEnv('ALERT_HTTP_5XX_5M');
+    if (http5xxThreshold !== null) {
+      lines.push(`wa_alert_http_5xx_5m_exceeded ${serverErrors5m > http5xxThreshold ? 1 : 0}`);
+    }
+
+    const httpP95Threshold = readOptionalNumberEnv('ALERT_HTTP_P95_MS_5M');
+    if (httpP95Threshold !== null && httpDuration5m) {
+      lines.push(`wa_alert_http_p95_ms_5m_exceeded ${httpDuration5m.p95 > httpP95Threshold ? 1 : 0}`);
+    }
+
+    const eventLoopP99Threshold = readOptionalNumberEnv('ALERT_RUNTIME_EVENT_LOOP_P99_MS');
+    if (eventLoopP99Threshold !== null && !isTestProcess) {
+      const lagP99Ms = eventLoopDelayMonitor.percentile(99) / 1_000_000;
+      if (Number.isFinite(lagP99Ms)) {
+        lines.push(`wa_alert_runtime_event_loop_p99_ms_exceeded ${lagP99Ms > eventLoopP99Threshold ? 1 : 0}`);
+      }
+    }
+
     const depthThresh = Number(process.env.ALERT_QUEUE_DEPTH || '');
     if (!isNaN(depthThresh)) lines.push(`wa_alert_queue_depth_exceeded ${snap.queued > depthThresh ? 1 : 0}`);
 
@@ -17373,8 +17652,6 @@ export function createApp(options: CreateAppOptions = {}){
 
     // Billing alert-style gauges computed from in-memory rolling windows.
     // Intended as a lightweight alternative when no external alerting exists.
-    const window15m = 15 * 60 * 1000;
-    const window24h = 24 * 60 * 60 * 1000;
 
     const sig15 = getWindowCount('billing_webhook_signature_failures_total', window15m, { provider: 'razorpay' });
     const json15 = getWindowCount('billing_webhook_invalid_json_total', window15m, { provider: 'razorpay' });
@@ -17393,15 +17670,29 @@ export function createApp(options: CreateAppOptions = {}){
     // Backfill freshness: how long since the scheduler last ran.
     // Note: this tracks only the in-process scheduler, not manual CLI runs.
     const backfillStatus = getBillingBackfillSchedulerStatus();
-    const lastBackfillIso = backfillStatus.lastRunAt;
-    let backfillAgeSeconds: number | null = null;
-    if (lastBackfillIso) {
-      const t = Date.parse(lastBackfillIso);
-      if (!Number.isNaN(t)) {
-        backfillAgeSeconds = Math.max(0, Math.floor((Date.now() - t) / 1000));
-      }
-    }
+    const backfillAgeSeconds = secondsSinceIso(backfillStatus.lastRunAt);
+    lines.push(`wa_billing_backfill_scheduler_enabled ${backfillStatus.enabled ? 1 : 0}`);
+    lines.push(`wa_billing_backfill_scheduler_started ${backfillStatus.schedulerStarted ? 1 : 0}`);
+    lines.push(`wa_billing_backfill_scheduler_running ${backfillStatus.isRunning ? 1 : 0}`);
     lines.push(`wa_billing_backfill_last_run_age_seconds ${backfillAgeSeconds ?? -1}`);
+
+    const playReconcileStatus = getPlayBillingReconcileSchedulerStatus();
+    const playReconcileAgeSeconds = secondsSinceIso(playReconcileStatus.lastRunAt);
+    const playReconcileNextRunInSeconds = secondsUntilIso(playReconcileStatus.nextRunAt);
+    lines.push(`wa_billing_play_reconcile_scheduler_enabled ${playReconcileStatus.enabled ? 1 : 0}`);
+    lines.push(`wa_billing_play_reconcile_scheduler_started ${playReconcileStatus.schedulerStarted ? 1 : 0}`);
+    lines.push(`wa_billing_play_reconcile_scheduler_running ${playReconcileStatus.isRunning ? 1 : 0}`);
+    lines.push(`wa_billing_play_reconcile_last_run_age_seconds ${playReconcileAgeSeconds ?? -1}`);
+    lines.push(`wa_billing_play_reconcile_next_run_in_seconds ${playReconcileNextRunInSeconds ?? -1}`);
+
+    const dailyQuoteStatus = getDailyQuoteSchedulerStatus();
+    const dailyQuoteLastRunAgeSeconds = secondsSinceIso(dailyQuoteStatus.lastRunAt);
+    const dailyQuoteNextRunInSeconds = secondsUntilIso(dailyQuoteStatus.nextRunAt);
+    lines.push(`wa_daily_quotes_scheduler_enabled ${dailyQuoteStatus.enabled ? 1 : 0}`);
+    lines.push(`wa_daily_quotes_scheduler_started ${dailyQuoteStatus.schedulerStarted ? 1 : 0}`);
+    lines.push(`wa_daily_quotes_scheduler_running ${dailyQuoteStatus.isRunning ? 1 : 0}`);
+    lines.push(`wa_daily_quotes_last_run_age_seconds ${dailyQuoteLastRunAgeSeconds ?? -1}`);
+    lines.push(`wa_daily_quotes_next_run_in_seconds ${dailyQuoteNextRunInSeconds ?? -1}`);
 
     const sigThreshRaw = (process.env.ALERT_BILLING_SIGNATURE_FAILURES_15M ?? '').trim();
     const sigThresh = sigThreshRaw === '' ? Number.NaN : Number(sigThreshRaw);
@@ -17442,6 +17733,20 @@ export function createApp(options: CreateAppOptions = {}){
       // This avoids false positives right after deployment/startup.
       const exceeded = backfillAgeSeconds !== null ? backfillAgeSeconds > staleSeconds : false;
       lines.push(`wa_alert_billing_backfill_stale_exceeded ${exceeded ? 1 : 0}`);
+    }
+
+    const playReconcileStaleHours = readOptionalNumberEnv('ALERT_BILLING_PLAY_RECONCILE_STALE_HOURS');
+    if (playReconcileStaleHours !== null && playReconcileStaleHours > 0) {
+      const staleSeconds = Math.max(0, Math.floor(playReconcileStaleHours * 3600));
+      const exceeded = playReconcileAgeSeconds !== null ? playReconcileAgeSeconds > staleSeconds : false;
+      lines.push(`wa_alert_billing_play_reconcile_stale_exceeded ${exceeded ? 1 : 0}`);
+    }
+
+    const dailyQuotesStaleHours = readOptionalNumberEnv('ALERT_DAILY_QUOTES_STALE_HOURS');
+    if (dailyQuotesStaleHours !== null && dailyQuotesStaleHours > 0) {
+      const staleSeconds = Math.max(0, Math.floor(dailyQuotesStaleHours * 3600));
+      const exceeded = dailyQuoteLastRunAgeSeconds !== null ? dailyQuoteLastRunAgeSeconds > staleSeconds : false;
+      lines.push(`wa_alert_daily_quotes_stale_exceeded ${exceeded ? 1 : 0}`);
     }
 
     res.type('text/plain').send(lines.join('\n') + '\n');

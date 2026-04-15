@@ -2,6 +2,20 @@ import crypto from 'crypto';
 import * as admin from 'firebase-admin';
 import { ensureFirebase } from './firebaseAdmin';
 
+interface SharedConversationWatch {
+  subscribers: Map<number, ConversationWatcherHandlers>;
+  nextSubscriberId: number;
+  cleanupFirebase: (() => void) | null;
+  initPromise: Promise<void>;
+}
+
+const sharedConversationWatches = new Map<string, SharedConversationWatch>();
+
+export interface ConversationWatchStats {
+  activeWatches: number;
+  totalSubscribers: number;
+}
+
 export interface InternalTokenPayload {
   sub?: string;
   exp?: number;
@@ -50,6 +64,18 @@ export interface ConversationWatcherHandlers {
   onStatus?: (payload: ChatStatusPayload) => void;
   onMessageUpdate?: (payload: ChatMessagePayload) => void;
   onMessageDelete?: (payload: ChatMessagePayload) => void;
+}
+
+export function getConversationWatchStats(): ConversationWatchStats {
+  let totalSubscribers = 0;
+  for (const watch of sharedConversationWatches.values()) {
+    totalSubscribers += watch.subscribers.size;
+  }
+
+  return {
+    activeWatches: sharedConversationWatches.size,
+    totalSubscribers,
+  };
 }
 
 export function normalizeEmail(value?: string | null): string {
@@ -190,89 +216,153 @@ export async function watchConversationRealtime(
   handlers: ConversationWatcherHandlers
 ): Promise<() => void> {
   ensureFirebase();
-  const db = admin.database();
   const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+  const normalizedConversationKey = typeof conversationKey === 'string' ? conversationKey.trim() : '';
   if (!normalizedTenantId) {
     throw new Error('Missing tenantId for watchConversationRealtime');
   }
-  const conversationRef = db
-    .ref('tenantChat')
-    .child(normalizedTenantId)
-    .child('conversationMessages')
-    .child(conversationKey);
-  const knownMessageIds = new Set<string>();
-  const messageCache = new Map<string, ChatMessagePayload>();
+  if (!normalizedConversationKey) {
+    throw new Error('Missing conversationKey for watchConversationRealtime');
+  }
 
-  const initialSnapshot = await conversationRef.once('value');
-  initialSnapshot.forEach((child) => {
-    if (child.key) {
-      knownMessageIds.add(child.key);
-      const payload = normalizeSnapshot(child, conversationKey);
-      if (payload) {
-        messageCache.set(child.key, payload);
-      }
+  const watchKey = [normalizedTenantId, normalizedConversationKey].join('::');
+  let watch = sharedConversationWatches.get(watchKey);
+
+  if (!watch) {
+    const db = admin.database();
+    const conversationRef = db
+      .ref('tenantChat')
+      .child(normalizedTenantId)
+      .child('conversationMessages')
+      .child(normalizedConversationKey);
+
+    const knownMessageIds = new Set<string>();
+    const messageCache = new Map<string, ChatMessagePayload>();
+
+    const listeners = {
+      messageListener: (snapshot: admin.database.DataSnapshot) => {
+        if (!snapshot.key) {
+          return;
+        }
+        if (knownMessageIds.has(snapshot.key)) {
+          return;
+        }
+        knownMessageIds.add(snapshot.key);
+        const payload = normalizeSnapshot(snapshot, normalizedConversationKey);
+        if (!payload) {
+          return;
+        }
+        messageCache.set(snapshot.key, payload);
+        broadcast(watchKey, (subscriber) => subscriber.onMessage?.(payload));
+      },
+      changeListener: (snapshot: admin.database.DataSnapshot) => {
+        if (!snapshot.key) {
+          return;
+        }
+
+        const payload = normalizeSnapshot(snapshot, normalizedConversationKey);
+        if (!payload) {
+          return;
+        }
+
+        const previous = messageCache.get(snapshot.key);
+        messageCache.set(snapshot.key, payload);
+
+        const statusChanged =
+          !previous ||
+          previous.delivered !== payload.delivered ||
+          previous.read !== payload.read ||
+          previous.deliveredAt !== payload.deliveredAt ||
+          previous.readAt !== payload.readAt;
+
+        if (statusChanged) {
+          const statusPayload = deriveStatusPayload(snapshot);
+          if (statusPayload) {
+            broadcast(watchKey, (subscriber) => subscriber.onStatus?.(statusPayload));
+          }
+        }
+
+        if (didMessageContentChange(previous, payload)) {
+          broadcast(watchKey, (subscriber) => subscriber.onMessageUpdate?.(payload));
+        }
+
+        if (payload.deleted && !previous?.deleted) {
+          broadcast(watchKey, (subscriber) => subscriber.onMessageDelete?.(payload));
+        }
+      },
+    };
+
+    watch = {
+      subscribers: new Map<number, ConversationWatcherHandlers>(),
+      nextSubscriberId: 1,
+      cleanupFirebase: null,
+      initPromise: Promise.resolve(),
+    };
+
+    watch.initPromise = (async () => {
+      const initialSnapshot = await conversationRef.once('value');
+      initialSnapshot.forEach((child) => {
+        if (child.key) {
+          knownMessageIds.add(child.key);
+          const payload = normalizeSnapshot(child, normalizedConversationKey);
+          if (payload) {
+            messageCache.set(child.key, payload);
+          }
+        }
+        return false;
+      });
+
+      conversationRef.on('child_added', listeners.messageListener);
+      conversationRef.on('child_changed', listeners.changeListener);
+
+      watch!.cleanupFirebase = () => {
+        conversationRef.off('child_added', listeners.messageListener);
+        conversationRef.off('child_changed', listeners.changeListener);
+      };
+    })();
+
+    sharedConversationWatches.set(watchKey, watch);
+  }
+
+  const subscriberId = watch.nextSubscriberId++;
+  watch.subscribers.set(subscriberId, handlers);
+
+  try {
+    await watch.initPromise;
+  } catch (error) {
+    watch.subscribers.delete(subscriberId);
+    if (watch.subscribers.size === 0) {
+      sharedConversationWatches.delete(watchKey);
     }
-    return false;
-  });
-
-  const messageListener = (snapshot: admin.database.DataSnapshot) => {
-    if (!snapshot.key) {
-      return;
-    }
-    if (knownMessageIds.has(snapshot.key)) {
-      return;
-    }
-    knownMessageIds.add(snapshot.key);
-    const payload = normalizeSnapshot(snapshot, conversationKey);
-    if (payload) {
-      messageCache.set(snapshot.key, payload);
-      handlers.onMessage?.(payload);
-    }
-  };
-
-  const changeListener = (snapshot: admin.database.DataSnapshot) => {
-    if (!snapshot.key) {
-      return;
-    }
-
-    const payload = normalizeSnapshot(snapshot, conversationKey);
-    if (!payload) {
-      return;
-    }
-
-    const previous = messageCache.get(snapshot.key);
-    messageCache.set(snapshot.key, payload);
-
-    const statusChanged =
-      !previous ||
-      previous.delivered !== payload.delivered ||
-      previous.read !== payload.read ||
-      previous.deliveredAt !== payload.deliveredAt ||
-      previous.readAt !== payload.readAt;
-
-    if (statusChanged) {
-      const statusPayload = deriveStatusPayload(snapshot);
-      if (statusPayload) {
-        handlers.onStatus?.(statusPayload);
-      }
-    }
-
-    if (didMessageContentChange(previous, payload)) {
-      handlers.onMessageUpdate?.(payload);
-    }
-
-    if (payload.deleted && !previous?.deleted) {
-      handlers.onMessageDelete?.(payload);
-    }
-  };
-
-  conversationRef.on('child_added', messageListener);
-  conversationRef.on('child_changed', changeListener);
+    throw error;
+  }
 
   return () => {
-    conversationRef.off('child_added', messageListener);
-    conversationRef.off('child_changed', changeListener);
+    const current = sharedConversationWatches.get(watchKey);
+    if (!current) {
+      return;
+    }
+    current.subscribers.delete(subscriberId);
+    if (current.subscribers.size === 0) {
+      current.cleanupFirebase?.();
+      sharedConversationWatches.delete(watchKey);
+    }
   };
+}
+
+function broadcast(watchKey: string, emit: (subscriber: ConversationWatcherHandlers) => void): void {
+  const watch = sharedConversationWatches.get(watchKey);
+  if (!watch || watch.subscribers.size === 0) {
+    return;
+  }
+
+  for (const subscriber of watch.subscribers.values()) {
+    try {
+      emit(subscriber);
+    } catch (error) {
+      console.warn('[chat-realtime] subscriber callback failed', error);
+    }
+  }
 }
 
 function stableStringify(value: unknown): string {

@@ -110,11 +110,17 @@ describe('tenant push notifications', () => {
 
       assert.strictEqual(response.status, 200);
       const payload = await response.json();
-      assert.deepStrictEqual(payload, { data: { status: 'ok', id: 'stub' } });
+      assert.strictEqual(payload.ok, true);
+      assert.deepStrictEqual(payload.expo, { data: { status: 'ok', id: 'stub' } });
+      assert.deepStrictEqual(payload.apns, { sent: 0, failed: 0, errors: [] });
+      assert.deepStrictEqual(payload.fcm, { sent: 0, failed: 0, errors: [] });
       assert.strictEqual(guardCalls.length, 1);
       assert.strictEqual(guardCalls[0].tenantId, 'tenant-push');
       assert.strictEqual(executorCalls.length, 1);
-      assert.strictEqual(executorCalls[0].payload.to.length, 2);
+      assert.ok(Array.isArray(executorCalls[0].payload));
+      assert.strictEqual(executorCalls[0].payload.length, 2);
+      assert.strictEqual(executorCalls[0].payload[0].to, 'ExponentPushToken[abc]');
+      assert.strictEqual(executorCalls[0].payload[1].to, 'ExponentPushToken[def]');
       assert.strictEqual(auditCalls.length, 1);
       assert.strictEqual(auditEvents.length, 1);
       assert.strictEqual(auditEvents[0].tenantId, 'tenant-push');

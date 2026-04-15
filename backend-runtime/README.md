@@ -11,7 +11,7 @@ Isolated WhatsApp queue backend with optional BullMQ (Redis) for durable process
 - Minimal WhatsApp webhook endpoint placeholder
 - Metrics endpoint (Prometheus text) with queue depth & in-flight
  - Latency histogram + counters with c8 coverage in CI (Codecov upload supported)
- - Alert gauges: queue depth & failure rate thresholds
+ - Alert gauges: queue depth, failure rate, HTTP/runtime, and chat realtime watcher thresholds
 - Dockerfile for container builds
 
 ## Environment Variables
@@ -29,6 +29,12 @@ Isolated WhatsApp queue backend with optional BullMQ (Redis) for durable process
  - REVIEWER_AUTO_APPROVE_ROLE / REVIEWER_AUTO_APPROVE_ACTOR_NAME (optional role + actor label for auto-approved requests; role supports member/staff/admin)
  - ALERT_QUEUE_DEPTH (trigger wa_alert_queue_depth_exceeded)
  - ALERT_FAILURE_RATE (0-1 float triggers wa_alert_failure_rate_exceeded)
+ - ALERT_HTTP_ERROR_RATE_5M (0-1 float triggers wa_alert_http_error_rate_5m_exceeded)
+ - ALERT_HTTP_5XX_5M (integer threshold triggers wa_alert_http_5xx_5m_exceeded)
+ - ALERT_HTTP_P95_MS_5M (ms threshold triggers wa_alert_http_p95_ms_5m_exceeded)
+ - ALERT_RUNTIME_EVENT_LOOP_P99_MS (ms threshold triggers wa_alert_runtime_event_loop_p99_ms_exceeded)
+ - ALERT_CHAT_REALTIME_WATCHES_ACTIVE (integer threshold triggers wa_alert_chat_realtime_watches_active_exceeded)
+ - ALERT_CHAT_REALTIME_WATCH_SUBSCRIBERS (integer threshold triggers wa_alert_chat_realtime_watch_subscribers_exceeded)
  - SHUTDOWN_TIMEOUT_MS (graceful shutdown max wait)
 
 ## Runtime Endpoints (Firestore)
@@ -110,6 +116,8 @@ POST /notifications/web-push/subscribe { tenantId, deviceId, subscription, notif
 POST /notifications/web-push/unsubscribe { tenantId, deviceId }
 POST /notifications/web-push/send { tenantId, deviceId, title, body, data?, tag?, requireInteraction?, clickUrl?, ttl?, urgency? }
 POST /notifications/web-push/test { tenantId, deviceId, title?, body?, type?, clickUrl?, requireInteraction? }
+
+Note: if INTERNAL_API_KEY is set, /metrics requires Authorization: Bearer <token> (internal token or master key).
 
 ## Auth
 Issue a token then use Authorization: Bearer <token>.

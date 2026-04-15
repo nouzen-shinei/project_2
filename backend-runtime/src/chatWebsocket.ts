@@ -74,7 +74,27 @@ export function setupChatWebsocket(server: Server): void {
     }
 
     try {
-      const cleanup = await watchConversationRealtime(normalizedTenantId, conversationKey, {
+      let cleanup: (() => void) | null = null;
+      let heartbeat: NodeJS.Timeout | null = null;
+      let terminated = false;
+
+      const terminate = () => {
+        if (terminated) {
+          return;
+        }
+        terminated = true;
+        if (heartbeat) {
+          clearInterval(heartbeat);
+          heartbeat = null;
+        }
+        cleanup?.();
+        cleanup = null;
+      };
+
+      socket.on('close', terminate);
+      socket.on('error', terminate);
+
+      cleanup = await watchConversationRealtime(normalizedTenantId, conversationKey, {
         onMessage: (message) => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: 'message', payload: message }));
@@ -97,23 +117,20 @@ export function setupChatWebsocket(server: Server): void {
         },
       });
 
+      if (socket.readyState !== WebSocket.OPEN) {
+        terminate();
+        return;
+      }
+
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: 'ready', payload: { tenantId: normalizedTenantId, conversationKey } }));
       }
 
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
         }
       }, 25000);
-
-      const terminate = () => {
-        clearInterval(heartbeat);
-        cleanup();
-      };
-
-      socket.on('close', terminate);
-      socket.on('error', terminate);
     } catch (error) {
       console.error('[chat-ws] watch failed', error);
       if (socket.readyState === WebSocket.OPEN) {

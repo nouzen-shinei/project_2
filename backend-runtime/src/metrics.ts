@@ -16,6 +16,13 @@ const DEFAULT_WINDOWED_METRICS = new Set([
   'billing_webhook_unknown_events_total',
   'billing_invoice_write_failures_total',
   'billing_state_write_failures_total',
+  'wa_http_requests_total',
+  'wa_http_responses_error_total',
+  'wa_http_responses_4xx_total',
+  'wa_http_responses_5xx_total',
+  'wa_http_auth_unauthorized_total',
+  'wa_http_rate_limited_total',
+  'wa_http_maintenance_blocked_total',
 ]);
 
 function getWindowedAllowlist(): Set<string> {
@@ -107,6 +114,14 @@ export const metricNames = {
   cspViolation: 'wa_csp_violation_total',
   cspViolationPersistFailure: 'wa_csp_violation_persist_failure_total',
   cspViolationPruned: 'wa_csp_violation_pruned_total',
+  httpRequestsTotal: 'wa_http_requests_total',
+  httpResponsesTotal: 'wa_http_responses_total',
+  httpResponsesErrorTotal: 'wa_http_responses_error_total',
+  httpResponses4xxTotal: 'wa_http_responses_4xx_total',
+  httpResponses5xxTotal: 'wa_http_responses_5xx_total',
+  httpAuthUnauthorizedTotal: 'wa_http_auth_unauthorized_total',
+  httpRateLimitedTotal: 'wa_http_rate_limited_total',
+  httpMaintenanceBlockedTotal: 'wa_http_maintenance_blocked_total',
   storageUploadPreflightRequests: 'storage_upload_preflight_requests_total',
   storageUploadPreflightAllowed: 'storage_upload_preflight_allowed_total',
   storageUploadPreflightBlocked: 'storage_upload_preflight_blocked_total',
