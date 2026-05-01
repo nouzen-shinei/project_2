@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
@@ -127,6 +127,11 @@ export function StickerGifPicker({
   const [hasMoreStickers, setHasMoreStickers] = useState(true);
   const [hasMoreGifs, setHasMoreGifs] = useState(true);
   const scrollViewRef = useRef<ScrollView>(null);
+  const stickerLoadMoreInFlightRef = useRef(false);
+  const gifLoadMoreInFlightRef = useRef(false);
+  const trimmedSearchQuery = searchQuery.trim();
+  const normalizedSearchQuery = trimmedSearchQuery.toLowerCase();
+  const hasSearchQuery = normalizedSearchQuery.length > 0;
 
   // Convert Tenor result to Sticker format
   // On native builds, WebP rendering can be limited; prefer GIF variants for reliability.
@@ -298,57 +303,101 @@ export function StickerGifPicker({
     }
   };
 
+  const handleSearchQueryChange = useCallback((value: string) => {
+    setSearchQuery((current) => (current === value ? current : value));
+  }, []);
+
+  const handleLoadMoreStickers = useCallback(() => {
+    if (!hasMoreStickers || isLoadingMore || isLoadingStickers || stickerLoadMoreInFlightRef.current) {
+      return;
+    }
+
+    stickerLoadMoreInFlightRef.current = true;
+    const loadMoreQuery = hasSearchQuery ? trimmedSearchQuery : undefined;
+
+    Promise.resolve(fetchStickers(loadMoreQuery, true))
+      .catch((error) => {
+        logger.error('Error loading more stickers:', error);
+      })
+      .finally(() => {
+        stickerLoadMoreInFlightRef.current = false;
+      });
+  }, [hasMoreStickers, isLoadingMore, isLoadingStickers, hasSearchQuery, trimmedSearchQuery]);
+
+  const handleLoadMoreGifs = useCallback(() => {
+    if (!hasMoreGifs || isLoadingMore || isLoadingGifs || gifLoadMoreInFlightRef.current) {
+      return;
+    }
+
+    gifLoadMoreInFlightRef.current = true;
+    const loadMoreQuery = hasSearchQuery ? trimmedSearchQuery : undefined;
+
+    Promise.resolve(fetchGifs(loadMoreQuery, true))
+      .catch((error) => {
+        logger.error('Error loading more GIFs:', error);
+      })
+      .finally(() => {
+        gifLoadMoreInFlightRef.current = false;
+      });
+  }, [hasMoreGifs, isLoadingMore, isLoadingGifs, hasSearchQuery, trimmedSearchQuery]);
+
   // Handle infinite scroll
-  const handleScroll = (event: any) => {
+  const handleScroll = useCallback((event: any) => {
     const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;
     const paddingToBottom = 100; // Load more when 100px from bottom
-    
-    if (layoutMeasurement.height + contentOffset.y >= contentSize.height - paddingToBottom) {
-      if (activeTab === 'stickers' && hasMoreStickers && !isLoadingMore && !isLoadingStickers) {
-        fetchStickers(searchQuery || undefined, true);
-      } else if (activeTab === 'gifs' && hasMoreGifs && !isLoadingMore && !isLoadingGifs) {
-        fetchGifs(searchQuery || undefined, true);
-      }
+
+    if (layoutMeasurement.height + contentOffset.y < contentSize.height - paddingToBottom) {
+      return;
     }
-  };
+
+    if (activeTab === 'stickers') {
+      handleLoadMoreStickers();
+      return;
+    }
+
+    handleLoadMoreGifs();
+  }, [activeTab, handleLoadMoreGifs, handleLoadMoreStickers]);
 
   // Filter stickers based on search
-  const filteredStickers = stickers.filter((sticker: Sticker) => {
-    if (!searchQuery.trim()) return true; // Show all when no search query
-    const searchLower = searchQuery.toLowerCase();
-    return (
-      sticker.name.toLowerCase().includes(searchLower) ||
-      sticker.pack.toLowerCase().includes(searchLower)
-    );
-  });
+  const filteredStickers = useMemo(() => {
+    if (!hasSearchQuery) {
+      return stickers;
+    }
+
+    return stickers.filter((sticker: Sticker) => {
+      return (
+        sticker.name.toLowerCase().includes(normalizedSearchQuery) ||
+        sticker.pack.toLowerCase().includes(normalizedSearchQuery)
+      );
+    });
+  }, [hasSearchQuery, normalizedSearchQuery, stickers]);
 
   // Filter GIFs based on search
-  const filteredGifs = gifs.filter((gif: GifData) => {
-    if (!searchQuery.trim()) return true; // Show all when no search query
-    const searchLower = searchQuery.toLowerCase();
-    return (
-      gif.title.toLowerCase().includes(searchLower) ||
-      gif.source.toLowerCase().includes(searchLower)
-    );
-  });
+  const filteredGifs = useMemo(() => {
+    if (!hasSearchQuery) {
+      return gifs;
+    }
 
-  // Debug logging for filtered results
-  useEffect(() => {
-    // Removed debug logs for cleaner console output
-  }, [stickers, gifs, filteredStickers, filteredGifs, searchQuery]);
+    return gifs.filter((gif: GifData) => {
+      return (
+        gif.title.toLowerCase().includes(normalizedSearchQuery) ||
+        gif.source.toLowerCase().includes(normalizedSearchQuery)
+      );
+    });
+  }, [gifs, hasSearchQuery, normalizedSearchQuery]);
 
   // Handle search with debouncing
   useEffect(() => {
     const timeoutId = setTimeout(() => {
       if (activeTab === 'stickers') {
-        if (searchQuery.trim()) {
-          fetchStickers(searchQuery);
+        if (hasSearchQuery) {
+          fetchStickers(trimmedSearchQuery);
         } else {
           fetchStickers();
         }
       } else {
-        if (searchQuery.trim()) {
-          fetchGifs(searchQuery);
+        if (hasSearchQuery) {
+          fetchGifs(trimmedSearchQuery);
         } else {
           fetchGifs();
         }
@@ -356,7 +405,7 @@ export function StickerGifPicker({
     }, 300);
 
     return () => clearTimeout(timeoutId);
-  }, [searchQuery, activeTab, selectedCategory]);
+  }, [activeTab, hasSearchQuery, selectedCategory, trimmedSearchQuery]);
 
   // Load initial content when tab changes or category changes
   useEffect(() => {
@@ -369,19 +418,17 @@ export function StickerGifPicker({
     }
   }, [visible, activeTab, selectedCategory]);
 
-  const handleStickerSelect = (sticker: Sticker) => {
+  const handleStickerSelect = useCallback((sticker: Sticker) => {
     onSelectSticker(sticker);
     onClose();
-  };
+  }, [onClose, onSelectSticker]);
 
-  const handleGifSelect = (gif: GifData) => {
+  const handleGifSelect = useCallback((gif: GifData) => {
     onSelectGif(gif);
     onClose();
-  };
+  }, [onClose, onSelectGif]);
 
-  if (!visible) return null;
-
-  const styles = StyleSheet.create({
+  const styles = useMemo(() => StyleSheet.create({
     overlay: {
       position: 'absolute',
       top: 0,
@@ -453,6 +500,11 @@ export function StickerGifPicker({
       borderWidth: 1,
       borderColor: theme.border,
     },
+    searchIcon: {
+      position: 'absolute',
+      right: 12,
+      top: 12,
+    },
     content: {
       flex: 1,
     },
@@ -514,6 +566,14 @@ export function StickerGifPicker({
       shadowRadius: 2,
       elevation: 2,
     },
+    gifGridItem: {
+      height: ITEM_SIZE * 0.75,
+    },
+    gridWrap: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'space-between',
+    },
     stickerText: {
       fontSize: 32,
     },
@@ -559,7 +619,9 @@ export function StickerGifPicker({
       color: theme.textSecondary,
       textAlign: 'center',
     },
-  });
+  }), [theme]);
+
+  if (!visible) return null;
 
   return (
     <View style={styles.overlay}>
@@ -618,16 +680,12 @@ export function StickerGifPicker({
               placeholder={`Search ${activeTab}...`}
               placeholderTextColor={theme.textSecondary}
               value={searchQuery}
-              onChangeText={setSearchQuery}
+              onChangeText={handleSearchQueryChange}
             />
             <Search
               size={20}
               color={theme.textSecondary}
-              style={{
-                position: 'absolute',
-                right: 12,
-                top: 12,
-              }}
+              style={styles.searchIcon}
             />
           </View>
         </View>
@@ -681,11 +739,7 @@ export function StickerGifPicker({
                 ) : (
                   <>
                     <View
-                      style={{
-                        flexDirection: 'row',
-                        flexWrap: 'wrap',
-                        justifyContent: 'space-between',
-                      }}
+                      style={styles.gridWrap}
                     >
                       {filteredStickers.map((sticker: Sticker) => (
                         <TouchableOpacity
@@ -712,8 +766,8 @@ export function StickerGifPicker({
                 {!isLoadingStickers && filteredStickers.length === 0 && (
                   <View style={styles.emptyContainer}>
                     <Text style={styles.emptyText}>
-                      {searchQuery
-                        ? `No stickers found for "${searchQuery}"`
+                      {hasSearchQuery
+                        ? `No stickers found for "${trimmedSearchQuery}"`
                         : 'No stickers available'}
                     </Text>
                   </View>
@@ -737,16 +791,12 @@ export function StickerGifPicker({
               ) : (
                 <>
                   <View
-                    style={{
-                      flexDirection: 'row',
-                      flexWrap: 'wrap',
-                      justifyContent: 'space-between',
-                    }}
+                    style={styles.gridWrap}
                   >
                     {filteredGifs.map((gif: GifData) => (
                       <TouchableOpacity
                         key={gif.id}
-                        style={[styles.gridItem, { height: ITEM_SIZE * 0.75 }]}
+                        style={[styles.gridItem, styles.gifGridItem]}
                         onPress={() => handleGifSelect(gif)}
                       >
                         <Image
@@ -768,8 +818,8 @@ export function StickerGifPicker({
               {!isLoadingGifs && filteredGifs.length === 0 && (
                 <View style={styles.emptyContainer}>
                   <Text style={styles.emptyText}>
-                    {searchQuery
-                      ? `No GIFs found for "${searchQuery}"`
+                    {hasSearchQuery
+                      ? `No GIFs found for "${trimmedSearchQuery}"`
                       : 'No GIFs available'}
                   </Text>
                 </View>

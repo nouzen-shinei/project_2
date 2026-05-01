@@ -100,6 +100,18 @@ export interface GifPayload {
   source?: string;
 }
 
+export interface ChatReplyContextPayload {
+  messageId: string;
+  sender: string;
+  senderName?: string;
+  text?: string;
+  isSpecial?: boolean;
+  hasAttachments?: boolean;
+  attachmentCount?: number;
+  hasSticker?: boolean;
+  hasGif?: boolean;
+}
+
 export interface SendChatMessageInput {
   senderEmail: string;
   recipientEmail: string;
@@ -112,6 +124,7 @@ export interface SendChatMessageInput {
   fileSize?: number;
   thumbnailUrl?: string;
   attachments?: FileAttachment[];
+  replyTo?: ChatReplyContextPayload;
   sticker?: StickerPayload;
   gif?: GifPayload;
   delivered?: boolean;
@@ -149,6 +162,7 @@ export interface ChatMessageRecord {
   fileSize?: number;
   thumbnailUrl?: string;
   attachments?: FileAttachment[];
+  replyTo?: ChatReplyContextPayload;
   sticker?: StickerPayload;
   gif?: GifPayload;
   delivered: boolean;
@@ -1249,6 +1263,7 @@ async function loadMessageContext(
     fileSize: typeof raw.fileSize === 'number' ? raw.fileSize : undefined,
     thumbnailUrl: typeof raw.thumbnailUrl === 'string' ? raw.thumbnailUrl : undefined,
     attachments: Array.isArray(raw.attachments) ? (raw.attachments as FileAttachment[]) : undefined,
+    replyTo: normalizeReplyContextPayload(raw.replyTo),
     sticker: raw.sticker as StickerPayload | undefined,
     gif: raw.gif as GifPayload | undefined,
     delivered: Boolean(raw.delivered),
@@ -1418,6 +1433,45 @@ function isTextEditableMessage(message: ChatMessageRecord): boolean {
   return text.length > 0;
 }
 
+function normalizeReplyContextPayload(input: unknown): ChatReplyContextPayload | undefined {
+  if (!input || typeof input !== 'object') {
+    return undefined;
+  }
+
+  const raw = input as Record<string, unknown>;
+  const messageId = typeof raw.messageId === 'string' ? raw.messageId.trim() : '';
+  const sender = normalizeEmail(typeof raw.sender === 'string' ? raw.sender : undefined);
+  if (!messageId || !sender) {
+    return undefined;
+  }
+
+  const senderName = typeof raw.senderName === 'string' ? raw.senderName.trim() : '';
+  const normalizedText = typeof raw.text === 'string'
+    ? raw.text.replace(/\s+/g, ' ').trim()
+    : '';
+
+  const attachmentCountCandidate = Number(raw.attachmentCount);
+  const attachmentCount = Number.isFinite(attachmentCountCandidate) && attachmentCountCandidate > 0
+    ? Math.trunc(attachmentCountCandidate)
+    : undefined;
+
+  const hasAttachments = Boolean(raw.hasAttachments) || Boolean(attachmentCount);
+  const hasSticker = raw.hasSticker === true;
+  const hasGif = raw.hasGif === true;
+
+  return pruneUndefined({
+    messageId,
+    sender,
+    senderName: senderName || undefined,
+    text: normalizedText || undefined,
+    isSpecial: raw.isSpecial === true ? true : undefined,
+    hasAttachments: hasAttachments ? true : undefined,
+    attachmentCount,
+    hasSticker: hasSticker ? true : undefined,
+    hasGif: hasGif ? true : undefined,
+  });
+}
+
 export async function sendChatMessage(input: SendChatMessageInput): Promise<ChatMessageRecord> {
   ensureFirebase();
   const db = admin.database();
@@ -1471,6 +1525,7 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
     fileSize: input.fileSize,
     thumbnailUrl: input.thumbnailUrl,
     attachments,
+    replyTo: normalizeReplyContextPayload(input.replyTo),
     sticker: input.sticker,
     gif: input.gif,
     delivered: Boolean(input.delivered),

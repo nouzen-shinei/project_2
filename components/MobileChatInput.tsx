@@ -1,19 +1,17 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle, memo, useMemo } from 'react';
+import React, { useState, useRef, useCallback, forwardRef, useImperativeHandle, memo, useMemo, useEffect } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TextInput,
+  NativeSyntheticEvent,
+  TextInputContentSizeChangeEventData,
+  TextInputKeyPressEventData,
   TouchableOpacity,
   ActivityIndicator,
   Platform,
-  Keyboard,
-  KeyboardAvoidingView,
-  Animated,
-  Dimensions,
-  UIManager,
-  findNodeHandle,
+  useWindowDimensions,
 } from 'react-native';
 import {
   Send,
@@ -24,7 +22,7 @@ import {
   Star,
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
-import RichEditText, { RichEditTextRef } from './RichEditText';
+import { resolveChatInputKeyboardCommand } from '../lib/chatInputKeyboardCommands';
 import StyledText from './StyledText';
 
 export interface MobileChatInputRef {
@@ -33,19 +31,44 @@ export interface MobileChatInputRef {
   syncValueFromParent: (value: string) => void;
 }
 
+interface MobileChatInputRecipient {
+  id?: string | number | null;
+  email?: string | null;
+  name?: string | null;
+}
+
+const COMPOSER_BUTTON_HIT_SLOP = { top: 8, right: 8, bottom: 8, left: 8 } as const;
+const COMPOSER_MIN_INPUT_HEIGHT = 40;
+const COMPOSER_MAX_INPUT_HEIGHT = 120;
+
+type ComposerKeyPressEvent = NativeSyntheticEvent<TextInputKeyPressEventData> & {
+  nativeEvent: NativeSyntheticEvent<TextInputKeyPressEventData>['nativeEvent'] & {
+    shiftKey?: boolean;
+    ctrlKey?: boolean;
+    metaKey?: boolean;
+    altKey?: boolean;
+    isComposing?: boolean;
+    repeat?: boolean;
+  };
+  preventDefault?: () => void;
+};
+
 interface MobileChatInputProps {
   message: string;
   onMessageChange: (text: string) => void;
   onSendMessage: () => void;
   onAttachmentPress: () => void;
   onStickerPress: () => void;
-  selectedTeamMember: any;
+  selectedTeamMember: MobileChatInputRecipient | null;
   isOffline: boolean;
   isComposingSpecial: boolean;
-  processingKeyboardMedia?: boolean;
-  onRichContent?: (items: any[]) => void;
   showFormattingGuide: boolean;
   onFormattingToggle: () => void;
+  isEditingMessage?: boolean;
+  onEditLastMessageShortcut?: () => void;
+  onCancelEditShortcut?: () => void;
+  onInputHeightChange?: (height: number) => void;
+  onInputBlur?: () => void;
   placeholder?: string;
   maxLength?: number;
   showCharacterCount?: boolean;
@@ -62,10 +85,13 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
   selectedTeamMember,
   isOffline,
   isComposingSpecial,
-  processingKeyboardMedia = false,
-  onRichContent,
   showFormattingGuide,
   onFormattingToggle,
+  isEditingMessage = false,
+  onEditLastMessageShortcut,
+  onCancelEditShortcut,
+  onInputHeightChange,
+  onInputBlur,
   placeholder,
   maxLength = 500,
   showCharacterCount = true,
@@ -73,201 +99,85 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
   canSend = true,
 }, ref) {
   const { theme } = useTheme();
+  const { width } = useWindowDimensions();
   const textInputRef = useRef<TextInput>(null);
-  const richTextInputRef = useRef<RichEditTextRef>(null);
-  const lastSyncedValueRef = useRef('');
-  const [inputHeight, setInputHeight] = useState(40);
-  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
-  const [isClearingInProgress, setIsClearingInProgress] = useState(false); // NEW: Clearing flag
-  // Removed remount key to avoid keyboard flicker on Android
-  const keyboardHeightAnim = useRef(new Animated.Value(0)).current;
-  
-  const screenData = Dimensions.get('window');
-  const isSmallScreen = screenData.width < 560;
+  const lastReportedInputHeightRef = useRef(COMPOSER_MIN_INPUT_HEIGHT);
+  const [inputHeight, setInputHeight] = useState(COMPOSER_MIN_INPUT_HEIGHT);
+  const isSmallScreen = width < 560;
+  const safeMessage = typeof message === 'string' ? message : '';
+  const hasSelectedTeamMember = !!selectedTeamMember;
 
-  // Keep track of keyboard state
-  useEffect(() => {
-    const keyboardWillShow = (event: any) => {
-      setIsKeyboardVisible(true);
-      const keyboardHeight = event.endCoordinates.height;
-      Animated.timing(keyboardHeightAnim, {
-        toValue: keyboardHeight,
-        duration: event.duration || 250,
-        useNativeDriver: false,
-      }).start();
-    };
-
-    const keyboardWillHide = (event: any) => {
-      setIsKeyboardVisible(false);
-      Animated.timing(keyboardHeightAnim, {
-        toValue: 0,
-        duration: event.duration || 250,
-        useNativeDriver: false,
-      }).start();
-    };
-
-    const showSubscription = Keyboard.addListener(
-      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
-      keyboardWillShow
-    );
-    const hideSubscription = Keyboard.addListener(
-      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
-      keyboardWillHide
-    );
-
-    return () => {
-      showSubscription?.remove();
-      hideSubscription?.remove();
-    };
-  }, [keyboardHeightAnim]);
+  const reportInputHeight = useCallback((nextHeight: number) => {
+    if (lastReportedInputHeightRef.current === nextHeight) {
+      return;
+    }
+    lastReportedInputHeightRef.current = nextHeight;
+    onInputHeightChange?.(nextHeight);
+  }, [onInputHeightChange]);
 
   const clearInput = useCallback(() => {
     if (__DEV__) logger.debug('MobileChatInput: clearInput');
+    onMessageChange('');
+    setInputHeight(COMPOSER_MIN_INPUT_HEIGHT);
+    reportInputHeight(COMPOSER_MIN_INPUT_HEIGHT);
 
-    const hadMessage = typeof message === 'string' && message.length > 0;
-
-    setIsClearingInProgress(true);
-
-    if (hadMessage) {
-      onMessageChange('');
-      if (__DEV__) logger.debug('MobileChatInput: state -> empty');
+    try {
+      textInputRef.current?.clear?.();
+    } catch (error) {
+      if (__DEV__) logger.debug('MobileChatInput: clearInput native clear failed', { error });
     }
+  }, [onMessageChange, reportInputHeight]);
 
-    lastSyncedValueRef.current = '';
-
-    if (Platform.OS === 'android' && richTextInputRef.current) {
-      try {
-        // Direct native clear via exposed nativeRef
-        // @ts-ignore
-        const native = richTextInputRef.current.nativeRef?.current;
-        native?.setNativeProps?.({ text: ' ', selection: { start: 1, end: 1 } });
-        setTimeout(() => native?.setNativeProps?.({ text: '', selection: { start: 0, end: 0 } }), 5);
-      } catch {}
-      try {
-        richTextInputRef.current.clear?.();
-        if (__DEV__) logger.debug('MobileChatInput: Android in-place clear');
-      } catch {}
-    } else if (textInputRef.current) {
-      textInputRef.current.clear?.();
+  useEffect(() => {
+    if (safeMessage.length > 0) {
+      return;
     }
-
-    setTimeout(() => {
-      if (Platform.OS === 'android' && richTextInputRef.current) {
-        try {
-          // @ts-ignore
-          const native = richTextInputRef.current.nativeRef?.current;
-          native?.setNativeProps?.({ text: '', selection: { start: 0, end: 0 } });
-        } catch {}
-      }
-    }, 50);
-
-    setTimeout(() => {
-      setIsClearingInProgress(false);
-      if (__DEV__) logger.debug('MobileChatInput: clear completed');
-    }, 160);
-  }, [message, onMessageChange]);
+    setInputHeight((prevHeight) => (prevHeight === COMPOSER_MIN_INPUT_HEIGHT ? prevHeight : COMPOSER_MIN_INPUT_HEIGHT));
+    reportInputHeight(COMPOSER_MIN_INPUT_HEIGHT);
+  }, [safeMessage, reportInputHeight]);
 
   const syncNativeValue = useCallback((value: string) => {
     const safeValue = typeof value === 'string' ? value : '';
-
-    if (Platform.OS === 'android' && richTextInputRef.current) {
-      const native = richTextInputRef.current?.nativeRef?.current;
-      const nodeHandle = native ? findNodeHandle(native) : null;
-      if (nodeHandle != null) {
-        try {
-          const config = UIManager.getViewManagerConfig?.('RichEditText');
-          const command = config?.Commands?.setTextFromJs ?? 'setTextFromJs';
-          UIManager.dispatchViewManagerCommand(nodeHandle, command as any, [safeValue]);
-          logger.debug('MobileChatInput: dispatched setTextFromJs command', { length: safeValue.length });
-        } catch (error) {
-          if (__DEV__) {
-            logger.debug('MobileChatInput: setTextFromJs command failed, falling back to setNativeProps', { error });
-          }
-          try {
-            native?.setNativeProps?.({ text: safeValue, selection: { start: safeValue.length, end: safeValue.length } });
-          } catch (nativeError) {
-            if (__DEV__) logger.debug('MobileChatInput: native fallback failed', { nativeError });
-          }
-        }
-      }
-    } else if (textInputRef.current) {
-      try {
-        textInputRef.current.setNativeProps?.({ text: safeValue, selection: { start: safeValue.length, end: safeValue.length } });
-        logger.info?.('MobileChatInput: synced iOS/native text input value', { length: safeValue.length });
-      } catch (error) {
-        if (__DEV__) logger.debug('MobileChatInput: syncNativeValue ios failed', { error });
-      }
+    try {
+      textInputRef.current?.setNativeProps?.({
+        text: safeValue,
+        selection: { start: safeValue.length, end: safeValue.length },
+      });
+    } catch (error) {
+      if (__DEV__) logger.debug('MobileChatInput: syncNativeValue failed', { error });
     }
-    lastSyncedValueRef.current = safeValue;
   }, []);
-
-  useEffect(() => {
-    if (isClearingInProgress) {
-      return;
-    }
-
-    const safeMessage = typeof message === 'string' ? message : '';
-
-    if (safeMessage === lastSyncedValueRef.current) {
-      return;
-    }
-
-    logger.debug('MobileChatInput: message prop changed, syncing native value', {
-      length: safeMessage.length,
-    });
-    syncNativeValue(safeMessage);
-  }, [message, isClearingInProgress, syncNativeValue]);
 
   const handleAttachmentPress = useCallback(() => {
-    // Prevent keyboard dismissal by maintaining focus
-    const currentInputRef = Platform.OS === 'ios' ? textInputRef : richTextInputRef;
-    
+    if (!hasSelectedTeamMember) {
+      return;
+    }
     onAttachmentPress();
-    
-    // Re-focus the input after a short delay to maintain keyboard
-    setTimeout(() => {
-      if (currentInputRef.current && selectedTeamMember) {
-        try {
-          currentInputRef.current.focus();
-        } catch (e) {
-          logger.debug('Focus not available');
-        }
-      }
-    }, 100);
-  }, [onAttachmentPress, selectedTeamMember]);
+  }, [hasSelectedTeamMember, onAttachmentPress]);
 
   const handleStickerPress = useCallback(() => {
-    // Prevent keyboard dismissal by maintaining focus
-    const currentInputRef = Platform.OS === 'ios' ? textInputRef : richTextInputRef;
-    
+    if (!hasSelectedTeamMember) {
+      return;
+    }
     onStickerPress();
-    
-    // Re-focus the input after a short delay to maintain keyboard
-    setTimeout(() => {
-      if (currentInputRef.current && selectedTeamMember) {
-        try {
-          currentInputRef.current.focus();
-        } catch (e) {
-          logger.debug('Focus not available');
-        }
-      }
-    }, 100);
-  }, [onStickerPress, selectedTeamMember]);
+  }, [hasSelectedTeamMember, onStickerPress]);
 
-  const handleInputSizeChange = useCallback((event: any) => {
-    const { height } = event.nativeEvent.contentSize;
-    const newHeight = Math.max(40, Math.min(120, height));
-    setInputHeight(newHeight);
-  }, []);
+  const handleInputSizeChange = useCallback((event: NativeSyntheticEvent<TextInputContentSizeChangeEventData>) => {
+    const rawHeight = Number(event?.nativeEvent?.contentSize?.height);
+    if (!Number.isFinite(rawHeight)) {
+      return;
+    }
+    const nextHeight = Math.max(COMPOSER_MIN_INPUT_HEIGHT, Math.min(COMPOSER_MAX_INPUT_HEIGHT, rawHeight));
+    setInputHeight((prevHeight) => (prevHeight === nextHeight ? prevHeight : nextHeight));
+    reportInputHeight(nextHeight);
+  }, [reportInputHeight]);
 
   const handleTyping = useCallback((text: string) => {
-    onMessageChange(text);
-    lastSyncedValueRef.current = typeof text === 'string' ? text : '';
+    onMessageChange(typeof text === 'string' ? text : '');
   }, [onMessageChange]);
 
   const generatePlaceholder = useCallback(() => {
     if (placeholder) return placeholder;
-    if (processingKeyboardMedia) return 'Processing media from keyboard...';
     if (isOffline) return 'Offline - messages will be queued';
     if (isComposingSpecial) return 'Type your special message here...';
     if (isSmallScreen) return 'Message';
@@ -276,19 +186,18 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
     const safeName = typeof rawName === 'string' ? rawName.trim() : 'team member';
     if (!safeName || safeName === '.' || safeName.length === 0) return 'Message team member...';
     return `Message ${safeName}...`;
-  }, [placeholder, processingKeyboardMedia, isOffline, isComposingSpecial, isSmallScreen, selectedTeamMember]);
+  }, [placeholder, isOffline, isComposingSpecial, isSmallScreen, selectedTeamMember]);
 
   const trimmedMessage = useMemo(() => {
-    return typeof message === 'string' ? message.trim() : '';
-  }, [message]);
+    return safeMessage.trim();
+  }, [safeMessage]);
 
   const canSendMessage = useMemo(() => {
     if (!canSend) return false;
     if (!trimmedMessage) return false;
-    if (!selectedTeamMember) return false;
-    if (processingKeyboardMedia) return false;
+    if (!hasSelectedTeamMember) return false;
     return true;
-  }, [canSend, trimmedMessage, selectedTeamMember, processingKeyboardMedia]);
+  }, [canSend, trimmedMessage, hasSelectedTeamMember]);
 
   const sendDisabled = isSendingMessage || !canSendMessage;
 
@@ -298,209 +207,243 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
     }
   }, [canSendMessage, isSendingMessage, onSendMessage]);
 
+  const handleKeyPress = useCallback((event: ComposerKeyPressEvent) => {
+    const nativeEvent = event?.nativeEvent || {};
+    const command = resolveChatInputKeyboardCommand({
+      platformOS: Platform.OS,
+      key: nativeEvent.key,
+      shiftKey: nativeEvent.shiftKey,
+      ctrlKey: nativeEvent.ctrlKey,
+      metaKey: nativeEvent.metaKey,
+      altKey: nativeEvent.altKey,
+      isComposing: nativeEvent.isComposing,
+      repeat: nativeEvent.repeat,
+      hasMessageContent: safeMessage.trim().length > 0,
+      isEditingMessage,
+    });
+
+    if (!command) {
+      return;
+    }
+
+    event?.preventDefault?.();
+    if (command === 'send-message') {
+      handleSendMessage();
+      return;
+    }
+
+    if (command === 'edit-last-message') {
+      onEditLastMessageShortcut?.();
+      return;
+    }
+
+    if (command === 'cancel-edit-message') {
+      onCancelEditShortcut?.();
+    }
+  }, [handleSendMessage, isEditingMessage, onCancelEditShortcut, onEditLastMessageShortcut, safeMessage]);
+
   // Expose methods to parent component
   useImperativeHandle(ref, () => ({
-    clearInput: () => {
-      // Use the robust, component-recreation clearing flow defined above
-      clearInput();
-    },
+    clearInput,
     focusInput: () => {
-      if (Platform.OS === 'ios' && textInputRef.current) {
-        textInputRef.current.focus();
-      } else if (Platform.OS === 'android' && richTextInputRef.current) {
-        try {
-          richTextInputRef.current.focus();
-        } catch (e) {
-          logger.debug('Focus failed');
-        }
-      }
+      textInputRef.current?.focus();
     },
     syncValueFromParent: (value: string) => {
-      setIsClearingInProgress(false);
-      logger.info?.('MobileChatInput: syncValueFromParent invoked', { length: typeof value === 'string' ? value.length : 0 });
       syncNativeValue(value);
     },
-  }));
+  }), [clearInput, syncNativeValue]);
 
   return (
-    <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 25}
-      style={styles.keyboardAvoidingView}
-    >
-      <View style={[styles.container, { backgroundColor: theme.surface, borderTopColor: theme.border }]}>
-        {/* Main Input Row */}
-        <View style={[styles.inputRow, { backgroundColor: theme.background, borderColor: theme.border }]}>
-          {/* Attachment Button */}
-          <TouchableOpacity 
-            style={[styles.iconButton, { backgroundColor: theme.surface }]}
-            onPress={handleAttachmentPress}
-            disabled={!selectedTeamMember}
-          >
-            <Paperclip size={20} color={selectedTeamMember ? theme.primary : theme.textSecondary} />
-          </TouchableOpacity>
-          
-          {/* Sticker/Emoji Button */}
-          <TouchableOpacity 
-            style={[styles.iconButton, { backgroundColor: theme.surface }]}
-            onPress={handleStickerPress}
-            disabled={!selectedTeamMember}
-          >
-            <Smile size={20} color={selectedTeamMember ? theme.primary : theme.textSecondary} />
-          </TouchableOpacity>
-          
-          {/* Text Input Container */}
-          <View style={styles.textInputContainer}>
-            {Platform.OS === 'android' ? (
-              <RichEditText
-                // @ts-ignore - RichEditText ref handling
-                ref={richTextInputRef}
-                style={[
-                  styles.textInput, 
-                  { 
-                    color: theme.text, 
-                    height: Math.max(40, inputHeight),
-                    backgroundColor: 'transparent',
-                  }
-                ]}
-                value={isClearingInProgress ? '' : message}
-                onChangeText={handleTyping}
-                onContentSizeChange={handleInputSizeChange}
-                placeholder={generatePlaceholder()}
-                placeholderTextColor={processingKeyboardMedia ? theme.primary : (isOffline ? theme.warning : theme.textSecondary)}
-                multiline={true}
-                numberOfLines={1}
-                textAlignVertical="center"
-                maxLength={maxLength}
-                editable={!!selectedTeamMember && !processingKeyboardMedia}
-                autoCorrect={false}
-                autoComplete="off"
-                blurOnSubmit={false}
-                enablesReturnKeyAutomatically={false}
-                returnKeyType="send"
-                onSubmitEditing={handleSendMessage}
-                onRichContent={onRichContent}
-                suppressChange={isClearingInProgress}
-                underlineColorAndroid="transparent"
-              />
-            ) : (
-              <TextInput
-                ref={textInputRef}
-                style={[
-                  styles.textInput, 
-                  { 
-                    color: theme.text, 
-                    height: Math.max(40, inputHeight),
-                    backgroundColor: 'transparent',
-                  }
-                ]}
-                value={isClearingInProgress ? '' : message}
-                onChangeText={handleTyping}
-                onContentSizeChange={handleInputSizeChange}
-                placeholder={generatePlaceholder()}
-                placeholderTextColor={isOffline ? theme.warning : theme.textSecondary}
-                multiline={true}
-                numberOfLines={1}
-                textAlignVertical="center"
-                maxLength={maxLength}
-                editable={!!selectedTeamMember}
-                blurOnSubmit={false}
-                enablesReturnKeyAutomatically={false}
-                returnKeyType="send"
-                onSubmitEditing={handleSendMessage}
-                underlineColorAndroid="transparent"
-              />
-            )}
-            
-            {/* Format Preview */}
-            {message && typeof message === 'string' && message.trim().length > 0 && 
-             (message.includes('***') || message.includes('**') || message.includes('*') || 
-              message.includes('__') || message.includes('~~') || message.includes('`')) && 
-             !message.includes('/special') && (
-              <View style={[styles.formatPreview, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+    <View style={[styles.container, { backgroundColor: theme.surface, borderTopColor: theme.border }]}> 
+      <View style={[styles.inputRow, { backgroundColor: theme.background, borderColor: theme.border }]}> 
+        <TouchableOpacity
+          style={[styles.iconButton, { backgroundColor: theme.surface }]}
+          onPress={handleAttachmentPress}
+          disabled={!hasSelectedTeamMember}
+          hitSlop={COMPOSER_BUTTON_HIT_SLOP}
+          testID="chat-input-attach"
+          accessibilityRole="button"
+          accessibilityLabel="Attach file"
+          accessibilityState={{ disabled: !hasSelectedTeamMember }}
+        >
+          <Paperclip size={20} color={hasSelectedTeamMember ? theme.primary : theme.textSecondary} />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.iconButton, { backgroundColor: theme.surface }]}
+          onPress={handleStickerPress}
+          disabled={!hasSelectedTeamMember}
+          hitSlop={COMPOSER_BUTTON_HIT_SLOP}
+          testID="chat-input-sticker"
+          accessibilityRole="button"
+          accessibilityLabel="Open sticker and emoji picker"
+          accessibilityState={{ disabled: !hasSelectedTeamMember }}
+        >
+          <Smile size={20} color={hasSelectedTeamMember ? theme.primary : theme.textSecondary} />
+        </TouchableOpacity>
+
+        <View style={styles.textInputContainer}>
+          <TextInput
+            ref={textInputRef}
+            style={[
+              styles.textInput,
+              {
+                color: theme.text,
+                height: Math.max(COMPOSER_MIN_INPUT_HEIGHT, inputHeight),
+                backgroundColor: 'transparent',
+              },
+            ]}
+            value={safeMessage}
+            testID="chat-input-field"
+            onChangeText={handleTyping}
+            onBlur={onInputBlur}
+            onContentSizeChange={handleInputSizeChange}
+            placeholder={generatePlaceholder()}
+            placeholderTextColor={isOffline ? theme.warning : theme.textSecondary}
+            multiline={true}
+            numberOfLines={1}
+            textAlignVertical="top"
+            maxLength={maxLength}
+            editable={hasSelectedTeamMember}
+            autoCorrect={false}
+            autoComplete="off"
+            selectionColor={theme.primary}
+            blurOnSubmit={false}
+            enablesReturnKeyAutomatically={false}
+            returnKeyType="send"
+            onSubmitEditing={Platform.OS === 'web' ? undefined : handleSendMessage}
+            onKeyPress={handleKeyPress}
+            underlineColorAndroid="transparent"
+          />
+
+          {safeMessage.trim().length > 0 &&
+            (safeMessage.includes('***') ||
+              safeMessage.includes('**') ||
+              safeMessage.includes('*') ||
+              safeMessage.includes('__') ||
+              safeMessage.includes('~~') ||
+              safeMessage.includes('`')) &&
+            !safeMessage.includes('/special') && (
+              <View style={[styles.formatPreview, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
                 <Text style={[styles.formatPreviewLabel, { color: theme.textSecondary }]}>Preview:</Text>
                 <StyledText
-                  text={message.trim() || 'Message preview'}
+                  text={safeMessage.trim() || 'Message preview'}
                   style={[styles.formatPreviewText, { color: theme.text }]}
                   linkStyle={{ color: theme.primary }}
                 />
               </View>
             )}
-          </View>
-          
-          {/* Action Buttons Row */}
-          <View style={styles.actionButtons}>
-            {/* Formatting Button */}
-            <TouchableOpacity 
-              style={[
-                styles.iconButton, 
-                { backgroundColor: showFormattingGuide ? theme.primary + '20' : theme.surface }
-              ]}
-              onPress={onFormattingToggle}
-            >
-              <Edit3 size={18} color={showFormattingGuide ? theme.primary : theme.textSecondary} />
-            </TouchableOpacity>
-            
-            {/* Send Button */}
-            <TouchableOpacity 
-              style={[
-                styles.sendButton, 
-                { 
-                  backgroundColor: canSendMessage
-                    ? (isOffline 
-                        ? theme.warning 
-                        : isComposingSpecial 
-                          ? theme.warning 
-                          : theme.primary)
-                    : theme.border,
-                  opacity: isSendingMessage ? 0.7 : 1,
-                }
-              ]}
-              onPress={handleSendMessage}
-              disabled={sendDisabled}
-            >
-              {isSendingMessage ? (
-                <ActivityIndicator size="small" color="#ffffff" />
-              ) : isOffline && canSendMessage ? (
-                <Clock size={18} color="#ffffff" />
-              ) : isComposingSpecial && canSendMessage ? (
-                <Star size={18} color="#ffffff" />
-              ) : (
-                <Send 
-                  size={18} 
-                  color={canSendMessage ? '#ffffff' : theme.textSecondary} 
-                />
-              )}
-            </TouchableOpacity>
-          </View>
         </View>
-        
-        {/* Character Count (shown when near limit) */}
-        {showCharacterCount && message.length > maxLength * 0.8 && (
-          <View style={styles.characterCount}>
-            <Text style={[
-              styles.characterCountText, 
-              { 
-                color: message.length > maxLength * 0.9 ? theme.error : theme.textSecondary 
-              }
-            ]}>
-              {message.length}/{maxLength}
-            </Text>
-          </View>
-        )}
+
+        <View style={styles.actionButtons}>
+          <TouchableOpacity
+            style={[
+              styles.iconButton,
+              { backgroundColor: showFormattingGuide ? theme.primary + '20' : theme.surface },
+            ]}
+            onPress={onFormattingToggle}
+            hitSlop={COMPOSER_BUTTON_HIT_SLOP}
+            testID="chat-input-formatting"
+            accessibilityRole="button"
+            accessibilityLabel="Toggle formatting guide"
+          >
+            <Edit3 size={18} color={showFormattingGuide ? theme.primary : theme.textSecondary} />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[
+              styles.sendButton,
+              {
+                backgroundColor: canSendMessage
+                  ? isOffline
+                    ? theme.warning
+                    : isComposingSpecial
+                      ? theme.warning
+                      : theme.primary
+                  : theme.border,
+                opacity: isSendingMessage ? 0.7 : 1,
+              },
+            ]}
+            onPress={handleSendMessage}
+            disabled={sendDisabled}
+            hitSlop={COMPOSER_BUTTON_HIT_SLOP}
+            testID="chat-input-send"
+            accessibilityRole="button"
+            accessibilityLabel="Send message"
+            accessibilityState={{ disabled: sendDisabled, busy: isSendingMessage }}
+          >
+            {isSendingMessage ? (
+              <ActivityIndicator size="small" color="#ffffff" />
+            ) : isOffline && canSendMessage ? (
+              <Clock size={18} color="#ffffff" />
+            ) : isComposingSpecial && canSendMessage ? (
+              <Star size={18} color="#ffffff" />
+            ) : (
+              <Send size={18} color={canSendMessage ? '#ffffff' : theme.textSecondary} />
+            )}
+          </TouchableOpacity>
+        </View>
       </View>
-    </KeyboardAvoidingView>
+
+      {showCharacterCount && safeMessage.length > maxLength * 0.8 && (
+        <View style={styles.characterCount}>
+          <Text
+            style={[
+              styles.characterCountText,
+              {
+                color: safeMessage.length > maxLength * 0.9 ? theme.error : theme.textSecondary,
+              },
+            ]}
+          >
+            {safeMessage.length}/{maxLength}
+          </Text>
+        </View>
+      )}
+    </View>
   );
 });
 
 MobileChatInputComponent.displayName = 'MobileChatInput';
 
-export default memo(MobileChatInputComponent);
+const getTeamMemberIdentity = (member: MobileChatInputRecipient | null) => {
+  if (!member) {
+    return '';
+  }
+
+  const idPart = member?.id != null ? String(member.id) : '';
+  const emailPart = typeof member?.email === 'string' ? member.email.trim().toLowerCase() : '';
+  const namePart = typeof member?.name === 'string' ? member.name.trim() : '';
+  return `${idPart}|${emailPart}|${namePart}`;
+};
+
+const areMobileChatInputPropsEqual = (prev: MobileChatInputProps, next: MobileChatInputProps) => {
+  return (
+    prev.message === next.message &&
+    prev.onMessageChange === next.onMessageChange &&
+    prev.onSendMessage === next.onSendMessage &&
+    prev.onAttachmentPress === next.onAttachmentPress &&
+    prev.onStickerPress === next.onStickerPress &&
+    getTeamMemberIdentity(prev.selectedTeamMember) === getTeamMemberIdentity(next.selectedTeamMember) &&
+    prev.isOffline === next.isOffline &&
+    prev.isComposingSpecial === next.isComposingSpecial &&
+    prev.showFormattingGuide === next.showFormattingGuide &&
+    prev.onFormattingToggle === next.onFormattingToggle &&
+    prev.isEditingMessage === next.isEditingMessage &&
+    prev.onEditLastMessageShortcut === next.onEditLastMessageShortcut &&
+    prev.onCancelEditShortcut === next.onCancelEditShortcut &&
+    prev.onInputHeightChange === next.onInputHeightChange &&
+    prev.onInputBlur === next.onInputBlur &&
+    prev.placeholder === next.placeholder &&
+    prev.maxLength === next.maxLength &&
+    prev.showCharacterCount === next.showCharacterCount &&
+    prev.isSendingMessage === next.isSendingMessage &&
+    prev.canSend === next.canSend
+  );
+};
+
+export default memo(MobileChatInputComponent, areMobileChatInputPropsEqual);
 
 const styles = StyleSheet.create({
-  keyboardAvoidingView: {
-    position: 'relative',
-  },
   container: {
     borderTopWidth: 1,
     paddingHorizontal: 12,
@@ -533,16 +476,16 @@ const styles = StyleSheet.create({
   textInput: {
     fontSize: 16,
     fontFamily: 'Inter-Regular',
-    minHeight: 40,
-    maxHeight: 120,
+    minHeight: COMPOSER_MIN_INPUT_HEIGHT,
+    maxHeight: COMPOSER_MAX_INPUT_HEIGHT,
     paddingVertical: 8,
     paddingHorizontal: 12,
     borderRadius: 20,
-    textAlignVertical: 'center',
+    textAlignVertical: 'top',
     includeFontPadding: false,
     ...Platform.select({
       android: {
-        textAlignVertical: 'center',
+        textAlignVertical: 'top',
       },
       ios: {
         paddingTop: 10,

@@ -7,6 +7,7 @@ import {
   startTransition,
   type SetStateAction,
 } from 'react';
+import { resolveChatAttachmentAutoText } from '@/lib/chatAttachmentMessage';
 import { getMimeTypeFromFileName } from '@/lib/fileUtils';
 import { chatService, ChatMessage, ChatMessageActionError, UploadSessionOptions } from '@/services/chatService';
 import { notificationService } from '@/services/notificationService';
@@ -21,6 +22,10 @@ export interface MessageWithAnimation extends ChatMessage {
 }
 
 type HydratedMessageState = HydratedChatMessage & { isNewMessage?: boolean };
+
+interface SendChatTextMessageOptions {
+  replyTo?: ChatMessage['replyTo'];
+}
 
 const paginationProfile = getChatPaginationProfile(Platform.OS === 'web' ? 'web' : 'native');
 const CHAT_PAGE_SIZE = paginationProfile.pageSize;
@@ -507,9 +512,9 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       recipientId,
       beginHydration,
       finalizeHydration,
+      handleMediaCached,
       isAbortError,
       isActiveConversation,
-      isAbortError,
     ]
   );
 
@@ -713,6 +718,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
   // Initial page and live tail
   useEffect(() => {
     let cancelled = false;
+    const activeHydrationAbortControllers = hydrationAbortRef.current;
 
     const bootstrapConversation = async () => {
       if (!user?.email || !recipientId) {
@@ -751,8 +757,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
 
     return () => {
       cancelled = true;
-      hydrationAbortRef.current.forEach((controller) => controller.abort());
-      hydrationAbortRef.current.clear();
+      activeHydrationAbortControllers.forEach((controller) => controller.abort());
+      activeHydrationAbortControllers.clear();
     };
   }, [
     user?.email,
@@ -1065,8 +1071,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         }
       }
 
-  let prefetched = aggressive ? null : prefetchedPageRef.current;
-  let cursorKey: string | null = null;
+      let prefetched = aggressive ? null : prefetchedPageRef.current;
       const expectedCursor = oldestCursorRef.current;
 
       if (prefetched && prefetched.cursor !== expectedCursor) {
@@ -1116,7 +1121,6 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         page = result.messages;
         pageHasMore = result.hasMore ?? cursorMetaRef.current.get(expectedCursor ?? '')?.hasMore ?? false;
         oldestTimestamp = result.oldestTimestamp ?? cursorMetaRef.current.get(expectedCursor ?? '')?.oldestTimestamp ?? expectedCursor;
-        cursorKey = expectedCursor;
       }
 
       if (!page.length) {
@@ -1216,7 +1220,12 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     isActiveConversation,
   ]);
 
-  const sendMessage = async (text: string, isSpecial: boolean = false, recipientId?: string): Promise<string> => {
+  const sendMessage = async (
+    text: string,
+    isSpecial: boolean = false,
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
+  ): Promise<string> => {
     try {
       if (!user?.email) {
         throw new Error('User not authenticated');
@@ -1227,6 +1236,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         sender: user.email,
         recipientId,
         isSpecial,
+        replyTo: options?.replyTo,
       });
 
       const timestamp = new Date().toISOString();
@@ -1238,6 +1248,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
           recipientId,
           timestamp,
           isSpecial,
+          replyTo: options?.replyTo,
         } as ChatMessage, recipientId);
       } catch (notificationError) {
         // Message write already succeeded; don't fail UI send state for push issues.
@@ -1288,7 +1299,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     fileSize?: number,
     recipientId?: string,
     onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions
+    options?: UploadSessionOptions & SendChatTextMessageOptions
   ) => {
     try {
       setError(null);
@@ -1324,17 +1335,23 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
                 cancelFn = fn;
               },
             }
-          : undefined
+          : undefined,
+        options?.replyTo
       );
+      const notificationText = resolveChatAttachmentAutoText({
+        text,
+        files: [{ fileType, fileName }],
+      });
 
       const timestamp = new Date().toISOString();
       await triggerRemoteNotification({
         id: messageId,
-        text,
+        text: notificationText,
         sender: user.email,
         recipientId,
         timestamp,
         isSpecial: false,
+        replyTo: options?.replyTo,
         attachments: [{
           url: '',
           fileName,
@@ -1350,16 +1367,16 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
 
   const sendMessageWithFiles = async (
     text: string,
-    files: Array<{
+    files: {
       uri: string;
       fileName: string;
       fileType: string;
       fileSize?: number;
       webFile?: Blob;
-    }>,
+    }[],
     recipientId?: string,
     onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions
+    options?: UploadSessionOptions & SendChatTextMessageOptions
   ): Promise<string> => {
     try {
       setError(null);
@@ -1367,7 +1384,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         throw new Error('User not authenticated');
       }
 
-      const cancelFns: Array<(() => void | Promise<void>) | undefined> = [];
+      const cancelFns: ((() => void | Promise<void>) | undefined)[] = [];
       if (options?.registerCancel) {
         options.registerCancel(async () => {
           const executions = cancelFns
@@ -1395,8 +1412,13 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
                 cancelFns.push(fn);
               },
             }
-          : undefined
+          : undefined,
+        options?.replyTo
       );
+      const notificationText = resolveChatAttachmentAutoText({
+        text,
+        files,
+      });
 
       const timestamp = new Date().toISOString();
       const attachments = files.map(file => ({
@@ -1409,11 +1431,12 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       try {
         await triggerRemoteNotification({
           id: messageId,
-          text,
+          text: notificationText,
           sender: user.email,
           recipientId,
           timestamp,
           isSpecial: false,
+          replyTo: options?.replyTo,
           attachments,
         } as ChatMessage, recipientId);
       } catch (notificationError) {
@@ -1431,7 +1454,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     text: string, 
     fileUri: string, 
     fileName: string, 
-    recipientId?: string
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
   ) => {
     try {
       setError(null);
@@ -1441,16 +1465,31 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       
       // Auto-detect mime type from file extension
       const mimeType = getMimeTypeFromFileName(fileName);
-      const messageId = await chatService.sendMessageWithFile(text, fileUri, fileName, mimeType, user.email, recipientId);
+      const messageId = await chatService.sendMessageWithFile(
+        text,
+        fileUri,
+        fileName,
+        mimeType,
+        user.email,
+        recipientId,
+        undefined,
+        undefined,
+        options?.replyTo
+      );
+      const notificationText = resolveChatAttachmentAutoText({
+        text,
+        files: [{ fileType: mimeType, fileName }],
+      });
 
       const timestamp = new Date().toISOString();
       await triggerRemoteNotification({
         id: messageId,
-        text,
+        text: notificationText,
         sender: user.email,
         recipientId,
         timestamp,
         isSpecial: false,
+        replyTo: options?.replyTo,
         attachments: [{
           url: '',
           fileName,
@@ -1468,7 +1507,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     text: string, 
     fileUri: string, 
     fileName: string, 
-    recipientId?: string
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
   ) => {
     try {
       setError(null);
@@ -1477,16 +1517,31 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       }
       
       const mimeType = getMimeTypeFromFileName(fileName);
-      const messageId = await chatService.sendMessageWithFile(text, fileUri, fileName, mimeType, user.email, recipientId);
+      const messageId = await chatService.sendMessageWithFile(
+        text,
+        fileUri,
+        fileName,
+        mimeType,
+        user.email,
+        recipientId,
+        undefined,
+        undefined,
+        options?.replyTo
+      );
+      const notificationText = resolveChatAttachmentAutoText({
+        text,
+        files: [{ fileType: mimeType, fileName }],
+      });
 
       const timestamp = new Date().toISOString();
       await triggerRemoteNotification({
         id: messageId,
-        text,
+        text: notificationText,
         sender: user.email,
         recipientId,
         timestamp,
         isSpecial: false,
+        replyTo: options?.replyTo,
         attachments: [{
           url: '',
           fileName,
@@ -1504,7 +1559,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     text: string, 
     fileUri: string, 
     fileName: string, 
-    recipientId?: string
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
   ) => {
     try {
       setError(null);
@@ -1513,16 +1569,31 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       }
       
       const mimeType = getMimeTypeFromFileName(fileName);
-      const messageId = await chatService.sendMessageWithFile(text, fileUri, fileName, mimeType, user.email, recipientId);
+      const messageId = await chatService.sendMessageWithFile(
+        text,
+        fileUri,
+        fileName,
+        mimeType,
+        user.email,
+        recipientId,
+        undefined,
+        undefined,
+        options?.replyTo
+      );
+      const notificationText = resolveChatAttachmentAutoText({
+        text,
+        files: [{ fileType: mimeType, fileName }],
+      });
 
       const timestamp = new Date().toISOString();
       await triggerRemoteNotification({
         id: messageId,
-        text,
+        text: notificationText,
         sender: user.email,
         recipientId,
         timestamp,
         isSpecial: false,
+        replyTo: options?.replyTo,
         attachments: [{
           url: '',
           fileName,
@@ -1538,12 +1609,13 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
 
   const sendMixedFiles = async (
     text: string, 
-    files: Array<{
+    files: {
       uri: string;
       fileName: string;
       detectedType?: string;
-    }>,
-    recipientId?: string
+    }[],
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
   ) => {
     try {
       setError(null);
@@ -1557,7 +1629,19 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         fileType: file.detectedType || getMimeTypeFromFileName(file.fileName),
       }));
       
-      const messageId = await chatService.sendMessageWithMultipleFiles(text, enrichedFiles, user.email, recipientId);
+      const messageId = await chatService.sendMessageWithMultipleFiles(
+        text,
+        enrichedFiles,
+        user.email,
+        recipientId,
+        undefined,
+        undefined,
+        options?.replyTo
+      );
+      const notificationText = resolveChatAttachmentAutoText({
+        text,
+        files: enrichedFiles,
+      });
 
       const timestamp = new Date().toISOString();
       const attachments = enrichedFiles.map(file => ({
@@ -1569,11 +1653,12 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
 
       await triggerRemoteNotification({
         id: messageId,
-        text,
+        text: notificationText,
         sender: user.email,
         recipientId,
         timestamp,
         isSpecial: false,
+        replyTo: options?.replyTo,
         attachments,
       } as ChatMessage, recipientId);
     } catch (err) {
@@ -1590,7 +1675,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       width?: number;
       height?: number;
     },
-    recipientId?: string
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
   ): Promise<string> => {
     try {
       setError(null);
@@ -1598,7 +1684,9 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         throw new Error('User not authenticated');
       }
       
-      const messageId = await chatService.sendSticker(sticker, user.email, recipientId);
+      const messageId = await chatService.sendSticker(sticker, user.email, recipientId, {
+        replyTo: options?.replyTo,
+      });
 
       const timestamp = new Date().toISOString();
       try {
@@ -1609,6 +1697,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
           recipientId,
           timestamp,
           isSpecial: false,
+          replyTo: options?.replyTo,
           sticker,
         } as ChatMessage, recipientId);
       } catch (notificationError) {
@@ -1631,7 +1720,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       title?: string;
       source?: string;
     },
-    recipientId?: string
+    recipientId?: string,
+    options?: SendChatTextMessageOptions
   ): Promise<string> => {
     try {
       setError(null);
@@ -1639,7 +1729,9 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         throw new Error('User not authenticated');
       }
       
-      const messageId = await chatService.sendGif(gif, user.email, recipientId);
+      const messageId = await chatService.sendGif(gif, user.email, recipientId, {
+        replyTo: options?.replyTo,
+      });
 
       const timestamp = new Date().toISOString();
       try {
@@ -1650,6 +1742,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
           recipientId,
           timestamp,
           isSpecial: false,
+          replyTo: options?.replyTo,
           gif,
         } as ChatMessage, recipientId);
       } catch (notificationError) {

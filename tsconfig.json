@@ -6,7 +6,6 @@
   "esModuleInterop": true,
   "allowSyntheticDefaultImports": true,
   "moduleSuffixes": [".native", ".web", ""],
-  "baseUrl": ".",
       "paths": {
         "@/*": ["./*"]
       }

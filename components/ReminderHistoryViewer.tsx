@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -21,7 +21,6 @@ import {
   PhoneCall,
   User,
   Calendar,
-  Filter,
   RefreshCw,
   Search,
   X,
@@ -31,7 +30,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useReminderHistory } from '../hooks/useReminderHistory';
 import { useAuth } from '../hooks/useAuthUnified';
 import { settingsService } from '../services/settingsService';
-import { ReminderHistoryEntry, reminderHistoryService } from '../services/reminderHistoryService';
+import { ReminderHistoryEntry } from '../services/reminderHistoryService';
 
 interface ReminderHistoryViewerProps {
   studentId?: string;
@@ -39,6 +38,505 @@ interface ReminderHistoryViewerProps {
   limit?: number;
   onClose?: () => void;
 }
+
+const WINDOW_DAY_OPTIONS = ['7', '30', '90', 'all'] as const;
+const STATUS_FILTER_OPTIONS = ['all', 'success', 'failed', 'pending'] as const;
+const TYPE_FILTER_OPTIONS = ['all', 'email', 'sms', 'whatsapp', 'voice'] as const;
+const STATUS_FILTER_LABELS: Record<(typeof STATUS_FILTER_OPTIONS)[number], string> = {
+  all: 'All Status',
+  success: 'Success',
+  failed: 'Failed',
+  pending: 'Pending',
+};
+const TYPE_FILTER_LABELS: Record<(typeof TYPE_FILTER_OPTIONS)[number], string> = {
+  all: 'All Types',
+  email: 'Email',
+  sms: 'SMS',
+  whatsapp: 'WhatsApp',
+  voice: 'Voice',
+};
+type ReminderWindowDays = 7 | 30 | 90 | 'all';
+type ReminderStatusFilter = (typeof STATUS_FILTER_OPTIONS)[number];
+type ReminderTypeFilter = (typeof TYPE_FILTER_OPTIONS)[number];
+type ReminderStatTone = 'primary' | 'success' | 'error' | 'warning' | 'secondary';
+
+function toReminderWindowDays(value: (typeof WINDOW_DAY_OPTIONS)[number]): ReminderWindowDays {
+  switch (value) {
+    case '7':
+      return 7;
+    case '30':
+      return 30;
+    case '90':
+      return 90;
+    default:
+      return 'all';
+  }
+}
+
+function normalizeTypeFilter(value: string | null | undefined): ReminderTypeFilter {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  switch (normalized) {
+    case 'email':
+    case 'sms':
+    case 'whatsapp':
+    case 'voice':
+    case 'all':
+      return normalized;
+    default:
+      return 'all';
+  }
+}
+
+function formatReminderAmount(amount: number | null | undefined): string {
+  const normalizedAmount = Number.isFinite(Number(amount)) ? Number(amount) : 0;
+  return `₹${normalizedAmount.toLocaleString()}`;
+}
+
+function getReminderTimestampKey(timestamp: unknown): string {
+  if (!timestamp) {
+    return 'unknown-time';
+  }
+
+  if (timestamp instanceof Date) {
+    return String(timestamp.getTime());
+  }
+
+  if (typeof timestamp === 'string' || typeof timestamp === 'number') {
+    return String(timestamp);
+  }
+
+  if (typeof timestamp === 'object') {
+    const ts = timestamp as {
+      toMillis?: () => number;
+      toDate?: () => Date;
+      seconds?: number;
+      nanoseconds?: number;
+    };
+
+    if (typeof ts.toMillis === 'function') {
+      const millis = ts.toMillis();
+      if (Number.isFinite(millis)) {
+        return String(millis);
+      }
+    }
+
+    if (typeof ts.toDate === 'function') {
+      const date = ts.toDate();
+      if (date instanceof Date && Number.isFinite(date.getTime())) {
+        return String(date.getTime());
+      }
+    }
+
+    if (typeof ts.seconds === 'number') {
+      return `${ts.seconds}:${typeof ts.nanoseconds === 'number' ? ts.nanoseconds : 0}`;
+    }
+  }
+
+  return String(timestamp);
+}
+
+function buildReminderStableFallbackKey(item: ReminderHistoryEntry): string {
+  return [
+    item.tenantId,
+    item.studentId,
+    item.reminderType,
+    getReminderTimestampKey(item.createdAt),
+    getReminderTimestampKey(item.updatedAt),
+    item.status,
+    item.parentContact,
+    item.parentEmail,
+    String(item.amount),
+    item.dueDate,
+  ]
+    .map((part) => String(part || ''))
+    .join('|');
+}
+
+interface ReminderHistoryListItemProps {
+  item: ReminderHistoryEntry;
+  styles: Record<string, any>;
+  formattedDate: string;
+  amountLabel: string;
+  textColor: string;
+  textSecondaryColor: string;
+  successColor: string;
+  errorColor: string;
+  warningColor: string;
+}
+
+interface ReminderHistoryDisplayInfo {
+  formattedDate: string;
+  amountLabel: string;
+}
+
+const ReminderHistoryListItem = React.memo(function ReminderHistoryListItem({
+  item,
+  styles,
+  formattedDate,
+  amountLabel,
+  textColor,
+  textSecondaryColor,
+  successColor,
+  errorColor,
+  warningColor,
+}: ReminderHistoryListItemProps) {
+  const iconSize = 16;
+  let typeIcon: React.ReactNode;
+  switch (item.reminderType) {
+    case 'email':
+      typeIcon = <Mail size={iconSize} color={textColor} />;
+      break;
+    case 'sms':
+      typeIcon = <MessageSquare size={iconSize} color={textColor} />;
+      break;
+    case 'whatsapp':
+      typeIcon = <FontAwesome name="whatsapp" size={iconSize} color={textColor} />;
+      break;
+    case 'voice':
+      typeIcon = <PhoneCall size={iconSize} color={textColor} />;
+      break;
+    default:
+      typeIcon = <Phone size={iconSize} color={textColor} />;
+      break;
+  }
+
+  let statusIcon: React.ReactNode;
+  switch (item.status) {
+    case 'success':
+      statusIcon = <CheckCircle size={iconSize} color={successColor} />;
+      break;
+    case 'failed':
+      statusIcon = <XCircle size={iconSize} color={errorColor} />;
+      break;
+    default:
+      statusIcon = <Clock size={iconSize} color={warningColor} />;
+      break;
+  }
+
+  return (
+    <View style={styles.historyItem}>
+      <View style={styles.historyHeader}>
+        <View style={styles.studentInfo}>
+          <User size={iconSize} color={textSecondaryColor} />
+          <Text style={styles.studentName}>{item.studentName}</Text>
+        </View>
+        <View style={styles.statusContainer}>
+          {typeIcon}
+          {statusIcon}
+        </View>
+      </View>
+
+      <View style={styles.historyDetails}>
+        <View style={styles.detailRow}>
+          <Calendar size={14} color={textSecondaryColor} />
+          <Text style={styles.detailText}>
+            {formattedDate}
+          </Text>
+        </View>
+
+        <View style={styles.detailRow}>
+          <Text style={styles.detailText}>Parent: {item.parentName}</Text>
+        </View>
+        {item.senderName && (
+          <View style={styles.detailRow}>
+            <Text style={styles.detailText}>Sent by: {item.senderName}</Text>
+          </View>
+        )}
+
+        <View style={styles.detailRow}>
+          <Text style={styles.detailText}>Contact: {item.parentContact}</Text>
+        </View>
+
+        {item.parentEmail && (
+          <View style={styles.detailRow}>
+            <Text style={styles.detailText}>Email: {item.parentEmail}</Text>
+          </View>
+        )}
+
+        <View style={styles.detailRow}>
+          <Text style={styles.detailText}>Amount: {amountLabel}</Text>
+        </View>
+
+        {item.feeCategories && item.feeCategories.length > 0 && (
+          <View style={styles.detailRow}>
+            <Text style={styles.detailText}>Categories: {item.feeCategories.join(', ')}</Text>
+          </View>
+        )}
+
+        {item.message && (
+          <View style={styles.detailRow}>
+            <Text style={styles.detailText}>Message: {item.message}</Text>
+          </View>
+        )}
+
+        {item.errorMessage && (
+          <Text style={styles.errorText}>Error: {item.errorMessage}</Text>
+        )}
+      </View>
+    </View>
+  );
+}, (prev, next) => {
+  return (
+    prev.item === next.item &&
+    prev.styles === next.styles &&
+    prev.formattedDate === next.formattedDate &&
+    prev.amountLabel === next.amountLabel &&
+    prev.textColor === next.textColor &&
+    prev.textSecondaryColor === next.textSecondaryColor &&
+    prev.successColor === next.successColor &&
+    prev.errorColor === next.errorColor &&
+    prev.warningColor === next.warningColor
+  );
+});
+
+interface ReminderHistoryHeaderSectionProps {
+  styles: Record<string, any>;
+  themeText: string;
+  themeTextSecondary: string;
+  scopeToggleButton: React.ReactNode;
+  onClose?: () => void;
+  searchQuery: string;
+  onSearchQueryChange: (value: string) => void;
+  onClearSearch: () => void;
+  statsSection: React.ReactNode;
+}
+
+const ReminderHistoryHeaderSection = React.memo(function ReminderHistoryHeaderSection({
+  styles,
+  themeText,
+  themeTextSecondary,
+  scopeToggleButton,
+  onClose,
+  searchQuery,
+  onSearchQueryChange,
+  onClearSearch,
+  statsSection,
+}: ReminderHistoryHeaderSectionProps) {
+  return (
+    <View style={styles.header}>
+      <View style={styles.headerRow}>
+        <Text allowFontScaling={false} style={styles.headerTitle}>Reminder History</Text>
+        {scopeToggleButton}
+        {onClose && (
+          <TouchableOpacity
+            onPress={onClose}
+            style={styles.closeButton}
+          >
+            <X size={18} color={themeText} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* Search Input */}
+      <View style={styles.searchContainer}>
+        <Search size={20} color={themeTextSecondary} />
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search by student, parent, contact, amount, date, status..."
+          placeholderTextColor={themeTextSecondary}
+          value={searchQuery}
+          onChangeText={onSearchQueryChange}
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity
+            onPress={onClearSearch}
+            style={styles.searchClearButton}
+          >
+            <X size={18} color={themeTextSecondary} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {statsSection}
+    </View>
+  );
+}, (prev, next) => {
+  return (
+    prev.styles === next.styles &&
+    prev.themeText === next.themeText &&
+    prev.themeTextSecondary === next.themeTextSecondary &&
+    prev.scopeToggleButton === next.scopeToggleButton &&
+    prev.onClose === next.onClose &&
+    prev.searchQuery === next.searchQuery &&
+    prev.onSearchQueryChange === next.onSearchQueryChange &&
+    prev.onClearSearch === next.onClearSearch &&
+    prev.statsSection === next.statsSection
+  );
+});
+
+interface ReminderHistoryFiltersSectionProps {
+  styles: Record<string, any>;
+  windowDayFilterButtons: React.ReactNode;
+  searchResultCountChip: React.ReactNode;
+  statusFilterButtons: React.ReactNode;
+  typeFilterButtons: React.ReactNode;
+  onRefreshWithFilters: () => void;
+  loading: boolean;
+}
+
+const ReminderHistoryFiltersSection = React.memo(function ReminderHistoryFiltersSection({
+  styles,
+  windowDayFilterButtons,
+  searchResultCountChip,
+  statusFilterButtons,
+  typeFilterButtons,
+  onRefreshWithFilters,
+  loading,
+}: ReminderHistoryFiltersSectionProps) {
+  return (
+    <View style={styles.filterContainer}>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+        <View style={styles.filterRow}>
+          {windowDayFilterButtons}
+          {searchResultCountChip}
+          {statusFilterButtons}
+          {typeFilterButtons}
+        </View>
+      </ScrollView>
+
+      <TouchableOpacity
+        style={styles.refreshButton}
+        onPress={onRefreshWithFilters}
+        disabled={loading}
+      >
+        {loading ? (
+          <ActivityIndicator size={16} color="#ffffff" />
+        ) : (
+          <RefreshCw size={16} color="#ffffff" />
+        )}
+      </TouchableOpacity>
+    </View>
+  );
+}, (prev, next) => {
+  return (
+    prev.styles === next.styles &&
+    prev.windowDayFilterButtons === next.windowDayFilterButtons &&
+    prev.searchResultCountChip === next.searchResultCountChip &&
+    prev.statusFilterButtons === next.statusFilterButtons &&
+    prev.typeFilterButtons === next.typeFilterButtons &&
+    prev.onRefreshWithFilters === next.onRefreshWithFilters &&
+    prev.loading === next.loading
+  );
+});
+
+interface ReminderHistoryFooterSectionProps {
+  styles: Record<string, any>;
+  hasMore: boolean;
+  loadingMore: boolean;
+  loading: boolean;
+  hasFilteredItems: boolean;
+  onLoadMore: () => void;
+  primaryColor: string;
+}
+
+const ReminderHistoryFooterSection = React.memo(function ReminderHistoryFooterSection({
+  styles,
+  hasMore,
+  loadingMore,
+  loading,
+  hasFilteredItems,
+  onLoadMore,
+  primaryColor,
+}: ReminderHistoryFooterSectionProps) {
+  if (!hasMore && hasFilteredItems) {
+    return (
+      <View style={styles.loadMoreContainer}>
+        <Text style={styles.endOfListText}>No more reminders to load</Text>
+      </View>
+    );
+  }
+
+  if (loadingMore) {
+    return (
+      <View style={styles.loadMoreContainer}>
+        <ActivityIndicator size="small" color={primaryColor} />
+        <Text style={styles.loadingMoreText}>Loading more reminders...</Text>
+      </View>
+    );
+  }
+
+  if (hasMore && hasFilteredItems) {
+    return (
+      <View style={styles.loadMoreContainer}>
+        <TouchableOpacity
+          style={[styles.loadMoreButton, styles.primaryBorder]}
+          onPress={onLoadMore}
+          disabled={loadingMore || loading}
+        >
+          <Text style={[styles.loadMoreText, styles.primaryText]}>
+            Load More Reminders
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return null;
+}, (prev, next) => {
+  return (
+    prev.styles === next.styles &&
+    prev.hasMore === next.hasMore &&
+    prev.loadingMore === next.loadingMore &&
+    prev.loading === next.loading &&
+    prev.hasFilteredItems === next.hasFilteredItems &&
+    prev.onLoadMore === next.onLoadMore &&
+    prev.primaryColor === next.primaryColor
+  );
+});
+
+interface ReminderHistoryEmptyStateSectionProps {
+  styles: Record<string, any>;
+  loading: boolean;
+  primaryColor: string;
+  textSecondaryColor: string;
+  trimmedSearchQuery: string;
+  onClearSearch: () => void;
+}
+
+const ReminderHistoryEmptyStateSection = React.memo(function ReminderHistoryEmptyStateSection({
+  styles,
+  loading,
+  primaryColor,
+  textSecondaryColor,
+  trimmedSearchQuery,
+  onClearSearch,
+}: ReminderHistoryEmptyStateSectionProps) {
+  if (loading) {
+    return (
+      <View style={styles.emptyState}>
+        <ActivityIndicator size="large" color={primaryColor} />
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.emptyState}>
+      <Clock size={48} color={textSecondaryColor} />
+      <Text style={styles.emptyStateText}>
+        {trimmedSearchQuery
+          ? `No reminders found matching "${trimmedSearchQuery}"`
+          : 'No reminder history found for the selected filters'}
+      </Text>
+      {trimmedSearchQuery ? (
+        <TouchableOpacity
+          style={[styles.filterButton, styles.clearSearchChip, styles.primaryBorder]}
+          onPress={onClearSearch}
+        >
+          <Text style={[styles.filterButtonText, styles.primaryText]}>Clear Search</Text>
+        </TouchableOpacity>
+      ) : null}
+    </View>
+  );
+}, (prev, next) => {
+  return (
+    prev.styles === next.styles &&
+    prev.loading === next.loading &&
+    prev.primaryColor === next.primaryColor &&
+    prev.textSecondaryColor === next.textSecondaryColor &&
+    prev.trimmedSearchQuery === next.trimmedSearchQuery &&
+    prev.onClearSearch === next.onClearSearch
+  );
+});
 
 export default function ReminderHistoryViewer({ 
   studentId, 
@@ -62,140 +560,132 @@ export default function ReminderHistoryViewer({
     refresh 
   } = useReminderHistory();
   
-  const [filter, setFilter] = useState<'all' | 'success' | 'failed' | 'pending'>('all');
-  const [typeFilter, setTypeFilter] = useState<string>('all');
+  const [filter, setFilter] = useState<ReminderStatusFilter>('all');
+  const [typeFilter, setTypeFilter] = useState<ReminderTypeFilter>(() => normalizeTypeFilter(reminderType));
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [scope, setScope] = useState<'mine' | 'all'>('mine');
   const [allowAllForNonAdmins, setAllowAllForNonAdmins] = useState<boolean>(false);
-  const [windowDays, setWindowDays] = useState<7 | 30 | 90 | 'all'>(30);
+  const [windowDays, setWindowDays] = useState<ReminderWindowDays>(30);
+  const windowDaysRef = useRef<ReminderWindowDays>(windowDays);
+  const filterRef = useRef<ReminderStatusFilter>(filter);
+  const typeFilterRef = useRef<ReminderTypeFilter>(typeFilter);
+  const loadMoreRequestInFlightRef = useRef(false);
+  const refreshWithFiltersInFlightRef = useRef(false);
+  const refreshInFlightRef = useRef(false);
+  const windowDaysValue = String(windowDays);
+  const trimmedSearchQuery = searchQuery.trim();
+  const normalizedSearchQuery = trimmedSearchQuery.toLowerCase();
+  const hasSearchQuery = normalizedSearchQuery.length > 0;
+  const trimmedSearchQueryRef = useRef(trimmedSearchQuery);
+  windowDaysRef.current = windowDays;
+  filterRef.current = filter;
+  typeFilterRef.current = typeFilter;
+  trimmedSearchQueryRef.current = trimmedSearchQuery;
+
+  const syncDebouncedSearch = useCallback(() => {
+    const nextSearch = trimmedSearchQueryRef.current;
+    setDebouncedSearch((current) => (current === nextSearch ? current : nextSearch));
+  }, []);
+
+  const handleSearchQueryChange = useCallback((value: string) => {
+    setSearchQuery((current) => (current === value ? current : value));
+  }, []);
+
+  const clearSearchQuery = useCallback(() => {
+    setSearchQuery((current) => (current.length > 0 ? '' : current));
+    setDebouncedSearch((current) => (current.length > 0 ? '' : current));
+  }, []);
+
+  const handleScopeToggle = useCallback(() => {
+    setScope((current) => (current === 'mine' ? 'all' : 'mine'));
+    syncDebouncedSearch();
+  }, [syncDebouncedSearch]);
+
+  const handleWindowDaysFilter = useCallback((value: (typeof WINDOW_DAY_OPTIONS)[number]) => {
+    const nextWindowDays = toReminderWindowDays(value);
+    if (windowDaysRef.current === nextWindowDays) {
+      return;
+    }
+
+    setWindowDays(nextWindowDays);
+    syncDebouncedSearch();
+  }, [syncDebouncedSearch]);
+
+  const handleStatusFilter = useCallback((status: ReminderStatusFilter) => {
+    if (filterRef.current === status) {
+      return;
+    }
+
+    setFilter(status);
+    syncDebouncedSearch();
+  }, [syncDebouncedSearch]);
+
+  const handleTypeFilter = useCallback((type: ReminderTypeFilter) => {
+    if (typeFilterRef.current === type) {
+      return;
+    }
+
+    setTypeFilter(type);
+    syncDebouncedSearch();
+  }, [syncDebouncedSearch]);
+
+  const windowDaysPressHandlers = useMemo(() => {
+    return WINDOW_DAY_OPTIONS.reduce((handlers, option) => {
+      handlers[option] = () => handleWindowDaysFilter(option);
+      return handlers;
+    }, {} as Record<(typeof WINDOW_DAY_OPTIONS)[number], () => void>);
+  }, [handleWindowDaysFilter]);
+
+  const statusPressHandlers = useMemo(() => {
+    return STATUS_FILTER_OPTIONS.reduce((handlers, option) => {
+      handlers[option] = () => handleStatusFilter(option);
+      return handlers;
+    }, {} as Record<ReminderStatusFilter, () => void>);
+  }, [handleStatusFilter]);
+
+  const typePressHandlers = useMemo(() => {
+    return TYPE_FILTER_OPTIONS.reduce((handlers, option) => {
+      handlers[option] = () => handleTypeFilter(option);
+      return handlers;
+    }, {} as Record<ReminderTypeFilter, () => void>);
+  }, [handleTypeFilter]);
 
   useEffect(() => {
-    // Keep server filters (type/status/scope) in sync and set currentSearchRef
-  loadHistory(limit, studentId, typeFilter, filter, searchQuery, windowDays, scope === 'all');
-    // Update stats for current filters (excluding search); debounced effect handles search
-    loadStats(windowDays);
-  }, [loadHistory, loadStats, limit, studentId, typeFilter, filter, scope, windowDays]);
+    const normalizedTypeFilter = normalizeTypeFilter(reminderType);
+    setTypeFilter((current) => (current === normalizedTypeFilter ? current : normalizedTypeFilter));
+  }, [reminderType]);
 
-  // Debounce search text and refresh stats for full-dataset counts
   useEffect(() => {
-    const t = setTimeout(() => setDebouncedSearch(searchQuery), 350);
+    // Keep server filters and stats in sync with the same debounced search input.
+    loadHistory(limit, studentId, typeFilter, filter, debouncedSearch, windowDays, scope === 'all');
+    loadStats(windowDays, { searchQuery: debouncedSearch });
+  }, [loadHistory, loadStats, limit, studentId, typeFilter, filter, debouncedSearch, scope, windowDays]);
+
+  // Debounce search text before issuing list/stats fetches.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchQuery.trim()), 350);
     return () => clearTimeout(t);
   }, [searchQuery]);
 
-  useEffect(() => {
-    // Update stats to reflect current search across all matches
-    loadStats(windowDays, { searchQuery: debouncedSearch });
-  }, [debouncedSearch, windowDays, loadStats]);
-
   // Load app setting to decide if non-admins can see All scope
-  useEffect(() => {
-    (async () => {
-      try {
-        const appSettings = await settingsService.getSettings();
-        setAllowAllForNonAdmins(!!appSettings.allowNonAdminAllReminderHistory);
-      } catch (e) {
-        setAllowAllForNonAdmins(false);
-      }
-    })();
+  const loadScopeSettings = useCallback(async () => {
+    try {
+      const appSettings = await settingsService.getSettings();
+      setAllowAllForNonAdmins(!!appSettings.allowNonAdminAllReminderHistory);
+    } catch {
+      setAllowAllForNonAdmins(false);
+    }
   }, []);
 
-  // Filter history based on current filters and search
-  const filteredHistory = useMemo(() => {
-    return history.filter(entry => {
-      if (filter !== 'all' && entry.status !== filter) return false;
-      if (typeFilter !== 'all' && entry.reminderType !== typeFilter) return false;
-      
-      // Search functionality
-      if (searchQuery.trim()) {
-        const query = searchQuery.toLowerCase();
-        const matchesStudentName = entry.studentName?.toLowerCase().includes(query);
-        const matchesParentName = entry.parentName?.toLowerCase().includes(query);
-        const matchesContact = entry.parentContact?.includes(query);
-        const matchesEmail = entry.parentEmail?.toLowerCase().includes(query);
-        const matchesMessage = entry.message?.toLowerCase().includes(query);
-        const matchesAmount = entry.amount?.toString().includes(query);
-        const matchesFeeCategories = entry.feeCategories?.some(category => 
-          category.toLowerCase().includes(query)
-        );
-        const matchesReminderType = entry.reminderType?.toLowerCase().includes(query);
-        const matchesStatus = entry.status?.toLowerCase().includes(query);
-        const matchesErrorMessage = entry.errorMessage?.toLowerCase().includes(query);
-        
-        // Also search in formatted date
-        let matchesDate = false;
-        try {
-          const formattedDate = formatDate(entry.createdAt).toLowerCase();
-          matchesDate = formattedDate.includes(query);
-        } catch (e) {
-          // Ignore date formatting errors for search
-        }
-        
-        if (!matchesStudentName && !matchesParentName && !matchesContact && 
-            !matchesEmail && !matchesMessage && !matchesAmount && !matchesFeeCategories &&
-            !matchesReminderType && !matchesStatus && !matchesErrorMessage && !matchesDate) {
-          return false;
-        }
-      }
-      
-      return true;
-    });
-  }, [history, filter, typeFilter, searchQuery]);
-
-  const trimmedSearchQuery = searchQuery.trim();
-  const debouncedTrimmedSearch = debouncedSearch.trim();
-  const isStatsSyncedWithSearch = trimmedSearchQuery === debouncedTrimmedSearch;
-  const totalMatchingResults = trimmedSearchQuery
-    ? (isStatsSyncedWithSearch && !statsLoading ? stats.totalReminders : null)
-    : null;
-
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case 'success':
-        return <CheckCircle size={16} color={theme.success} />;
-      case 'failed':
-        return <XCircle size={16} color={theme.error} />;
-      default:
-        return <Clock size={16} color={theme.warning} />;
-    }
-  };
-
-  const getTypeIcon = (type: string) => {
-    const iconSize = 16;
-    const iconColor = theme.text;
-    
-    switch (type) {
-      case 'email':
-        return <Mail size={iconSize} color={iconColor} />;
-      case 'sms':
-        return <MessageSquare size={iconSize} color={iconColor} />;
-      case 'whatsapp':
-        return <FontAwesome name="whatsapp" size={iconSize} color={iconColor} />;
-      case 'voice':
-        return <PhoneCall size={iconSize} color={iconColor} />;
-      default:
-        return <Phone size={iconSize} color={iconColor} />;
-    }
-  };
-
-  // Debug logging
   useEffect(() => {
-    logger.debug('ReminderHistoryViewer - Debug Info:', {
-      historyLength: history.length,
-      filteredLength: filteredHistory.length,
-      filter,
-      typeFilter,
-      searchQuery,
-      statsTotal: stats.totalReminders,
-      loading,
-      error
-    });
-  }, [history, filteredHistory, filter, typeFilter, searchQuery, stats, loading, error]);
+    void loadScopeSettings();
+  }, [loadScopeSettings]);
 
-  const formatDate = (timestamp: any) => {
+  const formatDate = useCallback((timestamp: any) => {
     try {
       let date: Date;
-      
+
       // Handle serverTimestamp objects (not yet resolved)
       if (timestamp && typeof timestamp === 'object' && (timestamp as any)._methodName === 'serverTimestamp') {
         date = new Date(); // Use current time for unresolved serverTimestamp
@@ -220,156 +710,259 @@ export default function ReminderHistoryViewer({
       else {
         date = new Date();
       }
-      
-      return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { 
-        hour: '2-digit', 
-        minute: '2-digit' 
+
+      return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit'
       });
     } catch (error) {
       logger.error('Error formatting date:', error);
       return 'Invalid Date';
     }
-  };
+  }, []);
 
-  const formatCurrency = (amount: number) => {
-    return `₹${amount.toLocaleString()}`;
-  };
+  const historyDerivedData = useMemo(() => {
+    const displayInfo = new Map<ReminderHistoryEntry, ReminderHistoryDisplayInfo>();
+    const stableKeys = new Map<ReminderHistoryEntry, string>();
+    const searchIndex: { entry: ReminderHistoryEntry; searchText: string }[] = [];
+
+    for (const entry of history) {
+      const formattedDate = formatDate(entry.createdAt);
+      const amountLabel = formatReminderAmount(entry.amount);
+
+      displayInfo.set(entry, {
+        formattedDate,
+        amountLabel,
+      });
+      stableKeys.set(entry, buildReminderStableFallbackKey(entry));
+
+      if (hasSearchQuery) {
+        const searchText = [
+          entry.studentName ?? '',
+          entry.parentName ?? '',
+          entry.parentContact ?? '',
+          entry.parentEmail ?? '',
+          entry.message ?? '',
+          entry.amount != null ? String(entry.amount) : '',
+          entry.feeCategories?.join(' ') ?? '',
+          entry.reminderType ?? '',
+          entry.status ?? '',
+          entry.errorMessage ?? '',
+          formattedDate,
+        ]
+          .join(' ')
+          .toLowerCase();
+
+        searchIndex.push({
+          entry,
+          searchText,
+        });
+      }
+    }
+
+    return {
+      displayInfo,
+      stableKeys,
+      searchIndex,
+    };
+  }, [formatDate, hasSearchQuery, history]);
+
+  const historyDisplayInfo = historyDerivedData.displayInfo;
+  const historyStableKeys = historyDerivedData.stableKeys;
+  const historySearchIndex = historyDerivedData.searchIndex;
+
+  // Filter history based on current filters and search
+  const filteredHistory = useMemo(() => {
+    if (!hasSearchQuery && filter === 'all' && typeFilter === 'all') {
+      return history;
+    }
+
+    const next: ReminderHistoryEntry[] = [];
+
+    if (!hasSearchQuery) {
+      for (const entry of history) {
+        if (filter !== 'all' && entry.status !== filter) {
+          continue;
+        }
+        if (typeFilter !== 'all' && entry.reminderType !== typeFilter) {
+          continue;
+        }
+
+        next.push(entry);
+      }
+
+      return next;
+    }
+
+    for (const indexedEntry of historySearchIndex) {
+      const { entry, searchText } = indexedEntry;
+
+      if (filter !== 'all' && entry.status !== filter) {
+        continue;
+      }
+      if (typeFilter !== 'all' && entry.reminderType !== typeFilter) {
+        continue;
+      }
+
+      if (!searchText.includes(normalizedSearchQuery)) {
+        continue;
+      }
+
+      next.push(entry);
+    }
+
+    return next;
+  }, [filter, hasSearchQuery, history, historySearchIndex, normalizedSearchQuery, typeFilter]);
+
+  const debouncedTrimmedSearch = debouncedSearch.trim();
+  const isStatsSyncedWithSearch = trimmedSearchQuery === debouncedTrimmedSearch;
+  const totalMatchingResults = trimmedSearchQuery
+    ? (isStatsSyncedWithSearch && !statsLoading ? stats.totalReminders : null)
+    : null;
+  const successRatePercent = useMemo(() => {
+    if (stats.totalReminders <= 0) {
+      return 0;
+    }
+    return Math.round((stats.successfulReminders / stats.totalReminders) * 100);
+  }, [stats.successfulReminders, stats.totalReminders]);
+  const statsCards = useMemo(() => {
+    return [
+      {
+        key: 'total',
+        label: 'Total',
+        value: stats.totalReminders,
+        tone: 'primary' as ReminderStatTone,
+      },
+      {
+        key: 'successful',
+        label: 'Successful',
+        value: stats.successfulReminders,
+        tone: 'success' as ReminderStatTone,
+      },
+      {
+        key: 'failed',
+        label: 'Failed',
+        value: stats.failedReminders,
+        tone: 'error' as ReminderStatTone,
+      },
+      {
+        key: 'pending',
+        label: 'Pending',
+        value: stats.pendingReminders,
+        tone: 'warning' as ReminderStatTone,
+      },
+      {
+        key: 'rate',
+        label: 'Success Rate',
+        value: `${successRatePercent}%`,
+        tone: 'secondary' as ReminderStatTone,
+      },
+    ];
+  }, [
+    stats.failedReminders,
+    stats.pendingReminders,
+    stats.successfulReminders,
+    stats.totalReminders,
+    successRatePercent,
+  ]);
+
+  // Debug logging
+  useEffect(() => {
+    if (!__DEV__) {
+      return;
+    }
+
+    logger.debug('ReminderHistoryViewer - Debug Info:', {
+      historyLength: history.length,
+      filteredLength: filteredHistory.length,
+      filter,
+      typeFilter,
+      searchQuery,
+      statsTotal: stats.totalReminders,
+      loading,
+      error
+    });
+  }, [
+    error,
+    filter,
+    filteredHistory.length,
+    history.length,
+    loading,
+    searchQuery,
+    stats.totalReminders,
+    typeFilter,
+  ]);
 
   // Handle load more functionality
   const handleLoadMore = useCallback(() => {
-    if (hasMore && !loadingMore && !loading) {
-      loadMoreHistory();
+    if (!hasMore || loadingMore || loading || loadMoreRequestInFlightRef.current) {
+      return;
     }
+
+    loadMoreRequestInFlightRef.current = true;
+
+    Promise.resolve(loadMoreHistory())
+      .catch((err: unknown) => {
+        logger.error('Error loading more reminder history from viewer:', err);
+      })
+      .finally(() => {
+        loadMoreRequestInFlightRef.current = false;
+      });
   }, [hasMore, loadingMore, loading, loadMoreHistory]);
 
   // Handle refresh with filters
   const handleRefreshWithFilters = useCallback(async () => {
+    if (refreshWithFiltersInFlightRef.current) {
+      return;
+    }
+
+    refreshWithFiltersInFlightRef.current = true;
+
     try {
-    setFilter('all');
-    setSearchQuery('');
-  await loadHistory(limit, studentId, typeFilter, 'all', '', windowDays, scope === 'all');
-    await loadStats(windowDays);
-    } catch (err) {
+      const shouldReloadViaEffect = filter !== 'all' || trimmedSearchQuery.length > 0 || debouncedSearch.length > 0;
+      if (shouldReloadViaEffect) {
+        setFilter((current) => (current === 'all' ? current : 'all'));
+        clearSearchQuery();
+        return;
+      }
+
+      await loadHistory(limit, studentId, typeFilter, 'all', '', windowDays, scope === 'all');
+      await loadStats(windowDays);
+    } catch {
       Alert.alert('Error', 'Failed to refresh reminder history');
+    } finally {
+      refreshWithFiltersInFlightRef.current = false;
     }
-  }, [loadHistory, loadStats, limit, studentId, typeFilter, scope, windowDays]);
-
-  // Render individual reminder item
-  const renderReminderItem = useCallback(({ item }: { item: ReminderHistoryEntry }) => (
-    <View style={styles.historyItem}>
-      <View style={styles.historyHeader}>
-        <View style={styles.studentInfo}>
-          <User size={16} color={theme.textSecondary} />
-          <Text style={styles.studentName}>{item.studentName}</Text>
-        </View>
-        <View style={styles.statusContainer}>
-          {getTypeIcon(item.reminderType)}
-          {getStatusIcon(item.status)}
-        </View>
-      </View>
-
-      <View style={styles.historyDetails}>
-        <View style={styles.detailRow}>
-          <Calendar size={14} color={theme.textSecondary} />
-          <Text style={styles.detailText}>
-            {formatDate(item.createdAt)}
-          </Text>
-        </View>
-
-        <View style={styles.detailRow}>
-          <Text style={styles.detailText}>Parent: {item.parentName}</Text>
-        </View>
-        {item.senderName && (
-          <View style={styles.detailRow}>
-            <Text style={styles.detailText}>Sent by: {item.senderName}</Text>
-          </View>
-        )}
-
-        <View style={styles.detailRow}>
-          <Text style={styles.detailText}>Contact: {item.parentContact}</Text>
-        </View>
-
-        {item.parentEmail && (
-          <View style={styles.detailRow}>
-            <Text style={styles.detailText}>Email: {item.parentEmail}</Text>
-          </View>
-        )}
-
-        <View style={styles.detailRow}>
-          <Text style={styles.detailText}>Amount: {formatCurrency(item.amount)}</Text>
-        </View>
-
-        {item.feeCategories && item.feeCategories.length > 0 && (
-          <View style={styles.detailRow}>
-            <Text style={styles.detailText}>Categories: {item.feeCategories.join(', ')}</Text>
-          </View>
-        )}
-
-        {item.message && (
-          <View style={styles.detailRow}>
-            <Text style={styles.detailText}>Message: {item.message}</Text>
-          </View>
-        )}
-
-        {item.errorMessage && (
-          <Text style={styles.errorText}>Error: {item.errorMessage}</Text>
-        )}
-      </View>
-    </View>
-  ), [theme, formatDate, formatCurrency, getTypeIcon, getStatusIcon]);
-
-  // Render load more footer
-  const renderFooter = useCallback(() => {
-    if (!hasMore && filteredHistory.length > 0) {
-      return (
-        <View style={styles.loadMoreContainer}>
-          <Text style={styles.endOfListText}>No more reminders to load</Text>
-        </View>
-      );
-    }
-
-    if (loadingMore) {
-      return (
-        <View style={styles.loadMoreContainer}>
-          <ActivityIndicator size="small" color={theme.primary} />
-          <Text style={styles.loadingMoreText}>Loading more reminders...</Text>
-        </View>
-      );
-    }
-
-    if (hasMore && filteredHistory.length > 0) {
-      return (
-        <View style={styles.loadMoreContainer}>
-          <TouchableOpacity
-            style={[styles.loadMoreButton, { borderColor: theme.primary }]}
-            onPress={handleLoadMore}
-            disabled={loadingMore || loading}
-          >
-            <Text style={[styles.loadMoreText, { color: theme.primary }]}>
-              Load More Reminders
-            </Text>
-          </TouchableOpacity>
-        </View>
-      );
-    }
-
-    return null;
-  }, [hasMore, loadingMore, loading, filteredHistory.length, theme, handleLoadMore]);
+  }, [clearSearchQuery, debouncedSearch, filter, loadHistory, loadStats, limit, scope, studentId, trimmedSearchQuery, typeFilter, windowDays]);
 
   // Key extractor for FlatList
   const keyExtractor = useCallback((item: ReminderHistoryEntry, index: number) => {
-    return item.id || `reminder-${index}`;
-  }, []);
+    if (item.id) {
+      return item.id;
+    }
 
-  const handleRefresh = async () => {
+    const stableFallbackKey = historyStableKeys.get(item) ?? buildReminderStableFallbackKey(item);
+
+    return stableFallbackKey || `reminder-${index}`;
+  }, [historyStableKeys]);
+
+  const handleRefresh = useCallback(async () => {
+    if (refreshInFlightRef.current) {
+      return;
+    }
+
+    refreshInFlightRef.current = true;
+
     try {
       await refresh();
-    } catch (err) {
+    } catch {
       Alert.alert('Error', 'Failed to refresh reminder history');
+    } finally {
+      refreshInFlightRef.current = false;
     }
-  };
+  }, [refresh]);
 
-  const styles = StyleSheet.create({
+  const styles = useMemo(() => StyleSheet.create({
     container: {
       flex: 1,
       backgroundColor: theme.background,
@@ -386,12 +979,23 @@ export default function ReminderHistoryViewer({
       color: theme.text,
       marginBottom: 8,
     },
+    headerRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
     closeButton: {
       padding: 6,
       borderRadius: 6,
       backgroundColor: theme.background,
       borderWidth: 1,
       borderColor: theme.border,
+    },
+    scopeToggleButton: {
+      marginLeft: 10,
+    },
+    scopeToggleText: {
+      fontSize: 12,
     },
     searchContainer: {
       flexDirection: 'row',
@@ -410,6 +1014,9 @@ export default function ReminderHistoryViewer({
       fontSize: 16,
       marginLeft: 10,
     },
+    searchClearButton: {
+      padding: 5,
+    },
     statsContainer: {
       flexDirection: 'row',
       justifyContent: 'space-around',
@@ -423,6 +1030,21 @@ export default function ReminderHistoryViewer({
       fontWeight: 'bold',
       color: theme.text,
     },
+    statNumberPrimary: {
+      color: theme.primary,
+    },
+    statNumberSuccess: {
+      color: theme.success,
+    },
+    statNumberError: {
+      color: theme.error,
+    },
+    statNumberWarning: {
+      color: theme.warning,
+    },
+    statNumberSecondary: {
+      color: theme.textSecondary,
+    },
     statLabel: {
       fontSize: 12,
       color: theme.textSecondary,
@@ -434,12 +1056,29 @@ export default function ReminderHistoryViewer({
       backgroundColor: theme.surface,
       gap: 10,
     },
+    filterRow: {
+      flexDirection: 'row',
+      gap: 10,
+    },
     filterButton: {
       paddingHorizontal: 12,
       paddingVertical: 6,
       borderRadius: 8,
       borderWidth: 1,
       borderColor: theme.border,
+    },
+    resultCountChip: {
+      paddingHorizontal: 14,
+    },
+    resultCountChipTone: {
+      backgroundColor: theme.background,
+      borderColor: theme.primary,
+    },
+    resultCountText: {
+      fontSize: 12,
+    },
+    resultCountTextTone: {
+      color: theme.primary,
     },
     filterButtonActive: {
       backgroundColor: theme.primary,
@@ -457,6 +1096,12 @@ export default function ReminderHistoryViewer({
       borderRadius: 8,
       backgroundColor: theme.primary,
       marginLeft: 'auto',
+    },
+    primaryBorder: {
+      borderColor: theme.primary,
+    },
+    primaryText: {
+      color: theme.primary,
     },
     listContainer: {
       flex: 1,
@@ -564,17 +1209,215 @@ export default function ReminderHistoryViewer({
       color: theme.textSecondary,
       fontStyle: 'italic',
     },
-  });
+    errorRefreshButton: {
+      marginTop: 15,
+    },
+    clearSearchChip: {
+      marginTop: 15,
+    },
+    emptyStateErrorText: {
+      color: theme.error,
+    },
+  }), [theme]);
+
+  // Render individual reminder item
+  const renderReminderItem = useCallback(({ item }: { item: ReminderHistoryEntry }) => {
+    const displayInfo = historyDisplayInfo.get(item);
+
+    return (
+      <ReminderHistoryListItem
+        item={item}
+        styles={styles}
+        formattedDate={displayInfo?.formattedDate ?? ''}
+        amountLabel={displayInfo?.amountLabel ?? ''}
+        textColor={theme.text}
+        textSecondaryColor={theme.textSecondary}
+        successColor={theme.success}
+        errorColor={theme.error}
+        warningColor={theme.warning}
+      />
+    );
+  }, [
+    styles,
+    historyDisplayInfo,
+    theme.text,
+    theme.textSecondary,
+    theme.success,
+    theme.error,
+    theme.warning,
+  ]);
+
+  const hasFilteredItems = filteredHistory.length > 0;
+
+  const listFooterComponent = useMemo(() => {
+    return (
+      <ReminderHistoryFooterSection
+        styles={styles}
+        hasMore={hasMore}
+        loadingMore={loadingMore}
+        loading={loading}
+        hasFilteredItems={hasFilteredItems}
+        onLoadMore={handleLoadMore}
+        primaryColor={theme.primary}
+      />
+    );
+  }, [handleLoadMore, hasFilteredItems, hasMore, loading, loadingMore, styles, theme.primary]);
+
+  const statToneStyles = useMemo(() => {
+    return {
+      primary: styles.statNumberPrimary,
+      success: styles.statNumberSuccess,
+      error: styles.statNumberError,
+      warning: styles.statNumberWarning,
+      secondary: styles.statNumberSecondary,
+    } as Record<ReminderStatTone, object>;
+  }, [styles]);
+
+  const statsSection = useMemo(() => {
+    return (
+      <View style={styles.statsContainer}>
+        {statsCards.map(card => (
+          <View key={card.key} style={styles.statItem}>
+            <Text style={[styles.statNumber, statToneStyles[card.tone]]}>
+              {card.value}
+            </Text>
+            <Text style={styles.statLabel}>{card.label}</Text>
+          </View>
+        ))}
+        {statsLoading && (
+          <View style={styles.statItem}>
+            <ActivityIndicator size="small" color={theme.textSecondary} />
+          </View>
+        )}
+      </View>
+    );
+  }, [statsCards, statsLoading, statToneStyles, styles, theme.textSecondary]);
+
+  const scopeToggleButton = useMemo(() => {
+    if (!((user?.role === 'admin') || allowAllForNonAdmins)) {
+      return null;
+    }
+
+    return (
+      <TouchableOpacity
+        onPress={handleScopeToggle}
+        style={[styles.filterButton, styles.scopeToggleButton]}
+      >
+        <Text allowFontScaling={false} style={[styles.filterButtonText, styles.scopeToggleText]}>
+          {scope === 'mine' ? 'My Reminders' : 'All Reminders'}
+        </Text>
+      </TouchableOpacity>
+    );
+  }, [allowAllForNonAdmins, handleScopeToggle, scope, styles, user?.role]);
+
+  const windowDayFilterButtons = useMemo(() => {
+    return WINDOW_DAY_OPTIONS.map(v => (
+      <TouchableOpacity
+        key={`win-${v}`}
+        style={[
+          styles.filterButton,
+          (windowDaysValue === v) && styles.filterButtonActive
+        ]}
+        onPress={windowDaysPressHandlers[v]}
+      >
+        <Text style={[
+          styles.filterButtonText,
+          (windowDaysValue === v) && styles.filterButtonTextActive
+        ]}>
+          {v === 'all' ? 'All Time' : `${v}d`}
+        </Text>
+      </TouchableOpacity>
+    ));
+  }, [styles, windowDaysPressHandlers, windowDaysValue]);
+
+  const statusFilterButtons = useMemo(() => {
+    return STATUS_FILTER_OPTIONS.map(status => (
+      <TouchableOpacity
+        key={status}
+        style={[
+          styles.filterButton,
+          filter === status && styles.filterButtonActive
+        ]}
+        onPress={statusPressHandlers[status]}
+      >
+        <Text style={[
+          styles.filterButtonText,
+          filter === status && styles.filterButtonTextActive
+        ]}>
+          {STATUS_FILTER_LABELS[status]}
+        </Text>
+      </TouchableOpacity>
+    ));
+  }, [filter, statusPressHandlers, styles]);
+
+  const typeFilterButtons = useMemo(() => {
+    return TYPE_FILTER_OPTIONS.map(type => (
+      <TouchableOpacity
+        key={type}
+        style={[
+          styles.filterButton,
+          typeFilter === type && styles.filterButtonActive
+        ]}
+        onPress={typePressHandlers[type]}
+      >
+        <Text style={[
+          styles.filterButtonText,
+          typeFilter === type && styles.filterButtonTextActive
+        ]}>
+          {TYPE_FILTER_LABELS[type]}
+        </Text>
+      </TouchableOpacity>
+    ));
+  }, [styles, typeFilter, typePressHandlers]);
+
+  const searchResultCountChip = useMemo(() => {
+    if (!trimmedSearchQuery || totalMatchingResults === null) {
+      return null;
+    }
+
+    return (
+      <View
+        style={[
+          styles.filterButton,
+          styles.resultCountChipTone,
+          styles.resultCountChip,
+        ]}
+      >
+        <Text
+          style={[
+            styles.filterButtonText,
+            styles.resultCountTextTone,
+            styles.resultCountText,
+          ]}
+        >
+          {totalMatchingResults} result{totalMatchingResults !== 1 ? 's' : ''}
+        </Text>
+      </View>
+    );
+  }, [styles, totalMatchingResults, trimmedSearchQuery]);
+
+  const listEmptyComponent = useMemo(() => {
+    return (
+      <ReminderHistoryEmptyStateSection
+        styles={styles}
+        loading={loading}
+        primaryColor={theme.primary}
+        textSecondaryColor={theme.textSecondary}
+        trimmedSearchQuery={trimmedSearchQuery}
+        onClearSearch={clearSearchQuery}
+      />
+    );
+  }, [clearSearchQuery, loading, styles, theme.primary, theme.textSecondary, trimmedSearchQuery]);
 
   if (error) {
     return (
       <View style={styles.emptyState}>
         <XCircle size={48} color={theme.error} />
-        <Text style={[styles.emptyStateText, { color: theme.error }]}>
+        <Text style={[styles.emptyStateText, styles.emptyStateErrorText]}> 
           {error}
         </Text>
         <TouchableOpacity
-          style={[styles.refreshButton, { marginTop: 15 }]}
+          style={[styles.refreshButton, styles.errorRefreshButton]}
           onPress={handleRefresh}
         >
           <RefreshCw size={16} color="#ffffff" />
@@ -585,200 +1428,27 @@ export default function ReminderHistoryViewer({
 
   return (
     <View style={styles.container}>
-      {/* Header with Stats */}
-      <View style={styles.header}>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-          <Text allowFontScaling={false} style={styles.headerTitle}>Reminder History</Text>
-          {((user?.role === 'admin') || allowAllForNonAdmins) && (
-            <TouchableOpacity
-              onPress={() => {
-                const newScope = scope === 'mine' ? 'all' : 'mine';
-                setScope(newScope);
-                loadHistory(limit, studentId, typeFilter, filter, searchQuery, windowDays, newScope === 'all');
-                loadStats(windowDays);
-              }}
-              style={[styles.filterButton, { marginLeft: 10 }]}
-            >
-              <Text allowFontScaling={false} style={[styles.filterButtonText, { fontSize: 12 }]}>{scope === 'mine' ? 'My Reminders' : 'All Reminders'}</Text>
-            </TouchableOpacity>
-          )}
-          {onClose && (
-            <TouchableOpacity
-              onPress={onClose}
-              style={styles.closeButton}
-            >
-              <X size={18} color={theme.text} />
-            </TouchableOpacity>
-          )}
-        </View>
-        
-        {/* Search Input */}
-        <View style={styles.searchContainer}>
-          <Search size={20} color={theme.textSecondary} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search by student, parent, contact, amount, date, status..."
-            placeholderTextColor={theme.textSecondary}
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-          />
-          {searchQuery.length > 0 && (
-            <TouchableOpacity
-              onPress={() => setSearchQuery('')}
-              style={{ padding: 5 }}
-            >
-              <X size={18} color={theme.textSecondary} />
-            </TouchableOpacity>
-          )}
-        </View>
-        
-        <View style={styles.statsContainer}>
-          <View style={styles.statItem}>
-            <Text style={[styles.statNumber, { color: theme.primary }]}>
-              {stats.totalReminders}
-            </Text>
-            <Text style={styles.statLabel}>Total</Text>
-          </View>
-          <View style={styles.statItem}>
-            <Text style={[styles.statNumber, { color: theme.success }]}>
-              {stats.successfulReminders}
-            </Text>
-            <Text style={styles.statLabel}>Successful</Text>
-          </View>
-          <View style={styles.statItem}>
-            <Text style={[styles.statNumber, { color: theme.error }]}>
-              {stats.failedReminders}
-            </Text>
-            <Text style={styles.statLabel}>Failed</Text>
-          </View>
-          <View style={styles.statItem}>
-            <Text style={[styles.statNumber, { color: theme.warning }]}>
-              {stats.pendingReminders}
-            </Text>
-            <Text style={styles.statLabel}>Pending</Text>
-          </View>
-          <View style={styles.statItem}>
-            <Text style={[styles.statNumber, { color: theme.textSecondary }]}>
-              {stats.totalReminders > 0
-                ? Math.round((stats.successfulReminders / stats.totalReminders) * 100)
-                : 0}%
-            </Text>
-            <Text style={styles.statLabel}>Success Rate</Text>
-          </View>
-          {statsLoading && (
-            <View style={styles.statItem}>
-              <ActivityIndicator size="small" color={theme.textSecondary} />
-            </View>
-          )}
-        </View>
-      </View>
+      <ReminderHistoryHeaderSection
+        styles={styles}
+        themeText={theme.text}
+        themeTextSecondary={theme.textSecondary}
+        scopeToggleButton={scopeToggleButton}
+        onClose={onClose}
+        searchQuery={searchQuery}
+        onSearchQueryChange={handleSearchQueryChange}
+        onClearSearch={clearSearchQuery}
+        statsSection={statsSection}
+      />
 
-      {/* Filters */}
-      <View style={styles.filterContainer}>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          <View style={{ flexDirection: 'row', gap: 10 }}>
-            {/* Time Window Selector */}
-            {(['7','30','90','all'] as const).map(v => (
-              <TouchableOpacity
-                key={`win-${v}`}
-                style={[
-                  styles.filterButton,
-                  (String(windowDays) === v) && styles.filterButtonActive
-                ]}
-                onPress={() => setWindowDays((v === 'all' ? 'all' : Number(v)) as any)}
-              >
-                <Text style={[
-                  styles.filterButtonText,
-                  (String(windowDays) === v) && styles.filterButtonTextActive
-                ]}>
-                  {v === 'all' ? 'All Time' : `${v}d`}
-                </Text>
-              </TouchableOpacity>
-            ))}
-
-            {/* Search Results Count */}
-            {trimmedSearchQuery && totalMatchingResults !== null && (
-              <View
-                style={[
-                  styles.filterButton,
-                  {
-                    backgroundColor: theme.background,
-                    borderColor: theme.primary,
-                    paddingHorizontal: 14,
-                  },
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.filterButtonText,
-                    { color: theme.primary, fontSize: 12 },
-                  ]}
-                >
-                  {totalMatchingResults} result{totalMatchingResults !== 1 ? 's' : ''}
-                </Text>
-              </View>
-            )}
-            
-            {/* Status Filters */}
-            {['all', 'success', 'failed', 'pending'].map(status => (
-              <TouchableOpacity
-                key={status}
-                style={[
-                  styles.filterButton,
-                  filter === status && styles.filterButtonActive
-                ]}
-                onPress={() => {
-                  setFilter(status as any);
-                  loadHistory(limit, studentId, typeFilter, status as any, searchQuery, windowDays, scope === 'all');
-                  loadStats(windowDays);
-                }}
-              >
-                <Text style={[
-                  styles.filterButtonText,
-                  filter === status && styles.filterButtonTextActive
-                ]}>
-                  {status === 'all' ? 'All Status' : status.charAt(0).toUpperCase() + status.slice(1)}
-                </Text>
-              </TouchableOpacity>
-            ))}
-
-            {/* Type Filters */}
-            {['all', 'email', 'sms', 'whatsapp', 'voice'].map(type => (
-              <TouchableOpacity
-                key={type}
-                style={[
-                  styles.filterButton,
-                  typeFilter === type && styles.filterButtonActive
-                ]}
-                onPress={() => {
-                  setTypeFilter(type);
-                  loadHistory(limit, studentId, type, filter, searchQuery, windowDays, scope === 'all');
-                  loadStats(windowDays);
-                }}
-              >
-                <Text style={[
-                  styles.filterButtonText,
-                  typeFilter === type && styles.filterButtonTextActive
-                ]}>
-                  {type === 'all' ? 'All Types' : type.charAt(0).toUpperCase() + type.slice(1)}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </ScrollView>
-
-        <TouchableOpacity
-          style={styles.refreshButton}
-          onPress={handleRefreshWithFilters}
-          disabled={loading}
-        >
-          {loading ? (
-            <ActivityIndicator size={16} color="#ffffff" />
-          ) : (
-            <RefreshCw size={16} color="#ffffff" />
-          )}
-        </TouchableOpacity>
-      </View>
+      <ReminderHistoryFiltersSection
+        styles={styles}
+        windowDayFilterButtons={windowDayFilterButtons}
+        searchResultCountChip={searchResultCountChip}
+        statusFilterButtons={statusFilterButtons}
+        typeFilterButtons={typeFilterButtons}
+        onRefreshWithFilters={handleRefreshWithFilters}
+        loading={loading}
+      />
 
       {/* History List */}
       <FlatList
@@ -793,33 +1463,8 @@ export default function ReminderHistoryViewer({
         initialNumToRender={20}
         onEndReached={handleLoadMore}
         onEndReachedThreshold={0.1}
-        ListEmptyComponent={() => (
-          <View style={styles.emptyState}>
-            {loading ? (
-              <ActivityIndicator size="large" color={theme.primary} />
-            ) : (
-              <>
-                <Clock size={48} color={theme.textSecondary} />
-                <Text style={styles.emptyStateText}>
-                  {searchQuery.trim()
-                    ? `No reminders found matching "${searchQuery}"`
-                    : 'No reminder history found for the selected filters'}
-                </Text>
-              </>
-            )}
-            {searchQuery.trim() && (
-              <TouchableOpacity
-                style={[styles.filterButton, { marginTop: 15, borderColor: theme.primary }]}
-                onPress={() => setSearchQuery('')}
-              >
-                <Text style={[styles.filterButtonText, { color: theme.primary }]}>
-                  Clear Search
-                </Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        )}
-        ListFooterComponent={renderFooter}
+        ListEmptyComponent={listEmptyComponent}
+        ListFooterComponent={listFooterComponent}
       />
     </View>
   );

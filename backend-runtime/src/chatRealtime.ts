@@ -1,6 +1,10 @@
 import crypto from 'crypto';
 import * as admin from 'firebase-admin';
 import { ensureFirebase } from './firebaseAdmin';
+import {
+  buildChatRealtimeMessageContentSignature,
+  normalizeChatRealtimeReplyPayload,
+} from './lib/chatRealtimePayload';
 
 interface SharedConversationWatch {
   subscribers: Map<number, ConversationWatcherHandlers>;
@@ -8,6 +12,8 @@ interface SharedConversationWatch {
   cleanupFirebase: (() => void) | null;
   initPromise: Promise<void>;
 }
+
+const MAX_SHARED_WATCH_CACHE_ENTRIES = 1200;
 
 const sharedConversationWatches = new Map<string, SharedConversationWatch>();
 
@@ -38,6 +44,17 @@ export interface ChatMessagePayload {
   fileSize?: number;
   thumbnailUrl?: string;
   attachments?: any[];
+  replyTo?: {
+    messageId: string;
+    sender: string;
+    senderName?: string;
+    text?: string;
+    isSpecial?: boolean;
+    hasAttachments?: boolean;
+    attachmentCount?: number;
+    hasSticker?: boolean;
+    hasGif?: boolean;
+  };
   sticker?: any;
   gif?: any;
   delivered?: boolean;
@@ -141,6 +158,57 @@ export function verifyInternalToken(token: string | undefined | null): boolean {
   return decodeInternalToken(token) !== null;
 }
 
+function normalizeBooleanFlag(value: unknown): boolean | undefined {
+  if (value === true) {
+    return true;
+  }
+  if (value === false) {
+    return false;
+  }
+  return undefined;
+}
+
+function normalizeStringField(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeTimestampField(value: unknown): string | undefined {
+  const textValue = normalizeStringField(value);
+  if (textValue) {
+    return textValue;
+  }
+
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+
+  const epochMs = value >= 1e12 ? value : value * 1000;
+  try {
+    const iso = new Date(epochMs).toISOString();
+    return iso;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeIntField(value: unknown): number | undefined {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return undefined;
+  }
+
+  return Math.trunc(numeric);
+}
+
+function normalizeReplyPayload(input: unknown): ChatMessagePayload['replyTo'] | undefined {
+  return normalizeChatRealtimeReplyPayload(input);
+}
+
 function normalizeSnapshot(
   snapshot: admin.database.DataSnapshot,
   conversationKey: string
@@ -153,32 +221,42 @@ function normalizeSnapshot(
     return null;
   }
   const sender = normalizeEmail(raw.sender);
+  if (!sender) {
+    return null;
+  }
+
+  const timestamp = normalizeTimestampField(raw.timestamp);
+  if (!timestamp) {
+    return null;
+  }
+
   const recipientId = normalizeEmail(raw.recipientId);
   const payload: ChatMessagePayload = {
     id: snapshot.key,
     text: typeof raw.text === 'string' ? raw.text : undefined,
     sender,
     recipientId: recipientId || undefined,
-    timestamp: raw.timestamp,
-    isSpecial: Boolean(raw.isSpecial),
+    timestamp,
+    isSpecial: raw.isSpecial === true ? true : undefined,
     conversationKey,
-    tenantId: typeof raw.tenantId === 'string' ? raw.tenantId : undefined,
-    fileUrl: raw.fileUrl,
-    fileName: raw.fileName,
-    fileType: raw.fileType,
-    fileSize: typeof raw.fileSize === 'number' ? raw.fileSize : undefined,
-    thumbnailUrl: raw.thumbnailUrl,
+    tenantId: normalizeStringField(raw.tenantId),
+    fileUrl: normalizeStringField(raw.fileUrl),
+    fileName: normalizeStringField(raw.fileName),
+    fileType: normalizeStringField(raw.fileType),
+    fileSize: normalizeIntField(raw.fileSize),
+    thumbnailUrl: normalizeStringField(raw.thumbnailUrl),
     attachments: Array.isArray(raw.attachments) ? raw.attachments : undefined,
-    sticker: raw.sticker,
-    gif: raw.gif,
-    delivered: raw.delivered,
-    read: raw.read,
-    deliveredAt: raw.deliveredAt,
-    readAt: raw.readAt,
-    editedAt: typeof raw.editedAt === 'string' ? raw.editedAt : undefined,
-    editCount: typeof raw.editCount === 'number' ? raw.editCount : undefined,
-    deleted: Boolean(raw.deleted),
-    deletedAt: typeof raw.deletedAt === 'string' ? raw.deletedAt : undefined,
+    replyTo: normalizeReplyPayload(raw.replyTo),
+    sticker: raw.sticker && typeof raw.sticker === 'object' ? raw.sticker : undefined,
+    gif: raw.gif && typeof raw.gif === 'object' ? raw.gif : undefined,
+    delivered: normalizeBooleanFlag(raw.delivered),
+    read: normalizeBooleanFlag(raw.read),
+    deliveredAt: normalizeTimestampField(raw.deliveredAt),
+    readAt: normalizeTimestampField(raw.readAt),
+    editedAt: normalizeTimestampField(raw.editedAt),
+    editCount: normalizeIntField(raw.editCount),
+    deleted: raw.deleted === true ? true : undefined,
+    deletedAt: normalizeTimestampField(raw.deletedAt),
     deletedBy: normalizeEmail(raw.deletedBy) || undefined,
   };
   return payload;
@@ -195,19 +273,44 @@ function deriveStatusPayload(snapshot: admin.database.DataSnapshot): ChatStatusP
   const payload: ChatStatusPayload = {
     id: snapshot.key,
   };
-  if (raw.delivered !== undefined) {
-    payload.delivered = Boolean(raw.delivered);
+  const delivered = normalizeBooleanFlag(raw.delivered);
+  const read = normalizeBooleanFlag(raw.read);
+  const deliveredAt = normalizeTimestampField(raw.deliveredAt);
+  const readAt = normalizeTimestampField(raw.readAt);
+
+  if (delivered !== undefined) {
+    payload.delivered = delivered;
   }
-  if (raw.read !== undefined) {
-    payload.read = Boolean(raw.read);
+  if (read !== undefined) {
+    payload.read = read;
   }
-  if (raw.deliveredAt) {
-    payload.deliveredAt = raw.deliveredAt;
+  if (deliveredAt) {
+    payload.deliveredAt = deliveredAt;
   }
-  if (raw.readAt) {
-    payload.readAt = raw.readAt;
+  if (readAt) {
+    payload.readAt = readAt;
   }
   return payload;
+}
+
+function trimWatchCaches(
+  knownMessageIds: Set<string>,
+  messageCache: Map<string, ChatMessagePayload>
+): void {
+  if (messageCache.size <= MAX_SHARED_WATCH_CACHE_ENTRIES) {
+    return;
+  }
+
+  while (messageCache.size > MAX_SHARED_WATCH_CACHE_ENTRIES) {
+    const oldestEntry = messageCache.keys().next();
+    if (oldestEntry.done || typeof oldestEntry.value !== 'string') {
+      break;
+    }
+
+    const oldestMessageId = oldestEntry.value;
+    messageCache.delete(oldestMessageId);
+    knownMessageIds.delete(oldestMessageId);
+  }
 }
 
 export async function watchConversationRealtime(
@@ -253,6 +356,7 @@ export async function watchConversationRealtime(
           return;
         }
         messageCache.set(snapshot.key, payload);
+        trimWatchCaches(knownMessageIds, messageCache);
         broadcast(watchKey, (subscriber) => subscriber.onMessage?.(payload));
       },
       changeListener: (snapshot: admin.database.DataSnapshot) => {
@@ -267,6 +371,7 @@ export async function watchConversationRealtime(
 
         const previous = messageCache.get(snapshot.key);
         messageCache.set(snapshot.key, payload);
+          trimWatchCaches(knownMessageIds, messageCache);
 
         const statusChanged =
           !previous ||
@@ -307,6 +412,7 @@ export async function watchConversationRealtime(
           const payload = normalizeSnapshot(child, normalizedConversationKey);
           if (payload) {
             messageCache.set(child.key, payload);
+            trimWatchCaches(knownMessageIds, messageCache);
           }
         }
         return false;
@@ -365,14 +471,6 @@ function broadcast(watchKey: string, emit: (subscriber: ConversationWatcherHandl
   }
 }
 
-function stableStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value) ?? '';
-  } catch {
-    return '';
-  }
-}
-
 function didMessageContentChange(
   previous: ChatMessagePayload | undefined,
   next: ChatMessagePayload
@@ -381,23 +479,8 @@ function didMessageContentChange(
     return true;
   }
 
-  const signature = (payload: ChatMessagePayload) =>
-    [
-      payload.text || '',
-      payload.fileUrl || '',
-      payload.fileName || '',
-      payload.fileType || '',
-      typeof payload.fileSize === 'number' ? payload.fileSize : '',
-      payload.thumbnailUrl || '',
-      payload.isSpecial ? '1' : '0',
-      payload.editedAt || '',
-      payload.deleted ? '1' : '0',
-      payload.deletedAt || '',
-      payload.deletedBy || '',
-      stableStringify(payload.attachments || []),
-      stableStringify(payload.sticker || null),
-      stableStringify(payload.gif || null),
-    ].join('|');
-
-  return signature(previous) !== signature(next);
+  return (
+    buildChatRealtimeMessageContentSignature(previous) !==
+    buildChatRealtimeMessageContentSignature(next)
+  );
 }

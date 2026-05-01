@@ -497,6 +497,18 @@ const chatGifSchema = z.object({
   source: z.string().optional(),
 });
 
+const chatReplyContextSchema = z.object({
+  messageId: z.string().min(1),
+  sender: z.string().email(),
+  senderName: z.string().min(1).max(120).optional(),
+  text: z.string().max(1000).optional(),
+  isSpecial: z.boolean().optional(),
+  hasAttachments: z.boolean().optional(),
+  attachmentCount: z.number().int().min(1).max(20).optional(),
+  hasSticker: z.boolean().optional(),
+  hasGif: z.boolean().optional(),
+});
+
 const chatMessagePayloadSchema = z
   .object({
     recipientId: z.string().min(1),
@@ -509,6 +521,7 @@ const chatMessagePayloadSchema = z
     fileSize: z.number().int().min(0).optional(),
     thumbnailUrl: z.string().url().optional(),
     attachments: z.array(chatAttachmentSchema).max(10).optional(),
+    replyTo: chatReplyContextSchema.optional(),
     sticker: chatStickerSchema.optional(),
     gif: chatGifSchema.optional(),
     delivered: z.boolean().optional(),
@@ -9495,6 +9508,7 @@ export function createApp(options: CreateAppOptions = {}){
         fileSize: payload.fileSize,
         thumbnailUrl: payload.thumbnailUrl,
         attachments: payload.attachments,
+        replyTo: payload.replyTo,
         sticker: payload.sticker,
         gif: payload.gif,
         delivered: payload.delivered,

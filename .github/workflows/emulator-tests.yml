@@ -20,25 +20,49 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Start Firebase Emulator
+      - name: Start Firebase Emulators
         run: |
-          npx firebase-tools emulators:start --only firestore --project demo-project &
-          # wait a bit for emulator to boot
-          sleep 5
+          npx firebase-tools emulators:start --only firestore,database --project demo-project &
+          # wait a bit for emulators to boot
+          sleep 7
         env:
           FIREBASE_CLI_PRETEND: 'true'
 
-      - name: Wait for emulator
+      - name: Wait for emulators
         run: |
-          # wait up to 20s for emulator to be ready
-          for i in {1..20}; do
-            nc -z localhost 8080 && echo "emulator ready" && break || echo "waiting..." && sleep 1
+          # wait up to 30s for both emulators to be ready
+          for i in {1..30}; do
+            firestore_ready=0
+            rtdb_ready=0
+
+            if nc -z localhost 8080; then
+              firestore_ready=1
+            fi
+
+            if nc -z localhost 9000; then
+              rtdb_ready=1
+            fi
+
+            if [ "$firestore_ready" -eq 1 ] && [ "$rtdb_ready" -eq 1 ]; then
+              echo "Firestore + RTDB emulators ready"
+              break
+            fi
+
+            echo "waiting for emulators..."
+            sleep 1
           done
 
-      - name: Run unit + integration tests
+          nc -z localhost 8080
+          nc -z localhost 9000
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run Firestore + RTDB integration harness
         env:
           FIRESTORE_EMULATOR_HOST: localhost:8080
-        run: npm run test:unit
+          FIREBASE_DATABASE_EMULATOR_HOST: localhost:9000
+        run: node scripts/runFirestoreIntegration.js
 
       - name: Stop Firebase Emulator
         run: |

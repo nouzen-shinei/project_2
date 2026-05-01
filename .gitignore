@@ -121,3 +121,4 @@ app/google-services.json
 
 README-old*.md
 firebase-debug.log
+patch_chat.py

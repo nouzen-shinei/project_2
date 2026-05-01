@@ -51,6 +51,7 @@ import { normalizePhoneNumber as normalizePhoneE164 } from '../../services/phone
 import { reminderHistoryService } from '../../services/reminderHistoryService';
 import ReminderHistoryViewer from '../../components/ReminderHistoryViewer';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
+import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
 import FeeHistory from '../../components/FeeHistory';
 
 // Define Student interface directly in the component to test
@@ -441,6 +442,14 @@ export default function Fees() {
   const [selectedReceipt, setSelectedReceipt] = useState<string | null>(null);
   const [uploadingReceipt, setUploadingReceipt] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const easedUploadProgress = useEasedUploadProgress(uploadProgress, {
+    isActive: uploadingReceipt,
+    smoothingPerSecond: 9,
+    minStepPercent: 0.12,
+    completionSnapThresholdPercent: 99.2,
+    nearCompletionBoostStartPercent: 96,
+    nearCompletionBoostMultiplier: 1.3,
+  });
   const [selectedFiles, setSelectedFiles] = useState<any[]>([]);
   const selectedReceiptFilesRef = useRef<any[]>([]);
   const [isReceiptDropActive, setIsReceiptDropActive] = useState(false);
@@ -9986,12 +9995,15 @@ export default function Fees() {
                   <View 
                     style={[
                       styles.progressBar, 
-                      { backgroundColor: theme.primary, width: `${uploadProgress}%` }
+                      {
+                        backgroundColor: theme.primary,
+                        width: `${easedUploadProgress}%`,
+                      }
                     ]} 
                   />
                 </View>
                 <Text style={[styles.progressText, { color: theme.textSecondary }]}>
-                  {Math.round(uploadProgress)}%
+                  {Math.round(easedUploadProgress)}%
                 </Text>
               </View>
             )}
@@ -10079,12 +10091,12 @@ export default function Fees() {
                   <View
                     style={[
                       { backgroundColor: theme.primary, height: '100%', borderRadius: 4 },
-                      { width: `${uploadProgress}%` }
+                      { width: `${easedUploadProgress}%` }
                     ]}
                   />
                 </View>
                 <Text style={[{ color: theme.textSecondary, fontSize: 12, marginTop: 4, textAlign: 'center' }]}> 
-                  {Math.round(uploadProgress)}%
+                  {Math.round(easedUploadProgress)}%
                 </Text>
               </View>
             )}

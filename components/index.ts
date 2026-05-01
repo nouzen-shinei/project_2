@@ -14,6 +14,7 @@ export { default as AttendanceCalendar } from './AttendanceCalendarNew';
 export { default as ReminderHistoryViewer } from './ReminderHistoryViewer';
 export { default as ChatProfileModal } from './ChatProfileModal';
 export { default as MobileChatInput } from './MobileChatInput';
+export type { MobileChatInputRef } from './MobileChatInput';
 export { default as TenantMembershipManager } from './TenantMembershipManager';
 export { default as TenantJoinCodeManager } from './TenantJoinCodeManager';
 export { default as TenantOnboardingChecklist } from './TenantOnboardingChecklist';

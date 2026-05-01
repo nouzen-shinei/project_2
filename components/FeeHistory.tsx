@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { View, Text, TouchableOpacity, TextInput, ActivityIndicator, StyleSheet, Modal, Pressable, type FlatListProps } from 'react-native';
 import { ScrollView as GHScrollView, FlatList as GHFlatList } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -77,6 +77,20 @@ function humanizeMethod(method?: string): string {
   return words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
 }
 
+function getPaymentStableKey(item: PaymentItem): string {
+  return [
+    item.feeId,
+    item.id,
+    item.studentId,
+    item.paymentDate,
+    String(item.amount ?? 0),
+    item.method,
+    item.transactionId,
+  ]
+    .map((part) => String(part || ''))
+    .join('|');
+}
+
 export default function FeeHistory({ onClose }: { onClose?: () => void }) {
   const router = useRouter();
   const { theme } = useTheme();
@@ -85,13 +99,31 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
   const { students: studentList } = useStudentsHook();
   const { payments, loading, loadingMore: backendLoadingMore, hasMore, loadHistory, loadMore, refresh, totalAmount: aggTotalAmount, totalCount: aggTotalCount, methodBreakdown } = usePaymentsHistory();
   const [refreshing, setRefreshing] = useState(false);
+  const refreshRequestInFlightRef = useRef(false);
+  const loadMoreInFlightRef = useRef(false);
+
   const onRefresh = useCallback(async () => {
+    if (refreshRequestInFlightRef.current) {
+      return;
+    }
+
+    refreshRequestInFlightRef.current = true;
     setRefreshing(true);
-    await refresh();
-    setRefreshing(false);
+    try {
+      await refresh();
+    } finally {
+      setRefreshing(false);
+      refreshRequestInFlightRef.current = false;
+    }
   }, [refresh]);
 
   const [query, setQuery] = useState('');
+  const handleQueryChange = useCallback((value: string) => {
+    setQuery((current) => (current === value ? current : value));
+  }, []);
+  const clearQuery = useCallback(() => {
+    setQuery((current) => (current.length > 0 ? '' : current));
+  }, []);
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('date');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
@@ -198,16 +230,25 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
     activeMembership?.role === 'owner' || activeMembership?.role === 'admin';
 
   const onRefreshWithUsage = useCallback(async () => {
-    setRefreshing(true);
-    const tasks: Promise<unknown>[] = [refresh()];
-    // If the selected time range is a full single month, ask backend to regenerate the usage snapshot
-    // so monthly rollups (like paymentsReceived) stay accurate.
-    if (activeTenant?.id && usageMonthId && canRequestUsageRefresh) {
-      tasks.push(usageAnalyticsService.requestUsageRefresh(activeTenant.id, { month: usageMonthId }).catch(() => undefined));
+    if (refreshRequestInFlightRef.current) {
+      return;
     }
-    tasks.push(refreshUsageSummary().catch(() => undefined));
-    await Promise.all(tasks);
-    setRefreshing(false);
+
+    refreshRequestInFlightRef.current = true;
+    setRefreshing(true);
+    try {
+      const tasks: Promise<unknown>[] = [refresh()];
+      // If the selected time range is a full single month, ask backend to regenerate the usage snapshot
+      // so monthly rollups (like paymentsReceived) stay accurate.
+      if (activeTenant?.id && usageMonthId && canRequestUsageRefresh) {
+        tasks.push(usageAnalyticsService.requestUsageRefresh(activeTenant.id, { month: usageMonthId }).catch(() => undefined));
+      }
+      tasks.push(refreshUsageSummary().catch(() => undefined));
+      await Promise.all(tasks);
+    } finally {
+      setRefreshing(false);
+      refreshRequestInFlightRef.current = false;
+    }
   }, [refresh, refreshUsageSummary, activeTenant?.id, usageMonthId, canRequestUsageRefresh]);
   // Client-side pagination for performance
   const PAGE_SIZE = 30;
@@ -221,6 +262,25 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
 
   // Backend-paginated payments
   const allPayments: PaymentItem[] = payments as any;
+
+  const paymentDerivedList = useMemo(() => {
+    return allPayments.map((payment) => {
+      const amount = payment.amount ?? 0;
+      const amountStr = String(amount);
+      const amountLocale = amount.toLocaleString('en-IN');
+      const methodPretty = humanizeMethod(payment.method);
+
+      return {
+        payment,
+        searchText: `${payment.studentName} ${payment.method ?? ''} ${methodPretty} ${payment.accountDetails ?? ''} ${payment.transactionId ?? ''} ${payment.notes ?? ''} ${payment.paidBy ?? ''} ${amountStr} ${amountLocale}`.toLowerCase(),
+        amountDigits: amountStr.replace(/[^0-9.]/g, ''),
+        amountLocaleDigits: amountLocale.replace(/[^0-9.]/g, ''),
+        paymentTime: new Date(payment.paymentDate || 0).getTime(),
+        normalizedMethod: (payment.method || '').toLowerCase(),
+        sortStudentName: payment.studentName || '',
+      };
+    });
+  }, [allPayments]);
 
   // Compute backend query bounds from timePreset/custom (always applied to paymentDate in backend)
   const computedBounds = useMemo(() => {
@@ -278,23 +338,16 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
   }, [studentList]);
 
   const filteredAndSorted = useMemo(() => {
-    let list = allPayments;
+    let list = paymentDerivedList;
 
     // Text search
     if (debouncedQuery) {
       const q = debouncedQuery;
       const numQ = q.replace(/[^0-9.]/g, '');
-      list = list.filter(p => {
-        const amount = p.amount ?? 0;
-        const amountStr = String(amount);
-        const amountLocale = amount.toLocaleString('en-IN');
-        const methodPretty = humanizeMethod(p.method);
-  const hay = `${p.studentName} ${p.method ?? ''} ${methodPretty} ${p.accountDetails ?? ''} ${p.transactionId ?? ''} ${p.notes ?? ''} ${p.paidBy ?? ''} ${amountStr} ${amountLocale}`.toLowerCase();
-        if (hay.includes(q)) return true;
+      list = list.filter((entry) => {
+        if (entry.searchText.includes(q)) return true;
         if (numQ) {
-          const amountDigits = amountStr.replace(/[^0-9.]/g, '');
-          const amountLocaleDigits = amountLocale.replace(/[^0-9.]/g, '');
-          if (amountDigits.includes(numQ) || amountLocaleDigits.includes(numQ)) return true;
+          if (entry.amountDigits.includes(numQ) || entry.amountLocaleDigits.includes(numQ)) return true;
         }
         return false;
       });
@@ -302,12 +355,13 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
 
     // Method filter
     if (filterMethod !== 'all') {
-      list = list.filter(p => (p.method || '').toLowerCase() === filterMethod.toLowerCase());
+      const normalizedFilterMethod = filterMethod.toLowerCase();
+      list = list.filter((entry) => entry.normalizedMethod === normalizedFilterMethod);
     }
 
     // Student filter
     if (filterStudentId !== 'all') {
-      list = list.filter(p => p.studentId === filterStudentId);
+      list = list.filter((entry) => entry.payment.studentId === filterStudentId);
     }
 
     // Date range filter (inclusive) from preset or custom
@@ -335,11 +389,11 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
     }
 
     if (fromTs !== undefined || toTs !== undefined) {
-      list = list.filter(p => {
-        const t = new Date(p.paymentDate || 0).getTime();
+      list = list.filter((entry) => {
+        const t = entry.paymentTime;
         if (Number.isNaN(t)) return false;
-        if (fromTs && t < fromTs) return false;
-        if (toTs && t > toTs) return false;
+        if (fromTs !== undefined && t < fromTs) return false;
+        if (toTs !== undefined && t > toTs) return false;
         return true;
       });
     }
@@ -348,17 +402,17 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
     const sorted = [...list].sort((a, b) => {
       let cmp = 0;
       if (sortKey === 'date') {
-        cmp = (new Date(a.paymentDate || 0).getTime()) - (new Date(b.paymentDate || 0).getTime());
+        cmp = a.paymentTime - b.paymentTime;
       } else if (sortKey === 'amount') {
-        cmp = (a.amount || 0) - (b.amount || 0);
+        cmp = (a.payment.amount || 0) - (b.payment.amount || 0);
       } else {
-        cmp = (a.studentName || '').localeCompare(b.studentName || '');
+        cmp = a.sortStudentName.localeCompare(b.sortStudentName);
       }
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return sorted;
-  }, [allPayments, debouncedQuery, filterMethod, filterStudentId, dateFrom, dateTo, timePreset, sortKey, sortDir]);
+    return sorted.map((entry) => entry.payment);
+  }, [paymentDerivedList, debouncedQuery, filterMethod, filterStudentId, dateFrom, dateTo, timePreset, sortKey, sortDir, selectedMonthId, currentMonthId]);
 
   const pageTotalAmount = useMemo(() => filteredAndSorted.reduce((s, p) => s + (p.amount || 0), 0), [filteredAndSorted]);
 
@@ -400,18 +454,26 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
   const displayedList = useMemo(() => filteredAndSorted.slice(0, visibleCount), [filteredAndSorted, visibleCount]);
 
   const handleLoadMore = useCallback(() => {
+    if (loadMoreInFlightRef.current) return;
+
     // First, try backend pagination if there is more to fetch
     if (hasMore && !backendLoadingMore) {
-      loadMore();
+      loadMoreInFlightRef.current = true;
+      Promise.resolve(loadMore()).finally(() => {
+        loadMoreInFlightRef.current = false;
+      });
       return;
     }
+
     // Otherwise, extend client window if needed
     if (loadingMore) return;
     if (visibleCount >= filteredAndSorted.length) return;
+    loadMoreInFlightRef.current = true;
     setLoadingMore(true);
     setTimeout(() => {
       setVisibleCount(v => Math.min(v + PAGE_SIZE, filteredAndSorted.length));
       setLoadingMore(false);
+      loadMoreInFlightRef.current = false;
     }, 120);
   }, [hasMore, backendLoadingMore, loadMore, loadingMore, visibleCount, filteredAndSorted.length]);
 
@@ -456,7 +518,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
     </View>
   ), [theme, formatDate]);
 
-  const keyExtractor = useCallback((item: PaymentItem, idx: number) => `${item.feeId}_${item.id}_${idx}`,[/* stable keys already */]);
+  const keyExtractor = useCallback((item: PaymentItem) => getPaymentStableKey(item),[]);
 
   const renderFooter = useCallback(() => {
     if (backendLoadingMore || loadingMore) {
@@ -495,13 +557,12 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
     return [...header, ...displayedList.map((p) => ({ kind: 'payment' as const, payment: p }))];
   }, [displayedList]);
 
-  const listKeyExtractor = useCallback((item: FeeHistoryListItem, idx: number) => {
+  const listKeyExtractor = useCallback((item: FeeHistoryListItem) => {
     if (item.kind === 'stats') return 'stats';
     if (item.kind === 'controls') return 'controls';
     if (item.kind === 'empty') return 'empty';
-    const p = item.payment;
-    return `${p.feeId}_${p.id}_${idx}`;
-  }, []);
+    return keyExtractor(item.payment);
+  }, [keyExtractor]);
 
   const renderListItem = useCallback(
     ({ item }: { item: FeeHistoryListItem }) => {
@@ -569,7 +630,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
                       </Text>
                     </View>
                     <TouchableOpacity
-                      onPress={() => setQuery('')}
+                      onPress={clearQuery}
                       delayPressIn={50}
                       style={[styles.pillClear, { borderColor: theme.border, backgroundColor: theme.card, marginLeft: 6, marginRight: 8 }]}
                     >
@@ -711,7 +772,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
       sortDir,
       toggleSort,
       renderItem,
-      setQuery,
+      clearQuery,
     ]
   );
 
@@ -741,7 +802,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
             <SearchIcon size={18} color={theme.textSecondary} />
             <TextInput
               value={query}
-              onChangeText={setQuery}
+              onChangeText={handleQueryChange}
               placeholder="Search by student, method, amount, account details, paid by, notes"
               placeholderTextColor={theme.textSecondary}
               style={[styles.input, { color: theme.text }]} autoCapitalize="none"

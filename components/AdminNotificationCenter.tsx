@@ -12,7 +12,6 @@ import {
   TextInput,
   Platform,
   ActivityIndicator,
-  Alert,
   useWindowDimensions,
   Animated
 } from 'react-native';
@@ -23,13 +22,10 @@ import {
   Monitor, 
   Tablet, 
   Send, 
-  Users, 
   X,
-  MessageCircle,
   AlertTriangle,
   Info,
   CheckCircle,
-  Settings,
   Eye,
   EyeOff,
   Ban,
@@ -40,14 +36,12 @@ import {
   Wifi,
   WifiOff,
   Clock,
-  MapPin,
   Trash2
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
-import { useAuth } from '../hooks/useAuthUnified';
 import { useTenant } from '@/hooks/useTenantContext';
 import { tenantService } from '@/services/tenantService';
-import { UserDevice, AuthorizedUser, deviceTrackingService, DeviceBan } from '../services/deviceTrackingService';
+import { UserDevice, AuthorizedUser, deviceTrackingService } from '../services/deviceTrackingService';
 import type { DeviceTenantFilterOptions } from '../services/deviceTrackingService';
 import { notificationService } from '../services/notificationService';
 import DeviceActionModal from './DeviceActionModal';
@@ -64,6 +58,13 @@ interface NotificationMessage {
   targetDevices: string[];
 }
 
+interface UserGroupSelectionMeta {
+  selectableIds: string[];
+  selectableIdSet: Set<string>;
+  allSelected: boolean;
+  onlineCount: number;
+}
+
 type FilterType = 'all' | 'online' | 'offline' | 'web' | 'mobile' | 'tablet' | 'deleted' | 'logged_out' | 'force_logged_out' | 'hard_banned';
 type SortType = 'name' | 'lastSeen' | 'deviceType' | 'status';
 
@@ -76,7 +77,6 @@ interface AdminNotificationCenterProps {
 export default function AdminNotificationCenter({ adminEmail, adminName, tenantMemberEmails = [] }: AdminNotificationCenterProps) {
   const { theme } = useTheme();
   const modalTopPadding = 16;
-  const { user } = useAuth();
   const { width } = useWindowDimensions();
   const { activeTenant } = useTenant();
   const tenantId = activeTenant?.id;
@@ -145,6 +145,9 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
   const [refreshing, setRefreshing] = useState(false);
   const [isRefreshAnimating, setIsRefreshAnimating] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const trimmedSearchQuery = searchQuery.trim();
+  const normalizedSearchQuery = trimmedSearchQuery.toLowerCase();
+  const hasSearchQuery = normalizedSearchQuery.length > 0;
   const [filterType, setFilterType] = useState<FilterType>('all');
   const [sortType, setSortType] = useState<SortType>('lastSeen');
   const [hideInactiveDevices, setHideInactiveDevices] = useState(false);
@@ -190,6 +193,18 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
   const refreshRotation = useState(new Animated.Value(0))[0];
   const refreshAnimationRef = useRef<any>(null);
   const initialLoadRef = useRef(false);
+  const refreshRequestInFlightRef = useRef(false);
+  const loadUsersRequestIdRef = useRef(0);
+  const hardBanRequestInFlightRef = useRef(false);
+  const sendNotificationRequestInFlightRef = useRef(false);
+
+  const handleSearchQueryChange = useCallback((value: string) => {
+    setSearchQuery((current) => (current === value ? current : value));
+  }, []);
+
+  const clearSearchQuery = useCallback(() => {
+    setSearchQuery((current) => (current.length > 0 ? '' : current));
+  }, []);
 
   const startRefreshAnimation = useCallback(() => {
     // Stop any existing animation first
@@ -281,6 +296,35 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
     return isDeviceOnline(device) && !device.isDeleted && !isDeviceLoggedOut(device);
   }, [isDeviceOnline, isDeviceLoggedOut]);
 
+  const getLastSeenTimestamp = useCallback((lastSeen: any): number => {
+    if (lastSeen && typeof lastSeen === 'object' && (lastSeen as any)._methodName === 'serverTimestamp') {
+      return Date.now();
+    }
+
+    if (lastSeen && typeof lastSeen === 'object' && (lastSeen as any).seconds !== undefined) {
+      const timestamp = lastSeen as any;
+      return timestamp.seconds * 1000 + Math.floor((timestamp.nanoseconds || 0) / 1000000);
+    }
+
+    if (lastSeen instanceof Date) {
+      return lastSeen.getTime();
+    }
+
+    if (typeof lastSeen === 'string') {
+      return new Date(lastSeen).getTime();
+    }
+
+    if (lastSeen && typeof lastSeen.toDate === 'function') {
+      return lastSeen.toDate().getTime();
+    }
+
+    if (lastSeen && (lastSeen as any).seconds) {
+      return (lastSeen as any).seconds * 1000;
+    }
+
+    return 0;
+  }, []);
+
   // Helper function to get hard ban expiration info directly from device_bans collection
   const getHardBanExpirationInfo = useCallback(async (device: UserDevice, userEmail: string): Promise<{ expiresAt?: Date; daysRemaining?: number; reason?: string } | null> => {
     try {
@@ -334,23 +378,6 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
   // Ban expiration info cache
   const [banExpirationInfo, setBanExpirationInfo] = useState<Record<string, { expiresAt?: Date; daysRemaining?: number; reason?: string }>>({});
 
-  // Helper function to check if a device is hard banned (checks both deletion reason AND device_bans collection)
-  const checkDeviceHardBanned = useCallback(async (device: UserDevice, userEmail: string): Promise<boolean> => {
-    try {
-      // First check deletion reason (legacy check)
-      const isDeletedWithHardBan = !!(device.isDeleted && device.deletionReason && device.deletionReason.toLowerCase().includes('hard banned'));
-      
-      // Also check device_bans collection with user-specific check
-      const banInfo = await deviceTrackingService.isDeviceBannedForUser(device, userEmail);
-      
-      return isDeletedWithHardBan || !!banInfo;
-    } catch (error) {
-      logger.error('Failed to check if device is hard banned:', error);
-      // Fallback to deletion reason check
-      return !!(device.isDeleted && device.deletionReason && device.deletionReason.toLowerCase().includes('hard banned'));
-    }
-  }, []);
-
   // Synchronous version for immediate UI checks (uses cached data)
   const isDeviceHardBanned = useCallback((device: UserDevice): boolean => {
     // Check deletion reason (legacy check)
@@ -377,10 +404,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
            isDeviceLoggedOut(device);
   }, [isDeviceHardBanned, isDeviceLoggedOut]);
 
-  // Helper function to check if the hide inactive toggle should be shown
-  const shouldShowHideInactiveToggle = useCallback(() => {
-    return filterType === 'all' || filterType === 'web' || filterType === 'mobile' || filterType === 'tablet';
-  }, [filterType]);
+  const showHideInactiveToggle = filterType === 'all' || filterType === 'web' || filterType === 'mobile' || filterType === 'tablet';
 
   // Modal state
   const [showNotificationModal, setShowNotificationModal] = useState(false);
@@ -411,33 +435,60 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
 
   // Load all users and their devices
   const loadAuthorizedUsersWithDevices = useCallback(async () => {
+    const requestId = loadUsersRequestIdRef.current + 1;
+    loadUsersRequestIdRef.current = requestId;
+
     try {
       setLoading(true);
       
       const allUsersData = await getAllUsersWithDevices(scopedTenantMemberEmails, true);
+      if (loadUsersRequestIdRef.current !== requestId) {
+        return;
+      }
       
       // Filter users based on tenant member email scope
-      const normalizedMemberEmails = scopedTenantMemberEmails.map(email => email.toLowerCase());
+      const normalizedMemberEmails = new Set(
+        scopedTenantMemberEmails.map((email) => email.toLowerCase())
+      );
       const filteredUsersData = scopedTenantMemberEmails.length > 0 
-        ? allUsersData.filter(userData => normalizedMemberEmails.includes(userData.email.toLowerCase()))
+        ? allUsersData.filter((userData) => normalizedMemberEmails.has(userData.email.toLowerCase()))
         : allUsersData;
+
+      if (loadUsersRequestIdRef.current !== requestId) {
+        return;
+      }
       
       setAuthorizedUsers(filteredUsersData);
 
       // Load ban expiration info for filtered users' devices only
-      const banInfo: Record<string, { expiresAt?: Date; daysRemaining?: number; reason?: string }> = {};
-      
-      for (const userData of filteredUsersData) {
-        for (const device of userData.devices) {
-          const expirationInfo = await getHardBanExpirationInfo(device, userData.email);
-          if (expirationInfo) {
-            banInfo[device.deviceId] = expirationInfo;
-          }
-        }
+      const banEntries = await Promise.all(
+        filteredUsersData.flatMap((userData) =>
+          userData.devices.map(async (device: UserDevice) => {
+            const expirationInfo = await getHardBanExpirationInfo(device, userData.email);
+            if (!expirationInfo) {
+              return null;
+            }
+            return [device.deviceId, expirationInfo] as const;
+          })
+        )
+      );
+
+      if (loadUsersRequestIdRef.current !== requestId) {
+        return;
       }
+
+      const banInfo = Object.fromEntries(
+        banEntries.filter(
+          (entry): entry is readonly [string, { expiresAt?: Date; daysRemaining?: number; reason?: string }] =>
+            entry !== null
+        )
+      );
       
       setBanExpirationInfo(banInfo);
     } catch (error) {
+      if (loadUsersRequestIdRef.current !== requestId) {
+        return;
+      }
       logger.error('Error loading users:', error);
       Toast.show({
         type: 'error',
@@ -445,9 +496,11 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
         text2: 'Failed to load users and devices'
       });
     } finally {
-      setLoading(false);
+      if (loadUsersRequestIdRef.current === requestId) {
+        setLoading(false);
+      }
     }
-  }, [getAllUsersWithDevices, getHardBanExpirationInfo, isDeviceOnline, scopedTenantMemberEmails]);
+  }, [getAllUsersWithDevices, getHardBanExpirationInfo, scopedTenantMemberEmails]);
 
   // Initial load
   useEffect(() => {
@@ -474,13 +527,27 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
 
   // Handle refresh
   const handleRefresh = useCallback(async () => {
+    if (refreshRequestInFlightRef.current) {
+      return;
+    }
+
+    refreshRequestInFlightRef.current = true;
     setRefreshing(true);
-    await loadAuthorizedUsersWithDevices();
-    setRefreshing(false);
+    try {
+      await loadAuthorizedUsersWithDevices();
+    } finally {
+      setRefreshing(false);
+      refreshRequestInFlightRef.current = false;
+    }
   }, [loadAuthorizedUsersWithDevices]);
 
   // Handle manual refresh with toast feedback
   const handleManualRefresh = useCallback(async () => {
+    if (refreshRequestInFlightRef.current) {
+      return;
+    }
+
+    refreshRequestInFlightRef.current = true;
     try {
       setLoading(true);
       startRefreshAnimation();
@@ -504,45 +571,46 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
     } finally {
       setLoading(false);
       stopRefreshAnimation();
+      refreshRequestInFlightRef.current = false;
     }
   }, [loadAuthorizedUsersWithDevices, startRefreshAnimation, stopRefreshAnimation]);
 
-  // Group devices by user email while maintaining filtering
-  const getGroupedDevices = useCallback(() => {
-    const groupedDevices = new Map<string, { device: UserDevice; userEmail: string; userName: string }[]>();
-    
-    // Collect all devices from all users
-    authorizedUsers.forEach(userData => {
-      userData.devices.forEach(device => {
+  const groupedDevices = useMemo(() => {
+    const next = new Map<string, { device: UserDevice; userEmail: string; userName: string }[]>();
+    const shouldHideInactive =
+      hideInactiveDevices &&
+      showHideInactiveToggle;
+
+    // Collect all devices from all users and apply filters once.
+    for (const userData of authorizedUsers) {
+      for (const device of userData.devices) {
         const deviceInfo = {
           device,
           userEmail: userData.email,
-          userName: userData.displayName || userData.email.split('@')[0]
+          userName: userData.displayName || userData.email.split('@')[0],
         };
-        
-        // Apply search filter
+
         let includeDevice = true;
-        if (searchQuery.trim()) {
-          const query = searchQuery.toLowerCase();
-          includeDevice = !!(device.deviceName?.toLowerCase().includes(query) ||
-            device.deviceType?.toLowerCase().includes(query) ||
-            device.browserName?.toLowerCase().includes(query) ||
-            device.osName?.toLowerCase().includes(query) ||
-            device.modelName?.toLowerCase().includes(query) ||
-            device.ipAddress?.toLowerCase().includes(query) ||
-            userData.email.toLowerCase().includes(query) ||
-            userData.displayName?.toLowerCase().includes(query));
+
+        if (hasSearchQuery) {
+          includeDevice = !!(
+            device.deviceName?.toLowerCase().includes(normalizedSearchQuery) ||
+            device.deviceType?.toLowerCase().includes(normalizedSearchQuery) ||
+            device.browserName?.toLowerCase().includes(normalizedSearchQuery) ||
+            device.osName?.toLowerCase().includes(normalizedSearchQuery) ||
+            device.modelName?.toLowerCase().includes(normalizedSearchQuery) ||
+            device.ipAddress?.toLowerCase().includes(normalizedSearchQuery) ||
+            userData.email.toLowerCase().includes(normalizedSearchQuery) ||
+            userData.displayName?.toLowerCase().includes(normalizedSearchQuery)
+          );
         }
-        
-        // Apply type filter
+
         if (includeDevice && filterType !== 'all') {
           switch (filterType) {
             case 'online':
-              // A device is truly online if it meets the lastSeen criteria AND has not been logged out
               includeDevice = isDeviceTrulyOnline(device);
               break;
             case 'offline':
-              // A device is offline if it doesn't meet the lastSeen criteria AND has not been logged out, and not deleted
               includeDevice = !!(!device.isDeleted && !isDeviceOnline(device) && !isDeviceLoggedOut(device));
               break;
             case 'deleted':
@@ -569,21 +637,20 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
           }
         }
 
-        // Apply hide inactive devices filter if enabled
-        if (includeDevice && hideInactiveDevices && shouldShowHideInactiveToggle()) {
+        if (includeDevice && shouldHideInactive) {
           includeDevice = !isDeviceInactive(device);
         }
-        
+
         if (includeDevice) {
-          const userDevices = groupedDevices.get(userData.email) || [];
+          const userDevices = next.get(userData.email) || [];
           userDevices.push(deviceInfo);
-          groupedDevices.set(userData.email, userDevices);
+          next.set(userData.email, userDevices);
         }
-      });
-    });
-    
-    // Sort devices within each user group
-    groupedDevices.forEach((devices, userEmail) => {
+      }
+    }
+
+    // Sort devices within each user group.
+    for (const devices of next.values()) {
       devices.sort((a, b) => {
         switch (sortType) {
           case 'name':
@@ -594,76 +661,136 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
             if (a.device.isDeleted !== b.device.isDeleted) {
               return a.device.isDeleted ? 1 : -1;
             }
-            return isDeviceTrulyOnline(a.device) === isDeviceTrulyOnline(b.device) ? 0 : (isDeviceTrulyOnline(a.device) ? -1 : 1);
+            {
+              const aOnline = isDeviceTrulyOnline(a.device);
+              const bOnline = isDeviceTrulyOnline(b.device);
+              return aOnline === bOnline ? 0 : (aOnline ? -1 : 1);
+            }
           case 'lastSeen':
-          default:
-            const getTime = (device: UserDevice) => {
-              // Handle serverTimestamp objects (not yet resolved)
-              if (device.lastSeen && typeof device.lastSeen === 'object' && (device.lastSeen as any)._methodName === 'serverTimestamp') {
-                return Date.now(); // Use current time for unresolved serverTimestamp
-              }
-              // Handle Firestore Timestamp objects with seconds and nanoseconds properties
-              else if (device.lastSeen && typeof device.lastSeen === 'object' && (device.lastSeen as any).seconds !== undefined) {
-                const timestamp = device.lastSeen as any;
-                return timestamp.seconds * 1000 + Math.floor(timestamp.nanoseconds / 1000000);
-              }
-              else if (device.lastSeen instanceof Date) {
-                return device.lastSeen.getTime();
-              } else if (typeof device.lastSeen === 'string') {
-                return new Date(device.lastSeen).getTime();
-              } else if (device.lastSeen && typeof device.lastSeen.toDate === 'function') {
-                return device.lastSeen.toDate().getTime();
-              } else if (device.lastSeen && (device.lastSeen as any).seconds) {
-                return (device.lastSeen as any).seconds * 1000;
-              } else {
-                return 0;
-              }
-            };
-            
-            return getTime(b.device) - getTime(a.device);
+          default: {
+            return getLastSeenTimestamp(b.device.lastSeen) - getLastSeenTimestamp(a.device.lastSeen);
+          }
         }
       });
-    });
-    
-    return groupedDevices;
-  }, [authorizedUsers, searchQuery, filterType, sortType, isDeviceHardBanned, hideInactiveDevices, shouldShowHideInactiveToggle, isDeviceInactive]);
+    }
 
-  // Get flattened devices array for compatibility with existing logic
-  const getFlattenedDevices = useCallback(() => {
-    const groupedDevices = getGroupedDevices();
+    return next;
+  }, [
+    authorizedUsers,
+    hasSearchQuery,
+    normalizedSearchQuery,
+    filterType,
+    sortType,
+    isDeviceHardBanned,
+    hideInactiveDevices,
+    showHideInactiveToggle,
+    isDeviceInactive,
+    isDeviceTrulyOnline,
+    getLastSeenTimestamp,
+    isDeviceOnline,
+    isDeviceLoggedOut,
+  ]);
+
+  const groupedDeviceEntries = useMemo(() => {
+    return Array.from(groupedDevices.entries());
+  }, [groupedDevices]);
+
+  const filteredDevices = useMemo(() => {
     const flatDevices: { device: UserDevice; userEmail: string; userName: string }[] = [];
-    
     groupedDevices.forEach((devices) => {
       flatDevices.push(...devices);
     });
-    
     return flatDevices;
-  }, [getGroupedDevices]);
+  }, [groupedDevices]);
+
+  const filteredDeviceOwnerById = useMemo(() => {
+    const deviceOwnerMap = new Map<string, string>();
+    for (const { device, userEmail } of filteredDevices) {
+      deviceOwnerMap.set(device.deviceId, userEmail);
+    }
+    return deviceOwnerMap;
+  }, [filteredDevices]);
+
+  const selectableFilteredDeviceIds = useMemo(() => {
+    const selectableIds: string[] = [];
+    for (const { device } of filteredDevices) {
+      if (!isDeviceSelectable(device)) {
+        continue;
+      }
+
+      selectableIds.push(device.deviceId);
+    }
+
+    return selectableIds;
+  }, [filteredDevices, isDeviceSelectable]);
+
+  const selectedDeviceIdSet = useMemo(() => {
+    return new Set(selectedDevices);
+  }, [selectedDevices]);
+
+  const selectableFilteredDeviceIdSet = useMemo(() => {
+    return new Set(selectableFilteredDeviceIds);
+  }, [selectableFilteredDeviceIds]);
+
+  const areAllSelectableDevicesSelected = useMemo(() => {
+    return selectableFilteredDeviceIds.length > 0 && selectableFilteredDeviceIds.every((id) => selectedDeviceIdSet.has(id));
+  }, [selectableFilteredDeviceIds, selectedDeviceIdSet]);
+
+  const userGroupSelectionMeta = useMemo(() => {
+    const next = new Map<string, UserGroupSelectionMeta>();
+
+    for (const [userEmail, devices] of groupedDeviceEntries) {
+      const selectableIds: string[] = [];
+      const selectableIdSet = new Set<string>();
+      let selectedCount = 0;
+      let onlineCount = 0;
+
+      for (const { device } of devices) {
+        if (isDeviceTrulyOnline(device)) {
+          onlineCount += 1;
+        }
+
+        if (!isDeviceSelectable(device)) {
+          continue;
+        }
+
+        selectableIds.push(device.deviceId);
+        selectableIdSet.add(device.deviceId);
+        if (selectedDeviceIdSet.has(device.deviceId)) {
+          selectedCount += 1;
+        }
+      }
+
+      next.set(userEmail, {
+        selectableIds,
+        selectableIdSet,
+        allSelected: selectableIds.length > 0 && selectedCount === selectableIds.length,
+        onlineCount,
+      });
+    }
+
+    return next;
+  }, [groupedDeviceEntries, isDeviceSelectable, isDeviceTrulyOnline, selectedDeviceIdSet]);
 
   // Clean up selection when devices become unselectable
   useEffect(() => {
-    if (selectedDevices.length > 0) {
-      const filteredDevices = getFlattenedDevices();
-      const selectableDeviceIds = filteredDevices
-        .filter(({ device }) => isDeviceSelectable(device))
-        .map(({ device }) => device.deviceId);
-      
-      const validSelectedDevices = selectedDevices.filter(deviceId => 
-        selectableDeviceIds.includes(deviceId)
-      );
-      
-      if (validSelectedDevices.length !== selectedDevices.length) {
-        setSelectedDevices(validSelectedDevices);
-      }
+    if (selectedDevices.length === 0) {
+      return;
     }
-  }, [selectedDevices, getFlattenedDevices, isDeviceSelectable]);
+
+    const validSelectedDevices = selectedDevices.filter((deviceId) => selectableFilteredDeviceIdSet.has(deviceId));
+
+    if (validSelectedDevices.length !== selectedDevices.length) {
+      setSelectedDevices(validSelectedDevices);
+    }
+  }, [selectedDevices, selectableFilteredDeviceIdSet]);
 
   // Reset hide inactive toggle when switching to filter types that don't support it
   useEffect(() => {
-    if (!shouldShowHideInactiveToggle() && hideInactiveDevices) {
+    if (!showHideInactiveToggle && hideInactiveDevices) {
       setHideInactiveDevices(false);
     }
-  }, [filterType, shouldShowHideInactiveToggle, hideInactiveDevices]);
+  }, [showHideInactiveToggle, hideInactiveDevices]);
 
   // Cleanup animation on unmount
   useEffect(() => {
@@ -738,46 +865,45 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
     });
   }, []);
 
-  const toggleUserSelection = useCallback((userEmail: string) => {
-    setSelectedUsers(prev => {
-      const updated = prev.includes(userEmail)
-        ? prev.filter(email => email !== userEmail)
-        : [...prev, userEmail];
-      return updated;
-    });
-  }, []);
-
   const selectAllDevices = useCallback(() => {
-    const filteredDevices = getFlattenedDevices();
-    const selectableDeviceIds = filteredDevices
-      .filter(({ device }) => isDeviceSelectable(device)) // Only select selectable devices
-      .map(({ device }) => device.deviceId);
-    
-    // Check if all selectable devices are already selected
-    const allSelected = selectableDeviceIds.every(id => selectedDevices.includes(id)) && selectableDeviceIds.length > 0;
-    
-    if (allSelected) {
+    if (areAllSelectableDevicesSelected) {
       // Deselect all devices
       setSelectedDevices([]);
     } else {
       // Select all devices
-      setSelectedDevices(selectableDeviceIds);
+      setSelectedDevices(selectableFilteredDeviceIds);
     }
-  }, [getFlattenedDevices, isDeviceSelectable, selectedDevices]);
-
-  // Helper to check if all selectable devices are selected
-  const areAllDevicesSelected = useCallback(() => {
-    const filteredDevices = getFlattenedDevices();
-    const selectableDeviceIds = filteredDevices
-      .filter(({ device }) => isDeviceSelectable(device))
-      .map(({ device }) => device.deviceId);
-    
-    return selectableDeviceIds.length > 0 && selectableDeviceIds.every(id => selectedDevices.includes(id));
-  }, [getFlattenedDevices, isDeviceSelectable, selectedDevices]);
+  }, [areAllSelectableDevicesSelected, selectableFilteredDeviceIds]);
 
   const clearSelection = useCallback(() => {
     setSelectedDevices([]);
     setSelectedUsers([]);
+  }, []);
+
+  const toggleUserSelectableDevices = useCallback((groupMeta?: UserGroupSelectionMeta) => {
+    if (!groupMeta || groupMeta.selectableIds.length === 0) {
+      return;
+    }
+
+    setSelectedDevices((previous) => {
+      if (groupMeta.allSelected) {
+        const next = previous.filter((id) => !groupMeta.selectableIdSet.has(id));
+        return next.length === previous.length ? previous : next;
+      }
+
+      const nextIds = new Set(previous);
+      let changed = false;
+      for (const id of groupMeta.selectableIds) {
+        if (nextIds.has(id)) {
+          continue;
+        }
+
+        nextIds.add(id);
+        changed = true;
+      }
+
+      return changed ? Array.from(nextIds) : previous;
+    });
   }, []);
 
   // Device action handlers
@@ -817,6 +943,10 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
 
   // Hard ban handler
   const handleHardBan = useCallback(async () => {
+    if (hardBanRequestInFlightRef.current) {
+      return;
+    }
+
     if (!selectedDevice || !selectedUserEmail || !hardBanReason.trim()) {
       Toast.show({
         type: 'error',
@@ -827,6 +957,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
     }
 
     try {
+      hardBanRequestInFlightRef.current = true;
       setLoading(true);
       
       const expirationDate = hardBanExpirationEnabled && hardBanExpiration ? hardBanExpiration : undefined;
@@ -856,11 +987,16 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
       });
     } finally {
       setLoading(false);
+      hardBanRequestInFlightRef.current = false;
     }
   }, [selectedDevice, selectedUserEmail, hardBanReason, hardBanExpirationEnabled, hardBanExpiration, adminEmail, adminName, handleDeviceActionComplete]);
 
   // Notification handlers
   const sendNotification = useCallback(async () => {
+    if (sendNotificationRequestInFlightRef.current) {
+      return;
+    }
+
     if (!notificationData.title.trim() || !notificationData.message.trim()) {
       Toast.show({
         type: 'error',
@@ -889,6 +1025,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
     }
 
     try {
+      sendNotificationRequestInFlightRef.current = true;
       setIsSendingNotification(true);
       setLoading(true);
       setNotificationErrors([]);
@@ -929,12 +1066,9 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
 
       // Send to selected devices
       if (selectedDevices.length > 0) {
-        const flattenedDevices = getFlattenedDevices();
         const deviceTargets = selectedDevices.map((deviceId) => {
-          const deviceData = flattenedDevices.find(({ device }) => device.deviceId === deviceId);
-
           return {
-            email: deviceData?.userEmail || '',
+            email: filteredDeviceOwnerById.get(deviceId) || '',
             deviceId,
           };
         });
@@ -1015,8 +1149,9 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
     } finally {
       setIsSendingNotification(false);
       setLoading(false);
+      sendNotificationRequestInFlightRef.current = false;
     }
-  }, [notificationData, selectedUsers, selectedDevices, adminEmail, adminName, tenantId, tenantName, sendBulkAdminNotifications, sendBulkAdminNotificationsToDevices, getFlattenedDevices, clearSelection]);
+  }, [notificationData, selectedUsers, selectedDevices, adminEmail, adminName, tenantId, tenantName, sendBulkAdminNotifications, sendBulkAdminNotificationsToDevices, filteredDeviceOwnerById, clearSelection]);
 
   // Notification type icon helper
   const getNotificationTypeIcon = useCallback((type: string) => {
@@ -1034,7 +1169,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
   }, [theme]);
 
   const renderDeviceCard = useCallback(({ device, userEmail, userName }: { device: UserDevice; userEmail: string; userName: string }) => {
-    const isSelected = selectedDevices.includes(device.deviceId);
+    const isSelected = selectedDeviceIdSet.has(device.deviceId);
     const isSelectable = isDeviceSelectable(device);
     const isWeb = device.deviceType === 'web' || device.platformOS === 'web' || 
                   !!(device.viewportWidth || device.currentUrl || device.screenScale);
@@ -1232,25 +1367,96 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
         )}
       </TouchableOpacity>
     );
-  }, [selectedDevices, theme, getDeviceIcon, toggleDeviceSelection, handleDeviceDetails, handleDeviceAction, formatLastSeen, isDeviceOnline, isDeviceHardBanned, banExpirationInfo, isDeviceTrulyOnline, isDeviceSelectable]);
+  }, [selectedDeviceIdSet, theme, getDeviceIcon, toggleDeviceSelection, handleDeviceDetails, handleDeviceAction, formatLastSeen, isDeviceOnline, isDeviceHardBanned, banExpirationInfo, isDeviceTrulyOnline, isDeviceSelectable]);
 
-  // Get filtered devices for rendering
-  const filteredDevices = getFlattenedDevices();
-  const onlineCount = filteredDevices.filter(({ device }) => isDeviceTrulyOnline(device)).length;
-  const offlineCount = filteredDevices.filter(({ device }) => !device.isDeleted && (!isDeviceOnline(device) || isDeviceLoggedOut(device))).length;
-  const deletedCount = filteredDevices.filter(({ device }) => device.isDeleted).length;
-  const hardBannedCount = filteredDevices.filter(({ device }) => isDeviceHardBanned(device)).length;
-  const deviceSummaryParts: { text: string; color?: string }[] = [];
-  if (filteredDevices.length > 0) {
-    deviceSummaryParts.push({ text: `${onlineCount} online` });
-    deviceSummaryParts.push({ text: `${offlineCount} offline` });
-  }
-  if (deletedCount > 0) {
-    deviceSummaryParts.push({ text: `${deletedCount} deleted` });
-  }
-  if (hardBannedCount > 0) {
-    deviceSummaryParts.push({ text: `${hardBannedCount} hard banned`, color: '#8B0000' });
-  }
+  // Get filtered device stats for rendering
+  const filteredDeviceMetrics = useMemo(() => {
+    let onlineCount = 0;
+    let offlineCount = 0;
+    let deletedCount = 0;
+    let hardBannedCount = 0;
+
+    for (const { device } of filteredDevices) {
+      if (isDeviceHardBanned(device)) {
+        hardBannedCount += 1;
+      }
+
+      if (device.isDeleted) {
+        deletedCount += 1;
+        continue;
+      }
+
+      if (isDeviceTrulyOnline(device)) {
+        onlineCount += 1;
+      } else if (!isDeviceOnline(device) || isDeviceLoggedOut(device)) {
+        offlineCount += 1;
+      }
+    }
+
+    const deviceSummaryParts: { text: string; color?: string }[] = [];
+    if (filteredDevices.length > 0) {
+      deviceSummaryParts.push({ text: `${onlineCount} online` });
+      deviceSummaryParts.push({ text: `${offlineCount} offline` });
+    }
+    if (deletedCount > 0) {
+      deviceSummaryParts.push({ text: `${deletedCount} deleted` });
+    }
+    if (hardBannedCount > 0) {
+      deviceSummaryParts.push({ text: `${hardBannedCount} hard banned`, color: '#8B0000' });
+    }
+
+    return {
+      onlineCount,
+      offlineCount,
+      deletedCount,
+      hardBannedCount,
+      deviceSummaryParts,
+    };
+  }, [filteredDevices, isDeviceHardBanned, isDeviceLoggedOut, isDeviceOnline, isDeviceTrulyOnline]);
+
+  const quickSelectableDeviceIds = useMemo(() => {
+    const online: string[] = [];
+    const web: string[] = [];
+    const mobile: string[] = [];
+
+    for (const { device } of filteredDevices) {
+      if (device.isDeleted) {
+        continue;
+      }
+
+      if (isDeviceTrulyOnline(device)) {
+        online.push(device.deviceId);
+      }
+
+      if (device.deviceType === 'web' || device.platformOS === 'web') {
+        web.push(device.deviceId);
+      }
+
+      if (device.deviceType === 'mobile') {
+        mobile.push(device.deviceId);
+      }
+    }
+
+    return {
+      online,
+      web,
+      mobile,
+    };
+  }, [filteredDevices, isDeviceTrulyOnline]);
+
+  const selectOnlineDevices = useCallback(() => {
+    setSelectedDevices(quickSelectableDeviceIds.online);
+  }, [quickSelectableDeviceIds.online]);
+
+  const selectWebDevices = useCallback(() => {
+    setSelectedDevices(quickSelectableDeviceIds.web);
+  }, [quickSelectableDeviceIds.web]);
+
+  const selectMobileDevices = useCallback(() => {
+    setSelectedDevices(quickSelectableDeviceIds.mobile);
+  }, [quickSelectableDeviceIds.mobile]);
+
+  const { onlineCount, deviceSummaryParts } = filteredDeviceMetrics;
   const hasRecipientsSelected = selectedUsers.length > 0 || selectedDevices.length > 0;
   const hasNotificationTitle = notificationData.title.trim().length > 0;
   const hasNotificationMessage = notificationData.message.trim().length > 0;
@@ -1343,7 +1549,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
           }]}
         >
           {`${filteredDevices.length} device${filteredDevices.length !== 1 ? 's' : ''}`}
-          {hideInactiveDevices && shouldShowHideInactiveToggle() && (
+          {hideInactiveDevices && showHideInactiveToggle && (
             <Text style={{ color: theme.primary }}> (active only)</Text>
           )}
           {deviceSummaryParts.map((part) => (
@@ -1363,12 +1569,12 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
             placeholder="Search devices, users, or IPs..."
             placeholderTextColor={theme.textSecondary}
             value={searchQuery}
-            onChangeText={setSearchQuery}
+            onChangeText={handleSearchQueryChange}
           />
           {searchQuery.length > 0 && (
             <TouchableOpacity
               style={styles.clearSearchButton}
-              onPress={() => setSearchQuery('')}
+              onPress={clearSearchQuery}
             >
               <X size={18} color={theme.textSecondary} />
             </TouchableOpacity>
@@ -1387,7 +1593,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
       </View>
 
       {/* Hide Inactive Devices Toggle */}
-      {shouldShowHideInactiveToggle() && (
+      {showHideInactiveToggle && (
         <View style={[styles.toggleContainer, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
           <TouchableOpacity
             style={[styles.toggleButton, { backgroundColor: hideInactiveDevices ? theme.primary + '15' : theme.background }]}
@@ -1453,26 +1659,29 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
                 style={[
                   styles.quickActionButton, 
                   { 
-                    backgroundColor: areAllDevicesSelected() ? theme.primary : theme.primary + '15' 
+                    backgroundColor: areAllSelectableDevicesSelected ? theme.primary : theme.primary + '15',
+                    opacity: selectableFilteredDeviceIds.length > 0 ? 1 : 0.45,
                   }
                 ]}
                 onPress={selectAllDevices}
+                disabled={selectableFilteredDeviceIds.length === 0}
               >
-                <CheckCircle size={16} color={areAllDevicesSelected() ? 'white' : theme.primary} />
+                <CheckCircle size={16} color={areAllSelectableDevicesSelected ? 'white' : theme.primary} />
                 <Text style={[
                   styles.quickActionText, 
-                  { color: areAllDevicesSelected() ? 'white' : theme.primary }
+                  { color: areAllSelectableDevicesSelected ? 'white' : theme.primary }
                 ]}>
-                  {areAllDevicesSelected() 
-                    ? `Selected (${filteredDevices.filter(({ device }) => isDeviceSelectable(device)).length})`
-                    : `Select All (${filteredDevices.filter(({ device }) => isDeviceSelectable(device)).length})`
+                  {areAllSelectableDevicesSelected
+                    ? `Selected (${selectableFilteredDeviceIds.length})`
+                    : `Select All (${selectableFilteredDeviceIds.length})`
                   }
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={[styles.quickActionButton, { backgroundColor: theme.textSecondary + '15' }]}
+                style={[styles.quickActionButton, { backgroundColor: theme.textSecondary + '15', opacity: selectedDevices.length > 0 || selectedUsers.length > 0 ? 1 : 0.45 }]}
                 onPress={clearSelection}
+                disabled={selectedDevices.length === 0 && selectedUsers.length === 0}
               >
                 <X size={16} color={theme.textSecondary} />
                 <Text style={[styles.quickActionText, { color: theme.textSecondary }]}>
@@ -1482,45 +1691,40 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
             </View>
 
             {/* Device Cards Grouped by User */}
-            {Array.from(getGroupedDevices().entries()).map(([userEmail, devices]) => (
-              <View key={userEmail} style={styles.userGroup}>
-                {/* User Header */}
-                <View style={[styles.userHeader, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-                  <View style={styles.userInfo}>
-                    <Text style={[styles.userEmail, { color: theme.text }]}>{userEmail}</Text>
-                    <Text style={[styles.userStats, { color: theme.textSecondary }]}>
-                      {devices.length} device{devices.length !== 1 ? 's' : ''} • {devices.filter(({device}) => isDeviceTrulyOnline(device)).length} online
-                    </Text>
+            {groupedDeviceEntries.map(([userEmail, devices]) => {
+              const groupMeta = userGroupSelectionMeta.get(userEmail);
+              const selectableUserDeviceIds = groupMeta?.selectableIds || [];
+              const areAllUserSelectableDevicesSelected = groupMeta?.allSelected || false;
+              const onlineUserDeviceCount = groupMeta?.onlineCount || 0;
+
+              return (
+                <View key={userEmail} style={styles.userGroup}>
+                  {/* User Header */}
+                  <View style={[styles.userHeader, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+                    <View style={styles.userInfo}>
+                      <Text style={[styles.userEmail, { color: theme.text }]}>{userEmail}</Text>
+                      <Text style={[styles.userStats, { color: theme.textSecondary }]}> 
+                        {devices.length} device{devices.length !== 1 ? 's' : ''} • {onlineUserDeviceCount} online
+                      </Text>
+                    </View>
+                    <TouchableOpacity
+                      style={[styles.selectUserButton, { backgroundColor: theme.primary + '15', opacity: selectableUserDeviceIds.length > 0 ? 1 : 0.45 }]}
+                      onPress={() => toggleUserSelectableDevices(groupMeta)}
+                      disabled={selectableUserDeviceIds.length === 0}
+                    >
+                      <Text style={[styles.selectUserText, { color: theme.primary }]}> 
+                        {areAllUserSelectableDevicesSelected ? 'Deselect All' : 'Select All'} ({selectableUserDeviceIds.length})
+                      </Text>
+                    </TouchableOpacity>
                   </View>
-                  <TouchableOpacity
-                    style={[styles.selectUserButton, { backgroundColor: theme.primary + '15' }]}
-                    onPress={() => {
-                      const userDeviceIds = devices
-                        .filter(({device}) => isDeviceSelectable(device))
-                        .map(({device}) => device.deviceId);
-                      const currentSelected = selectedDevices.filter(id => userDeviceIds.includes(id));
-                      
-                      if (currentSelected.length === userDeviceIds.length) {
-                        // Deselect all user devices
-                        setSelectedDevices(prev => prev.filter(id => !userDeviceIds.includes(id)));
-                      } else {
-                        // Select all user devices
-                        setSelectedDevices(prev => [...new Set([...prev, ...userDeviceIds])]);
-                      }
-                    }}
-                  >
-                    <Text style={[styles.selectUserText, { color: theme.primary }]}>
-                      {devices.filter(({device}) => isDeviceSelectable(device) && selectedDevices.includes(device.deviceId)).length === devices.filter(({device}) => isDeviceSelectable(device)).length ? 'Deselect All' : 'Select All'}
-                    </Text>
-                  </TouchableOpacity>
+
+                  {/* User's Devices */}
+                  {devices.map(({ device, userEmail, userName }) =>
+                    renderDeviceCard({ device, userEmail, userName })
+                  )}
                 </View>
-                
-                {/* User's Devices */}
-                {devices.map(({ device, userEmail, userName }) => 
-                  renderDeviceCard({ device, userEmail, userName })
-                )}
-              </View>
-            ))}
+              );
+            })}
           </View>
         ) : (
           <View style={styles.emptyState}>
@@ -1529,7 +1733,7 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
               No devices found
             </Text>
             <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}>
-              {searchQuery ? 'Try adjusting your search terms' : 'No devices are currently registered'}
+              {hasSearchQuery ? 'Try adjusting your search terms' : 'No devices are currently registered'}
             </Text>
           </View>
         )}
@@ -1587,47 +1791,35 @@ export default function AdminNotificationCenter({ adminEmail, adminName, tenantM
                 <Text style={[styles.quickSelectionTitle, { color: theme.text }]}>Quick Selection</Text>
                 <View style={styles.quickSelectionButtons}>
                   <TouchableOpacity
-                    style={[styles.quickSelectButton, { backgroundColor: theme.success + '20' }]}
-                    onPress={() => {
-                      const onlineDevices = getFlattenedDevices()
-                        .filter(({ device }) => isDeviceTrulyOnline(device) && !device.isDeleted)
-                        .map(({ device }) => device.deviceId);
-                      setSelectedDevices(onlineDevices);
-                    }}
+                    style={[styles.quickSelectButton, { backgroundColor: theme.success + '20', opacity: quickSelectableDeviceIds.online.length > 0 ? 1 : 0.45 }]}
+                    onPress={selectOnlineDevices}
+                    disabled={quickSelectableDeviceIds.online.length === 0}
                   >
                     <Wifi size={16} color={theme.success} />
                     <Text style={[styles.quickSelectText, { color: theme.success }]}>
-                      All Online ({onlineCount})
+                      All Online ({quickSelectableDeviceIds.online.length})
                     </Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={[styles.quickSelectButton, { backgroundColor: theme.primary + '20' }]}
-                    onPress={() => {
-                      const webDevices = getFlattenedDevices()
-                        .filter(({ device }) => (device.deviceType === 'web' || device.platformOS === 'web') && !device.isDeleted)
-                        .map(({ device }) => device.deviceId);
-                      setSelectedDevices(webDevices);
-                    }}
+                    style={[styles.quickSelectButton, { backgroundColor: theme.primary + '20', opacity: quickSelectableDeviceIds.web.length > 0 ? 1 : 0.45 }]}
+                    onPress={selectWebDevices}
+                    disabled={quickSelectableDeviceIds.web.length === 0}
                   >
                     <Monitor size={16} color={theme.primary} />
                     <Text style={[styles.quickSelectText, { color: theme.primary }]}>
-                      Web Browsers
+                      Web Browsers ({quickSelectableDeviceIds.web.length})
                     </Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={[styles.quickSelectButton, { backgroundColor: theme.warning + '20' }]}
-                    onPress={() => {
-                      const mobileDevices = getFlattenedDevices()
-                        .filter(({ device }) => device.deviceType === 'mobile' && !device.isDeleted)
-                        .map(({ device }) => device.deviceId);
-                      setSelectedDevices(mobileDevices);
-                    }}
+                    style={[styles.quickSelectButton, { backgroundColor: theme.warning + '20', opacity: quickSelectableDeviceIds.mobile.length > 0 ? 1 : 0.45 }]}
+                    onPress={selectMobileDevices}
+                    disabled={quickSelectableDeviceIds.mobile.length === 0}
                   >
                     <Smartphone size={16} color={theme.warning} />
                     <Text style={[styles.quickSelectText, { color: theme.warning }]}>
-                      Mobile Devices
+                      Mobile Devices ({quickSelectableDeviceIds.mobile.length})
                     </Text>
                   </TouchableOpacity>
                 </View>

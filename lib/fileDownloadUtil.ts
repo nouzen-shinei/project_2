@@ -1,4 +1,5 @@
 import { logger } from '@/lib/logger';
+import { normalizeUploadProgressDisplayPercent } from '@/lib/uploadProgressDisplayEasing';
 // File download utility with CORS support
 // This handles proper file downloads for web by fetching as blob
 
@@ -173,7 +174,7 @@ export const FileDownloadUtil = {
 
     const reportProgress = (percent: number) => {
       if (!onProgress) return;
-      const bounded = Math.max(0, Math.min(100, Math.round(percent)));
+      const bounded = normalizeUploadProgressDisplayPercent(percent);
       onProgress(bounded);
     };
 
@@ -285,7 +286,7 @@ export const FileDownloadUtil = {
       }
 
       return 'unknown';
-    } catch (error) {
+    } catch {
       return 'unknown';
     }
   }

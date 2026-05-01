@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { View, Text, ScrollView, FlatList, TouchableOpacity, StyleSheet, Modal, TextInput, ActivityIndicator, Platform } from 'react-native';
 import { 
   Clock, 
@@ -140,6 +140,11 @@ export default function AdminNotificationHistoryViewer({
   const [sortOption, setSortOption] = useState<SortOption>('date_desc');
   const [autoFetchingMore, setAutoFetchingMore] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const refreshRequestInFlightRef = useRef(false);
+  const loadMoreInFlightRef = useRef(false);
+  const searchRequestIdRef = useRef(0);
+  const trimmedSearchTerm = searchTerm.trim();
+  const hasSearchTerm = trimmedSearchTerm.length > 0;
 
   const toggleTypeFilter = useCallback((type: AdminNotificationHistoryEntry['type']) => {
     setSelectedTypes(prev => prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]);
@@ -287,30 +292,52 @@ export default function AdminNotificationHistoryViewer({
     return Math.round((notification.successfulDeliveries / notification.totalTargets) * 100);
   }, []);
 
-  // Handle real-time search
-  const handleSearchTermChange = useCallback(async (term: string) => {
-    setSearchTerm(term);
-    
-    if (!term.trim()) {
+  const handleSearchTermChange = useCallback((term: string) => {
+    setSearchTerm((current) => (current === term ? current : term));
+  }, []);
+
+  useEffect(() => {
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
+
+    if (!hasSearchTerm) {
       setSearchResults([]);
       setIsSearching(false);
       return;
     }
 
-    try {
-      setIsSearching(true);
-      const results = await searchNotificationsRealtime(term); // Remove adminEmail to search all notifications
-      setSearchResults(results);
-    } catch (error) {
-      logger.error('Search error:', error);
-      setSearchResults([]);
-    } finally {
-      setIsSearching(false);
-    }
-  }, [searchNotificationsRealtime]);
+    setIsSearching(true);
+
+    const timeoutId = setTimeout(() => {
+      searchNotificationsRealtime(trimmedSearchTerm)
+        .then((results) => {
+          if (searchRequestIdRef.current !== requestId) {
+            return;
+          }
+          setSearchResults(results);
+        })
+        .catch((error) => {
+          if (searchRequestIdRef.current !== requestId) {
+            return;
+          }
+          logger.error('Search error:', error);
+          setSearchResults([]);
+        })
+        .finally(() => {
+          if (searchRequestIdRef.current === requestId) {
+            setIsSearching(false);
+          }
+        });
+    }, 250);
+
+    return () => {
+      clearTimeout(timeoutId);
+    };
+  }, [hasSearchTerm, searchNotificationsRealtime, trimmedSearchTerm]);
 
   // Clear search
   const handleClearSearch = useCallback(() => {
+    searchRequestIdRef.current += 1;
     setSearchTerm('');
     setSearchResults([]);
     setIsSearching(false);
@@ -319,6 +346,11 @@ export default function AdminNotificationHistoryViewer({
 
   // Handle refresh all data
   const handleRefresh = useCallback(async () => {
+    if (refreshRequestInFlightRef.current) {
+      return;
+    }
+
+    refreshRequestInFlightRef.current = true;
     try {
       setIsRefreshing(true);
       await refresh(); // Remove adminEmail to load all notifications
@@ -336,21 +368,39 @@ export default function AdminNotificationHistoryViewer({
       });
     } finally {
       setIsRefreshing(false);
+      refreshRequestInFlightRef.current = false;
     }
   }, [refresh]);
 
   const handleLoadMore = useCallback(() => {
-    if (searchTerm.length > 0) {
+    if (hasSearchTerm || loadMoreInFlightRef.current) {
       return;
     }
 
     if (hasMore && !loadingMore && !loading) {
-      loadMoreHistory();
+      loadMoreInFlightRef.current = true;
+      Promise.resolve(loadMoreHistory()).finally(() => {
+        loadMoreInFlightRef.current = false;
+      });
     }
-  }, [hasMore, loadingMore, loading, loadMoreHistory, searchTerm.length]);
+  }, [hasMore, loadingMore, loading, loadMoreHistory, hasSearchTerm]);
+
+  const derivedNotifications = useMemo(() => {
+    const baseList = hasSearchTerm ? searchResults : history;
+
+    return baseList.map((notification) => {
+      const sentAtMs = parseTimestamp(notification.sentAt).date?.getTime() ?? 0;
+      const successRate = getSuccessRate(notification);
+
+      return {
+        notification,
+        sentAtMs,
+        successRate,
+      };
+    });
+  }, [hasSearchTerm, searchResults, history, parseTimestamp, getSuccessRate]);
 
   const filteredNotifications = useMemo(() => {
-    const baseList = searchTerm.length > 0 ? searchResults : history;
     const now = new Date();
     const cutoff = (() => {
       switch (dateRangeFilter) {
@@ -365,7 +415,9 @@ export default function AdminNotificationHistoryViewer({
       }
     })();
 
-    const filtered = baseList.filter(notification => {
+    const filtered = derivedNotifications.filter((entry) => {
+      const { notification, successRate, sentAtMs } = entry;
+
       if (selectedTypes.length > 0 && !selectedTypes.includes(notification.type)) {
         return false;
       }
@@ -378,7 +430,6 @@ export default function AdminNotificationHistoryViewer({
         return false;
       }
 
-      const successRate = getSuccessRate(notification);
       if (successFilter === 'successful' && successRate < 80) {
         return false;
       }
@@ -388,12 +439,10 @@ export default function AdminNotificationHistoryViewer({
       }
 
       if (cutoff !== null) {
-        const { date } = parseTimestamp(notification.sentAt);
-        if (!date) {
+        if (!sentAtMs) {
           return false;
         }
-
-        if (date.getTime() < cutoff) {
+        if (sentAtMs < cutoff) {
           return false;
         }
       }
@@ -402,18 +451,18 @@ export default function AdminNotificationHistoryViewer({
     });
 
     const sorted = [...filtered].sort((a, b) => {
-      const dateA = parseTimestamp(a.sentAt).date?.getTime() ?? 0;
-      const dateB = parseTimestamp(b.sentAt).date?.getTime() ?? 0;
+      const dateA = a.sentAtMs;
+      const dateB = b.sentAtMs;
 
       switch (sortOption) {
         case 'date_asc':
           return dateA - dateB;
         case 'success_desc':
-          return getSuccessRate(b) - getSuccessRate(a) || dateB - dateA;
+          return b.successRate - a.successRate || dateB - dateA;
         case 'success_asc':
-          return getSuccessRate(a) - getSuccessRate(b) || dateA - dateB;
+          return a.successRate - b.successRate || dateA - dateB;
         case 'priority_desc': {
-          const priorityComparison = (PRIORITY_WEIGHT[b.priority] || 0) - (PRIORITY_WEIGHT[a.priority] || 0);
+          const priorityComparison = (PRIORITY_WEIGHT[b.notification.priority] || 0) - (PRIORITY_WEIGHT[a.notification.priority] || 0);
           if (priorityComparison !== 0) {
             return priorityComparison;
           }
@@ -424,19 +473,15 @@ export default function AdminNotificationHistoryViewer({
       }
     });
 
-    return sorted;
+    return sorted.map((entry) => entry.notification);
   }, [
-    history,
-    searchResults,
-    searchTerm,
+    derivedNotifications,
     selectedTypes,
     selectedPriorities,
     selectedDeliveryMethods,
     successFilter,
     dateRangeFilter,
-    sortOption,
-    getSuccessRate,
-    parseTimestamp
+    sortOption
   ]);
 
   const sortOptionLabel = useMemo(() => {
@@ -482,7 +527,7 @@ export default function AdminNotificationHistoryViewer({
   ]);
 
   useEffect(() => {
-    if (!filtersApplied || searchTerm.length > 0) {
+    if (!filtersApplied || hasSearchTerm) {
       setAutoFetchingMore(false);
       return;
     }
@@ -507,9 +552,28 @@ export default function AdminNotificationHistoryViewer({
     loading,
     loadingMore,
     loadMoreHistory,
-    searchTerm,
+    hasSearchTerm,
     autoFetchingMore
   ]);
+
+  const listFooterComponent = useMemo(() => {
+    return (
+      <View style={styles.listFooter}>
+        {loadingMore ? (
+          <ActivityIndicator color={theme.primary} />
+        ) : hasMore && !hasSearchTerm ? (
+          <TouchableOpacity
+            style={[styles.listFooterButton, { borderColor: theme.border, backgroundColor: theme.surface }]}
+            onPress={handleLoadMore}
+          >
+            <Text style={[styles.listFooterButtonText, { color: theme.primary }]}>Load more</Text>
+          </TouchableOpacity>
+        ) : filteredNotifications.length > 0 ? (
+          <Text style={[styles.listFooterText, { color: theme.textSecondary }]}>No more notifications</Text>
+        ) : null}
+      </View>
+    );
+  }, [filteredNotifications.length, handleLoadMore, hasMore, hasSearchTerm, loadingMore, theme.border, theme.primary, theme.surface, theme.textSecondary]);
 
   const handleExportCsv = useCallback(async () => {
     if (!filteredNotifications.length) {
@@ -893,7 +957,7 @@ export default function AdminNotificationHistoryViewer({
             </View>
             
             {/* Search Results Info */}
-            {searchTerm.length > 0 && (
+            {hasSearchTerm && (
               <View style={styles.searchResultsInfo}>
                 <Text style={[styles.searchResultsText, { color: theme.textSecondary }]}>
                   {isSearching ? 'Searching...' : `${filteredNotifications.length} result${filteredNotifications.length !== 1 ? 's' : ''} shown`}
@@ -956,7 +1020,7 @@ export default function AdminNotificationHistoryViewer({
           <View style={styles.centerContainer}>
             <Bell size={48} color={theme.textSecondary} />
             <Text style={[styles.emptyText, { color: theme.textSecondary }]}> 
-              {searchTerm.length > 0
+              {hasSearchTerm
                 ? 'No search results found'
                 : filtersApplied
                   ? 'No notifications match the current filters'
@@ -976,22 +1040,7 @@ export default function AdminNotificationHistoryViewer({
             initialNumToRender={10}
             maxToRenderPerBatch={10}
             windowSize={7}
-            ListFooterComponent={
-              <View style={styles.listFooter}>
-                {loadingMore ? (
-                  <ActivityIndicator color={theme.primary} />
-                ) : hasMore && searchTerm.length === 0 ? (
-                  <TouchableOpacity
-                    style={[styles.listFooterButton, { borderColor: theme.border, backgroundColor: theme.surface }]}
-                    onPress={handleLoadMore}
-                  >
-                    <Text style={[styles.listFooterButtonText, { color: theme.primary }]}>Load more</Text>
-                  </TouchableOpacity>
-                ) : filteredNotifications.length > 0 ? (
-                  <Text style={[styles.listFooterText, { color: theme.textSecondary }]}>No more notifications</Text>
-                ) : null}
-              </View>
-            }
+            ListFooterComponent={listFooterComponent}
           />
         )}
 

@@ -34,6 +34,11 @@ import ProgressiveImage from './ui/ProgressiveImage';
 import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { useDownloadState } from '@/hooks/useDownloadState';
+import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
+import {
+  resolveDownloadProgressLabel,
+  resolveProgressPercentText,
+} from '@/lib/uploadProgressDisplayEasing';
 
 const sanitizeFileName = (name: string) => name.replace(/[^a-zA-Z0-9._-]/g, '_');
 const stripExtension = (name: string) => name.replace(/\.[^/.]+$/, '');
@@ -598,7 +603,20 @@ function ImageAttachmentViewer({
   const downloadState = useDownloadState(resolvedDownloadKey);
   const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
   const effectiveProgress = downloadProgress ?? downloadState.progress;
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    effectiveProgress,
+    effectiveIsDownloading
+  );
+  const modalDownloadLabel = resolveDownloadProgressLabel(
+    effectiveIsDownloading,
+    normalizedProgress
+  );
+  const inlineDownloadButtonA11yLabel = resolveDownloadProgressLabel(
+    effectiveIsDownloading,
+    normalizedProgress,
+    'Download image'
+  );
+  const inlineShareButtonA11yLabel = 'Share image';
 
   const remoteUrl = remoteFileUrl || fileUrl;
   const previewOnly = Boolean(isPreviewAsset && remoteFileUrl && remoteFileUrl !== fileUrl);
@@ -611,25 +629,49 @@ function ImageAttachmentViewer({
   const cardHeight = Math.min(320, Math.round(cardWidth * 0.7));
 
   const styles = useMemo(() => createImageViewerStyles(theme), [theme]);
+  const imageWrapperStyle = useMemo(
+    () => [styles.imageWrapper, { width: cardWidth, height: cardHeight }],
+    [styles, cardHeight, cardWidth]
+  );
+  const inlineDownloadActionButtonStyle = useMemo(
+    () => [styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }],
+    [styles, effectiveIsDownloading]
+  );
+  const modalDownloadActionButtonStyle = useMemo(
+    () => [styles.modalActionButton, { opacity: effectiveIsDownloading ? 0.7 : 1 }],
+    [styles, effectiveIsDownloading]
+  );
 
-  const handleDownload = () => {
+  const openModal = useCallback(() => {
+    setShowModal(true);
+  }, []);
+
+  const closeModal = useCallback(() => {
+    setShowModal(false);
+  }, []);
+
+  const closeShareModal = useCallback(() => {
+    setShowShareModal(false);
+  }, []);
+
+  const handleDownload = useCallback(() => {
     if (onDownload) {
       onDownload();
     } else {
       Alert.alert('Download', 'Download functionality not implemented');
     }
-  };
+  }, [onDownload]);
 
-  const handleShare = () => {
+  const handleShare = useCallback(() => {
     setShowShareModal(true);
-  };
+  }, []);
 
   return (
     <View style={styles.container}>
       <TouchableOpacity
-        style={[styles.imageWrapper, { width: cardWidth, height: cardHeight }]}
+        style={imageWrapperStyle}
         activeOpacity={0.9}
-        onPress={() => setShowModal(true)}
+        onPress={openModal}
       >
         <ProgressiveImage uri={previewUri} style={styles.image} resizeMode="cover" />
         {previewOnly && (
@@ -645,37 +687,44 @@ function ImageAttachmentViewer({
       </View>
 
       <View style={styles.actions}>
-        <TouchableOpacity style={styles.primaryButton} onPress={() => setShowModal(true)}>
+        <TouchableOpacity style={styles.primaryButton} onPress={openModal}>
           <Eye size={18} color="white" />
           <Text style={styles.primaryButtonText}>View</Text>
         </TouchableOpacity>
 
         <View style={styles.actionButtons}>
           <TouchableOpacity
-            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            style={inlineDownloadActionButtonStyle}
             onPress={handleDownload}
             disabled={effectiveIsDownloading}
+            accessibilityRole="button"
+            accessibilityLabel={inlineDownloadButtonA11yLabel}
           >
             {effectiveIsDownloading ? (
-              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
             ) : (
               <Download size={20} color={theme.textSecondary} />
             )}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={handleShare}
+            accessibilityRole="button"
+            accessibilityLabel={inlineShareButtonA11yLabel}
+          >
             <Share size={20} color={theme.textSecondary} />
           </TouchableOpacity>
         </View>
       </View>
 
-      <Modal visible={showModal} transparent animationType="fade" onRequestClose={() => setShowModal(false)}>
+      <Modal visible={showModal} transparent animationType="fade" onRequestClose={closeModal}>
         <View style={styles.modalBackdrop}>
           <SafeAreaView style={styles.modalContainer}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle} numberOfLines={1}>{fileName}</Text>
               <TouchableOpacity
                 style={styles.modalCloseButton}
-                onPress={() => setShowModal(false)}
+                onPress={closeModal}
               >
                 <X size={18} color="white" />
               </TouchableOpacity>
@@ -685,14 +734,12 @@ function ImageAttachmentViewer({
             </View>
             <View style={styles.modalActions}>
               <TouchableOpacity
-                style={[styles.modalActionButton, { opacity: effectiveIsDownloading ? 0.7 : 1 }]}
+                style={modalDownloadActionButtonStyle}
                 onPress={handleDownload}
                 disabled={effectiveIsDownloading}
               >
                 <Download size={18} color="white" />
-                <Text style={styles.modalActionText}>
-                  {effectiveIsDownloading ? `Downloading ${normalizedProgress}%` : 'Download'}
-                </Text>
+                <Text style={styles.modalActionText}>{modalDownloadLabel}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.modalActionButton} onPress={handleShare}>
                 <Share size={18} color="white" />
@@ -705,7 +752,7 @@ function ImageAttachmentViewer({
 
       <ShareModal
         visible={showShareModal}
-        onClose={() => setShowShareModal(false)}
+        onClose={closeShareModal}
         fileUrl={shareUrl}
         fileName={fileName}
         fileSize={fileSize}
@@ -739,7 +786,16 @@ function GenericFileViewerInner({
   const downloadState = useDownloadState(resolvedDownloadKey);
   const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
   const effectiveProgress = downloadProgress ?? downloadState.progress;
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    effectiveProgress,
+    effectiveIsDownloading
+  );
+  const inlineDownloadButtonA11yLabel = resolveDownloadProgressLabel(
+    effectiveIsDownloading,
+    normalizedProgress,
+    'Download file'
+  );
+  const inlineShareButtonA11yLabel = 'Share file';
 
   const remoteUrl = remoteFileUrl || fileUrl;
   const previewOnly = Boolean(isPreviewAsset && remoteFileUrl && remoteFileUrl !== fileUrl);
@@ -858,9 +914,9 @@ function GenericFileViewerInner({
 
     try {
       setIsLoading(true);
-  const localUri = await ensureLocalFile();
-  const inferredName = fileName || downloadFileName;
-  const mimeType = fileType || getMimeTypeFromFileName(inferredName);
+      const localUri = await ensureLocalFile();
+      const inferredName = fileName || downloadFileName;
+      const mimeType = fileType || getMimeTypeFromFileName(inferredName);
 
       if (Platform.OS === 'android') {
         const contentUri = await FileSystem.getContentUriAsync(localUri);
@@ -886,20 +942,28 @@ function GenericFileViewerInner({
     }
   };
 
-  const handleDownload = () => {
+  const handleDownload = useCallback(() => {
     if (onDownload) {
       onDownload();
     } else {
       Alert.alert('Download', 'Download functionality not implemented');
     }
-  };
+  }, [onDownload]);
 
-  const handleShare = () => {
+  const handleShare = useCallback(() => {
     setShowShareModal(true);
-  };
+  }, []);
+
+  const closeShareModal = useCallback(() => {
+    setShowShareModal(false);
+  }, []);
   const styles = useMemo(
     () => createGenericFileViewerStyles(theme, fileInfo.color, canOpen && !isDisabled),
     [theme, fileInfo.color, canOpen, isDisabled]
+  );
+  const inlineDownloadActionButtonStyle = useMemo(
+    () => [styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }],
+    [styles, effectiveIsDownloading]
   );
 
   const IconComponent = fileInfo.icon;
@@ -954,17 +1018,24 @@ function GenericFileViewerInner({
 
         <View style={styles.actionButtons}>
           <TouchableOpacity
-            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            style={inlineDownloadActionButtonStyle}
             onPress={handleDownload}
             disabled={effectiveIsDownloading}
+            accessibilityRole="button"
+            accessibilityLabel={inlineDownloadButtonA11yLabel}
           >
             {effectiveIsDownloading ? (
-              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
             ) : (
               <Download size={20} color={theme.textSecondary} />
             )}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={handleShare}
+            accessibilityRole="button"
+            accessibilityLabel={inlineShareButtonA11yLabel}
+          >
             <Share size={20} color={theme.textSecondary} />
           </TouchableOpacity>
         </View>
@@ -974,7 +1045,7 @@ function GenericFileViewerInner({
 
       <ShareModal
         visible={showShareModal}
-        onClose={() => setShowShareModal(false)}
+        onClose={closeShareModal}
         fileUrl={shareUrl}
         fileName={fileName}
         fileSize={fileSize}

@@ -24,6 +24,7 @@ import * as FileSystem from 'expo-file-system';
 import { doc, getDoc } from 'firebase/firestore';
 
 import { useAuth, authService } from '../../hooks/useAuthUnified';
+import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
 import useStudents from '../../hooks/useStudents';
 import useFees from '../../hooks/useFees';
 import { useTheme } from '../../hooks/useTheme';
@@ -419,6 +420,14 @@ export default function Settings() {
   const [pendingProfilePictureUri, setPendingProfilePictureUri] = useState<string | null>(null);
   const [uploadingProfilePicture, setUploadingProfilePicture] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const easedUploadProgress = useEasedUploadProgress(uploadProgress, {
+    isActive: uploadingProfilePicture,
+    smoothingPerSecond: 9,
+    minStepPercent: 0.12,
+    completionSnapThresholdPercent: 99.2,
+    nearCompletionBoostStartPercent: 96,
+    nearCompletionBoostMultiplier: 1.3,
+  });
   const [showImagePickerModal, setShowImagePickerModal] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
   const [selectedImageFileName, setSelectedImageFileName] = useState<string | null>(null);
@@ -2367,13 +2376,16 @@ export default function Settings() {
                   {uploadingProfilePicture && (
                     <View style={styles.uploadProgressContainer}>
                       <Text style={[styles.uploadingText, { color: theme.textSecondary }]}> 
-                        Uploading profile picture... {Math.round(uploadProgress)}%
+                        Uploading profile picture... {Math.round(easedUploadProgress)}%
                       </Text>
                       <View style={[styles.progressBar, { backgroundColor: theme.border }]}>
                         <View
                           style={[
                             styles.progressFill,
-                            { backgroundColor: theme.primary, width: `${uploadProgress}%` },
+                            {
+                              backgroundColor: theme.primary,
+                              width: `${easedUploadProgress}%`,
+                            },
                           ]}
                         />
                       </View>

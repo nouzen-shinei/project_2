@@ -25,10 +25,15 @@ import {
   InteractionManager,
   Alert,
   Easing,
+  LayoutAnimation,
+  UIManager,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import Toast from 'react-native-toast-message';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
+import * as Clipboard from 'expo-clipboard';
+import * as Haptics from 'expo-haptics';
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth, authService } from '../../hooks/useAuthUnified';
 import { useBirthdays } from '../../components/BirthdayProvider';
@@ -36,6 +41,8 @@ import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import type { TeamMember } from '../../hooks/useAuthUnified';
 import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useChat } from '../../hooks/useChat';
+import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
+import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
 import { chatService, ChatRateLimitError, ChatMessageActionError, ChatUploadCanceledError } from '../../services/chatService';
 import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
 import { getProfileImageUrl } from '../../lib/profileImage';
@@ -48,8 +55,56 @@ import {
 } from '../../lib/pendingMessageStorage';
 import { normalizePendingMessageStatus } from '../../lib/pendingMessageState';
 import {
+  resolveChatPendingServerMessageIdFromCandidates,
+  resolveChatPendingMessageCandidatesByKey,
+  buildChatPendingTextMatchKey,
+  resolveTimestampMs,
+} from '../../lib/chatPendingMessageServerIdMatcher';
+import { resolveChatRosterMergedWithPresence } from '../../lib/chatRosterMergeState';
+import {
+  resolveChatPendingRowAnimationTimings,
+  resolveChatActivePendingAnimationKeys,
+  resolveChatInactivePendingAnimationKeys,
+  buildChatPendingRowAnimationKey,
+  shouldStartPendingRowAnimation,
+  markPendingRowAnimationStarted,
+  PENDING_MESSAGE_BUBBLE_OPACITY_DEFAULT,
+  resolveChatPendingBubbleOpacityTarget,
+  shouldAnimateChatPendingBubbleOpacity,
+  resolveChatPendingBubbleOpacityDuration,
+  resolveChatInactivePendingBubbleOpacityIds,
+  resolveChatPendingBubbleOpacityEntry,
+  resolveChatPendingRowAnimationEntry,
+} from '../../lib/chatPendingAnimationState';
+import {
+  shouldFinalizeAttachmentCleanup,
+  hasPendingAttachment,
+  resolveChatAttachmentFinalizeDelayMs,
+  resolveChatAttachmentCleanupPlan,
+} from '../../lib/chatAttachmentFinalizeState';
+import {
+  resolveChatComposerEffectiveHeight,
+  resolveChatComposerExtraHeight,
+  resolveChatComposerAdaptiveExtraHeight,
+  resolveChatBottomVisibilityPadding,
+  resolveChatAutoscrollToTopThreshold,
+} from '../../lib/chatComposerLayoutState';
+import {
+  resolveChatPendingSenderEmail,
+  shouldLoadChatPendingMessages,
+  resolveChatNormalizedPendingMessages,
+} from '../../lib/chatPendingStorageState';
+import { resolveChatScrollToBottomButtonStyleState } from '../../lib/chatFloatingButtonLayoutState';
+import {
+  shouldRunChatPendingDeliveredCleanup,
+  hasChatPendingResolvedIds,
+  resolveChatPendingMapAfterRemovingIds,
+  resolveChatPendingActiveIdSet,
+} from '../../lib/chatPendingCleanupState';
+import {
   EnhancedMessageRenderer,
   MobileChatInput,
+  type MobileChatInputRef,
   MessageStatusTicks,
   ChatProfileModal,
   StyledText,
@@ -62,19 +117,282 @@ import {
 import VideoPlayer from '../../components/VideoPlayer';
 import { StickerGifPickerMobile } from '../../components/StickerGifPickerMobile';
 import ProgressiveImage from '../../components/ui/ProgressiveImage';
-import { ArrowLeft, Search, X, Paperclip, Smile, Play, Star, Clock, MessageCircle, Send, Heart, Eye, AlertCircle, Download, Share, Camera, Trash2, ChevronDown, RotateCcw, CheckCircle2, File as FileIcon, Image as ImageIcon, Edit3 } from 'lucide-react-native';
+import { ArrowLeft, Search, X, Paperclip, Smile, Play, Star, Clock, MessageCircle, Send, Heart, Eye, AlertCircle, Download, Share, Camera, Trash2, ChevronDown, RotateCcw, CheckCircle2, File as FileIcon, Image as ImageIcon, Edit3, Reply, Copy } from 'lucide-react-native';
 import { formatMessageTimestamp, getChatDateSeparator, formatOnlineStatus } from '../../lib/timeUtils';
 import { isImageFile, isVideoFile } from '../../lib/fileUtils';
 import { notificationService } from '../../services/notificationService';
 import { chatPreferencesService } from '../../services/chatPreferencesService';
-import type { FileAttachment , ConversationSummary } from '../../services/chatService';
+import type { FileAttachment , ConversationSummary, ChatReplyContext } from '../../services/chatService';
 import { chatCacheService } from '../../services/chatCacheService';
 import type { HydratedAttachment } from '../../services/chatCacheService';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useFrameTimingMonitor } from '../../hooks/useFrameTimingMonitor';
 import { getChatPaginationProfile } from '@/lib/chatPaginationConfig';
+import {
+  resolveChatLoadOlderStartPlan,
+  resolveChatLoadOlderAttemptOptions,
+  resolveChatReachedConversationStartPlan,
+  resolveChatLoadOlderFailurePlan,
+  resolveChatLoadOlderFailureLogPayload,
+  resolveChatLoadOlderConversationResetPlan,
+  resolveChatLoadOlderRunStartPlan,
+  resolveChatLoadOlderRunCompletionPlan,
+  resolveChatLoadOlderRetryAttemptPlan,
+  resolveChatLoadOlderFinalAddedState,
+  resolveChatLoadOlderReachedStartToastEmissionPlan,
+  resolveChatLoadOlderSyncingToastEmissionPlan,
+  type ChatLoadOlderReason,
+} from '@/lib/chatLoadOlderState';
 import { clearDownloadState, setDownloadState } from '@/lib/downloadStateStore';
+import { resolveDownloadProgressLabel } from '@/lib/uploadProgressDisplayEasing';
 import { reconcileConversationUnreadCount, shouldRefreshChatSummariesOnForegroundResume } from '@/lib/chatReceiptState';
+import {
+  applyChatReceiptRequestedReadMutation,
+  applyChatReceiptSyncRunFinalizePlan,
+  normalizeChatReceiptSyncEmail,
+  resolveChatReceiptSyncQueueExecutionPlan,
+  resolveChatReceiptForegroundQueueExecutionPlan,
+  shouldApplyChatReceiptSyncRunContinuation,
+  shouldRunChatReceiptSyncDeferredFlushContinuation,
+  resolveChatReceiptViewabilityQueueDispatchPlanForMarker,
+  resolveChatReceiptRequestedReadMutationPlan,
+  resolveChatReceiptSyncConversationResetPlan,
+  clearChatReceiptSyncQueuedState,
+  resolveChatReceiptSyncFlushExecutionPlan,
+  resolveChatReceiptSyncRunAttemptPlan,
+  resolveChatReceiptSyncFlushPlan,
+  resolveChatReceiptRequestedReadSeedMessageIds,
+} from '@/lib/chatReceiptSyncState';
+import { clearTimeoutRef, scheduleTimeoutRef } from '@/lib/timeoutRef';
+import { areChatTypingPairsEqual, createChatTypingPair, type ChatTypingPair } from '@/lib/chatTypingState';
+import { resolveChatTypingTransition } from '@/lib/chatTypingTransition';
+import {
+  createChatTypingStatusWriteRollupState,
+  recordChatTypingStatusWriteRollup,
+} from '@/lib/chatTypingMetrics';
+import { canAttemptChatComposerSend, isChatComposerMessageOverLimit } from '@/lib/chatComposerSendState';
+import {
+  resolveChatComposerMessageWithinLimits,
+  resolveChatComposerWordCount,
+} from '@/lib/chatComposerInputState';
+import { resolveChatRichTextInputResult } from '@/lib/chatRichContentState';
+import { getChatComposerDraftKey } from '@/lib/chatComposerDrafts';
+import { ChatComposer } from '../../components/chat/ChatComposer';
+
+import { resolveChatSpecialComposerState } from '@/lib/chatSpecialComposerState';
+import {
+  resolveChatSafeDisplayInitial,
+  resolveChatSanitizedAttachmentFileName,
+  resolveChatSanitizedDateSeparatorLabel,
+  resolveChatSanitizedMessageText,
+} from '@/lib/chatSanitizeState';
+import {
+  resolveChatNormalizedMessageId,
+  resolveChatNormalizedMessageValue,
+  resolveChatNormalizedParticipantEmail,
+} from '@/lib/chatNormalizationState';
+import {
+  resolveChatTenorGifCandidateUrl,
+  resolveChatTenorIdFromUrl,
+  resolveChatTenorPostsLookupUrl,
+  resolveChatTenorWebpToGifGuess,
+} from '@/lib/chatTenorUrlState';
+import { resolveChatTimestampMs } from '@/lib/chatTimestampState';
+import { resolveChatRealtimeOnline } from '@/lib/chatPresenceState';
+import { resolveChatReplyPreviewText } from '@/lib/chatReplyPreview';
+import { getEmojiName, normalizeReactions, areReactionsEqual, QUICK_REACTIONS, type ReactionPillDescriptor } from '@/lib/chatReactionUtils';
+import {
+  clampChatConversationSearchIndex,
+  type ChatConversationSearchScope,
+  type ChatConversationSearchScopeShortcutAction,
+  normalizeChatConversationSearchQuery,
+  normalizeChatConversationSearchScope,
+  resolveChatConversationSearchMatchIds,
+  resolveChatConversationSearchBestScopeSuggestion,
+  resolveChatConversationSearchNoMatchesGuidance,
+  resolveChatConversationSearchNoMatchesLabel,
+  resolveChatConversationSearchScopeMatchCounts,
+  resolveChatConversationSearchScopeShortcutAction,
+  resolveChatConversationSearchScopeSuggestionByOrdinal,
+  resolveChatConversationSearchScopeSuggestionCycle,
+  resolveChatConversationSearchScopeSuggestions,
+  resolveChatConversationSearchSeedQuery,
+  resolveChatConversationSearchSnippet,
+  resolveChatConversationSearchCounterLabel,
+  resolveChatConversationSearchSnippetTypeLabel,
+  resolveChatConversationSearchNextIndex,
+  resolveChatConversationSearchScopeStep,
+  shouldLoadOlderForConversationSearch,
+} from '@/lib/chatConversationSearch';
+import {
+  type ChatConversationSearchContextSnapshot,
+  type PersistedChatConversationSearchContextStore,
+  DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_AGE_MS,
+  DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_ENTRIES,
+  DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_QUERY_LENGTH,
+  normalizePersistedConversationSearchContextStore,
+  readPersistedConversationSearchContext,
+  upsertPersistedConversationSearchContext,
+} from '@/lib/chatConversationSearchContext';
+import { resolveChatConversationSearchContextKey } from '@/lib/chatConversationSearchContextKey';
+import {
+  createChatConversationSearchUxRollupState,
+  recordChatConversationSearchUxRollup,
+} from '@/lib/chatConversationSearchMetrics';
+import { resolveChatConversationSearchMatchCollections } from '@/lib/chatConversationSearchMatchCollections';
+import {
+  createChatRenderTraceState,
+  resolveChatRenderTraceCompletePayload,
+  resolveChatRenderTraceStartPayload,
+  type ChatRenderTraceState,
+} from '@/lib/chatRenderTraceMetrics';
+import {
+  resolveChatUnreadRepairEligibility,
+  resolveChatUnreadRepairRunPayload,
+} from '@/lib/chatUnreadRepairMetrics';
+import { resolveChatLiveConversationSummary } from '@/lib/chatConversationSummaryState';
+import { resolveChatUnreadDividerDerivedState } from '@/lib/chatUnreadDividerState';
+import { resolveChatUnreadSeparatorReconcilePlan } from '@/lib/chatUnreadSeparatorReconcileState';
+import { resolveChatFilteredTeamMembers } from '@/lib/chatTeamMemberListState';
+import {
+  resolveChatMessageRowMetaState,
+} from '@/lib/chatMessageRowMetaState';
+import {
+  resolveChatEstimatedItemSize,
+  resolveChatEstimatedListSize,
+  resolveChatListDrawDistance,
+} from '@/lib/chatListVirtualizationState';
+import { upsertChatConversationSummary } from '@/lib/chatConversationSummaryMapState';
+import {
+  resolveChatBottomAnchorAttemptPlan,
+  resolveChatEnsureAnchorActionPlan,
+  resolveChatPrependAnchorFailureExecutionPlanForRestore,
+  resolveChatPrependAnchorRestoreOffsetPlan,
+  resolveChatPrependAnchorCapturePlan,
+  resolveChatPrependAnchorCaptureTriggerOffset,
+} from '@/lib/chatAnchorStabilizationState';
+import {
+  applyChatPrependAnchorRestoreWithFallback,
+  type ChatPendingPrependAnchorRefValue,
+} from '@/lib/chatAnchorFailureExecutionRuntime';
+import {
+  applyChatViewabilityDeferredResolveDispatchPlan,
+  resolveChatViewabilityNearbyMediaPrefetchPlan,
+  resolveChatViewabilityPrefetchCandidateIndices,
+} from '@/lib/chatViewabilityPrefetch';
+import {
+  applyChatViewabilityWarmTargetPrefetch,
+  resolveChatViewabilityQueueDispatchResolverFallbackMetricEmissionPlan,
+  resolveChatViewabilityQueueDispatchEffectsPlan,
+  resolveChatViewabilityReceiptQueueDispatchPlan,
+} from '@/lib/chatViewabilityReceiptCollection';
+import {
+  resolveChatViewabilityWindowSummary,
+  resolveChatUnreadSeparatorVisibilityPlan,
+  resolveChatTopWindowActionPlan,
+} from '@/lib/chatViewabilityWindow';
+import {
+  createChatMessageInfoCopyMetricRollupState,
+  recordChatMessageInfoCopyMetricRollup,
+  resolveChatMessageInfoCopyToastCooldownState,
+  resolveChatMessageInfoCopyToastSuppressionPlan,
+  resolveChatMessageInfoCopySuccessPlan,
+  resolveChatMessageInfoCopyFeedbackAccessibilityLabel,
+  resolveChatMessageInfoCopyFeedbackLabel,
+  resolveChatMessageInfoCopyFeedbackSourceAccessibilityLabel,
+  resolveChatMessageInfoCopyFeedbackSourceBadgeText,
+  resolveChatMessageInfoCopyToastPayload,
+  resolveChatMessageInfoRowBadge,
+  resolveChatMessageInfoRowValueParts,
+  formatChatMessageInfoRowsForClipboard,
+  resolveChatMessageInfoCopyFeedbackSourceLabel,
+  resolveChatMessageInfoCopyFeedbackSourcePalette,
+  resolveChatMessageInfoShortcutAction,
+  resolveChatMessageInfoToastCooldownAccessibilityLabel,
+  resolveChatMessageInfoRows,
+} from '@/lib/chatMessageInfo';
+import { executeChatReplyJump } from '@/lib/chatReplyJump';
+import {
+  createChatReplyJumpMetricRollupState,
+  flushChatReplyJumpMetricRollup,
+  recordChatReplyJumpMetricRollup,
+  type ChatReplyJumpMetricReason,
+  type ChatReplyJumpMetricSource,
+} from '@/lib/chatReplyJumpMetrics';
+import {
+  normalizeReplyJumpTargetMessageId,
+  resolveReplyJumpHighlightAfterTimeout,
+  resolveReplyJumpStateForJumpSuccess,
+  resolveReplyJumpStateForLatestReturn,
+  resolveReplyJumpStateForNearBottom,
+} from '@/lib/chatReplyJumpUiState';
+import {
+  pruneDelimitedMapByPrefixSet,
+  pruneMapByKeySet,
+  pruneMapByNumericRange,
+  resolveMapCacheEntry,
+  resolveChatAttachmentBaseKeySet,
+} from '@/lib/chatHandlerCache';
+import {
+  resolveChatPendingReplyPreviewState,
+  resolveChatPendingStatusDisplayState,
+} from '@/lib/chatPendingRenderState';
+import {
+  resolveChatPendingAttachmentMessageReconciledIds,
+  resolveChatPendingMediaMessageReconciledIds,
+  resolveChatPendingTextMessageReconciledIds,
+} from '@/lib/chatPendingReconciliationState';
+import {
+  resolveChatPendingServerMatchVisibility,
+  resolveChatPendingTextVisibilityState,
+} from '@/lib/chatPendingVisibilityState';
+import { resolveChatPendingRetryOutcomeSummary } from '@/lib/chatPendingRetryOutcomeState';
+import { resolveChatPendingRetryAllGuard } from '@/lib/chatPendingRetryEligibilityState';
+import { resolveChatPendingRetryBatchPlan } from '@/lib/chatPendingRetryBatchState';
+import { resolveChatPendingRetryDispatchPromises } from '@/lib/chatPendingRetryDispatchState';
+import { resolveChatPendingAutoRetryPlan } from '@/lib/chatPendingAutoRetryState';
+import { resolveChatPendingConversationDerivedState } from '@/lib/chatPendingConversationDerived';
+import { resolveChatNearBottomState } from '@/lib/chatNearBottomState';
+import {
+  resolveChatStickyDateIdleHidePlan,
+  resolveChatStickyDateScrollPlan,
+} from '@/lib/chatStickyDateScrollState';
+import {
+  resolveChatMessageDisplayKey,
+  resolveChatMessageRenderSignature,
+} from '@/lib/chatMessageIdentityState';
+import {
+  resolveChatMessageLayoutSize,
+  resolveChatMessageListItemKey,
+  resolveChatMessageListItemType,
+} from '@/lib/chatMessageListItemState';
+import {
+  type ChatStableMessageCacheEntry,
+  resolveChatDisplayedMessagesState,
+  resolveChatDisplayedMessageIdSet,
+  shouldCompactChatMessagePositions,
+  resolveChatPrunedMessagePositions,
+} from '@/lib/chatDisplayedMessagesState';
+import {
+  resolveChatPendingRecipientEmail,
+  resolveChatTeamMembersByRecipientKey,
+} from '@/lib/chatRecipientLookupState';
+import {
+  resolveChatOptimisticReactionMap,
+  shouldKeepChatOptimisticReactionUntil,
+  resolveChatOptimisticReactionExpiryIds,
+  resolveChatPrunedLocalMessageReactions,
+} from '@/lib/chatReactionState';
+import {
+  resolveChatCanDeleteMessage,
+  resolveChatCanEditMessage,
+  resolveChatCanReplyMessage,
+  resolveChatFindLatestEditableOwnMessage,
+  resolveChatIsOwnMessageEmail,
+} from '@/lib/chatMessageActionState';
+import { resolveChatRosterSnapshotForRoster } from '@/lib/chatRosterSnapshotState';
+import { resolveChatReplyContextFromMessage, resolveChatReplySenderLabel } from '@/lib/chatReplyContextState';
+import { resolveChatScrollInteractionPlan } from '@/lib/chatScrollInteractionState';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { useLocalSearchParams, useRouter } from 'expo-router';
@@ -86,12 +404,67 @@ import { normalizeSharedFileName } from '@/services/sharedFileService';
 import { useDownloadState } from '@/hooks/useDownloadState';
 import { setEditingMessageId, setMessageReactionsForMessage } from '@/lib/messageUiStateStore';
 import { useMessageUiState } from '@/hooks/useMessageUiState';
+import AnimatedMessageWrapper from '@/components/chat/AnimatedMessageWrapper';
+import MessageRow from '@/components/chat/MessageRow';
+import MessageReplySnippet from '@/components/chat/MessageReplySnippet';
+import MessageReactionPills from '@/components/chat/MessageReactionPills';
+import MessagePendingOverlay from '@/components/chat/MessagePendingOverlay';
+import { ChatAttachmentModal } from '@/components/chat/ChatAttachmentModal';
+import { ChatFilePreviewModal } from '@/components/chat/ChatFilePreviewModal';
+import { ChatImageViewerModal } from '@/components/chat/ChatImageViewerModal';
+import { ChatContextProvider } from '@/components/chat/ChatContext';
+import { ChatHeader } from '@/components/chat/ChatHeader';
+import AnimatedTypingIndicator from '@/components/AnimatedTypingIndicator';
+import type { ChatStableContextValue, ChatReactiveContextValue } from '@/components/chat/ChatContext';
 
 const CHAT_PRESENCE_MODE = (process.env.EXPO_PUBLIC_PRESENCE_MODE || 'last_seen').toLowerCase();
 const MESSAGE_TUNE_SOURCE = require('../../assets/sounds/message_tune.mp3');
 const CHAT_OPEN_TONE_COOLDOWN_MS = 500;
 const CHAT_MESSAGE_MAX_CHARS = 500;
 const CHAT_MESSAGE_MAX_WORDS = 100;
+const CHAT_REPLY_PREVIEW_MAX_CHARS = 120;
+const MESSAGE_INFO_COPIED_RESET_DELAY_MS = 1400;
+const CONVERSATION_SEARCH_SCOPE_LABELS: Record<ChatConversationSearchScope, string> = {
+  all: 'All',
+  text: 'Text',
+  attachment: 'Attachment',
+  reply: 'Reply',
+  media: 'Media',
+};
+const CONVERSATION_SEARCH_SCOPE_SHORTCUT_LABELS: Record<ChatConversationSearchScope, string> = {
+  all: 'A',
+  text: 'T',
+  attachment: 'F',
+  reply: 'R',
+  media: 'M',
+};
+const CONVERSATION_SEARCH_SCOPE_OPTIONS: readonly {
+  key: ChatConversationSearchScope;
+  label: string;
+}[] = [
+  { key: 'all', label: CONVERSATION_SEARCH_SCOPE_LABELS.all },
+  { key: 'text', label: CONVERSATION_SEARCH_SCOPE_LABELS.text },
+  { key: 'attachment', label: CONVERSATION_SEARCH_SCOPE_LABELS.attachment },
+  { key: 'reply', label: CONVERSATION_SEARCH_SCOPE_LABELS.reply },
+  { key: 'media', label: CONVERSATION_SEARCH_SCOPE_LABELS.media },
+];
+
+const CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY =
+  'chat.conversation_search_context.v1';
+const CONVERSATION_SEARCH_CONTEXT_PERSIST_DEBOUNCE_MS = 220;
+const CONVERSATION_SEARCH_QUERY_DEBOUNCE_MS = 140;
+const CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS = {
+  maxAgeMs: DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_AGE_MS,
+  maxEntries: DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_ENTRIES,
+  maxQueryLength: DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_QUERY_LENGTH,
+};
+
+const DEFAULT_CONVERSATION_SEARCH_CONTEXT: ChatConversationSearchContextSnapshot = {
+  visible: false,
+  query: '',
+  scope: 'all',
+};
+
 const UNREAD_DIVIDER_AUTO_DISMISS_MS = 2200;
 const UNREAD_DIVIDER_ACTION_DISMISS_MS = 180;
 const resolveChatPresenceThresholdMin = () => {
@@ -101,47 +474,304 @@ const resolveChatPresenceThresholdMin = () => {
 };
 const CHAT_PRESENCE_THRESHOLD_MIN = resolveChatPresenceThresholdMin();
 
-function parsePresenceTimestamp(value: unknown): Date | null {
-  try {
-    if (!value) return null;
-    if (value instanceof Date) return value;
-    if (typeof value === 'string' || typeof value === 'number') {
-      const parsed = new Date(value);
-      return Number.isNaN(parsed.getTime()) ? null : parsed;
-    }
-    const maybeObj = value as { seconds?: number; nanoseconds?: number; toDate?: () => Date };
-    if (typeof maybeObj.toDate === 'function') {
-      const parsed = maybeObj.toDate();
-      return Number.isNaN(parsed.getTime()) ? null : parsed;
-    }
-    if (typeof maybeObj.seconds === 'number') {
-      const parsed = new Date(
-        maybeObj.seconds * 1000 + Math.floor(((maybeObj.nanoseconds || 0) as number) / 1e6)
-      );
-      return Number.isNaN(parsed.getTime()) ? null : parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+interface PendingUploadProgressBarProps {
+  progress: number;
+  label: string;
+  showPercent?: boolean;
+  isActive?: boolean;
+  textStyle?: any;
+  trackStyle?: any;
+  fillStyle?: any;
 }
 
-function deriveRealtimeOnline(isOnline: boolean | undefined, lastSeen: unknown): boolean {
-  if (CHAT_PRESENCE_MODE === 'flag') {
-    return isOnline === true;
+function normalizePendingUploadProgress(progress: unknown): number {
+  const numeric = Number(progress);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
   }
 
-  const parsedLastSeen = parsePresenceTimestamp(lastSeen);
-  if (parsedLastSeen) {
-    const diffMinutes = (Date.now() - parsedLastSeen.getTime()) / (1000 * 60);
-    return diffMinutes <= CHAT_PRESENCE_THRESHOLD_MIN;
+  if (numeric >= 100) {
+    return 100;
   }
 
-  return isOnline ?? false;
+  return numeric;
 }
+
+function PendingUploadProgressBar({
+  progress,
+  label,
+  showPercent = true,
+  isActive = true,
+  textStyle,
+  trackStyle,
+  fillStyle,
+}: PendingUploadProgressBarProps) {
+  const easedProgress = useEasedUploadProgress(progress, {
+    isActive,
+    smoothingPerSecond: 11,
+    minStepPercent: 0.18,
+    completionSnapThresholdPercent: 99.2,
+    nearCompletionBoostStartPercent: 96,
+    nearCompletionBoostMultiplier: 1.35,
+  });
+  const displayProgress = normalizePendingUploadProgress(easedProgress);
+
+  return (
+    <>
+      <Text style={textStyle}>
+        {showPercent ? `${label} ${Math.round(displayProgress)}%` : label}
+      </Text>
+      <View style={trackStyle}>
+        <View style={[fillStyle, { width: `${displayProgress}%` }]} />
+      </View>
+    </>
+  );
+}
+
+interface ChatMessagesListPaneProps {
+  stickyDateVisible: boolean;
+  stickyDateText: string;
+  sanitizeDateSeparatorLabel: (value: unknown) => string;
+  theme: any;
+  isInitialAnchorSettled: boolean;
+  flatListRef: any;
+  listKey: string;
+  displayedMessages: any[];
+  estimatedItemSize: number;
+  getMessageKey: (item: any, index: number) => string;
+  estimatedListSize: any;
+  listDrawDistance: number;
+  onViewableItemsChanged: any;
+  viewabilityConfig: any;
+  getMessageItemType: (item: any, index: number) => string;
+  overrideMessageLayout: any;
+  renderMessageItem: any;
+  listExtraData: any;
+  messagesContentContainerStyle: any;
+  onMessageListScroll: (event: any) => void;
+  onMessageListContentSizeChange: (width: number, height: number) => void;
+  onMessageListLayout: (event: any) => void;
+  maintainVisibleContentPositionConfig: any;
+  renderChatListHeader: () => React.ReactNode;
+  renderChatListFooter: () => React.ReactNode;
+  renderChatListEmpty: () => React.ReactElement | null;
+}
+
+interface ChatMessagesListShellProps {
+  listPaneProps: ChatMessagesListPaneProps;
+  scrollButtonProps: ChatScrollToBottomButtonProps;
+}
+
+interface ChatScrollToBottomButtonProps {
+  showScrollToBottom: boolean;
+  handleScrollToBottomPress: () => void;
+  scrollToBottomButtonStyle: any;
+  showReplyJumpToLatest: boolean;
+  unseenCount: number;
+  unseenCountBadgeStyle: any;
+  theme: any;
+}
+
+const ChatMessagesFlashListPane = React.memo(function ChatMessagesFlashListPane({
+  stickyDateVisible,
+  stickyDateText,
+  sanitizeDateSeparatorLabel,
+  theme,
+  isInitialAnchorSettled,
+  flatListRef,
+  listKey,
+  displayedMessages,
+  estimatedItemSize,
+  getMessageKey,
+  estimatedListSize,
+  listDrawDistance,
+  onViewableItemsChanged,
+  viewabilityConfig,
+  getMessageItemType,
+  overrideMessageLayout,
+  renderMessageItem,
+  listExtraData,
+  messagesContentContainerStyle,
+  onMessageListScroll,
+  onMessageListContentSizeChange,
+  onMessageListLayout,
+  maintainVisibleContentPositionConfig,
+  renderChatListHeader,
+  renderChatListFooter,
+  renderChatListEmpty,
+}: ChatMessagesListPaneProps) {
+  return (
+    <>
+      {stickyDateVisible && (
+        <View style={[styles.stickyDateHeader, { backgroundColor: 'transparent', pointerEvents: 'none' }]}> 
+          <View style={[styles.stickyDateContainer, {
+            backgroundColor: theme.surface,
+            borderColor: theme.border,
+            ...(Platform.OS === 'web' ? {} : { shadowColor: theme.text }),
+          }]}> 
+            <Text style={[styles.stickyDateText, { color: theme.textSecondary }]}> 
+              {sanitizeDateSeparatorLabel(stickyDateText)}
+            </Text>
+          </View>
+        </View>
+      )}
+
+      <View
+        style={[styles.messagesContainer, !isInitialAnchorSettled && styles.messagesContainerHidden]}
+      >
+        <FlashList
+          ref={flatListRef}
+          key={listKey}
+          data={displayedMessages}
+          estimatedItemSize={estimatedItemSize}
+          keyExtractor={getMessageKey}
+          estimatedListSize={estimatedListSize}
+          drawDistance={listDrawDistance}
+          onViewableItemsChanged={onViewableItemsChanged}
+          viewabilityConfig={viewabilityConfig}
+          getItemType={getMessageItemType}
+          overrideItemLayout={overrideMessageLayout}
+          renderItem={renderMessageItem}
+          extraData={listExtraData}
+          removeClippedSubviews={Platform.OS !== 'web'}
+          contentContainerStyle={messagesContentContainerStyle}
+          showsVerticalScrollIndicator={false}
+          onScroll={onMessageListScroll}
+          scrollEventThrottle={32}
+          onContentSizeChange={onMessageListContentSizeChange}
+          onLayout={onMessageListLayout}
+          maintainVisibleContentPosition={maintainVisibleContentPositionConfig}
+          ListHeaderComponent={renderChatListHeader}
+          ListFooterComponent={renderChatListFooter}
+          ListEmptyComponent={renderChatListEmpty}
+        />
+      </View>
+    </>
+  );
+});
+
+const ChatScrollToBottomButton = React.memo(function ChatScrollToBottomButton({
+  showScrollToBottom,
+  handleScrollToBottomPress,
+  scrollToBottomButtonStyle,
+  showReplyJumpToLatest,
+  unseenCount,
+  unseenCountBadgeStyle,
+  theme,
+}: ChatScrollToBottomButtonProps) {
+  if (!showScrollToBottom) {
+    return null;
+  }
+
+  return (
+    <TouchableOpacity
+      onPress={handleScrollToBottomPress}
+      activeOpacity={0.8}
+      style={scrollToBottomButtonStyle}
+    >
+      <ChevronDown size={18} color={theme.text} />
+      {showReplyJumpToLatest ? (
+        <Text style={[styles.scrollToBottomLatestLabel, { color: theme.text }]}>Latest</Text>
+      ) : unseenCount > 0 && (
+        <View style={unseenCountBadgeStyle}>
+          <Text style={styles.unreadBadgeText}>{unseenCount}</Text>
+        </View>
+      )}
+    </TouchableOpacity>
+  );
+});
+
+const ChatMessagesListShell = React.memo(function ChatMessagesListShell({
+  listPaneProps,
+  scrollButtonProps,
+}: ChatMessagesListShellProps) {
+  return (
+    <View style={styles.messagesWrapper}>
+      <ChatMessagesFlashListPane {...listPaneProps} />
+      <ChatScrollToBottomButton {...scrollButtonProps} />
+    </View>
+  );
+});
 
 export default function Chat() {
   const { theme, isDarkMode } = useTheme();
+
+  // ── Phase 6: Memoized theme-dependent styles ──
+  // Pre-compute the most frequently repeated inline style objects so that
+  // the render-message hot path reuses stable references instead of
+  // allocating new objects on every render.
+  const themedStyles = useMemo(() => ({
+    // Color styles (used 100+ times across message rows)
+    colorTextSecondary: { color: theme.textSecondary } as const,
+    colorText: { color: theme.text } as const,
+    colorPrimary: { color: theme.primary } as const,
+    colorWarning: { color: theme.warning } as const,
+    colorError: { color: theme.error } as const,
+    // Background styles (used 40+ times)
+    bgBackground: { backgroundColor: theme.background } as const,
+    bgPrimary: { backgroundColor: theme.primary } as const,
+    bgSurface: { backgroundColor: theme.surface } as const,
+    bgBorder: { backgroundColor: theme.border } as const,
+    // Compound styles for common patterns
+    borderPrimary: { borderColor: theme.primary } as const,
+    borderBorder: { borderColor: theme.border } as const,
+    borderWarning: { borderColor: theme.warning } as const,
+    borderLeftPrimary: { borderLeftColor: theme.primary } as const,
+    borderLeftWarning: { borderLeftColor: theme.warning } as const,
+    // Reaction pill compound styles (used per-reaction per-message)
+    reactionPillBase: { backgroundColor: theme.background, borderColor: theme.border } as const,
+    reactionPillSelected: { backgroundColor: theme.primary + '20', borderColor: theme.primary } as const,
+    // Deleted sticker placeholder
+    deletedPlaceholder: { backgroundColor: theme.background, borderColor: theme.border } as const,
+    // Special message bubble
+    specialBubble: { backgroundColor: theme.surface, borderColor: theme.warning } as const,
+    // Friend message bubble
+    friendBubble: { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border } as const,
+    // Retry button
+    retryButton: {
+      marginLeft: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      borderRadius: 8,
+      backgroundColor: theme.background,
+      borderWidth: 1,
+      borderColor: theme.border,
+      flexDirection: 'row' as const,
+      alignItems: 'center' as const,
+    },
+    retryButtonDisabled: {
+      marginLeft: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      borderRadius: 8,
+      backgroundColor: theme.background,
+      borderWidth: 1,
+      borderColor: theme.border,
+      flexDirection: 'row' as const,
+      alignItems: 'center' as const,
+      opacity: 0.6,
+    },
+    retryText: { color: theme.primary, fontWeight: '600' as const } as const,
+    // Link styles for StyledText (hot path – special + regular messages)
+    linkStylePrimary: { color: theme.primary, fontWeight: '600' as const } as const,
+    linkStyleOwn: { color: 'rgba(255, 255, 255, 0.9)' as const, fontWeight: '600' as const } as const,
+    // Editing border styles
+    editBorderOwn: { borderWidth: 2, borderColor: 'rgba(255, 255, 255, 0.7)' } as const,
+    editBorderFriend: { borderWidth: 2, borderColor: theme.primary } as const,
+    // ── Separator styles (renderMessageItem hot path) ──
+    dateSepLine: { backgroundColor: theme.border } as const,
+    dateSepText: { backgroundColor: theme.background, color: theme.textSecondary } as const,
+    unreadSepLine: { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' } as const,
+    unreadSepText: { backgroundColor: theme.background, color: isDarkMode ? '#FF4444' : '#FF0000', fontWeight: '600' as const } as const,
+    newDividerLine: { backgroundColor: theme.primary } as const,
+    newDividerText: { backgroundColor: theme.background, color: theme.primary, fontWeight: '600' as const } as const,
+    // Search result marker
+    searchMarkerActive: { borderColor: theme.primary, backgroundColor: isDarkMode ? 'rgba(59, 130, 246, 0.22)' : 'rgba(59, 130, 246, 0.15)' } as const,
+    searchMarkerInactive: { borderColor: isDarkMode ? 'rgba(148, 163, 184, 0.45)' : 'rgba(100, 116, 139, 0.34)', backgroundColor: theme.background } as const,
+    searchDotActive: { backgroundColor: theme.primary } as const,
+    searchDotInactive: { backgroundColor: isDarkMode ? 'rgba(147, 197, 253, 0.9)' : 'rgba(59, 130, 246, 0.76)' } as const,
+  }), [theme, isDarkMode]);
+
   // Debug toggle: set to true while diagnosing scroll/anchor behavior (web/native)
   const CHAT_SCROLL_DEBUG = false;
   const { headerCompensation, setSuppressFab } = useBirthdays();
@@ -162,9 +792,55 @@ export default function Chat() {
   const [teamMembersError, setTeamMembersError] = useState<string | null>(null);
   const [selectedTeamMember, setSelectedTeamMember] = useState<TeamMember | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [conversationSearchVisible, setConversationSearchVisible] = useState(false);
+  const [conversationSearchQuery, setConversationSearchQuery] = useState('');
+  const [conversationSearchDebouncedQuery, setConversationSearchDebouncedQuery] = useState('');
+  const [conversationSearchScope, setConversationSearchScope] = useState<ChatConversationSearchScope>('all');
+  const [conversationSearchActiveIndex, setConversationSearchActiveIndex] = useState(0);
+  const [conversationSearchHighlightMessageId, setConversationSearchHighlightMessageId] = useState<string | null>(null);
+  const [conversationSearchKeyboardSuggestionScope, setConversationSearchKeyboardSuggestionScope] =
+    useState<ChatConversationSearchScope | null>(null);
+  const [conversationSearchShortcutPulseScope, setConversationSearchShortcutPulseScope] =
+    useState<ChatConversationSearchScope | null>(null);
+  const [isConversationSearchHistoryLoading, setIsConversationSearchHistoryLoading] = useState(false);
+  const [conversationSearchContextHydrationTick, setConversationSearchContextHydrationTick] =
+    useState(0);
+  const conversationSearchInputRef = useRef<TextInput | null>(null);
+  const conversationSearchQueryRef = useRef('');
+  const previousConversationSearchQueryRef = useRef('');
+  const previousConversationSearchScopeRef = useRef<ChatConversationSearchScope>('all');
+  const conversationSearchContextByConversationKeyRef =
+    useRef<Map<string, ChatConversationSearchContextSnapshot>>(new Map());
+  const activeConversationSearchContextKeyRef = useRef<string | null>(null);
+  const conversationSearchContextStoreRef =
+    useRef<PersistedChatConversationSearchContextStore>({});
+  const conversationSearchContextHydratedRef = useRef(false);
+  const conversationSearchContextPersistTimerRef =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
+  const conversationSearchLoadTokenRef = useRef(0);
+  const conversationSearchHistoryLoadAttemptsRef = useRef(0);
+  const conversationSearchLoadDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const conversationSearchVisibleRef = useRef(false);
+  const conversationSearchMatchIdsRef = useRef<string[]>([]);
+  const normalizedConversationSearchQueryRef = useRef('');
+  const isConversationSearchHistoryLoadingRef = useRef(false);
+  const scheduleConversationSearchHistoryLoadRef = useRef<(query: string) => void>(() => {});
+  const conversationSearchScopeRef = useRef<ChatConversationSearchScope>('all');
+  const conversationSearchKeyboardSuggestionScopeRef = useRef<ChatConversationSearchScope | null>(null);
+  const conversationSearchShortcutPulseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const conversationSearchTelemetryRef = useRef(createChatConversationSearchUxRollupState());
+  // ── Refs for renderMessageItem dependency stabilization (Phase 4) ──
+  const conversationSearchHighlightMessageIdRef = useRef<string | null>(null);
+  const conversationSearchMatchIdSetRef = useRef<Set<string>>(new Set());
+  const conversationSearchMatchIndexByIdRef = useRef<Map<string, number>>(new Map());
+  const messageRowMetaByIdRef = useRef<typeof messageRowMetaById>(null as any);
+  const newDividerMessageIdRef = useRef<string | null>(null);
+  const showNewDividerRef = useRef(false);
+  const unreadDividerLabelRef = useRef('');
   const [isTyping, setIsTyping] = useState(false);
   const [message, setMessage] = useState('');
   const latestMessageRef = useRef(message);
+  const draftByConversationKeyRef = useRef<Map<string, string>>(new Map());
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const sendInFlightRef = useRef(false);
   const [pendingMessages, setPendingMessages] = useState<Map<string, PendingMessage>>(new Map());
@@ -202,15 +878,17 @@ export default function Chat() {
   }, []);
 
   const scheduleAttachmentFinalizeCleanup = useCallback(
-    (tempId: string, delayMs: number = 1200) => {
+    (tempId: string, delayMs?: number) => {
       clearAttachmentFinalizeTimer(tempId);
+      const actualDelay = resolveChatAttachmentFinalizeDelayMs(delayMs);
       const timer = setTimeout(() => {
         setPendingAttachments((prev) => {
-          if (!prev.has(tempId)) {
+          if (!hasPendingAttachment(prev, tempId)) {
             return prev;
           }
           const current = prev.get(tempId);
-          if (!current || current.status !== 'finalizing') {
+          const cleanupPlan = resolveChatAttachmentCleanupPlan(current);
+          if (!cleanupPlan.shouldCleanup) {
             return prev;
           }
           const next = new Map(prev);
@@ -219,7 +897,7 @@ export default function Chat() {
         });
         attachmentFinalizeTimers.current.delete(tempId);
         attachmentUploadCancelMap.current.delete(tempId);
-      }, delayMs);
+      }, actualDelay);
       attachmentFinalizeTimers.current.set(tempId, timer);
     },
     [clearAttachmentFinalizeTimer]
@@ -231,38 +909,11 @@ export default function Chat() {
         presenceMap: Map<string, TeamMember>,
         profileMap: Map<string, TeamMember>
       ): TeamMember[] => {
-        if (!roster || roster.length === 0) {
-          return [];
-        }
-
-        return roster.map((member) => {
-          const key = member.email?.toLowerCase?.() || member.id;
-          const presence = key ? presenceMap.get(key) : undefined;
-          const profile = key ? profileMap.get(key) : undefined;
-
-          if (!presence && !profile) {
-            return member;
-          }
-
-          return {
-            ...member,
-            role: member.role, // ensure tenant role overwrites stale role values
-            tenantRole: member.tenantRole,
-            name: profile?.name || presence?.name || member.name,
-            avatar: profile?.avatar || presence?.avatar || member.avatar,
-            photoURL: profile?.photoURL ?? presence?.photoURL ?? member.photoURL,
-            customImageURL: profile?.customImageURL ?? presence?.customImageURL ?? member.customImageURL,
-            isOnline: presence?.isOnline ?? member.isOnline,
-            lastSeen: presence?.lastSeen ?? member.lastSeen,
-            typingTo: presence?.typingTo ?? member.typingTo,
-            school: profile?.school ?? member.school,
-            bio: profile?.bio ?? member.bio,
-            phone: profile?.phone ?? member.phone,
-            dateOfBirth: profile?.dateOfBirth ?? member.dateOfBirth,
-            salutation: profile?.salutation ?? member.salutation,
-            subjects: profile?.subjects ?? member.subjects,
-          } satisfies TeamMember;
-        });
+        return resolveChatRosterMergedWithPresence({
+          roster,
+          presenceMap,
+          profileMap,
+        }) as TeamMember[];
       },
       []
     );
@@ -270,47 +921,13 @@ export default function Chat() {
     const buildPresenceSnapshotForRoster = useCallback((
       roster: TeamMember[],
     ): Map<string, TeamMember> => {
-      if (!roster || roster.length === 0) {
-        return new Map();
-      }
-
-      const rosterEmails = new Set(
-        roster
-          .map((member) => member.email?.toLowerCase?.())
-          .filter((value): value is string => Boolean(value))
-      );
-
-      const filtered = new Map<string, TeamMember>();
-      rawPresenceSnapshotRef.current.forEach((member, key) => {
-        if (rosterEmails.has(key)) {
-          filtered.set(key, member);
-        }
-      });
-
-      return filtered;
+      return resolveChatRosterSnapshotForRoster(roster, rawPresenceSnapshotRef.current);
     }, []);
 
     const buildProfileSnapshotForRoster = useCallback((
       roster: TeamMember[],
     ): Map<string, TeamMember> => {
-      if (!roster || roster.length === 0) {
-        return new Map();
-      }
-
-      const rosterEmails = new Set(
-        roster
-          .map((member) => member.email?.toLowerCase?.())
-          .filter((value): value is string => Boolean(value))
-      );
-
-      const filtered = new Map<string, TeamMember>();
-      rawProfileSnapshotRef.current.forEach((member, key) => {
-        if (rosterEmails.has(key)) {
-          filtered.set(key, member);
-        }
-      });
-
-      return filtered;
+      return resolveChatRosterSnapshotForRoster(roster, rawProfileSnapshotRef.current);
     }, []);
 
   useEffect(() => {
@@ -325,7 +942,6 @@ export default function Chat() {
     message: null,
   });
   const [attachmentModalVisible, setAttachmentModalVisible] = useState(false);
-  const [richTextInputVisible, setRichTextInputVisible] = useState(false);
   const appStateRef = useRef<AppStateStatus>(
     (Platform.OS === 'web' ? 'active' : (AppState.currentState ?? 'active')) as AppStateStatus
   );
@@ -335,6 +951,10 @@ export default function Chat() {
   const [isAppActive, setIsAppActive] = useState(appStateRef.current === 'active');
   const [presenceRenderTick, setPresenceRenderTick] = useState(0);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingStatusActiveRef = useRef(false);
+  const typingStatusPairRef = useRef<ChatTypingPair | null>(null);
+  const typingStatusMetricsRef = useRef(createChatTypingStatusWriteRollupState());
+  const replyJumpMetricRollupRef = useRef(createChatReplyJumpMetricRollupState());
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -352,9 +972,7 @@ export default function Chat() {
   const lastUserActivityRef = useRef<number>(Date.now());
   const userActivityTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const userActiveRef = useRef(false);
-  const mobileInputRef = useRef<any>(null);
-  const textInputRef = useRef<TextInput>(null);
-  const richTextInputRef = useRef<any>(null);
+  const mobileInputRef = useRef<MobileChatInputRef | null>(null);
   const [isLoadingChatInfo, setIsLoadingChatInfo] = useState(false);
   const [conversationSummaries, setConversationSummaries] = useState<Map<string, ConversationSummary>>(new Map());
   const isSmallScreen = screenData.width < 700;
@@ -363,6 +981,77 @@ export default function Chat() {
   const [longPressedMember, setLongPressedMember] = useState<TeamMember | null>(null);
   const openAttachmentModal = useCallback(() => setAttachmentModalVisible(true), []);
   const closeAttachmentModal = useCallback(() => setAttachmentModalVisible(false), []);
+
+  type TypingStatusWriteReason =
+    | 'unmount'
+    | 'inactivity'
+    | 'clear_active'
+    | 'pair_change'
+    | 'transition_clear'
+    | 'transition_activate'
+    | 'timeout_clear';
+
+  const recordTypingStatusWrite = useCallback((isTyping: boolean, reason: TypingStatusWriteReason) => {
+    const payload = recordChatTypingStatusWriteRollup(
+      typingStatusMetricsRef.current,
+      isTyping,
+      reason
+    );
+
+    if (!payload) {
+      return;
+    }
+
+    logger.metric('chat.typing.status_write.rollup', payload);
+  }, []);
+
+  const recordReplyJumpMetric = useCallback(
+    (
+      reason: ChatReplyJumpMetricReason,
+      success: boolean,
+      usedHistoryLoads: number,
+      source: ChatReplyJumpMetricSource
+    ) => {
+      const rollupPayload = recordChatReplyJumpMetricRollup(replyJumpMetricRollupRef.current, {
+        reason,
+        success,
+        usedHistoryLoads,
+        source,
+        platformOS: Platform.OS,
+      });
+
+      if (!rollupPayload) {
+        return;
+      }
+
+      logger.metric('chat.reply_jump.result.rollup', rollupPayload as Record<string, unknown>);
+    },
+    []
+  );
+
+  const flushReplyJumpMetricRollup = useCallback((flushReason: 'app-background' | 'unmount') => {
+    const rollupPayload = flushChatReplyJumpMetricRollup(replyJumpMetricRollupRef.current);
+    if (!rollupPayload) {
+      return;
+    }
+
+    logger.metric('chat.reply_jump.result.rollup', {
+      ...rollupPayload,
+      flushReason,
+    });
+  }, []);
+
+  const setTypingStatusForPair = useCallback(
+    (pair: ChatTypingPair | null, isTyping: boolean, reason: TypingStatusWriteReason) => {
+      if (!pair) {
+        return;
+      }
+
+      chatService.setTypingStatus(pair.userEmail, pair.recipientEmail, isTyping);
+      recordTypingStatusWrite(isTyping, reason);
+    },
+    [recordTypingStatusWrite]
+  );
 
   useFrameTimingMonitor({ tag: 'chat-screen', thresholdMs: 40, sampleSize: 240 });
 
@@ -384,16 +1073,47 @@ export default function Chat() {
     return () => {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
       }
+
+      flushReplyJumpMetricRollup('unmount');
+
+      const activeTypingPair = typingStatusPairRef.current;
+      setTypingStatusForPair(activeTypingPair, false, 'unmount');
+
+      typingStatusPairRef.current = null;
+      typingStatusActiveRef.current = false;
+
+      // Phase 7: Clean up animation and auto-scroll timers
+      clearTimeoutRef(animatedMessageCleanupTimerRef);
+      clearTimeoutRef(autoScrollFlagTimerRef);
+      clearTimeoutRef(selectMemberFocusTimerRef);
+      clearTimeoutRef(forceAnchorRetryTimerRef1);
+      clearTimeoutRef(forceAnchorRetryTimerRef2);
     };
-  }, []);
+  }, [flushReplyJumpMetricRollup, setTypingStatusForPair]);
 
   useEffect(() => {
+    const clearTypingForInactivity = () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
+
+      const activeTypingPair = typingStatusPairRef.current;
+      setTypingStatusForPair(activeTypingPair, false, 'inactivity');
+
+      typingStatusPairRef.current = null;
+      typingStatusActiveRef.current = false;
+    };
+
     const handleAppStateChange = (nextState: AppStateStatus) => {
       appStateRef.current = nextState;
       setIsAppActive(nextState === 'active');
       if (nextState !== 'active') {
         lastBackgroundAtRef.current = Date.now();
+        flushReplyJumpMetricRollup('app-background');
+        clearTypingForInactivity();
       }
     };
 
@@ -404,6 +1124,8 @@ export default function Chat() {
         setIsAppActive(visible);
         if (!visible) {
           lastBackgroundAtRef.current = Date.now();
+          flushReplyJumpMetricRollup('app-background');
+          clearTypingForInactivity();
         }
       };
 
@@ -427,7 +1149,7 @@ export default function Chat() {
         subscription.remove();
       }
     };
-  }, []);
+  }, [flushReplyJumpMetricRollup, setTypingStatusForPair]);
 
   // (moved back handler lower to avoid use-before-define)
 
@@ -458,6 +1180,7 @@ export default function Chat() {
     sender: string;
     status: 'sending' | 'failed' | 'queued' | 'sent';
     serverMessageId?: string;
+    replyTo?: ChatReplyContext;
     mime?: string;
     source?: 'keyboard' | 'picker';
     progress?: number; // 0-100 upload progress for local uploads
@@ -477,6 +1200,7 @@ export default function Chat() {
     sender: string;
     status: 'sending' | 'failed' | 'finalizing' | 'sent';
     serverMessageId?: string;
+    replyTo?: ChatReplyContext;
     progress: number; // 0-100 overall progress
     cancelable?: boolean;
     cancelRequested?: boolean;
@@ -542,10 +1266,36 @@ export default function Chat() {
   const [animatedMessages, setAnimatedMessages] = useState<Set<string>>(new Set());
   const previousMessageIdsRef = useRef<Set<string>>(new Set());
   const toneBootstrapChatKeyRef = useRef<string | null>(null);
+  // ── Phase 7: Cancellable timer refs for leak-free timeouts ──
+  const animatedMessageCleanupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoScrollFlagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const selectMemberFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const forceAnchorRetryTimerRef1 = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const forceAnchorRetryTimerRef2 = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   // Special message command state
   const [showSpecialCommand, setShowSpecialCommand] = useState(false);
   const [isComposingSpecial, setIsComposingSpecial] = useState(false);
+  const activeComposerDraftKey = useMemo(
+    () =>
+      getChatComposerDraftKey({
+        id: selectedTeamMember?.id,
+        email: selectedTeamMember?.email,
+      }),
+    [selectedTeamMember?.id, selectedTeamMember?.email]
+  );
+  const activeConversationSearchContextKey = useMemo(() => {
+    return resolveChatConversationSearchContextKey({
+      activeComposerDraftKey,
+      tenantId: activeTenant?.id ?? null,
+    });
+  }, [activeComposerDraftKey, activeTenant?.id]);
+
+  const updateSpecialComposerState = useCallback((value: string) => {
+    const nextSpecialComposerState = resolveChatSpecialComposerState(value);
+    setShowSpecialCommand(nextSpecialComposerState.showSpecialCommand);
+    setIsComposingSpecial(nextSpecialComposerState.isComposingSpecial);
+  }, []);
 
   // Sticker and GIF picker state
   const [stickerGifPickerVisible, setStickerGifPickerVisible] = useState(false);
@@ -574,20 +1324,6 @@ export default function Chat() {
   );
   // Defer early return until after all hooks are declared
 
-  const extractTenorIdFromUrl = useCallback((url: string): string | null => {
-    try {
-      const u = new URL(url);
-      if (!u.hostname.includes('tenor.com')) return null;
-      // media.tenor.com/{id}/...
-      const parts = u.pathname.split('/').filter(Boolean);
-      if (parts.length >= 1) return parts[0];
-      return null;
-    } catch {
-      return null;
-    }
-  }, []);
-  
-
   const headOk = useCallback(async (url: string) => {
     try {
       const controller = new AbortController();
@@ -609,8 +1345,9 @@ export default function Chat() {
     if (/\.gif($|\?)/i.test(originalUrl)) return originalUrl;
 
     // Quick extension swap try for Tenor
-    if (/tenor\.com/.test(originalUrl) && /\.webp($|\?)/i.test(originalUrl)) {
-      const guess = originalUrl.replace(/\.webp(\?|$)/i, '.gif$1');
+    const guessedGifUrl = resolveChatTenorWebpToGifGuess(originalUrl);
+    if (guessedGifUrl) {
+      const guess = guessedGifUrl;
       if (await headOk(guess)) {
         setStickerUrlMap(prev => new Map(prev).set(originalUrl, guess));
         return guess;
@@ -618,16 +1355,21 @@ export default function Chat() {
     }
 
     // Use Tenor posts lookup by id to find gif variant
-    const id = extractTenorIdFromUrl(originalUrl);
-    if (id && TENOR_API_KEY) {
+    const id = resolveChatTenorIdFromUrl(originalUrl);
+    const lookupUrl = resolveChatTenorPostsLookupUrl({
+      tenorBaseUrl: TENOR_BASE_URL,
+      tenorApiKey: TENOR_API_KEY,
+      tenorId: id,
+    });
+    if (lookupUrl) {
       try {
-        const url = `${TENOR_BASE_URL}/posts?ids=${encodeURIComponent(id)}&key=${TENOR_API_KEY}&media_filter=basic`;
-        const res = await fetch(url);
+        const res = await fetch(lookupUrl);
         if (res.ok) {
           const data = await res.json();
           const result = data?.results?.[0];
-          const fm = result?.media_formats || {};
-          const alt = fm.tinygif?.url || fm.nanogif?.url || fm.gif?.url || fm.mediumgif?.url || null;
+          const alt = resolveChatTenorGifCandidateUrl({
+            mediaFormats: result?.media_formats,
+          });
           if (alt) {
             setStickerUrlMap(prev => new Map(prev).set(originalUrl, alt));
             return alt;
@@ -636,343 +1378,120 @@ export default function Chat() {
       } catch {}
     }
     return null;
-  }, [TENOR_API_KEY, extractTenorIdFromUrl, headOk, stickerUrlMap]);
+  }, [TENOR_API_KEY, TENOR_BASE_URL, headOk, stickerUrlMap]);
 
   // Prefer smaller Tenor GIF variant for performance
   const resolveOptimizedGifUrl = useCallback(async (originalUrl: string): Promise<string> => {
     const mapped = gifUrlMap.get(originalUrl);
     if (mapped) return mapped;
-    const id = extractTenorIdFromUrl(originalUrl);
-    if (id && TENOR_API_KEY) {
+    const id = resolveChatTenorIdFromUrl(originalUrl);
+    const lookupUrl = resolveChatTenorPostsLookupUrl({
+      tenorBaseUrl: TENOR_BASE_URL,
+      tenorApiKey: TENOR_API_KEY,
+      tenorId: id,
+    });
+    if (lookupUrl) {
       try {
-        const url = `${TENOR_BASE_URL}/posts?ids=${encodeURIComponent(id)}&key=${TENOR_API_KEY}&media_filter=basic`;
-        const res = await fetch(url);
+        const res = await fetch(lookupUrl);
         if (res.ok) {
           const data = await res.json();
           const result = data?.results?.[0];
-          const fm = result?.media_formats || {};
-          const alt = fm.tinygif?.url || fm.nanogif?.url || fm.gif?.url || fm.mediumgif?.url || originalUrl;
+          const alt = resolveChatTenorGifCandidateUrl({
+            mediaFormats: result?.media_formats,
+            fallbackUrl: originalUrl,
+          }) || originalUrl;
           setGifUrlMap(prev => new Map(prev).set(originalUrl, alt));
           return alt;
         }
       } catch {}
     }
     return originalUrl;
-  }, [TENOR_API_KEY, TENOR_BASE_URL, gifUrlMap, extractTenorIdFromUrl]);
+  }, [TENOR_API_KEY, TENOR_BASE_URL, gifUrlMap]);
   const [emojiPickerVisible, setEmojiPickerVisible] = useState(false);
   const [selectedMessageForReaction, setSelectedMessageForReaction] = useState<string | null>(null);
   const [reactionPickerPosition, setReactionPickerPosition] = useState({ x: 0, y: 0 });
   const [selectedMessageForAction, setSelectedMessageForAction] = useState<any | null>(null);
+  const [messageInfoModalState, setMessageInfoModalState] = useState<{
+    visible: boolean;
+    rows: { label: string; value: string }[];
+  }>({
+    visible: false,
+    rows: [],
+  });
+  const [messageInfoExpandedRows, setMessageInfoExpandedRows] = useState<Record<string, boolean>>({});
+  const [messageInfoCopiedRowKey, setMessageInfoCopiedRowKey] = useState<string | null>(null);
+  const [messageInfoLastCopiedRowLabel, setMessageInfoLastCopiedRowLabel] = useState<string>('');
+  const [messageInfoCopyToastNotice, setMessageInfoCopyToastNotice] = useState<string>('');
+  const [showMessageInfoHint, setShowMessageInfoHint] = useState(false);
+  const messageInfoCopiedResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messageInfoCopyToastNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messageInfoSuppressedToastCountRef = useRef(0);
+  const messageInfoSuccessToastAtRef = useRef(0);
+  const messageInfoErrorToastAtRef = useRef(0);
+  const messageInfoCopyMetricsRef = useRef(createChatMessageInfoCopyMetricRollupState());
+  const hasShownMessageInfoHintRef = useRef(false);
+  const [replyingToMessage, setReplyingToMessage] = useState<ChatReplyContext | null>(null);
   const [editingMessageInfo, setEditingMessageInfo] = useState<{ id: string; originalText: string } | null>(null);
   const [pendingMessageActions, setPendingMessageActions] = useState<Set<string>>(new Set());
 
-  const buildDisplayKey = useCallback((message: any): string => {
-    if (!message) {
-      return '';
-    }
-
-    if (message.id) {
-      return `id:${String(message.id)}`;
-    }
-
-    const sender = typeof message.sender === 'string' ? message.sender.toLowerCase() : '';
-    const recipient = typeof message.recipientId === 'string' ? message.recipientId.toLowerCase() : '';
-
-    let timestamp = '';
-    const rawTimestamp = (message as any)?.timestamp;
-    if (typeof rawTimestamp === 'string') {
-      timestamp = rawTimestamp;
-    } else if (rawTimestamp instanceof Date) {
-      timestamp = rawTimestamp.toISOString();
-    } else if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)) {
-      timestamp = new Date(rawTimestamp).toISOString();
-    } else if (rawTimestamp && typeof rawTimestamp.toDate === 'function') {
-      try {
-        timestamp = rawTimestamp.toDate().toISOString();
-      } catch {
-        timestamp = '';
-      }
-    }
-
-    const text = typeof message.text === 'string' ? message.text : '';
-    const attachmentsSignature = Array.isArray(message.attachments)
-      ? (message.attachments as (HydratedAttachment | FileAttachment | { url?: string; fileName?: string })[])
-          .map((att) => `${att?.url ?? ''}:${att?.fileName ?? ''}`)
-          .join(',')
-      : '';
-    const gifUrl = typeof message?.gif?.url === 'string' ? message.gif.url : '';
-    const stickerUrl = typeof message?.sticker?.url === 'string' ? message.sticker.url : '';
-
-    return `fallback:${sender}|${recipient}|${timestamp}|${text}|${attachmentsSignature}|${gifUrl}|${stickerUrl}`;
-  }, []);
-
   const normalizeMessageId = useCallback((id: any): string => {
-    if (id === null || id === undefined) {
-      return '';
-    }
-    return String(id);
+    return resolveChatNormalizedMessageId(id);
   }, []);
 
   const normalizeParticipantEmail = useCallback((value: unknown): string => {
-    if (typeof value !== 'string') {
-      return '';
-    }
-    return value.trim().toLowerCase();
+    return resolveChatNormalizedParticipantEmail(value);
   }, []);
 
-  const sanitizeMessageText = useCallback((value: unknown, fallback: string): string => {
-    const raw = typeof value === 'string' ? value : String(value ?? '');
-    const trimmed = raw.trim();
-    if (!trimmed || trimmed === '.') {
-      return fallback;
-    }
-    return raw;
-  }, []);
-
-  const sanitizeAttachmentFileName = useCallback((value: unknown): string => {
-    const safeFileName = String(value || 'File').trim();
-    if (!safeFileName || safeFileName === '.') {
-      return 'File';
-    }
-    return safeFileName;
-  }, []);
-
-  const sanitizeDateSeparatorLabel = useCallback((value: unknown): string => {
-    const safeDate = String(value ?? '').trim();
-    if (!safeDate || safeDate === '.') {
-      return 'Today';
-    }
-    return safeDate;
-  }, []);
-
-  const getSafeDisplayInitial = useCallback((value: unknown): string => {
-    const safeName = String(value ?? '').trim();
-    if (!safeName) {
-      return 'U';
-    }
-    const firstChar = safeName.charAt(0).toUpperCase();
-    if (/^[A-Z0-9]$/i.test(firstChar)) {
-      return firstChar;
-    }
-    return 'U';
-  }, []);
-
-  const normalizePendingMediaStatus = useCallback((status: PendingMediaItem['status'] | undefined): PendingMediaItem['status'] => {
-    if (status === 'queued' || status === 'failed' || status === 'sent') {
-      return status;
-    }
-    // Stale "sending" state from a previous app session should be retryable.
-    return 'queued';
-  }, []);
-
-  const normalizePendingAttachmentStatus = useCallback((
-    item: PendingAttachmentMessage
-  ): PendingAttachmentItem['status'] => {
-    if (item.status === 'failed' || item.status === 'sent' || item.status === 'finalizing') {
-      return item.status;
-    }
-    // If app closed mid-upload, surface as failed so retry is available immediately.
-    return 'failed';
-  }, []);
+  const sanitizeMessageText = resolveChatSanitizedMessageText;
+  const sanitizeAttachmentFileName = resolveChatSanitizedAttachmentFileName;
+  const sanitizeDateSeparatorLabel = resolveChatSanitizedDateSeparatorLabel;
+  const getSafeDisplayInitial = resolveChatSafeDisplayInitial;
 
   const teamMembersByRecipientKey = useMemo(() => {
-    const map = new Map<string, TeamMember>();
-
-    teamMembersWithChatInfo.forEach((member: any) => {
-      const normalizedId = normalizeParticipantEmail(member?.id);
-      const normalizedEmail = normalizeParticipantEmail(member?.email);
-      if (normalizedId && !map.has(normalizedId)) {
-        map.set(normalizedId, member as TeamMember);
-      }
-      if (normalizedEmail && !map.has(normalizedEmail)) {
-        map.set(normalizedEmail, member as TeamMember);
-      }
+    return resolveChatTeamMembersByRecipientKey<TeamMember>({
+      teamMembersWithChatInfo: teamMembersWithChatInfo as TeamMember[],
+      teamMembers,
+      normalizeParticipantEmail,
     });
-
-    teamMembers.forEach((member: TeamMember) => {
-      const normalizedId = normalizeParticipantEmail(member?.id);
-      const normalizedEmail = normalizeParticipantEmail(member?.email);
-      if (normalizedId && !map.has(normalizedId)) {
-        map.set(normalizedId, member);
-      }
-      if (normalizedEmail && !map.has(normalizedEmail)) {
-        map.set(normalizedEmail, member);
-      }
-    });
-
-    return map;
   }, [teamMembersWithChatInfo, teamMembers, normalizeParticipantEmail]);
 
   const resolvePendingRecipientEmail = useCallback((recipientId?: string): string => {
-    const normalizedRecipientId = normalizeParticipantEmail(recipientId);
-    if (!normalizedRecipientId) {
-      return '';
-    }
-
-    const resolvedMember = teamMembersByRecipientKey.get(normalizedRecipientId);
-    if (resolvedMember?.email) {
-      return String(resolvedMember.email);
-    }
-
-    return recipientId || '';
+    return resolveChatPendingRecipientEmail({
+      recipientId,
+      teamMembersByRecipientKey,
+      normalizeParticipantEmail,
+    });
   }, [teamMembersByRecipientKey, normalizeParticipantEmail]);
-
-  const getIncomingConversationMessages = useCallback((
-    sourceMessages: any[],
-    userEmailRaw?: string | null,
-    senderEmailRaw?: string | null
-  ) => {
-    const userEmail = normalizeParticipantEmail(userEmailRaw);
-    const senderEmail = normalizeParticipantEmail(senderEmailRaw);
-    if (!Array.isArray(sourceMessages) || sourceMessages.length === 0 || !userEmail || !senderEmail) {
-      return [];
-    }
-
-    return sourceMessages.filter((msg: any) => (
-      msg?.id &&
-      !msg?.deleted &&
-      normalizeParticipantEmail(msg?.sender) === senderEmail &&
-      normalizeParticipantEmail(msg?.recipientId) === userEmail
-    ));
-  }, [normalizeParticipantEmail]);
 
   const shouldKeepOptimisticReactions = useCallback(
     (messageId: string) => {
       if (!messageId) return false;
       const until = reactionOptimisticUntilRef.current.get(messageId);
-      if (!until) return false;
-      if (until > Date.now()) return true;
-      reactionOptimisticUntilRef.current.delete(messageId);
-      return false;
+      const keep = shouldKeepChatOptimisticReactionUntil(until, Date.now());
+      if (!keep && typeof until === 'number') {
+        reactionOptimisticUntilRef.current.delete(messageId);
+      }
+      return keep;
     },
     []
   );
 
-  const stableMessageCacheRef = useRef<Map<string, { signature: string; message: any }>>(new Map());
+  const stableMessageCacheRef = useRef<Map<string, ChatStableMessageCacheEntry<any>>>(new Map());
   const stableDisplayedMessagesRef = useRef<any[]>([]);
 
-  const getMessageRenderSignature = useCallback((message: any): string => {
-    if (!message) {
-      return '';
-    }
-
-    const sender = typeof message.sender === 'string' ? message.sender.toLowerCase() : '';
-    const recipient = typeof message.recipientId === 'string' ? message.recipientId.toLowerCase() : '';
-
-    let timestamp = '';
-    const rawTimestamp = (message as any)?.timestamp;
-    if (typeof rawTimestamp === 'string') {
-      timestamp = rawTimestamp;
-    } else if (rawTimestamp instanceof Date) {
-      timestamp = rawTimestamp.toISOString();
-    } else if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)) {
-      timestamp = new Date(rawTimestamp).toISOString();
-    } else if (rawTimestamp && typeof rawTimestamp.toDate === 'function') {
-      try {
-        timestamp = rawTimestamp.toDate().toISOString();
-      } catch {
-        timestamp = '';
-      }
-    }
-
-    const text = typeof message.text === 'string' ? message.text : '';
-    const editCount = typeof message.editCount === 'number' ? String(message.editCount) : '';
-    const editedAt = message.editedAt ? String(message.editedAt) : '';
-    const deleted = message.deleted ? '1' : '0';
-    const delivered = message.delivered ? '1' : '0';
-    const read = message.read ? '1' : '0';
-    const isSpecial = message.isSpecial ? '1' : '0';
-    const gifUrl = typeof message?.gif?.url === 'string' ? message.gif.url : '';
-    const stickerUrl = typeof message?.sticker?.url === 'string' ? message.sticker.url : '';
-    const attachmentsSignature = Array.isArray(message.attachments)
-      ? (message.attachments as (HydratedAttachment | FileAttachment | { url?: string; fileName?: string; fileType?: string; fileSize?: number; resolvedUrl?: string })[])
-          .map((att) => `${att?.url ?? ''}:${(att as any)?.resolvedUrl ?? ''}:${att?.fileName ?? ''}:${att?.fileType ?? ''}:${att?.fileSize ?? ''}`)
-          .join(',')
-      : '';
-
-    return [
-      sender,
-      recipient,
-      timestamp,
-      text,
-      editCount,
-      editedAt,
-      deleted,
-      delivered,
-      read,
-      isSpecial,
-      gifUrl,
-      stickerUrl,
-      attachmentsSignature,
-    ].join('|');
-  }, []);
-
   const displayedMessages = useMemo(() => {
-    if (!Array.isArray(messages) || messages.length === 0) {
-      stableMessageCacheRef.current = new Map();
-      stableDisplayedMessagesRef.current = [];
-      return [] as any[];
-    }
-
-    const deduped = new Map<string, any>();
-
-    messages.forEach((message: any) => {
-      if (!message) {
-        return;
-      }
-      const key = buildDisplayKey(message);
-      if (!key) {
-        return;
-      }
-
-      if (!deduped.has(key)) {
-        deduped.set(key, message);
-        return;
-      }
-
-      const existing = deduped.get(key);
-      if (!existing?.id && message.id) {
-        deduped.set(key, message);
-        return;
-      }
-
-      const existingTime = new Date(existing?.timestamp ?? '').getTime();
-      const incomingTime = new Date(message?.timestamp ?? '').getTime();
-      if (Number.isFinite(incomingTime) && (!Number.isFinite(existingTime) || incomingTime > existingTime)) {
-        deduped.set(key, message);
-      }
+    const resolvedState = resolveChatDisplayedMessagesState({
+      messages,
+      previousStableCache: stableMessageCacheRef.current,
+      previousDisplayedMessages: stableDisplayedMessagesRef.current,
+      resolveDisplayKey: resolveChatMessageDisplayKey,
+      resolveRenderSignature: resolveChatMessageRenderSignature,
     });
 
-    const nextCache = new Map<string, { signature: string; message: any }>();
-    const result = Array.from(deduped.entries()).map(([key, message]) => {
-      const stableKey = message?.id != null
-        ? `id:${String(message.id)}`
-        : message?.localId != null
-          ? `local:${String(message.localId)}`
-          : `display:${key}`;
-      const signature = getMessageRenderSignature(message);
-      const cached = stableMessageCacheRef.current.get(stableKey);
-      if (cached && cached.signature === signature) {
-        nextCache.set(stableKey, cached);
-        return cached.message;
-      }
-      const entry = { signature, message };
-      nextCache.set(stableKey, entry);
-      return message;
-    });
-
-    result.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-    stableMessageCacheRef.current = nextCache;
-
-    const previous = stableDisplayedMessagesRef.current;
-    if (previous.length === result.length && previous.every((msg, index) => msg === result[index])) {
-      return previous;
-    }
-
-    stableDisplayedMessagesRef.current = result;
-    return result;
-  }, [messages, buildDisplayKey, getMessageRenderSignature]);
+    stableMessageCacheRef.current = resolvedState.nextStableCache;
+    stableDisplayedMessagesRef.current = resolvedState.displayedMessages;
+    return resolvedState.displayedMessages;
+  }, [messages]);
 
   useEffect(() => {
     const positions = messagePositionsRef.current;
@@ -987,71 +1506,36 @@ export default function Chat() {
     }
 
     // Avoid expensive pruning on every small update; only compact when map has meaningful drift.
-    if (positionIds.length <= displayedMessages.length + 40) {
+    if (!shouldCompactChatMessagePositions(positionIds.length, displayedMessages.length)) {
       return;
     }
 
-    const validIds = new Set<string>();
-    displayedMessages.forEach((message: any) => {
-      const id = normalizeMessageId(message?.id);
-      if (id) {
-        validIds.add(id);
-      }
+    const validIds = resolveChatDisplayedMessageIdSet(displayedMessages, (message: any) => {
+      return normalizeMessageId(message?.id);
     });
 
-    positionIds.forEach((id) => {
-      if (!validIds.has(id)) {
-        delete positions[id];
-      }
-    });
+    messagePositionsRef.current = resolveChatPrunedMessagePositions(positions, validIds);
   }, [displayedMessages, normalizeMessageId]);
 
-  const getMessageItemType = useCallback((item: any) => {
-    if (!item) return 'unknown';
-    if (item.sticker) return 'sticker';
-    if (item.gif) return 'gif';
-    if (Array.isArray(item.attachments) && item.attachments.length > 0) return 'attachment';
-    if (item.isSpecial) return 'special';
-    return 'text';
-  }, []);
+  const getMessageItemType = resolveChatMessageListItemType;
 
   const getMessageKey = useCallback(
     (item: any, index: number) => {
-      if (!item) {
-        return `ghost:${index}`;
-      }
-
-      if (item.id != null) {
-        return `id:${String(item.id)}`;
-      }
-
-      if (item.localId) {
-        return `local:${String(item.localId)}`;
-      }
-
-      const fallback = buildDisplayKey(item);
-      if (fallback) {
-        return `display:${fallback}`;
-      }
-
-      if (item.timestamp) {
-        return `timestamp:${item.timestamp}:${index}`;
-      }
-
-      return `index:${index}`;
+      return resolveChatMessageListItemKey({
+        item,
+        index,
+        resolveDisplayKey: resolveChatMessageDisplayKey,
+      });
     },
-    [buildDisplayKey]
+    []
   );
 
   const overrideMessageLayout = useCallback(
     (layout: { size?: number; span?: number }, item: any, _index: number) => {
       const type = getMessageItemType(item);
-      if (type === 'sticker') {
-        layout.size = 188;
-      } else if (type === 'gif') {
-        layout.size = 280;
-      } else if (type === 'attachment') {
-        layout.size = 220;
+      const size = resolveChatMessageLayoutSize(type);
+      if (typeof size === 'number') {
+        layout.size = size;
       }
     },
     [getMessageItemType]
@@ -1063,28 +1547,12 @@ export default function Chat() {
       return;
     }
 
-    const visibleIds = new Set(
-      displayedMessages
-        .map((msg: any) => normalizeMessageId(msg?.id))
-        .filter((id: string) => id.length > 0)
-    );
+    const visibleIds = resolveChatDisplayedMessageIdSet(displayedMessages, (msg: any) => {
+      return normalizeMessageId(msg?.id);
+    });
 
     setLocalMessageReactions(prev => {
-      if (prev.size === 0) {
-        return prev;
-      }
-
-      let changed = false;
-      const next = new Map<string, { [key: string]: Set<string> }>();
-      prev.forEach((value, key) => {
-        if (visibleIds.has(key)) {
-          next.set(key, value);
-        } else {
-          changed = true;
-        }
-      });
-
-      return changed ? next : prev;
+      return resolveChatPrunedLocalMessageReactions(prev, visibleIds);
     });
   }, [displayedMessages, selectedTeamMember?.id]);
 
@@ -1096,8 +1564,6 @@ export default function Chat() {
   const hideFormattingGuide = useCallback(() => {
     setShowFormattingGuide(false);
   }, []);
-  // Processing state for keyboard-inserted media (Android/iOS)
-  const [processingKeyboardMedia, setProcessingKeyboardMedia] = useState(false);
 
   // Sound throttling state
   const lastSoundPlayedRef = useRef<number>(0);
@@ -1185,34 +1651,6 @@ export default function Chat() {
     void playMessageSoundNow();
   }, [playMessageSoundNow]);
 
-  const parseMessageTimestampMs = useCallback((value: unknown): number => {
-    if (value instanceof Date) {
-      const time = value.getTime();
-      return Number.isFinite(time) ? time : 0;
-    }
-
-    if (value && typeof (value as any).toDate === 'function') {
-      try {
-        const parsed = (value as any).toDate();
-        const time = parsed instanceof Date ? parsed.getTime() : new Date(parsed).getTime();
-        return Number.isFinite(time) ? time : 0;
-      } catch {
-        return 0;
-      }
-    }
-
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      return value;
-    }
-
-    if (typeof value === 'string') {
-      const parsed = new Date(value).getTime();
-      return Number.isFinite(parsed) ? parsed : 0;
-    }
-
-    return 0;
-  }, []);
-
   // sendMessageNotification is defined after effectiveUser to avoid TDZ
   const [selectedFiles, setSelectedFiles] = useState<any[]>([]);
   const selectedFilesRef = useRef<any[]>([]);
@@ -1233,6 +1671,14 @@ export default function Chat() {
   const [filePreviewVisible, setFilePreviewVisible] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [isUploading, setIsUploading] = useState(false);
+  const easedUploadProgress = useEasedUploadProgress(uploadProgress, {
+    isActive: isUploading,
+    smoothingPerSecond: 10,
+    minStepPercent: 0.15,
+    completionSnapThresholdPercent: 99.2,
+    nearCompletionBoostStartPercent: 96,
+    nearCompletionBoostMultiplier: 1.35,
+  });
   const [imageViewerVisible, setImageViewerVisible] = useState(false);
   const [selectedImageUri, setSelectedImageUri] = useState<string>('');
   const [lastViewedRemoteImage, setLastViewedRemoteImage] = useState<string | undefined>(undefined);
@@ -1247,6 +1693,383 @@ export default function Chat() {
   const closeImageViewer = useCallback(() => setImageViewerVisible(false), []);
   const openImageShareModal = useCallback(() => setShowImageShareModal(true), []);
   const closeImageShareModal = useCallback(() => setShowImageShareModal(false), []);
+  const clearMessageInfoCopiedResetTimer = useCallback(() => {
+    clearTimeoutRef(messageInfoCopiedResetTimerRef);
+  }, []);
+
+  const scheduleMessageInfoCopiedReset = useCallback((callback: () => void) => {
+    scheduleTimeoutRef(messageInfoCopiedResetTimerRef, callback, MESSAGE_INFO_COPIED_RESET_DELAY_MS);
+  }, []);
+
+  const clearMessageInfoCopyToastNoticeTimer = useCallback(() => {
+    clearTimeoutRef(messageInfoCopyToastNoticeTimerRef);
+  }, []);
+
+  const resetMessageInfoCopyToastNoticeState = useCallback(() => {
+    setMessageInfoCopyToastNotice('');
+    messageInfoSuppressedToastCountRef.current = 0;
+    clearMessageInfoCopyToastNoticeTimer();
+  }, [clearMessageInfoCopyToastNoticeTimer]);
+
+  const scheduleMessageInfoCopyToastNoticeReset = useCallback((delayMs: number) => {
+    scheduleTimeoutRef(messageInfoCopyToastNoticeTimerRef, () => {
+      setMessageInfoCopyToastNotice('');
+      messageInfoSuppressedToastCountRef.current = 0;
+    }, delayMs);
+  }, []);
+
+  const closeMessageInfoModal = useCallback(() => {
+    clearMessageInfoCopiedResetTimer();
+
+    setMessageInfoCopiedRowKey(null);
+    setMessageInfoLastCopiedRowLabel('');
+    resetMessageInfoCopyToastNoticeState();
+    setMessageInfoExpandedRows({});
+    setShowMessageInfoHint(false);
+    setMessageInfoModalState({
+      visible: false,
+      rows: [],
+    });
+  }, [clearMessageInfoCopiedResetTimer, resetMessageInfoCopyToastNoticeState]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+
+    if (typeof UIManager.setLayoutAnimationEnabledExperimental !== 'function') {
+      return;
+    }
+
+    try {
+      UIManager.setLayoutAnimationEnabledExperimental(true);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearMessageInfoCopiedResetTimer();
+
+      clearMessageInfoCopyToastNoticeTimer();
+    };
+  }, [clearMessageInfoCopiedResetTimer, clearMessageInfoCopyToastNoticeTimer]);
+
+  const triggerMessageInfoHaptic = useCallback((type: 'copy' | 'toggle' | 'error') => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+
+    try {
+      if (type === 'copy') {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        return;
+      }
+
+      if (type === 'error') {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        return;
+      }
+
+      void Haptics.selectionAsync();
+    } catch {}
+  }, []);
+
+  const showMessageInfoCopyToast = useCallback((
+    type: 'success' | 'error',
+    source: 'row' | 'all',
+    rowLabel?: string
+  ) => {
+    const now = Date.now();
+    const targetRef =
+      type === 'success' ? messageInfoSuccessToastAtRef : messageInfoErrorToastAtRef;
+    const cooldownState = resolveChatMessageInfoCopyToastCooldownState(now, targetRef.current, type);
+    const isWebPlatform = Platform.OS === 'web';
+    const suppressionPlan = resolveChatMessageInfoCopyToastSuppressionPlan(
+      cooldownState,
+      messageInfoSuppressedToastCountRef.current,
+      isWebPlatform
+    );
+
+    if (suppressionPlan.shouldSuppress) {
+      messageInfoSuppressedToastCountRef.current = suppressionPlan.nextSuppressedCount;
+      if (isWebPlatform && suppressionPlan.noticeText) {
+        setMessageInfoCopyToastNotice(suppressionPlan.noticeText);
+        scheduleMessageInfoCopyToastNoticeReset(suppressionPlan.noticeClearDelayMs);
+      }
+      return;
+    }
+
+    targetRef.current = now;
+    messageInfoSuppressedToastCountRef.current = suppressionPlan.nextSuppressedCount;
+    resetMessageInfoCopyToastNoticeState();
+    const toastPayload = resolveChatMessageInfoCopyToastPayload(type, source, rowLabel);
+    Toast.show({
+      type,
+      text1: toastPayload.title,
+      text2: toastPayload.detail,
+      position: 'top',
+    });
+  }, [resetMessageInfoCopyToastNoticeState, scheduleMessageInfoCopyToastNoticeReset]);
+
+  const recordMessageInfoCopyMetric = useCallback((
+    source: 'row' | 'all',
+    outcome: 'success' | 'error'
+  ) => {
+    const payload = recordChatMessageInfoCopyMetricRollup(
+      messageInfoCopyMetricsRef.current,
+      source,
+      outcome
+    );
+
+    if (!payload) {
+      return;
+    }
+
+    logger.metric('chat.message_info.copy.rollup', payload);
+  }, []);
+
+  const toggleMessageInfoRowExpanded = useCallback((rowKey: string) => {
+    triggerMessageInfoHaptic('toggle');
+    if (Platform.OS !== 'web') {
+      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    }
+    setMessageInfoExpandedRows((currentState) => ({
+      ...currentState,
+      [rowKey]: !currentState[rowKey],
+    }));
+  }, [triggerMessageInfoHaptic]);
+
+  const handleMessageInfoRowCopy = useCallback(async (rowKey: string, value: string, rowLabel?: string) => {
+    const normalizedValue = typeof value === 'string' ? value.trim() : '';
+    if (!normalizedValue) {
+      return;
+    }
+
+    try {
+      await Clipboard.setStringAsync(normalizedValue);
+
+      const copySuccessPlan = resolveChatMessageInfoCopySuccessPlan('row', rowKey, rowLabel);
+      setMessageInfoCopiedRowKey(copySuccessPlan.selection.copiedRowKey);
+      setMessageInfoLastCopiedRowLabel(copySuccessPlan.selection.copiedRowLabel);
+
+      scheduleMessageInfoCopiedReset(() => {
+        setMessageInfoCopiedRowKey(copySuccessPlan.resetPayload.nextRowKey);
+        setMessageInfoLastCopiedRowLabel(copySuccessPlan.resetPayload.nextRowLabel);
+      });
+
+      triggerMessageInfoHaptic('copy');
+      recordMessageInfoCopyMetric('row', 'success');
+      showMessageInfoCopyToast('success', 'row', copySuccessPlan.selection.copiedRowLabel);
+    } catch {
+      triggerMessageInfoHaptic('error');
+      recordMessageInfoCopyMetric('row', 'error');
+
+      showMessageInfoCopyToast('error', 'row');
+    }
+  }, [recordMessageInfoCopyMetric, scheduleMessageInfoCopiedReset, showMessageInfoCopyToast, triggerMessageInfoHaptic]);
+
+  const resolveMessageInfoRowBadge = resolveChatMessageInfoRowBadge;
+  const resolveMessageInfoRowValueParts = resolveChatMessageInfoRowValueParts;
+
+  const messageInfoExpandableRowKeys = useMemo(() => {
+    if (!Array.isArray(messageInfoModalState.rows) || messageInfoModalState.rows.length <= 0) {
+      return [] as string[];
+    }
+
+    return messageInfoModalState.rows.reduce<string[]>((keys, row, index) => {
+      const rowKey = `${row.label}:${index}`;
+      const valueParts = resolveMessageInfoRowValueParts(row.value);
+      if (valueParts.details.length > 0) {
+        keys.push(rowKey);
+      }
+      return keys;
+    }, []);
+  }, [messageInfoModalState.rows, resolveMessageInfoRowValueParts]);
+
+  const areAllMessageInfoDetailsExpanded = useMemo(() => {
+    if (messageInfoExpandableRowKeys.length <= 0) {
+      return false;
+    }
+
+    return messageInfoExpandableRowKeys.every((rowKey) => Boolean(messageInfoExpandedRows[rowKey]));
+  }, [messageInfoExpandableRowKeys, messageInfoExpandedRows]);
+
+  const messageInfoCopyFeedbackLabel = useMemo(() => {
+    return resolveChatMessageInfoCopyFeedbackLabel(
+      messageInfoCopiedRowKey,
+      messageInfoLastCopiedRowLabel
+    );
+  }, [messageInfoCopiedRowKey, messageInfoLastCopiedRowLabel]);
+
+  const messageInfoCopyFeedbackSourceLabel = useMemo(() => {
+    return resolveChatMessageInfoCopyFeedbackSourceLabel(messageInfoCopiedRowKey);
+  }, [messageInfoCopiedRowKey]);
+
+  const messageInfoCopyFeedbackSourcePalette = useMemo(() => {
+    return resolveChatMessageInfoCopyFeedbackSourcePalette(
+      messageInfoCopyFeedbackSourceLabel,
+      isDarkMode
+    );
+  }, [isDarkMode, messageInfoCopyFeedbackSourceLabel]);
+
+  const messageInfoCopyFeedbackSourceBadgeText = useMemo(() => {
+    return resolveChatMessageInfoCopyFeedbackSourceBadgeText(messageInfoCopyFeedbackSourceLabel);
+  }, [messageInfoCopyFeedbackSourceLabel]);
+
+  const messageInfoCopyFeedbackSourceAccessibilityLabel = useMemo(() => {
+    return resolveChatMessageInfoCopyFeedbackSourceAccessibilityLabel(messageInfoCopyFeedbackSourceLabel);
+  }, [messageInfoCopyFeedbackSourceLabel]);
+
+  const messageInfoCopyFeedbackAccessibilityLabel = useMemo(() => {
+    return resolveChatMessageInfoCopyFeedbackAccessibilityLabel(
+      messageInfoCopyFeedbackLabel,
+      messageInfoCopyFeedbackSourceLabel
+    );
+  }, [messageInfoCopyFeedbackLabel, messageInfoCopyFeedbackSourceLabel]);
+
+  const messageInfoCopyToastNoticeAccessibilityLabel = useMemo(() => {
+    return resolveChatMessageInfoToastCooldownAccessibilityLabel(messageInfoCopyToastNotice);
+  }, [messageInfoCopyToastNotice]);
+
+  const toggleAllMessageInfoDetailsExpanded = useCallback(() => {
+    if (messageInfoExpandableRowKeys.length <= 0) {
+      return;
+    }
+
+    triggerMessageInfoHaptic('toggle');
+    if (Platform.OS !== 'web') {
+      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    }
+
+    setMessageInfoExpandedRows((currentState) => {
+      const shouldExpand = !messageInfoExpandableRowKeys.every((rowKey) => Boolean(currentState[rowKey]));
+      const nextState = { ...currentState };
+
+      messageInfoExpandableRowKeys.forEach((rowKey) => {
+        if (shouldExpand) {
+          nextState[rowKey] = true;
+          return;
+        }
+
+        delete nextState[rowKey];
+      });
+
+      return nextState;
+    });
+  }, [messageInfoExpandableRowKeys, triggerMessageInfoHaptic]);
+
+  const handleMessageInfoCopyAll = useCallback(async () => {
+    if (!Array.isArray(messageInfoModalState.rows) || messageInfoModalState.rows.length <= 0) {
+      return;
+    }
+
+    const normalizedText = formatChatMessageInfoRowsForClipboard(messageInfoModalState.rows);
+    if (!normalizedText) {
+      return;
+    }
+
+    try {
+      await Clipboard.setStringAsync(normalizedText);
+
+      const copySuccessPlan = resolveChatMessageInfoCopySuccessPlan('all');
+      setMessageInfoCopiedRowKey(copySuccessPlan.selection.copiedRowKey);
+      setMessageInfoLastCopiedRowLabel(copySuccessPlan.selection.copiedRowLabel);
+
+      scheduleMessageInfoCopiedReset(() => {
+        setMessageInfoCopiedRowKey(copySuccessPlan.resetPayload.nextRowKey);
+        setMessageInfoLastCopiedRowLabel(copySuccessPlan.resetPayload.nextRowLabel);
+      });
+
+      triggerMessageInfoHaptic('copy');
+      recordMessageInfoCopyMetric('all', 'success');
+      showMessageInfoCopyToast('success', 'all');
+    } catch {
+      triggerMessageInfoHaptic('error');
+      recordMessageInfoCopyMetric('all', 'error');
+      showMessageInfoCopyToast('error', 'all');
+    }
+  }, [messageInfoModalState.rows, recordMessageInfoCopyMetric, scheduleMessageInfoCopiedReset, showMessageInfoCopyToast, triggerMessageInfoHaptic]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      return;
+    }
+
+    if (!messageInfoModalState.visible) {
+      return;
+    }
+
+    const handleMessageInfoShortcut = (event: KeyboardEvent) => {
+      const target = event.target as { tagName?: string; isContentEditable?: boolean } | null;
+      const targetTagName = typeof target?.tagName === 'string' ? target.tagName.toLowerCase() : '';
+      const isTargetEditable =
+        targetTagName === 'input' ||
+        targetTagName === 'textarea' ||
+        targetTagName === 'select' ||
+        target?.isContentEditable === true;
+
+      const shortcutAction = resolveChatMessageInfoShortcutAction({
+        key: event.key,
+        code: event.code,
+        altKey: event.altKey,
+        shiftKey: event.shiftKey,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        isTargetEditable,
+        hasExpandableRows: messageInfoExpandableRowKeys.length > 0,
+      });
+
+      if (!shortcutAction) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (shortcutAction === 'close') {
+        closeMessageInfoModal();
+        return;
+      }
+
+      if (shortcutAction === 'copy-all') {
+        void handleMessageInfoCopyAll();
+        return;
+      }
+
+      toggleAllMessageInfoDetailsExpanded();
+    };
+
+    window.addEventListener('keydown', handleMessageInfoShortcut);
+    return () => {
+      window.removeEventListener('keydown', handleMessageInfoShortcut);
+    };
+  }, [
+    closeMessageInfoModal,
+    handleMessageInfoCopyAll,
+    messageInfoExpandableRowKeys.length,
+    messageInfoModalState.visible,
+    toggleAllMessageInfoDetailsExpanded,
+  ]);
+
+  useEffect(() => {
+    if (!messageInfoModalState.visible) {
+      return;
+    }
+
+    const validRowKeys = new Set(
+      messageInfoModalState.rows.map((row, index) => `${row.label}:${index}`)
+    );
+    setMessageInfoExpandedRows((currentState) => {
+      const nextState: Record<string, boolean> = {};
+      Object.entries(currentState).forEach(([rowKey, isExpanded]) => {
+        if (!isExpanded || !validRowKeys.has(rowKey)) {
+          return;
+        }
+
+        nextState[rowKey] = true;
+      });
+      return nextState;
+    });
+  }, [messageInfoModalState.rows, messageInfoModalState.visible]);
 
   useEffect(() => {
     brokenFileUrlsRef.current = brokenFileUrls;
@@ -1393,6 +2216,119 @@ export default function Chat() {
     displayedMessagesRef.current = displayed;
   }, [displayedMessages, selectedTeamMember?.id, effectiveUser?.email, normalizeMessageId]);
 
+  const normalizedConversationSearchQuery = useMemo(
+    () => normalizeChatConversationSearchQuery(conversationSearchDebouncedQuery),
+    [conversationSearchDebouncedQuery]
+  );
+  useEffect(() => {
+    conversationSearchQueryRef.current = conversationSearchQuery;
+  }, [conversationSearchQuery]);
+
+  useEffect(() => {
+    if (!conversationSearchVisible) {
+      setConversationSearchDebouncedQuery(conversationSearchQuery);
+      return;
+    }
+
+    const normalizedQuery = normalizeChatConversationSearchQuery(conversationSearchQuery);
+    if (!normalizedQuery) {
+      setConversationSearchDebouncedQuery('');
+      return;
+    }
+
+    const debounceTimer = setTimeout(() => {
+      setConversationSearchDebouncedQuery(conversationSearchQuery);
+    }, CONVERSATION_SEARCH_QUERY_DEBOUNCE_MS);
+
+    return () => {
+      clearTimeout(debounceTimer);
+    };
+  }, [conversationSearchQuery, conversationSearchVisible]);
+
+  useEffect(() => {
+    normalizedConversationSearchQueryRef.current = normalizedConversationSearchQuery;
+  }, [normalizedConversationSearchQuery]);
+
+  const conversationSearchMatchIds = useMemo(
+    () =>
+      resolveChatConversationSearchMatchIds(
+        displayedMessages,
+        normalizedConversationSearchQuery,
+        normalizeMessageId,
+        conversationSearchScope
+      ),
+    [
+      conversationSearchScope,
+      displayedMessages,
+      normalizeMessageId,
+      normalizedConversationSearchQuery,
+    ]
+  );
+  useEffect(() => {
+    conversationSearchMatchIdsRef.current = conversationSearchMatchIds;
+  }, [conversationSearchMatchIds]);
+
+  const conversationSearchMatchCollections = useMemo(() => {
+    return resolveChatConversationSearchMatchCollections(conversationSearchMatchIds);
+  }, [conversationSearchMatchIds]);
+
+  const conversationSearchMatchIdSet = conversationSearchMatchCollections.matchIdSet;
+  const conversationSearchMatchIndexById =
+    conversationSearchMatchCollections.matchIndexById;
+
+  // ── Phase 4: keep renderMessageItem refs in sync ──
+  useEffect(() => {
+    conversationSearchMatchIdSetRef.current = conversationSearchMatchIdSet;
+    conversationSearchMatchIndexByIdRef.current = conversationSearchMatchIndexById;
+  }, [conversationSearchMatchIdSet, conversationSearchMatchIndexById]);
+  useEffect(() => {
+    conversationSearchHighlightMessageIdRef.current = conversationSearchHighlightMessageId;
+  }, [conversationSearchHighlightMessageId]);
+  const conversationSearchScopeMatchCounts = useMemo(
+    () =>
+      resolveChatConversationSearchScopeMatchCounts(
+        displayedMessages,
+        normalizedConversationSearchQuery,
+        normalizeMessageId
+      ),
+    [displayedMessages, normalizeMessageId, normalizedConversationSearchQuery]
+  );
+
+  const conversationSearchCounterLabel = useMemo(() => {
+    return resolveChatConversationSearchCounterLabel({
+      normalizedQuery: normalizedConversationSearchQuery,
+      matchCount: conversationSearchMatchIds.length,
+      activeIndex: conversationSearchActiveIndex,
+      isLoadingHistory: isConversationSearchHistoryLoading,
+    });
+  }, [
+    conversationSearchActiveIndex,
+    conversationSearchMatchIds.length,
+    isConversationSearchHistoryLoading,
+    normalizedConversationSearchQuery,
+  ]);
+
+  const conversationSearchActiveSnippet = useMemo(
+    () =>
+      resolveChatConversationSearchSnippet(
+        displayedMessages,
+        conversationSearchMatchIds,
+        conversationSearchActiveIndex,
+        normalizedConversationSearchQuery,
+        normalizeMessageId,
+        38,
+        conversationSearchScope
+      ),
+    [
+      conversationSearchActiveIndex,
+      conversationSearchMatchIds,
+      conversationSearchScope,
+      displayedMessages,
+      normalizeMessageId,
+      normalizedConversationSearchQuery,
+    ]
+  );
+
   const getDisplayedMessageById = useCallback((messageId?: unknown) => {
     const normalizedMessageId = normalizeMessageId(messageId);
     if (!normalizedMessageId) {
@@ -1444,7 +2380,7 @@ export default function Chat() {
     () => getChatPaginationProfile(Platform.OS === 'web' ? 'web' : 'native'),
     []
   );
-  const requestOlderMessagesRef = useRef<((reason: 'auto' | 'manual') => void) | null>(null);
+  const requestOlderMessagesRef = useRef<((reason: 'auto' | 'manual') => Promise<void>) | null>(null);
   const TOP_AUTO_LOAD_THRESHOLD = 2;
   const TOP_PREFETCH_THRESHOLD = paginationProfile.prefetchThreshold;
   const loadOlderLockRef = useRef(false);
@@ -1464,12 +2400,7 @@ export default function Chat() {
   const flatListRef = useRef<FlashList<any>>(null);
   type TelemetryProfile = Awaited<ReturnType<typeof chatCacheService.getTelemetryContext>>;
   const concurrencyProfileRef = useRef<TelemetryProfile | null>(null);
-  const renderTraceRef = useRef<{
-    startedAt: number;
-    conversationId: string;
-    reason: 'initial' | 'refresh';
-    profile?: TelemetryProfile | null;
-  } | null>(null);
+  const renderTraceRef = useRef<ChatRenderTraceState | null>(null);
   const prevSettlementRef = useRef<boolean | null>(null);
 
   const [stickyDateVisible, setStickyDateVisible] = useState(false);
@@ -1480,13 +2411,18 @@ export default function Chat() {
   const scrollToBottomRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isAtBottomRef = useRef(true);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [showReplyJumpToLatest, setShowReplyJumpToLatest] = useState(false);
+  const [replyJumpHighlightMessageId, setReplyJumpHighlightMessageId] = useState<string | null>(null);
+  const replyJumpHighlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [unseenCount, setUnseenCount] = useState(0);
   const lastTailIdRef = useRef<string | null>(null);
   const contentHeightRef = useRef(0);
   const layoutHeightRef = useRef(0);
   const lastScrollOffsetRef = useRef(0);
   const topVisibleMessageRef = useRef<{ id: string; index: number } | null>(null);
-  const pendingPrependAnchorRef = useRef<{ id: string; offset: number; attempts: number } | null>(null);
+  const stickyDateSourceMessageIdRef = useRef<string | null>(null);
+  const pendingPrependAnchorRef =
+    useRef<ChatPendingPrependAnchorRefValue | null>(null);
   const lastAnchoredAtRef = useRef<number>(0);
   const anchoredTargetRef = useRef<{ type: 'bottom' | 'message'; id?: string } | null>(null);
   const userInteractedRef = useRef(false);
@@ -1501,9 +2437,48 @@ export default function Chat() {
   const [isInitialAnchorSettled, setIsInitialAnchorSettled] = useState(false);
   const isInitialAnchorSettledRef = useRef(false);
   const [inputHeight, setInputHeight] = useState(40);
-  const [lastTypingHeight, setLastTypingHeight] = useState(40);
+
+  useEffect(() => {
+    if (!activeComposerDraftKey || editingMessageInfo) {
+      return;
+    }
+
+    const currentValue = typeof message === 'string' ? message : '';
+    if (currentValue.length > 0) {
+      draftByConversationKeyRef.current.set(activeComposerDraftKey, currentValue);
+      return;
+    }
+
+    draftByConversationKeyRef.current.delete(activeComposerDraftKey);
+  }, [activeComposerDraftKey, editingMessageInfo, message]);
+
+  useEffect(() => {
+    const nextDraft = activeComposerDraftKey ? draftByConversationKeyRef.current.get(activeComposerDraftKey) || '' : '';
+    const currentValue = typeof latestMessageRef.current === 'string' ? latestMessageRef.current : '';
+
+    setEditingMessageInfo(null);
+    setReplyingToMessage(null);
+
+    if (nextDraft !== currentValue) {
+      setMessage(nextDraft);
+      latestMessageRef.current = nextDraft;
+      try {
+        mobileInputRef.current?.syncValueFromParent?.(nextDraft);
+      } catch (syncError) {
+        logger.debug('Failed to sync draft value when switching chat', { syncError });
+      }
+    }
+
+    updateSpecialComposerState(nextDraft);
+
+    if (!nextDraft) {
+      setInputHeight(40);
+    }
+  }, [activeComposerDraftKey, updateSpecialComposerState]);
+
   const previousIncomingUnreadRef = useRef<number>(0);
   const unreadRepairInFlightRef = useRef(false);
+  const unreadRepairTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastUnreadRepairAtRef = useRef<{ partnerEmail: string | null; at: number }>({
     partnerEmail: null,
     at: 0,
@@ -1512,12 +2487,18 @@ export default function Chat() {
   const queuedReadReceiptIdsRef = useRef<Set<string>>(new Set());
   const queuedConversationDeliverySyncRef = useRef(false);
   const receiptSyncRunningRef = useRef(false);
+  const receiptSyncGenerationRef = useRef(0);
   const receiptSyncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastConversationDeliverySyncRef = useRef<{ partnerEmail: string | null; at: number }>({
     partnerEmail: null,
     at: 0,
   });
   const flushConversationReceiptSyncRef = useRef<() => Promise<void>>(async () => {});
+  const clearQueuedReceiptSyncState = useCallback(() => {
+    const nextQueuedState = clearChatReceiptSyncQueuedState(queuedReadReceiptIdsRef.current);
+    queuedConversationDeliverySyncRef.current =
+      nextQueuedState.requestConversationDelivered;
+  }, []);
 
   useEffect(() => {
     if (!selectedTeamMember) {
@@ -1553,48 +2534,67 @@ export default function Chat() {
   }, [selectedTeamMember?.id, selectedTeamMember?.email, isChatBootstrapGateDone]);
 
   useEffect(() => {
+    const resetPlan = resolveChatReceiptSyncConversationResetPlan(selectedTeamMember?.email);
+    receiptSyncGenerationRef.current += 1;
+    receiptSyncRunningRef.current = false;
+
+    clearTimeoutRef(receiptSyncTimeoutRef);
     requestedReadReceiptIdsRef.current.clear();
-    queuedReadReceiptIdsRef.current.clear();
-    queuedConversationDeliverySyncRef.current = false;
-    lastConversationDeliverySyncRef.current = {
-      partnerEmail: selectedTeamMember?.email?.toLowerCase?.() ?? null,
-      at: 0,
-    };
-  }, [selectedTeamMember?.id, selectedTeamMember?.email]);
+    clearQueuedReceiptSyncState();
+    lastConversationDeliverySyncRef.current = resetPlan.deliverySyncMarker;
+  }, [clearQueuedReceiptSyncState, selectedTeamMember?.id, selectedTeamMember?.email]);
 
   useEffect(() => {
-    messages.forEach((msg: any) => {
-      if (msg?.id && msg.read) {
-        requestedReadReceiptIdsRef.current.add(String(msg.id));
-      }
+    const seedReadMessageIds = resolveChatReceiptRequestedReadSeedMessageIds(messages);
+    const seedMutationPlan = resolveChatReceiptRequestedReadMutationPlan({
+      addMessageIds: seedReadMessageIds,
     });
+    applyChatReceiptRequestedReadMutation(
+      requestedReadReceiptIdsRef.current,
+      seedMutationPlan
+    );
   }, [messages]);
 
   const queueConversationReceiptSync = useCallback((options: {
     readMessageIds?: string[];
     requestConversationDelivered?: boolean;
-  }) => {
-    const readMessageIds = Array.isArray(options.readMessageIds) ? options.readMessageIds : [];
-    readMessageIds.forEach((messageId) => {
-      const normalized = String(messageId || '').trim();
-      if (!normalized || requestedReadReceiptIdsRef.current.has(normalized)) {
-        return;
-      }
-      queuedReadReceiptIdsRef.current.add(normalized);
+  }, queueGeneration?: number) => {
+    const activeGeneration = receiptSyncGenerationRef.current;
+    const executionGeneration =
+      typeof queueGeneration === 'number' ? queueGeneration : activeGeneration;
+    const queueExecutionPlan = resolveChatReceiptSyncQueueExecutionPlan({
+      options,
+      requestedReadMessageIds: requestedReadReceiptIdsRef.current,
+      queuedReadMessageIds: queuedReadReceiptIdsRef.current,
+      requestConversationDelivered: queuedConversationDeliverySyncRef.current,
+      hasPendingTimeout: Boolean(receiptSyncTimeoutRef.current),
+      deferredFlushDelayMs: 120,
+      queueGeneration: executionGeneration,
+      activeGeneration,
     });
-
-    if (options.requestConversationDelivered) {
-      queuedConversationDeliverySyncRef.current = true;
-    }
-
-    if (receiptSyncTimeoutRef.current) {
+    if (!queueExecutionPlan.shouldApplyQueueExecutionPlan) {
       return;
     }
 
-    receiptSyncTimeoutRef.current = setTimeout(() => {
-      receiptSyncTimeoutRef.current = null;
+    const { deferredFlushPlan, nextQueuedState } = queueExecutionPlan;
+    queuedConversationDeliverySyncRef.current =
+      nextQueuedState.requestConversationDelivered;
+
+    if (!deferredFlushPlan.shouldScheduleDeferredFlush) {
+      return;
+    }
+
+    const scheduledGeneration = receiptSyncGenerationRef.current;
+    scheduleTimeoutRef(receiptSyncTimeoutRef, () => {
+      if (!shouldRunChatReceiptSyncDeferredFlushContinuation({
+        scheduledGeneration,
+        activeGeneration: receiptSyncGenerationRef.current,
+      })) {
+        return;
+      }
+
       void flushConversationReceiptSyncRef.current();
-    }, 120);
+    }, deferredFlushPlan.deferredFlushDelayMs);
   }, []);
 
   const flushConversationReceiptSync = useCallback(async () => {
@@ -1602,57 +2602,90 @@ export default function Chat() {
       return;
     }
 
-    const partnerEmail = selectedPartnerEmailRef.current;
-    const userEmail = effectiveUserEmailRef.current;
-    if (!partnerEmail || !userEmail || !isFocused || !isAppActive) {
-      queuedReadReceiptIdsRef.current.clear();
-      queuedConversationDeliverySyncRef.current = false;
+    const flushPlan = resolveChatReceiptSyncFlushPlan({
+      partnerEmail: selectedPartnerEmailRef.current,
+      userEmail: effectiveUserEmailRef.current,
+      isFocused,
+      isAppActive,
+      queuedReadMessageIds: queuedReadReceiptIdsRef.current,
+      requestConversationDelivered: queuedConversationDeliverySyncRef.current,
+    });
+    const flushExecutionPlan = resolveChatReceiptSyncFlushExecutionPlan(flushPlan);
+
+    if (flushExecutionPlan.shouldClearQueue) {
+      clearQueuedReceiptSyncState();
+    }
+
+    if (!flushExecutionPlan.shouldRunSync) {
       return;
     }
 
-    const readMessageIds = Array.from(queuedReadReceiptIdsRef.current);
-    const requestConversationDelivered = queuedConversationDeliverySyncRef.current;
-    queuedReadReceiptIdsRef.current.clear();
-    queuedConversationDeliverySyncRef.current = false;
-
-    if (!readMessageIds.length && !requestConversationDelivered) {
-      return;
-    }
+    const flushRunAttemptPlan = resolveChatReceiptSyncRunAttemptPlan({
+      partnerEmail: flushExecutionPlan.partnerEmail,
+      readMessageIds: flushExecutionPlan.readMessageIds,
+      requestConversationDelivered: flushExecutionPlan.requestConversationDelivered,
+    });
+    const runGeneration = receiptSyncGenerationRef.current;
+    const { partnerEmail } = flushExecutionPlan;
+    const { failureRecoveryPlan, requestMutationPlan, syncPayload } = flushRunAttemptPlan;
+    let flushFailureRecoveryPlan: typeof failureRecoveryPlan | null = null;
 
     receiptSyncRunningRef.current = true;
-    readMessageIds.forEach((messageId) => requestedReadReceiptIdsRef.current.add(messageId));
+    applyChatReceiptRequestedReadMutation(
+      requestedReadReceiptIdsRef.current,
+      requestMutationPlan
+    );
 
     try {
       await chatService.syncConversationReceipts(partnerEmail, {
-        readMessageIds,
-        markConversationDelivered: requestConversationDelivered,
+        readMessageIds: syncPayload.readMessageIds,
+        markConversationDelivered: syncPayload.markConversationDelivered,
       });
     } catch (error) {
-      readMessageIds.forEach((messageId) => requestedReadReceiptIdsRef.current.delete(messageId));
-      if (requestConversationDelivered) {
-        lastConversationDeliverySyncRef.current = { partnerEmail, at: 0 };
-      }
+      flushFailureRecoveryPlan = failureRecoveryPlan;
       logger.debug('Failed to sync chat receipts', error);
     } finally {
+      const shouldContinueRunFinalization = shouldApplyChatReceiptSyncRunContinuation({
+        runGeneration,
+        activeGeneration: receiptSyncGenerationRef.current,
+      });
+      if (!shouldContinueRunFinalization) {
+        return;
+      }
+
       receiptSyncRunningRef.current = false;
-      if (queuedReadReceiptIdsRef.current.size || queuedConversationDeliverySyncRef.current) {
+
+      const flushRunFinalizePlan = applyChatReceiptSyncRunFinalizePlan({
+        requestedReadMessageIds: requestedReadReceiptIdsRef.current,
+        failureRecoveryPlan: flushFailureRecoveryPlan,
+        currentDeliverySyncMarker: lastConversationDeliverySyncRef.current,
+        queuedReadMessageCount: queuedReadReceiptIdsRef.current.size,
+        requestConversationDelivered: queuedConversationDeliverySyncRef.current,
+      });
+      lastConversationDeliverySyncRef.current =
+        flushRunFinalizePlan.nextDeliverySyncMarker;
+      if (flushRunFinalizePlan.shouldFlushImmediately) {
         void flushConversationReceiptSyncRef.current();
       }
     }
-  }, [isAppActive, isFocused]);
+  }, [clearQueuedReceiptSyncState, isAppActive, isFocused]);
 
   useEffect(() => {
     flushConversationReceiptSyncRef.current = flushConversationReceiptSync;
   }, [flushConversationReceiptSync]);
 
   const lastExpensiveViewabilityWorkAtRef = useRef(0);
+  const queueDispatchResolverFallbackMetricRef = useRef<{
+    reason: 'missing' | 'invalid' | null;
+    at: number;
+  }>({
+    reason: null,
+    at: 0,
+  });
 
   useEffect(() => {
     return () => {
-      if (receiptSyncTimeoutRef.current) {
-        clearTimeout(receiptSyncTimeoutRef.current);
-        receiptSyncTimeoutRef.current = null;
-      }
+      clearTimeoutRef(receiptSyncTimeoutRef);
     };
   }, []);
 
@@ -1660,189 +2693,235 @@ export default function Chat() {
   const onViewableItemsChangedRef = useRef(({ viewableItems }: any) => {
     const displayedMessages = displayedMessagesRef.current;
     if (!displayedMessages || displayedMessages.length === 0) return;
+    const viewableEntries = Array.isArray(viewableItems) ? viewableItems : [];
     const nowMs = Date.now();
     const runExpensiveViewabilityWork = nowMs - lastExpensiveViewabilityWorkAtRef.current >= 120;
     if (runExpensiveViewabilityWork) {
       lastExpensiveViewabilityWorkAtRef.current = nowMs;
     }
-    const prefetch = prefetchUriRef.current;
-    const resolveSticker = resolveNativeSafeStickerUrlRef.current;
-    const resolveGif = resolveOptimizedGifUrlRef.current;
-    const stickerMap = stickerUrlMapRef.current;
-    const gifMap = gifUrlMapRef.current;
-    const partnerEmail = selectedPartnerEmailRef.current;
-    const userEmail = effectiveUserEmailRef.current;
-    if (runExpensiveViewabilityWork && partnerEmail && userEmail && Array.isArray(viewableItems)) {
-      const warmTargets: { remoteUrl: string; fileName?: string }[] = [];
-      const visibleUnreadIncomingIds: string[] = [];
-      viewableItems.forEach((viewable: any) => {
-        const msg = viewable?.item;
-        if (!msg) return;
-        const addUrl = (url?: string, fileName?: string) => {
-          if (!url) return;
-          if (url.startsWith('file://')) return;
-          warmTargets.push({ remoteUrl: url, fileName });
-        };
-        if (Array.isArray(msg.attachments)) {
-          msg.attachments.forEach((att: any) => addUrl(att.url, att.fileName));
-        }
-        if (
-          msg.id &&
-          !msg.deleted &&
-          String(msg.sender || '').toLowerCase() === partnerEmail &&
-          String(msg.recipientId || '').toLowerCase() === userEmail.toLowerCase() &&
-          !msg.read
-        ) {
-          visibleUnreadIncomingIds.push(String(msg.id));
-        }
-      });
-      if (warmTargets.length) {
-        Promise.allSettled(
-          warmTargets.slice(0, 5).map(({ remoteUrl, fileName }) =>
-            chatCacheService.getMediaForDownload(remoteUrl, fileName, undefined, 'low').catch(() => undefined)
-          )
-        ).catch(() => undefined);
-      }
-
-      const normalizedPartner = selectedPartnerEmailRef.current;
-      const now = Date.now();
-      const requestConversationDelivered =
-        Boolean(normalizedPartner) &&
-        (lastConversationDeliverySyncRef.current.partnerEmail !== normalizedPartner ||
-          now - lastConversationDeliverySyncRef.current.at >= 15000);
-
-      if (requestConversationDelivered && normalizedPartner) {
-        lastConversationDeliverySyncRef.current = {
-          partnerEmail: normalizedPartner,
-          at: now,
-        };
-      }
-
-      if (visibleUnreadIncomingIds.length || requestConversationDelivered) {
-        queueConversationReceiptSync({
-          readMessageIds: visibleUnreadIncomingIds,
-          requestConversationDelivered,
-        });
-      }
-    }
-
-    // Prefetch nearby media (stickers/GIFs/images) for smoother scrolling
     if (runExpensiveViewabilityWork) {
-      const indices = (viewableItems || [])
-        .map((v: any) => v.index as number)
-        .filter((i: number) => typeof i === 'number') as number[];
-      const candidates = new Set<number>();
-      indices.forEach(i => {
-        for (let d = -2; d <= 4; d++) {
-          const idx = i + d;
-          if (idx >= 0 && idx < displayedMessages.length) candidates.add(idx);
+      const asyncContinuationGeneration = receiptSyncGenerationRef.current;
+      const prefetch = prefetchUriRef.current;
+      const resolveSticker = resolveNativeSafeStickerUrlRef.current;
+      const resolveGif = resolveOptimizedGifUrlRef.current;
+      const stickerMap = stickerUrlMapRef.current;
+      const gifMap = gifUrlMapRef.current;
+
+      const normalizedPartnerEmail = normalizeChatReceiptSyncEmail(
+        selectedPartnerEmailRef.current
+      );
+      const normalizedUserEmail = normalizeChatReceiptSyncEmail(
+        effectiveUserEmailRef.current
+      );
+      if (viewableEntries.length > 0) {
+        const {
+          warmTargets,
+          queueDispatchPlan: viewabilityQueueDispatchPlan,
+        } = resolveChatViewabilityReceiptQueueDispatchPlan({
+          viewableEntries,
+          normalizedPartnerEmail,
+          normalizedUserEmail,
+          maxWarmTargets: 5,
+          lastDeliverySyncMarker: lastConversationDeliverySyncRef.current,
+          resolveQueueDispatchPlan:
+            resolveChatReceiptViewabilityQueueDispatchPlanForMarker,
+          onQueueDispatchResolverFallback: (reason) => {
+            const fallbackMetricEmissionPlan =
+              resolveChatViewabilityQueueDispatchResolverFallbackMetricEmissionPlan(
+                {
+                  reason,
+                  lastMetricState:
+                    queueDispatchResolverFallbackMetricRef.current,
+                  nowMs,
+                  cooldownMs: 15000,
+                  hasPartnerEmail: Boolean(normalizedPartnerEmail),
+                  hasUserEmail: Boolean(normalizedUserEmail),
+                  queueGeneration: asyncContinuationGeneration,
+                  activeGeneration: receiptSyncGenerationRef.current,
+                }
+              );
+            queueDispatchResolverFallbackMetricRef.current =
+              fallbackMetricEmissionPlan.nextMetricState;
+
+            if (!fallbackMetricEmissionPlan.shouldEmitMetric) {
+              return;
+            }
+            logger.metric('chat.viewability.queue_dispatch_resolver_fallback', {
+              ...fallbackMetricEmissionPlan.metricPayload,
+            });
+          },
+          queueGeneration: asyncContinuationGeneration,
+          activeGeneration: receiptSyncGenerationRef.current,
+        });
+        applyChatViewabilityWarmTargetPrefetch({
+          warmTargets,
+          prefetchWarmTarget: ({ remoteUrl, fileName }) =>
+            chatCacheService
+              .getMediaForDownload(remoteUrl, fileName, undefined, 'low')
+              .catch(() => undefined),
+        });
+
+        const viewabilityQueueDispatchEffectsPlan =
+          resolveChatViewabilityQueueDispatchEffectsPlan(
+            viewabilityQueueDispatchPlan
+          );
+
+        if (
+          viewabilityQueueDispatchEffectsPlan.shouldUpdateDeliverySyncMarker &&
+          viewabilityQueueDispatchEffectsPlan.nextDeliverySyncMarker
+        ) {
+          lastConversationDeliverySyncRef.current =
+            viewabilityQueueDispatchEffectsPlan.nextDeliverySyncMarker;
         }
-      });
-      candidates.forEach((idx) => {
-        const m = displayedMessages[idx];
-        if (!m) return;
-        // Stickers
-        if (m.sticker?.url) {
-          const original = m.sticker.url as string;
-          const display = Platform.OS === 'web' ? original : (stickerMap.get(original) || original);
-          prefetch(display);
-          if (Platform.OS !== 'web') {
-            resolveSticker(original).then((alt: string | null) => { if (alt) prefetch(alt); });
+
+        if (viewabilityQueueDispatchEffectsPlan.shouldQueueSync) {
+          queueConversationReceiptSync(
+            viewabilityQueueDispatchEffectsPlan.queueOptions,
+            asyncContinuationGeneration
+          );
+        }
+      }
+
+      // Prefetch nearby media (stickers/GIFs/images) for smoother scrolling
+      if (viewableEntries.length > 0) {
+        const candidates = resolveChatViewabilityPrefetchCandidateIndices({
+          viewableItems: viewableEntries,
+          messageCount: displayedMessages.length,
+          behindDistance: 2,
+          aheadDistance: 4,
+        });
+
+        const nearbyMediaPrefetchPlan =
+          resolveChatViewabilityNearbyMediaPrefetchPlan({
+            displayedMessages,
+            candidateIndices: candidates,
+            stickerUrlMap: stickerMap,
+            gifUrlMap: gifMap,
+            isWeb: Platform.OS === 'web',
+            shouldPrefetchAttachment: (attachment) => {
+              const rawAttachment = attachment as
+                | { fileType?: string; fileName?: string }
+                | null
+                | undefined;
+              return isImageFile(
+                rawAttachment?.fileType || '',
+                rawAttachment?.fileName || ''
+              );
+            },
+          });
+
+        const prefetchedMediaUrls = new Set<string>();
+        const prefetchOnce = (url: string | null | undefined) => {
+          if (!url || prefetchedMediaUrls.has(url)) {
+            return;
           }
+
+          prefetchedMediaUrls.add(url);
+          prefetch(url);
+        };
+
+        for (const url of nearbyMediaPrefetchPlan.immediatePrefetchUrls) {
+          prefetchOnce(url);
         }
-        // GIFs
-        if (m.gif?.url) {
-          const original = m.gif.url as string;
-          const display = Platform.OS === 'web' ? original : (gifMap.get(original) || original);
-          prefetch(display);
-          if (Platform.OS !== 'web') {
-            resolveGif(original).then((alt: string) => { if (alt) prefetch(alt); });
-          }
-        }
-        // Image attachments
-        if (m.attachments && Array.isArray(m.attachments)) {
-          m.attachments.forEach((att: any) => {
-            if (att?.url && isImageFile(att.fileType, att.fileName)) prefetch(att.url);
+
+        if (Platform.OS !== 'web') {
+          applyChatViewabilityDeferredResolveDispatchPlan({
+            stickerResolveUrls: nearbyMediaPrefetchPlan.stickerResolveUrls,
+            gifResolveUrls: nearbyMediaPrefetchPlan.gifResolveUrls,
+            dispatchStickerResolve: (originalStickerUrl) => {
+              resolveSticker(originalStickerUrl).then((alt: string | null) => {
+                if (!shouldApplyChatReceiptSyncRunContinuation({
+                  runGeneration: asyncContinuationGeneration,
+                  activeGeneration: receiptSyncGenerationRef.current,
+                })) {
+                  return;
+                }
+
+                prefetchOnce(alt);
+              });
+            },
+            dispatchGifResolve: (originalGifUrl) => {
+              resolveGif(originalGifUrl).then((alt: string) => {
+                if (!shouldApplyChatReceiptSyncRunContinuation({
+                  runGeneration: asyncContinuationGeneration,
+                  activeGeneration: receiptSyncGenerationRef.current,
+                })) {
+                  return;
+                }
+
+                prefetchOnce(alt);
+              });
+            },
           });
         }
-      });
+      }
     }
 
-    if (Array.isArray(viewableItems) && viewableItems.length) {
-
-    const unreadId = unreadSeparatorMessageIdRef.current;
-    if (unreadId) {
-      const isUnreadVisible = Array.isArray(viewableItems) && viewableItems.some((viewable: any) => {
-        const itemId = normalizeMessageId(viewable?.item?.id);
-        return itemId && itemId === unreadId;
+    if (viewableEntries.length) {
+      const viewabilityWindowSummary = resolveChatViewabilityWindowSummary({
+        viewableItems: viewableEntries,
+        unreadMessageId: unreadSeparatorMessageIdRef.current,
       });
 
-      if (isUnreadVisible) {
+      const unreadVisibilityPlan = resolveChatUnreadSeparatorVisibilityPlan({
+        hasUnreadTarget: viewabilityWindowSummary.hasUnreadTarget,
+        isUnreadVisible: viewabilityWindowSummary.isUnreadVisible,
+        hasAcknowledgedUnread: hasAcknowledgedUnreadRef.current,
+        incomingUnreadCount: incomingUnreadCountRef.current,
+        unreadDividerSeedCount: unreadDividerSeedCountRef.current,
+      });
+      unreadSeparatorIsVisibleRef.current = unreadVisibilityPlan.nextUnreadSeparatorIsVisible;
+      if (unreadVisibilityPlan.shouldAcknowledgeUnread) {
         hasAcknowledgedUnreadRef.current = true;
-        unreadSeparatorIsVisibleRef.current = true;
-        if (unreadSeparatorDismissTimeoutRef.current) {
-          clearTimeout(unreadSeparatorDismissTimeoutRef.current);
-          unreadSeparatorDismissTimeoutRef.current = null;
-        }
-      } else {
-        unreadSeparatorIsVisibleRef.current = false;
-        if (
-          hasAcknowledgedUnreadRef.current &&
-          incomingUnreadCountRef.current === 0 &&
-          unreadDividerSeedCountRef.current === 0
-        ) {
-          scheduleUnreadSeparatorDismissRef.current?.(UNREAD_DIVIDER_AUTO_DISMISS_MS);
-        }
       }
-    } else {
-      unreadSeparatorIsVisibleRef.current = false;
-    }
-      let topEntry: any = null;
-      let bottomEntry: any = null;
-      for (const entry of viewableItems) {
-        if (!entry) continue;
-        const idx = typeof entry.index === 'number' ? entry.index : null;
-        if (idx === null || idx < 0) continue;
-        if (!topEntry || idx < topEntry.index) {
-          topEntry = entry;
-        }
-        if (!bottomEntry || idx > bottomEntry.index) {
-          bottomEntry = entry;
-        }
+      if (
+        unreadVisibilityPlan.shouldClearDismissTimeout &&
+        unreadSeparatorDismissTimeoutRef.current
+      ) {
+        clearTimeout(unreadSeparatorDismissTimeoutRef.current);
+        unreadSeparatorDismissTimeoutRef.current = null;
+      }
+      if (unreadVisibilityPlan.shouldScheduleDismiss) {
+        scheduleUnreadSeparatorDismissRef.current?.(UNREAD_DIVIDER_AUTO_DISMISS_MS);
       }
 
-      if (topEntry?.item?.id != null) {
-        const topIndex = typeof topEntry.index === 'number' ? topEntry.index : 0;
-        const topId = String(topEntry.item.id);
+      const topWindowActionPlan = resolveChatTopWindowActionPlan({
+        topVisibleIndex: viewabilityWindowSummary.topVisibleIndex,
+        topVisibleMessageId: viewabilityWindowSummary.topVisibleMessageId,
+        shouldUseManualAnchorPreservation,
+        hasPendingPrependAnchor: Boolean(pendingPrependAnchorRef.current),
+        isInitialAnchorSettled: isInitialAnchorSettledRef.current,
+        hasUserInteracted: userInteractedRef.current,
+        allowTopAutoPagination: allowTopAutoPaginationRef.current,
+        topAutoLoadThreshold: TOP_AUTO_LOAD_THRESHOLD,
+        currentAutoLoadAnchorId: autoLoadAnchorRef.current,
+        topPrefetchThreshold: TOP_PREFETCH_THRESHOLD,
+      });
+
+      if (topWindowActionPlan.shouldUpdateTopVisibleMessage) {
         topVisibleMessageRef.current = {
-          id: topId,
-          index: topIndex,
+          id: topWindowActionPlan.nextTopVisibleMessageId as string,
+          index: topWindowActionPlan.nextTopVisibleIndex as number,
         };
-
-        const anchorBlocked = shouldUseManualAnchorPreservation && Boolean(pendingPrependAnchorRef.current);
-        if (isInitialAnchorSettledRef.current && userInteractedRef.current && allowTopAutoPaginationRef.current) {
-          if (topIndex <= TOP_AUTO_LOAD_THRESHOLD) {
-            if (topId !== autoLoadAnchorRef.current && !anchorBlocked) {
-              autoLoadAnchorRef.current = topId;
-              requestOlderMessagesRef.current?.('auto');
-            }
-          } else if (topIndex > TOP_AUTO_LOAD_THRESHOLD + 1) {
-            autoLoadAnchorRef.current = null;
-          }
-        }
-
-        if (topIndex <= TOP_PREFETCH_THRESHOLD) {
-          warmNextPageRef.current?.();
-        }
-      } else {
-        autoLoadAnchorRef.current = null;
       }
 
-      if (bottomEntry?.index != null) {
-        const bottomIndex = typeof bottomEntry.index === 'number' ? bottomEntry.index : displayedMessages.length - 1;
-        if (bottomIndex >= displayedMessages.length - 1) {
-          isAtBottomRef.current = true;
-        }
+      if (topWindowActionPlan.shouldResetAutoLoadAnchor) {
+        autoLoadAnchorRef.current = null;
+      } else if (topWindowActionPlan.nextAutoLoadAnchorId !== autoLoadAnchorRef.current) {
+        autoLoadAnchorRef.current = topWindowActionPlan.nextAutoLoadAnchorId;
+      }
+
+      if (topWindowActionPlan.shouldRequestOlder) {
+        requestOlderMessagesRef.current?.('auto');
+      }
+
+      if (topWindowActionPlan.shouldWarmNextPage) {
+        warmNextPageRef.current?.();
+      }
+
+      const bottomIndex = viewabilityWindowSummary.bottomVisibleIndex;
+      if (bottomIndex !== null && bottomIndex >= displayedMessages.length - 1) {
+        isAtBottomRef.current = true;
       }
     }
   });
@@ -1878,15 +2957,9 @@ export default function Chat() {
       cancelled = true;
     };
   }, []);
-  
-  const BASE_COMPOSER_HEIGHT = 40;
 
   const bottomVisibilityPadding = useMemo(() => {
-    const composerHeight = Math.max(inputHeight || BASE_COMPOSER_HEIGHT, BASE_COMPOSER_HEIGHT);
-  const basePadding = DEFAULT_BOTTOM_VISIBILITY_BUFFER + 12; // small buffer to float above composer
-    const extraComposerHeight = Math.max(0, composerHeight - BASE_COMPOSER_HEIGHT);
-    const adaptiveExtra = Math.min(extraComposerHeight, 28);
-    return basePadding + adaptiveExtra;
+    return resolveChatBottomVisibilityPadding(DEFAULT_BOTTOM_VISIBILITY_BUFFER, inputHeight);
   }, [inputHeight, DEFAULT_BOTTOM_VISIBILITY_BUFFER]);
   const maintainVisibleContentPositionConfig = useMemo(() => {
     if (Platform.OS === 'web') {
@@ -1894,7 +2967,7 @@ export default function Chat() {
     }
     return {
       minIndexForVisible: 0,
-      autoscrollToTopThreshold: bottomVisibilityPadding + 48,
+      autoscrollToTopThreshold: resolveChatAutoscrollToTopThreshold(bottomVisibilityPadding),
     } as const;
   }, [bottomVisibilityPadding]);
 
@@ -1919,114 +2992,140 @@ export default function Chat() {
     }
     const positions = messagePositionsRef.current || {};
     const target = positions[anchor.id];
-    if (!target) {
-      if (anchor.attempts >= MAX_PREPEND_ANCHOR_ATTEMPTS) {
-        pendingPrependAnchorRef.current = null;
+    const selectedFailureExecutionPlan =
+      resolveChatPrependAnchorFailureExecutionPlanForRestore({
+        targetExists: Boolean(target),
+        anchorAttempts: anchor.attempts,
+        maxAttempts: MAX_PREPEND_ANCHOR_ATTEMPTS,
+        anchorId: anchor.id,
+        anchorOffset: anchor.offset,
+        displayedMessages: displayedMessagesRef.current,
+        displayedMessageIndexById: displayedMessageIndexRef.current,
+      });
 
-        const displayed = displayedMessagesRef.current;
-        if (Array.isArray(displayed) && displayed.length) {
-          const fallbackIndex = displayedMessageIndexRef.current.get(String(anchor.id)) ?? -1;
-          if (fallbackIndex >= 0) {
-            try {
-              (flatListRef.current as any)?.scrollToIndex?.({
-                index: fallbackIndex,
-                animated: false,
-                viewPosition: 0,
-                viewOffset: Math.max(0, anchor.offset),
-              });
-            } catch {}
-          }
+    const restoreOffsetPlan = resolveChatPrependAnchorRestoreOffsetPlan({
+      targetY: target?.y,
+      anchorOffset: anchor.offset,
+    });
+
+    applyChatPrependAnchorRestoreWithFallback({
+      scrollAction: () => {
+        if (target) {
+          flatListRef.current?.scrollToOffset?.(restoreOffsetPlan.payload);
+        } else {
+          throw new Error('No target to restore');
         }
-        return;
-      }
-      pendingPrependAnchorRef.current = { ...anchor, attempts: anchor.attempts + 1 };
-      setTimeout(() => restorePrependAnchorIfNeeded(), 50);
-      return;
-    }
-
-    const desiredOffset = Math.max(0, target.y + anchor.offset);
-    try {
-      (flatListRef.current as any)?.scrollToOffset?.({ offset: desiredOffset, animated: false });
-      pendingPrependAnchorRef.current = null;
-    } catch {
-      if (anchor.attempts >= MAX_PREPEND_ANCHOR_ATTEMPTS) {
-        pendingPrependAnchorRef.current = null;
-        return;
-      }
-      pendingPrependAnchorRef.current = { ...anchor, attempts: anchor.attempts + 1 };
-      setTimeout(() => restorePrependAnchorIfNeeded(), 50);
-    }
+      },
+      failureExecutionPlan: selectedFailureExecutionPlan,
+      pendingPrependAnchorRef,
+      list: flatListRef.current,
+      scheduleRetry: () => restorePrependAnchorIfNeeded(),
+    });
   }, [shouldUseManualAnchorPreservation]);
 
   const capturePrependAnchor = useCallback((currentOffset: number) => {
-    if (!shouldUseManualAnchorPreservation) return;
-    if (pendingPrependAnchorRef.current) return;
     const topVisible = topVisibleMessageRef.current;
-    if (!topVisible?.id) return;
-    const topPos = messagePositionsRef.current[topVisible.id];
-    const offset = Math.max(0, currentOffset - (topPos?.y ?? 0));
-    pendingPrependAnchorRef.current = { id: topVisible.id, offset, attempts: 0 };
+    const topVisibleId = topVisible?.id ?? null;
+    const topPos = topVisibleId ? messagePositionsRef.current[topVisibleId] : null;
+    const capturePlan = resolveChatPrependAnchorCapturePlan({
+      shouldUseManualAnchorPreservation,
+      hasPendingAnchor: Boolean(pendingPrependAnchorRef.current),
+      topVisibleId,
+      topVisibleY: topPos?.y ?? null,
+      currentOffset,
+    });
+    if (!capturePlan.shouldCapture || !capturePlan.anchorId) {
+      return;
+    }
+
+    pendingPrependAnchorRef.current = {
+      id: capturePlan.anchorId,
+      offset: capturePlan.anchorOffset,
+      attempts: 0,
+    };
   }, [shouldUseManualAnchorPreservation]);
   const requestOlderMessages = useCallback(
-    async (reason: 'auto' | 'manual' = 'manual') => {
+    async (reason: ChatLoadOlderReason = 'manual') => {
       const alreadyAtStart = reachedConversationStartRef.current;
-      if (loadOlderLockRef.current || loadingMore) {
-        return;
-      }
-
-      if (alreadyAtStart) {
-        if (reason === 'manual') {
-          Toast.show({
-            type: 'info',
-            text1: 'No older messages',
-            text2: 'You have reached the beginning of this chat history.',
-            position: 'top',
-          });
+      const hasAttemptedBefore = loadOlderAttemptsRef.current > 0;
+      const startPlan = resolveChatLoadOlderStartPlan({
+        reason,
+        alreadyAtStart,
+        isLoadOlderLocked: loadOlderLockRef.current,
+        isLoadingMore: loadingMore,
+        hasMore,
+        hasAttemptedBefore,
+        hasLoadMoreFunction: typeof loadMore === 'function',
+      });
+      if (!startPlan.shouldProceed) {
+        const reachedStartToastPlan =
+          resolveChatLoadOlderReachedStartToastEmissionPlan(
+            startPlan.shouldShowReachedStartToast
+          );
+        if (reachedStartToastPlan.shouldShow && reachedStartToastPlan.payload) {
+          Toast.show(reachedStartToastPlan.payload);
         }
         return;
       }
 
-      const hasAttemptedBefore = loadOlderAttemptsRef.current > 0;
-
-      if (!hasMore && reason === 'auto' && hasAttemptedBefore) {
-        return;
+      const runStartPlan = resolveChatLoadOlderRunStartPlan(
+        loadOlderAttemptsRef.current
+      );
+      loadOlderAttemptsRef.current = runStartPlan.nextLoadOlderAttempts;
+      if (runStartPlan.shouldLockLoadOlder) {
+        loadOlderLockRef.current = true;
       }
-      if (typeof loadMore !== 'function') {
-        return;
-      }
-
-      loadOlderAttemptsRef.current += 1;
-      loadOlderLockRef.current = true;
       let added = false;
       try {
-        const currentOffset = lastScrollOffsetRef.current || 0;
+        const currentOffset = resolveChatPrependAnchorCaptureTriggerOffset(
+          lastScrollOffsetRef.current
+        );
         capturePrependAnchor(currentOffset);
       } catch {}
 
       try {
-        const loadOptions = reason === 'manual' ? { aggressive: true, force: true } : undefined;
-        added = await loadMore(loadOptions);
+        const manualLoadOptions = resolveChatLoadOlderAttemptOptions(reason);
+        const firstAttemptAdded = await loadMore(manualLoadOptions);
+        const retryPlan = resolveChatLoadOlderRetryAttemptPlan({
+          reason,
+          firstAttemptAdded,
+          hasMore: hasMoreRef.current,
+          hasManualLoadOptions: Boolean(manualLoadOptions),
+        });
+        const retryAttemptAdded = retryPlan.shouldRunRetryAttempt
+          ? await loadMore(manualLoadOptions)
+          : undefined;
 
-        if (!added && reason === 'manual' && hasMoreRef.current) {
-          added = await loadMore({ aggressive: true, force: true });
-        }
+        added = resolveChatLoadOlderFinalAddedState(
+          firstAttemptAdded,
+          retryAttemptAdded
+        );
 
-        if (!added && reason === 'manual' && hasMoreRef.current) {
-          Toast.show({
-            type: 'info',
-            text1: 'Syncing older messages…',
-            text2: 'Fetching a fuller history from the server.',
-            position: 'top',
-          });
+        const syncingToastPlan = resolveChatLoadOlderSyncingToastEmissionPlan(
+          reason,
+          added,
+          hasMoreRef.current
+        );
+        if (syncingToastPlan.shouldShow && syncingToastPlan.payload) {
+          Toast.show(syncingToastPlan.payload);
         }
       } catch (error) {
-        logger.warn('chat.pagination.loadOlder.failed', { error, reason });
-        pendingPrependAnchorRef.current = null;
+        logger.warn(
+          'chat.pagination.loadOlder.failed',
+          resolveChatLoadOlderFailureLogPayload(reason, error)
+        );
+        const failurePlan = resolveChatLoadOlderFailurePlan();
+        if (failurePlan.shouldClearPendingPrependAnchor) {
+          pendingPrependAnchorRef.current = null;
+        }
       } finally {
-        if (reason === 'auto' && !added) {
+        const runCompletionPlan = resolveChatLoadOlderRunCompletionPlan(reason, added);
+        if (runCompletionPlan.shouldResetAutoLoadAnchor) {
           autoLoadAnchorRef.current = null;
         }
-        loadOlderLockRef.current = false;
+        if (runCompletionPlan.shouldUnlockLoadOlder) {
+          loadOlderLockRef.current = false;
+        }
       }
     },
     [hasMore, loadingMore, loadMore, capturePrependAnchor]
@@ -2037,27 +3136,28 @@ export default function Chat() {
   }, [requestOlderMessages]);
 
   useEffect(() => {
-    if (loadingMore) {
+    const reachedStartPlan = resolveChatReachedConversationStartPlan({
+      isLoadingMore: loadingMore,
+      hasMore,
+      loadOlderAttempts: loadOlderAttemptsRef.current,
+    });
+
+    if (!reachedStartPlan.shouldUpdate) {
       return;
     }
 
-    if (hasMore) {
-      reachedConversationStartRef.current = false;
-      setReachedConversationStart(false);
-      return;
-    }
-
-    if (loadOlderAttemptsRef.current > 0) {
-      reachedConversationStartRef.current = true;
-      setReachedConversationStart(true);
-    }
+    reachedConversationStartRef.current = reachedStartPlan.nextReachedConversationStart;
+    setReachedConversationStart(reachedStartPlan.nextReachedConversationStart);
   }, [hasMore, loadingMore]);
 
   useEffect(() => {
-    loadOlderAttemptsRef.current = 0;
-    reachedConversationStartRef.current = false;
-    setReachedConversationStart(false);
-    autoLoadAnchorRef.current = null;
+    const resetPlan = resolveChatLoadOlderConversationResetPlan();
+    loadOlderAttemptsRef.current = resetPlan.nextLoadOlderAttempts;
+    reachedConversationStartRef.current = resetPlan.nextReachedConversationStart;
+    setReachedConversationStart(resetPlan.nextReachedConversationStart);
+    if (resetPlan.shouldResetAutoLoadAnchor) {
+      autoLoadAnchorRef.current = null;
+    }
   }, [selectedTeamMember?.id]);
 
   const scheduleUnreadSeparatorDismiss = useCallback((delay: number = UNREAD_DIVIDER_AUTO_DISMISS_MS) => {
@@ -2088,68 +3188,8 @@ export default function Chat() {
   // Centralized in lib/profileImage to keep behavior consistent across the app
   const getProfilePictureURL = getProfileImageUrl;
 
-  // Rich content handling functions for keyboard stickers
-  const detectRichContent = (text: string) => {
-    // Detect if the text contains high-quality emojis or stickers
-    // This includes extended Unicode emojis, compound emojis, and special characters
-    const complexEmojiPattern = /[\u{1F600}-\u{1F64F}][\u{FE0F}]?[\u{1F3FB}-\u{1F3FF}]?|[\u{1F300}-\u{1F5FF}][\u{FE0F}]?|[\u{1F680}-\u{1F6FF}][\u{FE0F}]?|[\u{1F700}-\u{1F77F}]|[\u{1F780}-\u{1F7FF}]|[\u{1F800}-\u{1F8FF}]|[\u{1F900}-\u{1F9FF}]|[\u{1FA00}-\u{1FA6F}]|[\u{1FA70}-\u{1FAFF}]|[\u{2600}-\u{26FF}][\u{FE0F}]?|[\u{2700}-\u{27BF}][\u{FE0F}]?/gu;
-    
-    const emojiMatches = text.match(complexEmojiPattern) || [];
-    
-    // Check for compound emojis (multiple Unicode points forming one visual emoji)
-    const compoundEmojiPattern = /[\u{1F3F4}][\u{E0067}][\u{E0062}][\u{E0065}][\u{E006E}][\u{E0067}][\u{E007F}]|[\u{1F468}][\u{200D}][\u{1F469}][\u{200D}][\u{1F467}][\u{200D}][\u{1F466}]|[\u{1F1E6}-\u{1F1FF}][\u{1F1E6}-\u{1F1FF}]/gu;
-    const compoundMatches = text.match(compoundEmojiPattern) || [];
-    
-    // Check for skin tone variations
-    const skinTonePattern = /[\u{1F3FB}-\u{1F3FF}]/gu;
-    const skinToneMatches = text.match(skinTonePattern) || [];
-    
-    return {
-      hasRichEmojis: emojiMatches.length > 0 || compoundMatches.length > 0 || skinToneMatches.length > 0,
-      emojiCount: emojiMatches.length + compoundMatches.length,
-      isEmojiOnly: text.trim().replace(complexEmojiPattern, '').replace(compoundEmojiPattern, '').trim() === '',
-      emojis: [...emojiMatches, ...compoundMatches]
-    };
-  };
-
   const handleRichTextInput = async (inputText: string) => {
-    const richContent = detectRichContent(inputText);
-    // Compute remainder after removing emojis and common joiners/variation selectors
-    const complexEmojiPattern = /[\u{1F600}-\u{1F64F}][\u{FE0F}]?[\u{1F3FB}-\u{1F3FF}]?|[\u{1F300}-\u{1F5FF}][\u{FE0F}]?|[\u{1F680}-\u{1F6FF}][\u{FE0F}]?|[\u{1F700}-\u{1F77F}]|[\u{1F780}-\u{1F7FF}]|[\u{1F800}-\u{1F8FF}]|[\u{1F900}-\u{1F9FF}]|[\u{1FA00}-\u{1FA6F}]|[\u{1FA70}-\u{1FAFF}]|[\u{2600}-\u{26FF}][\u{FE0F}]?|[\u{2700}-\u{27BF}][\u{FE0F}]?/gu;
-    const compoundEmojiPattern = /[\u{1F3F4}][\u{E0067}][\u{E0062}][\u{E0065}][\u{E006E}][\u{E0067}][\u{E007F}]|[\u{1F468}][\u{200D}][\u{1F469}][\u{200D}][\u{1F467}][\u{200D}][\u{1F466}]|[\u{1F1E6}-\u{1F1FF}][\u{1F1E6}-\u{1F1FF}]/gu;
-    const remainder = inputText
-      .trim()
-      .replace(complexEmojiPattern, '')
-      .replace(compoundEmojiPattern, '')
-      .replace(/[\u200D\uFE0F\s]/g, '') // strip ZWJ, VS-16, whitespace
-      .trim();
-
-    const isEmojiMostly = (richContent.emojiCount >= 1 && richContent.emojiCount <= 5) && (remainder.length === 0 || (remainder.length === 1 && /[A-Za-z]/.test(remainder)));
-
-    if (isEmojiMostly) {
-      // Only emojis (or emojis plus one stray character) → convert to sticker
-      const emojiSticker = {
-        url: '',
-        name: richContent.emojis.join(''), // exclude the stray char from display
-        pack: 'system',
-        width: 100,
-        height: 100,
-        isEmoji: true,
-        original: inputText.trim()
-      };
-
-      return {
-        type: 'sticker' as const,
-        content: emojiSticker,
-        originalText: inputText
-      };
-    }
-
-    return {
-      type: 'text' as const,
-      content: inputText,
-      originalText: inputText
-    };
+    return resolveChatRichTextInputResult(inputText);
   };
 
   // Handle emoji reactions with Firebase Realtime Database integration
@@ -2181,93 +3221,15 @@ export default function Chat() {
     try {
       // Update local state immediately for responsive UI
       reactionOptimisticUntilRef.current.set(normalizedMessageId, Date.now() + 1500);
-      setLocalMessageReactions(prevReactions => {
-        const newReactions = new Map(prevReactions);
-        const baseReaction = newReactions.get(normalizedMessageId) || {};
-        const messageReaction: { [key: string]: Set<string> } = { ...baseReaction };
-        
-        if (isSpecialMessage) {
-          // For special messages: handle multiple reactions per user
-          logger.debug('🎯 Special message reaction handling:', {
-            messageId,
-            reactionType,
-            userEmail,
-            currentReactions: Object.keys(messageReaction),
-            hasThisReaction: messageReaction[reactionType] && 
-                            (messageReaction[reactionType] as Set<string>).has(userEmail)
-          });
-          
-          // Check if user already has this specific reaction
-          const existingSet = messageReaction[reactionType];
-          const hasThisReaction = existingSet && (existingSet as Set<string>).has(userEmail);
-          
-          if (hasThisReaction) {
-            // Remove this specific reaction (toggle off)
-            logger.debug('🔄 Removing specific reaction for special message');
-            const nextSet = new Set(existingSet as Set<string>);
-            nextSet.delete(userEmail);
-            if (nextSet.size === 0) {
-              delete messageReaction[reactionType];
-            } else {
-              messageReaction[reactionType] = nextSet;
-            }
-          } else {
-            // Add this reaction (don't remove others)
-            logger.debug('✅ Adding new reaction for special message');
-            const nextSet = new Set((existingSet as Set<string>) ?? []);
-            nextSet.add(userEmail);
-            messageReaction[reactionType] = nextSet;
-          }
-        } else {
-          // For regular messages: only one reaction per user (existing behavior)
-          // Find if user has already reacted with any emoji for this message
-          let currentUserReaction = null;
-          for (const [emoji, users] of Object.entries(messageReaction)) {
-            if ((users as Set<string>).has(userEmail)) {
-              currentUserReaction = emoji;
-              break;
-            }
-          }
-          
-          // If user is selecting the same reaction they already have, remove it
-          if (currentUserReaction === reactionType) {
-            const existingSet = messageReaction[reactionType] as Set<string> | undefined;
-            const nextSet = new Set(existingSet ?? []);
-            nextSet.delete(userEmail);
-            if (nextSet.size === 0) {
-              delete messageReaction[reactionType];
-            } else {
-              messageReaction[reactionType] = nextSet;
-            }
-          } else {
-            // Remove user's previous reaction if they had one
-            if (currentUserReaction) {
-              const previousSet = messageReaction[currentUserReaction] as Set<string> | undefined;
-              const nextPrevSet = new Set(previousSet ?? []);
-              nextPrevSet.delete(userEmail);
-              if (nextPrevSet.size === 0) {
-                delete messageReaction[currentUserReaction];
-              } else {
-                messageReaction[currentUserReaction] = nextPrevSet;
-              }
-            }
-            
-            // Add new reaction
-            const nextSet = new Set((messageReaction[reactionType] as Set<string>) ?? []);
-            nextSet.add(userEmail);
-            messageReaction[reactionType] = nextSet;
-          }
-        }
-        
-        if (Object.keys(messageReaction).length === 0) {
-          // Keep an explicit empty entry during optimistic window so removals stay visible.
-          newReactions.set(normalizedMessageId, {});
-        } else {
-          newReactions.set(normalizedMessageId, messageReaction);
-        }
-        
-        return newReactions;
-      });
+      setLocalMessageReactions((prevReactions) =>
+        resolveChatOptimisticReactionMap(
+          prevReactions,
+          normalizedMessageId,
+          reactionType,
+          userEmail,
+          isSpecialMessage
+        )
+      );
 
       // Save to Firebase Realtime Database
       const updatedUsers = await chatService.toggleMessageReaction(normalizedMessageId, reactionType, userEmail);
@@ -2324,25 +3286,7 @@ export default function Chat() {
     }
   };
 
-  // Get emoji name for display
-  const getEmojiName = (emoji: string): string => {
-    const emojiNames: { [key: string]: string } = {
-      '❤️': 'heart',
-      '😂': 'laugh',
-      '😮': 'wow',
-      '😢': 'sad',
-      '😡': 'angry',
-      '👍': 'like',
-      '👎': 'dislike',
-      '🔥': 'fire',
-      '💯': 'hundred',
-      '✨': 'sparkles',
-      'heart': 'heart',
-      'star': 'star',
-      'smile': 'smile'
-    };
-    return emojiNames[emoji] || emoji;
-  };
+
 
   // Handle long press on message to show emoji picker
   const handleMessageLongPress = (messageId: string, event: any) => {
@@ -2372,12 +3316,7 @@ export default function Chat() {
     users: string[];
   };
 
-  type MessageReactionPill = {
-    emoji: string;
-    count: number;
-    users: string[];
-    hasUserReacted: boolean;
-  };
+
 
   const EMPTY_REACTION_STATUS: ReactionStatusSnapshot = {
     count: 0,
@@ -2416,7 +3355,7 @@ export default function Chat() {
     const normalizedMessageId = normalizeMessageId(message?.id);
     if (!normalizedMessageId) {
       return {
-        pills: [] as MessageReactionPill[],
+        pills: [] as ReactionPillDescriptor[],
         statusByType: new Map<string, ReactionStatusSnapshot>(),
         glowByType: new Set<string>(),
       };
@@ -2425,7 +3364,7 @@ export default function Chat() {
     const reactions = reactionsOverride ?? messageReactionsRef.current.get(normalizedMessageId);
     if (!reactions) {
       return {
-        pills: [] as MessageReactionPill[],
+        pills: [] as ReactionPillDescriptor[],
         statusByType: new Map<string, ReactionStatusSnapshot>(),
         glowByType: new Set<string>(),
       };
@@ -2435,38 +3374,21 @@ export default function Chat() {
     const recipientEmail = normalizeParticipantEmail(selectedTeamMember?.email);
     const canGlow = Boolean(senderEmail && recipientEmail);
 
-    const pills: MessageReactionPill[] = [];
+    const pills = normalizeReactions(reactions, effectiveUser?.email);
     const statusByType = new Map<string, ReactionStatusSnapshot>();
     const glowByType = new Set<string>();
 
-    Object.entries(reactions).forEach(([emoji, users]) => {
-      if (!users || users.size === 0) {
-        return;
-      }
-
-      const normalizedEmoji = String(emoji || '');
-      if (!normalizedEmoji) {
-        return;
-      }
-
-      const reactionUsers = Array.from(users);
-      const hasUserReacted = effectiveUser?.email ? users.has(effectiveUser.email) : false;
+    pills.forEach((pill) => {
       const status: ReactionStatusSnapshot = {
-        count: users.size,
-        hasUserReacted,
-        users: reactionUsers,
+        count: pill.count,
+        hasUserReacted: pill.hasUserReacted,
+        users: pill.users,
       };
 
-      statusByType.set(normalizedEmoji, status);
-      pills.push({
-        emoji: normalizedEmoji,
-        count: users.size,
-        users: reactionUsers,
-        hasUserReacted,
-      });
+      statusByType.set(pill.emoji, status);
 
-      if (canGlow && users.has(senderEmail) && users.has(recipientEmail)) {
-        glowByType.add(normalizedEmoji);
+      if (canGlow && pill.users.includes(senderEmail) && pill.users.includes(recipientEmail)) {
+        glowByType.add(pill.emoji);
       }
     });
 
@@ -2480,36 +3402,145 @@ export default function Chat() {
   }, [effectiveUser?.email, normalizeMessageId, normalizeParticipantEmail, selectedTeamMember?.email]);
 
   const isOwnMessageEmail = useCallback(
-    (msg?: any) => {
-      if (!msg) return false;
-      if (!effectiveUserEmail) return false;
-      const sender = typeof msg.sender === 'string' ? msg.sender.toLowerCase() : '';
-      return sender === effectiveUserEmail.toLowerCase();
-    },
+    (msg?: any) => resolveChatIsOwnMessageEmail(msg, effectiveUserEmail),
     [effectiveUserEmail]
   );
 
   const canEditMessage = useCallback(
-    (msg: any) => {
-      if (!msg || !msg.id) return false;
-      if (!isOwnMessageEmail(msg)) return false;
-      if (msg.deleted) return false;
-      if (msg.isSpecial) return false;
-      if (msg.gif || msg.sticker) return false;
-      if (Array.isArray(msg.attachments) && msg.attachments.length > 0) return false;
-      const text = typeof msg.text === 'string' ? msg.text.trim() : '';
-      return text.length > 0;
-    },
-    [isOwnMessageEmail]
+    (msg: any) => resolveChatCanEditMessage(msg, effectiveUserEmail),
+    [effectiveUserEmail]
   );
 
+  const findLatestEditableOwnMessage = useCallback(() => {
+    return resolveChatFindLatestEditableOwnMessage(messages as any, effectiveUserEmail);
+  }, [messages, effectiveUserEmail]);
+
   const canDeleteMessage = useCallback(
-    (msg: any) => {
-      if (!msg || !msg.id) return false;
-      if (!isOwnMessageEmail(msg)) return false;
-      return !msg.deleted;
+    (msg: any) => resolveChatCanDeleteMessage(msg, effectiveUserEmail),
+    [effectiveUserEmail]
+  );
+
+  const canReplyMessage = useCallback(
+    (msg: any) => resolveChatCanReplyMessage(msg),
+    []
+  );
+
+  const showMessageInfo = useCallback(
+    (targetMessage: any) => {
+      if (!targetMessage) {
+        return;
+      }
+
+      const ownMessage = isOwnMessageEmail(targetMessage);
+      const fallbackSenderName = !ownMessage && typeof selectedTeamMember?.name === 'string'
+        ? selectedTeamMember.name
+        : undefined;
+
+      const recipientStatusDetails = Array.isArray(targetMessage?.recipientStatusDetails)
+        ? targetMessage.recipientStatusDetails
+        : Array.isArray(targetMessage?.recipientStatuses)
+          ? targetMessage.recipientStatuses
+          : undefined;
+
+      const infoRows = resolveChatMessageInfoRows({
+        isOwnMessage: ownMessage,
+        senderEmail: normalizeParticipantEmail(targetMessage?.sender),
+        senderName: typeof targetMessage?.senderName === 'string'
+          ? targetMessage.senderName
+          : fallbackSenderName,
+        recipientEmail: ownMessage
+          ? normalizeParticipantEmail(targetMessage?.recipientId) ||
+            normalizeParticipantEmail(selectedTeamMember?.email)
+          : normalizeParticipantEmail(effectiveUserEmail),
+        recipientName: ownMessage
+          ? typeof selectedTeamMember?.name === 'string'
+            ? selectedTeamMember.name
+            : undefined
+          : undefined,
+        recipientStatusDetails,
+        sentAt:
+          typeof targetMessage?.timestamp === 'string'
+            ? targetMessage.timestamp
+            : targetMessage?.timestamp != null
+              ? String(targetMessage.timestamp)
+              : undefined,
+        delivered: targetMessage?.delivered === true,
+        deliveredAt:
+          typeof targetMessage?.deliveredAt === 'string'
+            ? targetMessage.deliveredAt
+            : undefined,
+        read: targetMessage?.read === true,
+        readAt:
+          typeof targetMessage?.readAt === 'string'
+            ? targetMessage.readAt
+            : undefined,
+        editedAt:
+          typeof targetMessage?.editedAt === 'string'
+            ? targetMessage.editedAt
+            : undefined,
+        deleted: targetMessage?.deleted === true,
+        formatTimestamp: (value) => formatMessageTimestamp(value),
+      });
+
+      if (messageInfoCopiedResetTimerRef.current) {
+        clearTimeout(messageInfoCopiedResetTimerRef.current);
+        messageInfoCopiedResetTimerRef.current = null;
+      }
+      setMessageInfoCopiedRowKey(null);
+
+      const shouldShowHint = !hasShownMessageInfoHintRef.current;
+      if (shouldShowHint) {
+        hasShownMessageInfoHintRef.current = true;
+      }
+      setShowMessageInfoHint(shouldShowHint);
+
+      setMessageInfoModalState({
+        visible: true,
+        rows: infoRows,
+      });
     },
-    [isOwnMessageEmail]
+    [
+      effectiveUserEmail,
+      isOwnMessageEmail,
+      normalizeParticipantEmail,
+      selectedTeamMember?.email,
+      selectedTeamMember?.name,
+    ]
+  );
+
+  const beginConversationSearchFromMessage = useCallback(
+    (targetMessage: any) => {
+      const seededQuery = resolveChatConversationSearchSeedQuery(targetMessage?.text);
+      if (!seededQuery) {
+        return;
+      }
+
+      clearTimeoutRef(conversationSearchLoadDebounceTimerRef);
+      conversationSearchLoadTokenRef.current += 1;
+      conversationSearchHistoryLoadAttemptsRef.current = 0;
+      previousConversationSearchQueryRef.current = '';
+      previousConversationSearchScopeRef.current = 'all';
+      setIsConversationSearchHistoryLoading(false);
+      setConversationSearchVisible(true);
+      setConversationSearchQuery(seededQuery);
+      setConversationSearchScope('all');
+      setConversationSearchActiveIndex(0);
+      setConversationSearchHighlightMessageId(null);
+    },
+    []
+  );
+
+  const buildReplyContextFromMessage = useCallback(
+    (targetMessage: any): ChatReplyContext | null => {
+      return resolveChatReplyContextFromMessage({
+        targetMessage,
+        effectiveUserEmail,
+        selectedMemberEmail: selectedTeamMember?.email,
+        selectedMemberName: selectedTeamMember?.name,
+        maxPreviewLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
+      });
+    },
+    [effectiveUserEmail, selectedTeamMember?.email, selectedTeamMember?.name]
   );
 
   const isMessageActionPending = useCallback(
@@ -2543,6 +3574,7 @@ export default function Chat() {
   const unreadSeparatorDismissTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const unreadSeparatorMessageIdRef = useRef<string | null>(null);
   const showUnreadSeparatorRef = useRef(false);
+  const lastNearBottomUnreadDismissAnchorRef = useRef<string | null>(null);
   const unreadSeparatorIsVisibleRef = useRef(false);
   const hasAcknowledgedUnreadRef = useRef(false);
   const incomingUnreadCountRef = useRef(0);
@@ -2562,6 +3594,83 @@ export default function Chat() {
   const scrollToUnreadAttemptedRef = useRef(false); // tracks if we attempted to scroll to first unread
   const isAutoScrollingRef = useRef(false);
   const onScrollFailAttemptsRef = useRef(0); // track scrollToIndex failures (esp. on web)
+  const jumpingToReplyRef = useRef(false);
+  const replyJumpConversationKeyRef = useRef<string | null>(activeComposerDraftKey);
+
+  const setShowScrollToBottomSafely = useCallback((nextValue: boolean) => {
+    setShowScrollToBottom((current) => (current === nextValue ? current : nextValue));
+  }, []);
+
+  const setShowReplyJumpToLatestSafely = useCallback((nextValue: boolean) => {
+    setShowReplyJumpToLatest((current) => (current === nextValue ? current : nextValue));
+  }, []);
+
+  const setStickyDateVisibleSafely = useCallback((nextValue: boolean) => {
+    setStickyDateVisible((current) => (current === nextValue ? current : nextValue));
+  }, []);
+
+  const setStickyDateTextSafely = useCallback((nextValue: string) => {
+    setStickyDateText((current) => (current === nextValue ? current : nextValue));
+  }, []);
+
+  const resetUnseenCount = useCallback(() => {
+    setUnseenCount((current) => (current === 0 ? current : 0));
+  }, []);
+
+  const incrementUnseenCount = useCallback((amount: number = 1) => {
+    const normalizedAmount = Number.isFinite(amount) ? Math.max(0, Math.trunc(amount)) : 0;
+    if (normalizedAmount <= 0) {
+      return;
+    }
+
+    setUnseenCount((current) => current + normalizedAmount);
+  }, []);
+
+  const clearNewMessageDivider = useCallback(() => {
+    setShowNewDivider((current) => (current ? false : current));
+    setNewDividerMessageId((current) => (current === null ? current : null));
+  }, []);
+
+  const showNewMessageDividerAt = useCallback((messageId: unknown) => {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    if (!normalizedMessageId) {
+      return;
+    }
+
+    setNewDividerMessageId((current) => (current === normalizedMessageId ? current : normalizedMessageId));
+    setShowNewDivider((current) => (current ? current : true));
+  }, [normalizeMessageId]);
+
+  const messageListScrollHandlerRef = useRef<(e: any) => void>(() => {});
+  const messageListContentSizeHandlerRef = useRef<(_w: number, h: number) => void>(() => {});
+  const messageListLayoutHandlerRef = useRef<(e: any) => void>(() => {});
+  const messageListHeaderRendererRef = useRef<React.ReactNode>(null);
+  const messageListFooterRendererRef = useRef<React.ReactNode>(null);
+  const messageListEmptyRendererRef = useRef<() => React.ReactElement | null>(() => null);
+
+  const handleMessageListScrollStable = useCallback((e: any) => {
+    messageListScrollHandlerRef.current(e);
+  }, []);
+
+  const handleMessageListContentSizeChangeStable = useCallback((_w: number, h: number) => {
+    messageListContentSizeHandlerRef.current(_w, h);
+  }, []);
+
+  const handleMessageListLayoutStable = useCallback((e: any) => {
+    messageListLayoutHandlerRef.current(e);
+  }, []);
+
+  const renderMessageListHeaderStable = useCallback(() => {
+    return messageListHeaderRendererRef.current;
+  }, []);
+
+  const renderMessageListFooterStable = useCallback(() => {
+    return messageListFooterRendererRef.current;
+  }, []);
+
+  const renderMessageListEmptyStable = useCallback(() => {
+    return messageListEmptyRendererRef.current();
+  }, []);
 
 
 
@@ -2596,100 +3705,36 @@ export default function Chat() {
     return () => subscription?.remove();
   }, []);
 
-  const incomingConversationMessages = useMemo(() => {
-    return getIncomingConversationMessages(
+  const unreadDividerDerivedState = useMemo(() => {
+    return resolveChatUnreadDividerDerivedState({
       displayedMessages,
-      effectiveUser?.email,
-      selectedTeamMember?.email
-    );
-  }, [displayedMessages, effectiveUser?.email, getIncomingConversationMessages, selectedTeamMember?.email]);
-
-  const incomingUnreadMessages = useMemo(() => {
-    if (!incomingConversationMessages.length) {
-      return [] as any[];
-    }
-
-    return incomingConversationMessages.filter((msg: any) => !msg?.read);
-  }, [incomingConversationMessages]);
-
-  const incomingUnreadMessageIds = useMemo(() => {
-    if (!incomingUnreadMessages.length) {
-      return [] as string[];
-    }
-
-    const ids: string[] = [];
-    incomingUnreadMessages.forEach((msg: any) => {
-      const id = normalizeMessageId(msg?.id);
-      if (id) {
-        ids.push(id);
-      }
+      effectiveUserEmail: effectiveUser?.email,
+      selectedTeamMemberEmail: selectedTeamMember?.email,
+      unreadDividerSeedCount,
+      normalizeParticipantEmail,
+      normalizeMessageId,
     });
-
-    return ids;
-  }, [incomingUnreadMessages, normalizeMessageId]);
-
-  const firstUnreadMessageId = useMemo(() => {
-    return incomingUnreadMessageIds.length > 0 ? incomingUnreadMessageIds[0] : null;
-  }, [incomingUnreadMessageIds]);
-
-  const incomingUnreadCount = useMemo(() => incomingUnreadMessageIds.length, [incomingUnreadMessageIds]);
-
-  const latestIncomingMessageId = useMemo(() => {
-    if (!incomingConversationMessages.length) {
-      return null;
-    }
-    return normalizeMessageId(incomingConversationMessages[incomingConversationMessages.length - 1]?.id) || null;
-  }, [
-    incomingConversationMessages,
-    normalizeMessageId,
-  ]);
-
-  const unreadDividerSeedAnchorMessageId = useMemo(() => {
-    if (firstUnreadMessageId) {
-      return null;
-    }
-
-    const seedCount = Math.max(0, Math.trunc(unreadDividerSeedCount || 0));
-    if (seedCount <= 0) {
-      return null;
-    }
-
-    if (!incomingConversationMessages.length) {
-      return normalizeMessageId(displayedMessages?.[0]?.id) || null;
-    }
-
-    const clampedUnreadCount = Math.min(seedCount, incomingConversationMessages.length);
-    const boundaryIndex = Math.max(0, incomingConversationMessages.length - clampedUnreadCount);
-    return normalizeMessageId(incomingConversationMessages[boundaryIndex]?.id) || null;
   }, [
     displayedMessages,
-    firstUnreadMessageId,
-    incomingConversationMessages,
+    effectiveUser?.email,
     normalizeMessageId,
+    normalizeParticipantEmail,
+    selectedTeamMember?.email,
     unreadDividerSeedCount,
   ]);
 
-  const unreadSeparatorAnchorMessageId = firstUnreadMessageId || unreadDividerSeedAnchorMessageId;
-
-  const unreadDividerDisplayCount = useMemo(() => {
-    const liveCount = Math.max(0, Math.trunc(Number(incomingUnreadCount || 0)));
-    const seedCount = Math.max(0, Math.trunc(Number(unreadDividerSeedCount || 0)));
-    const count = liveCount > 0 ? liveCount : seedCount;
-    return Number.isFinite(count) ? count : 0;
-  }, [incomingUnreadCount, unreadDividerSeedCount]);
-
-  const unreadDividerLabel = useMemo(() => {
-    if (unreadDividerDisplayCount <= 0) {
-      return 'Unread messages';
-    }
-    if (unreadDividerDisplayCount === 1) {
-      return '1 unread message';
-    }
-    if (unreadDividerDisplayCount > 99) {
-      return '99+ unread messages';
-    }
-    return `${unreadDividerDisplayCount} unread messages`;
-  }, [unreadDividerDisplayCount]);
+  const {
+    incomingConversationMessages,
+    incomingUnreadMessages,
+    incomingUnreadMessageIds,
+    firstUnreadMessageId,
+    incomingUnreadCount,
+    latestIncomingMessageId,
+    unreadDividerSeedAnchorMessageId,
+    unreadSeparatorAnchorMessageId,
+    unreadDividerDisplayCount,
+    unreadDividerLabel,
+  } = unreadDividerDerivedState;
 
   const dismissUnreadDividerForCurrentBatch = useCallback((delay: number = UNREAD_DIVIDER_ACTION_DISMISS_MS) => {
     const activeAnchorId = unreadSeparatorAnchorMessageId || unreadSeparatorMessageIdRef.current;
@@ -2705,100 +3750,17 @@ export default function Chat() {
   }, [latestIncomingMessageId, unreadSeparatorAnchorMessageId]);
 
   const liveSelectedConversationSummary = useMemo<ConversationSummary | null>(() => {
-    const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
-    const userEmail = effectiveUser?.email?.toLowerCase?.();
-    if (!partnerEmail || !userEmail || !Array.isArray(displayedMessages) || displayedMessages.length === 0) {
-      return null;
-    }
-
-    let latestMessage: any = null;
-    for (let index = displayedMessages.length - 1; index >= 0; index -= 1) {
-      const candidate = displayedMessages[index];
-      if (candidate?.id) {
-        latestMessage = candidate;
-        break;
-      }
-    }
-
-    const toIsoString = (value: any): string => {
-      if (typeof value === 'string' && value.trim()) {
-        return value;
-      }
-      if (value instanceof Date) {
-        return value.toISOString();
-      }
-      if (value && typeof value.toDate === 'function') {
-        try {
-          return value.toDate().toISOString();
-        } catch {
-          return new Date().toISOString();
-        }
-      }
-      if (typeof value === 'number' && Number.isFinite(value)) {
-        return new Date(value).toISOString();
-      }
-      return new Date().toISOString();
-    };
-
-    const getPreview = (msg: any): { text: string; type: 'text' | 'sticker' | 'gif' | 'attachment' | 'special' | 'unknown' } => {
-      if (!msg) {
-        return { text: '', type: 'unknown' };
-      }
-      if (msg.deleted) {
-        return { text: 'Message removed', type: 'text' };
-      }
-      if (msg.isSpecial) {
-        const txt = typeof msg.text === 'string' ? msg.text.trim() : '';
-        return { text: txt || 'Special message', type: 'special' };
-      }
-      if (msg.sticker) {
-        return { text: 'Sticker', type: 'sticker' };
-      }
-      if (msg.gif) {
-        return { text: 'GIF', type: 'gif' };
-      }
-      if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
-        return { text: '📎 Attachment', type: 'attachment' };
-      }
-      const txt = typeof msg.text === 'string' ? msg.text.trim() : '';
-      return { text: txt || '📎 Attachment', type: 'text' };
-    };
-
-    const unreadCount = incomingUnreadCount;
-
-    const effectiveUnread = isFocused && isAppActive ? 0 : unreadCount;
-
-    const timestamp = toIsoString(latestMessage?.timestamp);
-    const preview = getPreview(latestMessage);
-    const isOwnMessage = String(latestMessage?.sender || '').toLowerCase() === userEmail;
-
-    return {
-      partnerEmail,
-      partnerId: selectedTeamMember?.id ?? partnerEmail,
-      partnerName: selectedTeamMember?.name ?? null,
-      tenantId: activeTenant?.id ?? null,
-      unreadCount: effectiveUnread,
-      updatedAt: timestamp,
-      lastMessage: latestMessage
-        ? {
-            messageId: String(latestMessage.id),
-            text: preview.text,
-            timestamp,
-            sender: String(latestMessage.sender || ''),
-            isOwnMessage,
-            delivered: Boolean(latestMessage.delivered),
-            read: Boolean(latestMessage.read),
-            type: preview.type,
-            attachmentCount: Array.isArray(latestMessage.attachments) ? latestMessage.attachments.length : undefined,
-            editedAt: latestMessage.editedAt ? String(latestMessage.editedAt) : undefined,
-            editCount: typeof latestMessage.editCount === 'number' ? latestMessage.editCount : undefined,
-            deleted: Boolean(latestMessage.deleted),
-            deletedAt: latestMessage.deletedAt ? String(latestMessage.deletedAt) : undefined,
-            deletedBy: latestMessage.deletedBy ? String(latestMessage.deletedBy) : undefined,
-            isSpecial: Boolean(latestMessage.isSpecial),
-          }
-        : undefined,
-    };
+    return resolveChatLiveConversationSummary({
+      displayedMessages,
+      partnerEmail: selectedTeamMember?.email,
+      partnerId: selectedTeamMember?.id,
+      partnerName: selectedTeamMember?.name,
+      tenantId: activeTenant?.id,
+      userEmail: effectiveUser?.email,
+      incomingUnreadCount,
+      isFocused,
+      isAppActive,
+    });
   }, [displayedMessages, incomingUnreadCount, selectedTeamMember?.email, selectedTeamMember?.id, selectedTeamMember?.name, effectiveUser?.email, activeTenant?.id, isFocused, isAppActive]);
 
   useEffect(() => {
@@ -2812,54 +3774,37 @@ export default function Chat() {
     }
 
     setConversationSummaries((prev) => {
-      const existing = prev.get(partnerEmail);
-      const existingLast = existing?.lastMessage;
-      const nextLast = liveSelectedConversationSummary.lastMessage;
-      const unchanged = Boolean(
-        existing &&
-        existing.unreadCount === liveSelectedConversationSummary.unreadCount &&
-        existing.updatedAt === liveSelectedConversationSummary.updatedAt &&
-        existingLast?.messageId === nextLast?.messageId &&
-        existingLast?.delivered === nextLast?.delivered &&
-        existingLast?.read === nextLast?.read &&
-        existingLast?.text === nextLast?.text
+      return upsertChatConversationSummary(
+        prev,
+        liveSelectedConversationSummary,
+        activeTenant?.id ?? null
       );
-
-      if (unchanged) {
-        return prev;
-      }
-
-      const next = new Map(prev);
-      next.set(partnerEmail, {
-        ...(existing ?? {
-          partnerEmail,
-          tenantId: activeTenant?.id ?? null,
-          unreadCount: 0,
-          updatedAt: liveSelectedConversationSummary.updatedAt,
-        }),
-        ...liveSelectedConversationSummary,
-        partnerEmail,
-        tenantId: liveSelectedConversationSummary.tenantId ?? existing?.tenantId ?? activeTenant?.id ?? null,
-      });
-      return next;
     });
   }, [liveSelectedConversationSummary, activeTenant?.id]);
 
   useEffect(() => {
-    if (!isFocused || !isAppActive) {
-      return;
-    }
-
-    const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
-    const userEmail = effectiveUser?.email?.toLowerCase?.();
-    if (!partnerEmail || !userEmail || !incomingUnreadMessageIds.length) {
-      return;
-    }
-
-    queueConversationReceiptSync({
+    const activeQueueGeneration = receiptSyncGenerationRef.current;
+    const foregroundQueueExecutionPlan = resolveChatReceiptForegroundQueueExecutionPlan({
+      partnerEmail: selectedTeamMember?.email,
+      userEmail: effectiveUser?.email,
+      isFocused,
+      isAppActive,
       readMessageIds: incomingUnreadMessageIds,
-      requestConversationDelivered: true,
+      requestConversationDelivered: incomingUnreadMessageIds.length > 0,
+      queueGeneration: activeQueueGeneration,
+      activeGeneration: activeQueueGeneration,
     });
+    if (
+      !foregroundQueueExecutionPlan.shouldApplyQueueInvocationExecutionPlan ||
+      !foregroundQueueExecutionPlan.shouldQueueSync
+    ) {
+      return;
+    }
+
+    queueConversationReceiptSync(
+      foregroundQueueExecutionPlan.queueOptions,
+      activeQueueGeneration
+    );
   }, [incomingUnreadMessageIds, selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, queueConversationReceiptSync]);
 
   useEffect(() => {
@@ -2887,14 +3832,19 @@ export default function Chat() {
     const anchorExists = Boolean(
       normalizedAnchorId && displayedMessageIndexRef.current.has(normalizedAnchorId)
     );
-    if (anchorExists) {
+    const unreadSeparatorReconcilePlan = resolveChatUnreadSeparatorReconcilePlan({
+      showUnreadSeparator,
+      unreadSeparatorMessageId,
+      unreadSeparatorAnchorMessageId,
+      anchorExists,
+    });
+
+    if (unreadSeparatorReconcilePlan.shouldUpdateAnchor) {
+      setUnreadSeparatorMessageId(unreadSeparatorReconcilePlan.nextAnchorMessageId);
       return;
     }
 
-    if (unreadSeparatorAnchorMessageId) {
-      if (unreadSeparatorAnchorMessageId !== unreadSeparatorMessageId) {
-        setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
-      }
+    if (!unreadSeparatorReconcilePlan.shouldClearUnreadSeparator) {
       return;
     }
 
@@ -2923,83 +3873,29 @@ export default function Chat() {
     });
   }, [incomingUnreadCount, selectedTeamMember?.email, setConversationSummaries, isFocused, isAppActive, loading]);
 
-  useEffect(() => () => {
-    if (unreadSeparatorDismissTimeoutRef.current) {
-      clearTimeout(unreadSeparatorDismissTimeoutRef.current);
-    }
-  }, []);
-
-  const estimatedItemSize = useMemo(() => {
-    if (displayedMessages.length === 0) return 112;
-
-    const positions = messagePositionsRef.current;
-    const sampledHeights: number[] = [];
-    const sampleStep = Math.max(1, Math.floor(displayedMessages.length / 24));
-
-    for (let index = displayedMessages.length - 1; index >= 0 && sampledHeights.length < 24; index -= sampleStep) {
-      const message = displayedMessages[index];
-      const id = normalizeMessageId(message?.id);
-      if (!id) {
-        continue;
-      }
-      const height = positions[id]?.height;
-      if (typeof height === 'number' && height > 0) {
-        sampledHeights.push(height);
-      }
-    }
-
-    if (sampledHeights.length >= 6) {
-      sampledHeights.sort((a, b) => a - b);
-      const middleIndex = Math.floor(sampledHeights.length / 2);
-      const median = sampledHeights.length % 2
-        ? sampledHeights[middleIndex]
-        : Math.round((sampledHeights[middleIndex - 1] + sampledHeights[middleIndex]) / 2);
-      return Math.max(72, Math.min(280, median));
-    }
-
-    // Heuristic fallback when row measurements are still sparse.
-    const recentMessages = displayedMessages.slice(Math.max(0, displayedMessages.length - 20));
-    let weightedTotal = 0;
-
-    recentMessages.forEach((message: any) => {
-      if (message?.sticker || message?.gif) {
-        weightedTotal += 196;
-        return;
-      }
-      if (Array.isArray(message?.attachments) && message.attachments.length > 0) {
-        weightedTotal += 172;
-        return;
-      }
-
-      const textLength = typeof message?.text === 'string' ? message.text.trim().length : 0;
-      if (textLength > 240) {
-        weightedTotal += 176;
-      } else if (textLength > 120) {
-        weightedTotal += 152;
-      } else if (textLength > 40) {
-        weightedTotal += 132;
-      } else {
-        weightedTotal += 112;
-      }
-    });
-
-    const heuristic = Math.round(weightedTotal / Math.max(1, recentMessages.length));
-    return Math.max(96, Math.min(220, heuristic));
-  }, [displayedMessages, normalizeMessageId]);
-
   const estimatedListSize = useMemo(() => {
-    return {
-      height: Math.max(600, Math.round(screenData.height || Dimensions.get('window').height || 800)),
-      width: Math.max(360, Math.round(screenData.width || Dimensions.get('window').width || 400)),
-    };
+    const windowSize = Dimensions.get('window');
+    return resolveChatEstimatedListSize({
+      screenHeight: screenData.height,
+      screenWidth: screenData.width,
+      fallbackHeight: windowSize.height,
+      fallbackWidth: windowSize.width,
+    });
   }, [screenData.height, screenData.width]);
 
+  const estimatedItemSize = useMemo(() => {
+    return resolveChatEstimatedItemSize({
+      displayedMessages,
+      messagePositionsById: messagePositionsRef.current,
+      normalizeMessageId,
+    });
+  }, [displayedMessages, normalizeMessageId]);
+
   const listDrawDistance = useMemo(() => {
-    const baseHeight = estimatedListSize.height;
-    if (Platform.OS === 'web') {
-      return Math.max(Math.round(baseHeight * 1.8), 1200);
-    }
-    return Math.max(Math.round(baseHeight * 1.2), 900);
+    return resolveChatListDrawDistance(
+      estimatedListSize.height,
+      Platform.OS === 'web'
+    );
   }, [estimatedListSize.height]);
 
   useEffect(() => {
@@ -3406,34 +4302,34 @@ export default function Chat() {
   }, [effectiveUser?.email, activeTenant?.id, buildSummaryMap]);
 
   const repairConversationUnreadState = useCallback(async () => {
-    const userEmail = effectiveUser?.email?.toLowerCase?.();
-    const partnerEmail = selectedTeamMember?.email?.toLowerCase?.();
-    if (!userEmail || !partnerEmail || !isFocused || !isAppActive) {
+    const eligibility = resolveChatUnreadRepairEligibility({
+      userEmail: effectiveUser?.email,
+      partnerEmail: selectedTeamMember?.email,
+      isFocused,
+      isAppActive,
+      inFlight: unreadRepairInFlightRef.current,
+      lastPartnerEmail: lastUnreadRepairAtRef.current.partnerEmail,
+      lastRunAtMs: lastUnreadRepairAtRef.current.at,
+    });
+
+    if (!eligibility.shouldRun || !eligibility.userEmail || !eligibility.partnerEmail) {
       return;
     }
 
-    if (unreadRepairInFlightRef.current) {
-      return;
-    }
-
-    const now = Date.now();
-    const last = lastUnreadRepairAtRef.current;
-    if (last.partnerEmail === partnerEmail && now - last.at < 45000) {
-      return;
-    }
+    const userEmail = eligibility.userEmail;
+    const partnerEmail = eligibility.partnerEmail;
 
     unreadRepairInFlightRef.current = true;
-    lastUnreadRepairAtRef.current = { partnerEmail, at: now };
+    lastUnreadRepairAtRef.current = { partnerEmail, at: eligibility.nowMs };
     const repairStartedAt = Date.now();
 
     try {
       const fixedCount = await chatService.markConversationAsRead(userEmail, partnerEmail);
 
-      logger.metric('chat.unread.repair.run', {
-        partnerEmail,
-        fixedCount,
-        durationMs: Date.now() - repairStartedAt,
-      });
+      logger.metric(
+        'chat.unread.repair.run',
+        resolveChatUnreadRepairRunPayload(partnerEmail, fixedCount, repairStartedAt)
+      );
 
       await chatService.rebuildConversationSummariesForUser(userEmail);
       await refreshChatSummaries();
@@ -3449,14 +4345,17 @@ export default function Chat() {
 
   useEffect(() => {
     if (!selectedTeamMember?.email || !effectiveUser?.email || !isFocused || !isAppActive) {
+      clearTimeoutRef(unreadRepairTimeoutRef);
       return;
     }
 
-    const timer = setTimeout(() => {
+    scheduleTimeoutRef(unreadRepairTimeoutRef, () => {
       void repairConversationUnreadState();
     }, 600);
 
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeoutRef(unreadRepairTimeoutRef);
+    };
   }, [selectedTeamMember?.email, effectiveUser?.email, isFocused, isAppActive, repairConversationUnreadState]);
 
   useEffect(() => {
@@ -3675,7 +4574,12 @@ export default function Chat() {
             name: '',
             avatar: '',
             role: 'user',
-            isOnline: deriveRealtimeOnline(data?.isOnline, data?.lastSeen),
+            isOnline: resolveChatRealtimeOnline({
+              isOnline: data?.isOnline,
+              lastSeen: data?.lastSeen,
+              presenceMode: CHAT_PRESENCE_MODE,
+              presenceThresholdMin: CHAT_PRESENCE_THRESHOLD_MIN,
+            }),
             lastSeen: typeof data?.lastSeen === 'string' ? data.lastSeen : undefined,
             typingTo,
           });
@@ -3785,7 +4689,12 @@ export default function Chat() {
 
       return {
         ...member,
-        isOnline: deriveRealtimeOnline(member.isOnline, member.lastSeen),
+        isOnline: resolveChatRealtimeOnline({
+          isOnline: member.isOnline,
+          lastSeen: member.lastSeen,
+          presenceMode: CHAT_PRESENCE_MODE,
+          presenceThresholdMin: CHAT_PRESENCE_THRESHOLD_MIN,
+        }),
         unreadCount: summary?.unreadCount ?? 0,
         lastMessage,
         lastMessageTime,
@@ -3842,10 +4751,13 @@ export default function Chat() {
 
     setLocalMessageReactions(() => next);
 
-    reactionOptimisticUntilRef.current.forEach((until, messageId) => {
-      if (until <= Date.now() || !next.has(messageId)) {
-        reactionOptimisticUntilRef.current.delete(messageId);
-      }
+    const expiryIds = resolveChatOptimisticReactionExpiryIds(
+      reactionOptimisticUntilRef.current,
+      new Set<string>(Array.from(next.keys())),
+      Date.now()
+    );
+    expiryIds.forEach((messageId) => {
+      reactionOptimisticUntilRef.current.delete(messageId);
     });
   }, [messages, selectedTeamMember?.id, shouldKeepOptimisticReactions]);
 
@@ -3941,7 +4853,7 @@ export default function Chat() {
             return false;
           }
 
-          const timestampMs = parseMessageTimestampMs(msg?.timestamp);
+          const timestampMs = resolveChatTimestampMs(msg?.timestamp);
           if (timestampMs > 0 && timestampMs < messageToneEligibleSinceRef.current - TONE_HISTORICAL_TIMESTAMP_GRACE_MS) {
             return false;
           }
@@ -3960,14 +4872,14 @@ export default function Chat() {
         return updated;
       });
 
-      // Clear animated messages after animation completes
-      setTimeout(() => {
+      // Clear animated messages after animation completes (cancellable via ref)
+      scheduleTimeoutRef(animatedMessageCleanupTimerRef, () => {
         setAnimatedMessages(prev => {
           const updated = new Set(prev);
           newMessageIds.forEach(id => updated.delete(id));
           return updated;
         });
-      }, 1000); // 1 second should be enough for animation
+      }, 1000);
     }
 
     previousMessageIdsRef.current = currentMessageIds;
@@ -3980,93 +4892,45 @@ export default function Chat() {
     loading,
     isInitialAnchorSettled,
     normalizeParticipantEmail,
-    parseMessageTimestampMs,
     playMessageSound,
     selectedTeamMember?.email,
   ]);
 
   // Use useMemo to properly handle filtering when user or teamMembers change
   const filteredTeamMembers = useMemo(() => {
-    const getRecencyTs = (member: TeamMemberWithChatInfo): number => {
-      const summaryTime = member.summaryUpdatedAt ? new Date(member.summaryUpdatedAt).getTime() : 0;
-      const messageTime = member.lastMessage?.timestamp ? new Date(member.lastMessage.timestamp).getTime() : 0;
-      return Math.max(summaryTime, messageTime);
-    };
-
-    const withPin = teamMembersWithChatInfo.map((m: any) => ({
-      ...m,
-      pinnedSerial: pinnedChats[chatPreferencesService.sanitizeEmailKey(m.email)] || undefined,
-    }));
-    return withPin
-      .filter(member => {
-        if (!effectiveUser?.email) {
-          return true; // If no user email, don't filter anyone out yet
-        }
-        const shouldExclude = member.email === effectiveUser.email || member.id === effectiveUser.email;
-        return !shouldExclude;
-      })
-      .filter(member => {
-        const q = searchQuery.toLowerCase().trim();
-        if (!q) {
-          return true;
-        }
-        const name = (member.name || '').toLowerCase();
-        const email = (member.email || '').toLowerCase();
-        return name.includes(q) || email.includes(q);
-      })
-  .sort((a: any, b: any) => {
-    // Pinned chats first by serial asc
-    const aPin = a.pinnedSerial ?? 0;
-    const bPin = b.pinnedSerial ?? 0;
-    if (aPin && bPin && aPin !== bPin) return aPin - bPin;
-    if (aPin && !bPin) return -1;
-    if (!aPin && bPin) return 1;
-    // Then by summary recency (most recent first), then by unread count, then by name.
-        const aTime = getRecencyTs(a);
-        const bTime = getRecencyTs(b);
-        if (aTime !== bTime) return bTime - aTime;
-
-        const aUnread = a.unreadCount || 0;
-        const bUnread = b.unreadCount || 0;
-        if (aUnread !== bUnread) return bUnread - aUnread;
-
-        return a.name.localeCompare(b.name);
+    return resolveChatFilteredTeamMembers({
+      members: teamMembersWithChatInfo,
+      pinnedChats,
+      currentUserEmail: effectiveUser?.email,
+      searchQuery,
+      sanitizeEmailKey: chatPreferencesService.sanitizeEmailKey,
     });
   }, [effectiveUser?.email, teamMembersWithChatInfo, pinnedChats, searchQuery]);
 
-  // Helper function to get date for a message
-  const getMessageDate = (msg: any, previousMsg?: any): string => {
-    // Always calculate the date for this message, regardless of separators
-    try {
-      const msgDate = new Date(msg.timestamp);
-      const now = new Date();
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const msgDay = new Date(msgDate);
-      msgDay.setHours(0, 0, 0, 0);
-      
-      const diffInDays = Math.floor((today.getTime() - msgDay.getTime()) / (1000 * 60 * 60 * 24));
-      
-      if (diffInDays === 0) return 'Today';
-      if (diffInDays === 1) return 'Yesterday';
-      if (diffInDays <= 6) return msgDate.toLocaleDateString([], { weekday: 'long' });
-      if (msgDate.getFullYear() === now.getFullYear()) {
-        return msgDate.toLocaleDateString([], {
-          weekday: 'long',
-          month: 'long',
-          day: 'numeric'
-        });
-      }
-      return msgDate.toLocaleDateString([], {
-        weekday: 'long',
-        month: 'long',
-        day: 'numeric',
-        year: 'numeric'
-      });
-    } catch (error) {
-      return 'Today'; // Fallback
-    }
-  };
+  const messageRowMetaById = useMemo(() => {
+    return resolveChatMessageRowMetaState({
+      displayedMessages,
+      normalizeMessageId,
+      sanitizeDateSeparatorLabel,
+      resolveDateSeparator: (currentTimestamp, previousTimestamp) =>
+        getChatDateSeparator(
+          currentTimestamp as string,
+          previousTimestamp as string | undefined
+        ),
+    });
+  }, [displayedMessages, normalizeMessageId, sanitizeDateSeparatorLabel]);
+
+  // ── Phase 4: sync remaining renderMessageItem refs ──
+  useEffect(() => {
+    messageRowMetaByIdRef.current = messageRowMetaById;
+  }, [messageRowMetaById]);
+  useEffect(() => {
+    showNewDividerRef.current = showNewDivider;
+    newDividerMessageIdRef.current = newDividerMessageId;
+  }, [showNewDivider, newDividerMessageId]);
+  useEffect(() => {
+    unreadDividerLabelRef.current = unreadDividerLabel;
+  }, [unreadDividerLabel]);
 
   const scrollToBottom = (animated: boolean = true, delay: number = 100, skipAutoFlag: boolean = false) => {
     if (scrollToBottomRetryTimeoutRef.current) {
@@ -4188,29 +5052,1142 @@ export default function Chat() {
 
   const markAutoScroll = useCallback((duration: number = 260) => {
     isAutoScrollingRef.current = true;
-    setTimeout(() => {
+    scheduleTimeoutRef(autoScrollFlagTimerRef, () => {
       isAutoScrollingRef.current = false;
     }, duration);
   }, []);
 
+  const clearReplyJumpHighlightTimer = useCallback(() => {
+    clearTimeoutRef(replyJumpHighlightTimerRef);
+  }, []);
+
+  const clearScheduledConversationSearchHistoryLoad = useCallback(() => {
+    clearTimeoutRef(conversationSearchLoadDebounceTimerRef);
+  }, []);
+
+  const triggerReplyJumpHighlight = useCallback(
+    (messageId: string) => {
+      const normalizedMessageId = normalizeReplyJumpTargetMessageId(messageId);
+      if (!normalizedMessageId) {
+        return;
+      }
+
+      const nextFabState = resolveReplyJumpStateForJumpSuccess();
+      setShowReplyJumpToLatestSafely(nextFabState.showReplyJumpToLatest);
+      setShowScrollToBottomSafely(nextFabState.showScrollToBottom);
+      setReplyJumpHighlightMessageId(normalizedMessageId);
+      clearReplyJumpHighlightTimer();
+      scheduleTimeoutRef(replyJumpHighlightTimerRef, () => {
+        setReplyJumpHighlightMessageId((current) =>
+          resolveReplyJumpHighlightAfterTimeout(current, normalizedMessageId)
+        );
+      }, 1800);
+    },
+    [clearReplyJumpHighlightTimer, setShowReplyJumpToLatestSafely, setShowScrollToBottomSafely]
+  );
+
+  useEffect(() => {
+    return () => {
+      clearReplyJumpHighlightTimer();
+    };
+  }, [clearReplyJumpHighlightTimer]);
+
+  useEffect(() => {
+    replyJumpConversationKeyRef.current = activeComposerDraftKey;
+  }, [activeComposerDraftKey]);
+
+  const schedulePersistConversationSearchContextStore = useCallback(() => {
+    if (!conversationSearchContextHydratedRef.current) {
+      return;
+    }
+
+    scheduleTimeoutRef(conversationSearchContextPersistTimerRef, () => {
+      const serializedStore = JSON.stringify(conversationSearchContextStoreRef.current);
+      void AsyncStorage.setItem(
+        CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY,
+        serializedStore
+      ).catch((error) => {
+        logger.debug('Failed to persist conversation search context store', {
+          error,
+        });
+      });
+    }, CONVERSATION_SEARCH_CONTEXT_PERSIST_DEBOUNCE_MS);
+  }, []);
+
+  const persistConversationSearchContextForKey = useCallback(
+    (
+      conversationKey: string,
+      snapshot: ChatConversationSearchContextSnapshot
+    ) => {
+      const normalizedConversationKey = conversationKey.trim();
+      if (!normalizedConversationKey) {
+        return;
+      }
+
+      const normalizedSnapshot: ChatConversationSearchContextSnapshot = {
+        visible: snapshot.visible === true,
+        query: typeof snapshot.query === 'string' ? snapshot.query : '',
+        scope: normalizeChatConversationSearchScope(snapshot.scope),
+      };
+
+      conversationSearchContextByConversationKeyRef.current.set(
+        normalizedConversationKey,
+        normalizedSnapshot
+      );
+      conversationSearchContextStoreRef.current =
+        upsertPersistedConversationSearchContext(
+          conversationSearchContextStoreRef.current,
+          normalizedConversationKey,
+          normalizedSnapshot,
+          Date.now(),
+          CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS
+        );
+
+      schedulePersistConversationSearchContextStore();
+    },
+    [schedulePersistConversationSearchContextStore]
+  );
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const hydrateConversationSearchContextStore = async () => {
+      try {
+        const serializedStore = await AsyncStorage.getItem(
+          CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY
+        );
+        const parsedStore = serializedStore ? JSON.parse(serializedStore) : {};
+        const normalizedStore = normalizePersistedConversationSearchContextStore(
+          parsedStore,
+          Date.now(),
+          CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS
+        );
+
+        if (isCancelled) {
+          return;
+        }
+
+        conversationSearchContextStoreRef.current = normalizedStore;
+        const hydratedMap = new Map<string, ChatConversationSearchContextSnapshot>();
+        for (const [conversationKey, entry] of Object.entries(normalizedStore)) {
+          hydratedMap.set(conversationKey, {
+            visible: entry.visible === true,
+            query: typeof entry.query === 'string' ? entry.query : '',
+            scope: normalizeChatConversationSearchScope(entry.scope),
+          });
+        }
+        conversationSearchContextByConversationKeyRef.current = hydratedMap;
+      } catch (error) {
+        logger.debug('Failed to hydrate conversation search context store', {
+          error,
+        });
+      } finally {
+        if (isCancelled) {
+          return;
+        }
+
+        conversationSearchContextHydratedRef.current = true;
+        setConversationSearchContextHydrationTick((currentTick) =>
+          currentTick + 1
+        );
+      }
+    };
+
+    void hydrateConversationSearchContextStore();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (!conversationSearchContextPersistTimerRef.current) {
+        return;
+      }
+
+      clearTimeoutRef(conversationSearchContextPersistTimerRef);
+
+      const serializedStore = JSON.stringify(conversationSearchContextStoreRef.current);
+      void AsyncStorage.setItem(
+        CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY,
+        serializedStore
+      ).catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    const previousConversationKey = activeConversationSearchContextKeyRef.current;
+    if (previousConversationKey) {
+      persistConversationSearchContextForKey(previousConversationKey, {
+        visible: conversationSearchVisibleRef.current,
+        query: conversationSearchQueryRef.current,
+        scope: conversationSearchScopeRef.current,
+      });
+    }
+
+    const nextConversationKey = activeConversationSearchContextKey || null;
+    activeConversationSearchContextKeyRef.current = nextConversationKey;
+
+    const inMemoryContext = nextConversationKey
+      ? conversationSearchContextByConversationKeyRef.current.get(nextConversationKey)
+      : null;
+    const persistedContext =
+      !inMemoryContext && nextConversationKey
+        ? readPersistedConversationSearchContext(
+            conversationSearchContextStoreRef.current,
+            nextConversationKey,
+            Date.now(),
+            CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS
+          )
+        : null;
+
+    const savedContext = inMemoryContext || persistedContext;
+    if (nextConversationKey && savedContext) {
+      conversationSearchContextByConversationKeyRef.current.set(
+        nextConversationKey,
+        savedContext
+      );
+    }
+
+    const restoredContext: ChatConversationSearchContextSnapshot = {
+      visible: savedContext?.visible === true,
+      query:
+        typeof savedContext?.query === 'string'
+          ? savedContext.query
+          : DEFAULT_CONVERSATION_SEARCH_CONTEXT.query,
+      scope: normalizeChatConversationSearchScope(
+        savedContext?.scope ?? DEFAULT_CONVERSATION_SEARCH_CONTEXT.scope
+      ),
+    };
+
+    setShowReplyJumpToLatestSafely(false);
+    setReplyJumpHighlightMessageId(null);
+    clearReplyJumpHighlightTimer();
+    clearScheduledConversationSearchHistoryLoad();
+    clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
+    conversationSearchLoadTokenRef.current += 1;
+    conversationSearchHistoryLoadAttemptsRef.current = 0;
+    setIsConversationSearchHistoryLoading(false);
+    setConversationSearchVisible(restoredContext.visible);
+    setConversationSearchQuery(restoredContext.query);
+    setConversationSearchScope(restoredContext.scope);
+    setConversationSearchActiveIndex(0);
+    setConversationSearchHighlightMessageId(null);
+    setConversationSearchKeyboardSuggestionScope(null);
+    setConversationSearchShortcutPulseScope(null);
+    previousConversationSearchQueryRef.current = '';
+    previousConversationSearchScopeRef.current = restoredContext.scope;
+  }, [
+    activeConversationSearchContextKey,
+    conversationSearchContextHydrationTick,
+    clearReplyJumpHighlightTimer,
+    clearScheduledConversationSearchHistoryLoad,
+    persistConversationSearchContextForKey,
+    setShowReplyJumpToLatestSafely,
+  ]);
+
+  const jumpToReplyMessage = useCallback(
+    async (replyContext?: ChatReplyContext | null, options?: { silent?: boolean }): Promise<boolean> => {
+      const metricSource: ChatReplyJumpMetricSource = options?.silent ? 'silent' : 'interactive';
+      const targetMessageId = normalizeMessageId(replyContext?.messageId);
+      if (!targetMessageId) {
+        recordReplyJumpMetric('invalid-target', false, 0, metricSource);
+        return false;
+      }
+
+      if (jumpingToReplyRef.current) {
+        return false;
+      }
+
+      const tryScrollToTarget = (messageId: string, animated: boolean) => {
+        markAutoScroll();
+        return scrollToMessage(messageId, animated);
+      };
+
+      const jumpConversationKey = replyJumpConversationKeyRef.current;
+      let jumpWasCancelled = false;
+
+      jumpingToReplyRef.current = true;
+      try {
+        const jumpResult = await executeChatReplyJump({
+          targetMessageId,
+          tryScrollToMessage: tryScrollToTarget,
+          canLoadMoreHistory: () => hasMoreRef.current,
+          loadOlderMessages: async () => {
+            await requestOlderMessagesRef.current?.('auto');
+          },
+          maxLoadAttempts: 4,
+          shouldContinue: () => replyJumpConversationKeyRef.current === jumpConversationKey,
+        });
+
+        recordReplyJumpMetric(
+          jumpResult.reason,
+          jumpResult.success,
+          jumpResult.usedHistoryLoads,
+          metricSource
+        );
+
+        jumpWasCancelled = jumpResult.reason === 'cancelled';
+
+        if (jumpResult.success) {
+          triggerReplyJumpHighlight(targetMessageId);
+          return true;
+        }
+      } finally {
+        jumpingToReplyRef.current = false;
+      }
+
+      if (jumpWasCancelled) {
+        return false;
+      }
+
+      if (!options?.silent) {
+        Toast.show({
+          type: 'info',
+          text1: 'Original message not available',
+          text2: 'It may be outside the loaded chat history.',
+          position: 'top',
+        });
+      }
+
+      return false;
+    },
+    [markAutoScroll, normalizeMessageId, recordReplyJumpMetric, scrollToMessage, triggerReplyJumpHighlight]
+  );
+
+  const closeConversationSearch = useCallback(() => {
+    clearScheduledConversationSearchHistoryLoad();
+    clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
+    conversationSearchLoadTokenRef.current += 1;
+    conversationSearchHistoryLoadAttemptsRef.current = 0;
+    setConversationSearchVisible(false);
+    setConversationSearchActiveIndex(0);
+    setConversationSearchHighlightMessageId(null);
+    setConversationSearchKeyboardSuggestionScope(null);
+    setConversationSearchShortcutPulseScope(null);
+    setIsConversationSearchHistoryLoading(false);
+    previousConversationSearchQueryRef.current = normalizedConversationSearchQueryRef.current;
+    previousConversationSearchScopeRef.current = conversationSearchScopeRef.current;
+  }, [clearScheduledConversationSearchHistoryLoad]);
+
+  const toggleConversationSearch = useCallback(() => {
+    if (conversationSearchVisible) {
+      closeConversationSearch();
+      return;
+    }
+
+    setConversationSearchVisible(true);
+  }, [closeConversationSearch, conversationSearchVisible]);
+
+  const clearConversationSearchShortcutPulseTimer = useCallback(() => {
+    clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
+  }, []);
+
+  const triggerConversationSearchShortcutPulse = useCallback(
+    (scope: ChatConversationSearchScope) => {
+      setConversationSearchShortcutPulseScope(scope);
+      clearConversationSearchShortcutPulseTimer();
+      scheduleTimeoutRef(conversationSearchShortcutPulseTimerRef, () => {
+        setConversationSearchShortcutPulseScope((currentScope) =>
+          currentScope === scope ? null : currentScope
+        );
+      }, 280);
+    },
+    [clearConversationSearchShortcutPulseTimer]
+  );
+
+  const recordConversationSearchTelemetry = useCallback(
+    (
+      kind: 'scope-switch' | 'no-result-recovery',
+      source: string,
+      extra?: Record<string, unknown>
+    ) => {
+      const payload = recordChatConversationSearchUxRollup(
+        conversationSearchTelemetryRef.current,
+        kind,
+        source
+      );
+
+      if (!payload) {
+        return;
+      }
+
+      logger.metric('chat.conversation_search.ux_rollup', {
+        ...payload,
+        ...extra,
+      });
+    },
+    []
+  );
+
+  const recordConversationSearchNoResultRecovery = useCallback(
+    (source: string, extra?: Record<string, unknown>) => {
+      if (normalizedConversationSearchQueryRef.current.length <= 0) {
+        return;
+      }
+
+      if (conversationSearchMatchIdsRef.current.length > 0) {
+        return;
+      }
+
+      recordConversationSearchTelemetry('no-result-recovery', source, extra);
+    },
+    [recordConversationSearchTelemetry]
+  );
+
+  const recordConversationSearchScopeSwitch = useCallback(
+    (source: string, nextScope: ChatConversationSearchScope) => {
+      recordConversationSearchTelemetry('scope-switch', source, {
+        nextScope,
+      });
+
+      recordConversationSearchNoResultRecovery(source, {
+        recoveryType: 'scope-switch',
+        nextScope,
+      });
+    },
+    [recordConversationSearchNoResultRecovery, recordConversationSearchTelemetry]
+  );
+
+  const executeConversationSearchShortcutAction = useCallback(
+    (
+      shortcutAction: ChatConversationSearchScopeShortcutAction,
+      context: {
+        scope: ChatConversationSearchScope;
+        keyboardSuggestionScope: ChatConversationSearchScope | null;
+        normalizedQuery: string;
+      }
+    ) => {
+      if (shortcutAction.type === 'reset-all') {
+        if (context.scope !== 'all') {
+          recordConversationSearchScopeSwitch('shortcut-reset', 'all');
+          triggerConversationSearchShortcutPulse('all');
+        }
+        setConversationSearchScope('all');
+        setConversationSearchActiveIndex(0);
+        setConversationSearchKeyboardSuggestionScope(null);
+        return;
+      }
+
+      if (shortcutAction.type === 'clear-query') {
+        recordConversationSearchNoResultRecovery('shortcut-clear-query', {
+          recoveryType: 'clear-query',
+        });
+        clearScheduledConversationSearchHistoryLoad();
+        conversationSearchLoadTokenRef.current += 1;
+        setIsConversationSearchHistoryLoading(false);
+        setConversationSearchQuery('');
+        setConversationSearchActiveIndex(0);
+        setConversationSearchHighlightMessageId(null);
+        setConversationSearchKeyboardSuggestionScope(null);
+        return;
+      }
+
+      if (shortcutAction.type === 'load-more-history') {
+        recordConversationSearchNoResultRecovery('shortcut-load-older', {
+          recoveryType: 'load-older',
+        });
+        scheduleConversationSearchHistoryLoadRef.current(context.normalizedQuery);
+        return;
+      }
+
+      if (shortcutAction.type === 'step') {
+        const nextScope = resolveChatConversationSearchScopeStep(
+          context.scope,
+          shortcutAction.direction
+        );
+        if (context.scope !== nextScope) {
+          recordConversationSearchScopeSwitch('shortcut-step', nextScope);
+          triggerConversationSearchShortcutPulse(nextScope);
+        }
+        setConversationSearchScope(nextScope);
+        setConversationSearchActiveIndex(0);
+        setConversationSearchKeyboardSuggestionScope(null);
+        return;
+      }
+
+      if (shortcutAction.type === 'select-scope') {
+        if (context.scope !== shortcutAction.scope) {
+          recordConversationSearchScopeSwitch('shortcut-select', shortcutAction.scope);
+          triggerConversationSearchShortcutPulse(shortcutAction.scope);
+        }
+        setConversationSearchScope((currentScope) =>
+          currentScope === shortcutAction.scope ? currentScope : shortcutAction.scope
+        );
+        setConversationSearchActiveIndex(0);
+        setConversationSearchKeyboardSuggestionScope(null);
+        return;
+      }
+
+      const shortcutSuggestions = resolveChatConversationSearchScopeSuggestions(
+        conversationSearchScopeMatchCounts,
+        context.scope,
+        3
+      );
+
+      if (shortcutAction.type === 'suggestion-step') {
+        const stepSuggestion = resolveChatConversationSearchScopeSuggestionCycle(
+          shortcutSuggestions,
+          context.keyboardSuggestionScope,
+          shortcutAction.direction
+        );
+
+        if (stepSuggestion) {
+          setConversationSearchKeyboardSuggestionScope(stepSuggestion.scope);
+          triggerConversationSearchShortcutPulse(stepSuggestion.scope);
+        }
+        return;
+      }
+
+      if (shortcutAction.type === 'best-suggestion') {
+        const bestScopeSuggestion =
+          shortcutSuggestions.find(
+            (suggestion) => suggestion.scope === context.keyboardSuggestionScope
+          ) ||
+          resolveChatConversationSearchBestScopeSuggestion(
+            conversationSearchScopeMatchCounts,
+            context.scope
+          );
+
+        if (!bestScopeSuggestion) {
+          return;
+        }
+
+        if (context.scope !== bestScopeSuggestion.scope) {
+          recordConversationSearchScopeSwitch('shortcut-best', bestScopeSuggestion.scope);
+          triggerConversationSearchShortcutPulse(bestScopeSuggestion.scope);
+        }
+
+        setConversationSearchScope((currentScope) =>
+          currentScope === bestScopeSuggestion.scope
+            ? currentScope
+            : bestScopeSuggestion.scope
+        );
+        setConversationSearchActiveIndex(0);
+        setConversationSearchKeyboardSuggestionScope(bestScopeSuggestion.scope);
+        return;
+      }
+
+      if (shortcutAction.type === 'suggestion-ordinal') {
+        const ordinalSuggestion = resolveChatConversationSearchScopeSuggestionByOrdinal(
+          shortcutSuggestions,
+          shortcutAction.ordinal
+        );
+
+        if (!ordinalSuggestion) {
+          return;
+        }
+
+        if (context.scope !== ordinalSuggestion.scope) {
+          recordConversationSearchScopeSwitch('shortcut-ordinal', ordinalSuggestion.scope);
+          triggerConversationSearchShortcutPulse(ordinalSuggestion.scope);
+        }
+
+        setConversationSearchScope((currentScope) =>
+          currentScope === ordinalSuggestion.scope
+            ? currentScope
+            : ordinalSuggestion.scope
+        );
+        setConversationSearchActiveIndex(0);
+        setConversationSearchKeyboardSuggestionScope(ordinalSuggestion.scope);
+      }
+    },
+    [
+      clearScheduledConversationSearchHistoryLoad,
+      conversationSearchScopeMatchCounts,
+      recordConversationSearchNoResultRecovery,
+      recordConversationSearchScopeSwitch,
+      triggerConversationSearchShortcutPulse,
+    ]
+  );
+
+  useEffect(() => {
+    return () => {
+      clearConversationSearchShortcutPulseTimer();
+    };
+  }, [clearConversationSearchShortcutPulseTimer]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      return;
+    }
+
+    if (!selectedTeamMember) {
+      return;
+    }
+
+    const handleConversationSearchShortcut = (event: KeyboardEvent) => {
+      const key = typeof event.key === 'string' ? event.key.toLowerCase() : '';
+      if (messageInfoModalState.visible) {
+        return;
+      }
+
+      const isFindShortcut = key === 'f' && (event.metaKey || event.ctrlKey);
+      const hasScopeShortcutModifiers =
+        conversationSearchVisible &&
+        event.altKey &&
+        event.shiftKey &&
+        !event.metaKey &&
+        !event.ctrlKey;
+
+      if (isFindShortcut) {
+        event.preventDefault();
+        if (!conversationSearchVisible) {
+          setConversationSearchVisible(true);
+          return;
+        }
+
+        try {
+          conversationSearchInputRef.current?.focus();
+        } catch {}
+        return;
+      }
+
+      if (hasScopeShortcutModifiers) {
+        const shortcutAction = resolveChatConversationSearchScopeShortcutAction({
+          key: event.key,
+          code: event.code,
+          altKey: event.altKey === true,
+          shiftKey: event.shiftKey === true,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          hasMatches: conversationSearchMatchIdsRef.current.length > 0,
+          hasQuery: normalizedConversationSearchQueryRef.current.length > 0,
+          hasMoreHistory: hasMoreRef.current,
+          isLoadingHistory: isConversationSearchHistoryLoadingRef.current,
+        });
+
+        if (shortcutAction) {
+          event.preventDefault();
+
+          executeConversationSearchShortcutAction(shortcutAction, {
+            scope: conversationSearchScopeRef.current,
+            keyboardSuggestionScope: conversationSearchKeyboardSuggestionScopeRef.current,
+            normalizedQuery: normalizedConversationSearchQueryRef.current,
+          });
+
+          try {
+            conversationSearchInputRef.current?.focus();
+          } catch {}
+          return;
+        }
+      }
+
+      if (key === 'escape' && conversationSearchVisible) {
+        event.preventDefault();
+        closeConversationSearch();
+      }
+    };
+
+    window.addEventListener('keydown', handleConversationSearchShortcut);
+    return () => {
+      window.removeEventListener('keydown', handleConversationSearchShortcut);
+    };
+  }, [
+    closeConversationSearch,
+    conversationSearchVisible,
+    executeConversationSearchShortcutAction,
+    messageInfoModalState.visible,
+    selectedTeamMember,
+  ]);
+
+  useEffect(() => {
+    conversationSearchVisibleRef.current = conversationSearchVisible;
+  }, [conversationSearchVisible]);
+
+  useEffect(() => {
+    conversationSearchScopeRef.current = conversationSearchScope;
+  }, [conversationSearchScope]);
+
+  useEffect(() => {
+    conversationSearchKeyboardSuggestionScopeRef.current =
+      conversationSearchKeyboardSuggestionScope;
+  }, [conversationSearchKeyboardSuggestionScope]);
+
+  useEffect(() => {
+    isConversationSearchHistoryLoadingRef.current = isConversationSearchHistoryLoading;
+  }, [isConversationSearchHistoryLoading]);
+
+  useEffect(() => {
+    const conversationKey = activeConversationSearchContextKeyRef.current;
+    if (!conversationKey) {
+      return;
+    }
+
+    persistConversationSearchContextForKey(conversationKey, {
+      visible: conversationSearchVisible,
+      query: conversationSearchQuery,
+      scope: conversationSearchScope,
+    });
+  }, [
+    conversationSearchQuery,
+    conversationSearchScope,
+    conversationSearchVisible,
+    persistConversationSearchContextForKey,
+  ]);
+
+  useEffect(() => {
+    if (!conversationSearchVisible) {
+      setConversationSearchKeyboardSuggestionScope(null);
+      return;
+    }
+
+    if (normalizedConversationSearchQuery.length <= 0 || conversationSearchMatchIds.length > 0) {
+      setConversationSearchKeyboardSuggestionScope(null);
+    }
+  }, [
+    conversationSearchMatchIds.length,
+    conversationSearchVisible,
+    normalizedConversationSearchQuery,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      clearScheduledConversationSearchHistoryLoad();
+    };
+  }, [clearScheduledConversationSearchHistoryLoad]);
+
+  const loadOlderForConversationSearch = useCallback(
+    async (query: string) => {
+      const normalizedQuery = normalizeChatConversationSearchQuery(query);
+      if (!normalizedQuery) {
+        setIsConversationSearchHistoryLoading(false);
+        return;
+      }
+
+      const MAX_SEARCH_HISTORY_LOADS_PER_QUERY = 12;
+      if (conversationSearchHistoryLoadAttemptsRef.current >= MAX_SEARCH_HISTORY_LOADS_PER_QUERY) {
+        return;
+      }
+
+      const shouldStart = shouldLoadOlderForConversationSearch({
+        normalizedQuery,
+        matchCount: conversationSearchMatchIdsRef.current.length,
+        hasMoreHistory: hasMoreRef.current,
+        isLoadingHistory: isConversationSearchHistoryLoadingRef.current,
+      });
+
+      if (!shouldStart) {
+        return;
+      }
+
+      conversationSearchLoadTokenRef.current += 1;
+      const currentToken = conversationSearchLoadTokenRef.current;
+      setIsConversationSearchHistoryLoading(true);
+
+      let loadAttempts = 0;
+      const MAX_SEARCH_HISTORY_LOAD_ATTEMPTS = 4;
+
+      try {
+        while (loadAttempts < MAX_SEARCH_HISTORY_LOAD_ATTEMPTS) {
+          const isCancelled =
+            conversationSearchLoadTokenRef.current !== currentToken ||
+            !conversationSearchVisibleRef.current ||
+            normalizedConversationSearchQueryRef.current !== normalizedQuery;
+          if (isCancelled) {
+            break;
+          }
+
+          const shouldContinueLoading = shouldLoadOlderForConversationSearch({
+            normalizedQuery,
+            matchCount: conversationSearchMatchIdsRef.current.length,
+            hasMoreHistory: hasMoreRef.current,
+            isLoadingHistory: false,
+          });
+
+          if (!shouldContinueLoading) {
+            break;
+          }
+
+          if (conversationSearchHistoryLoadAttemptsRef.current >= MAX_SEARCH_HISTORY_LOADS_PER_QUERY) {
+            break;
+          }
+
+          loadAttempts += 1;
+          conversationSearchHistoryLoadAttemptsRef.current += 1;
+          await requestOlderMessagesRef.current?.('auto');
+
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 80);
+          });
+        }
+      } finally {
+        if (conversationSearchLoadTokenRef.current === currentToken) {
+          setIsConversationSearchHistoryLoading(false);
+        }
+      }
+    },
+    []
+  );
+
+  const scheduleConversationSearchHistoryLoad = useCallback(
+    (query: string) => {
+      const normalizedQuery = normalizeChatConversationSearchQuery(query);
+      clearScheduledConversationSearchHistoryLoad();
+
+      if (!normalizedQuery) {
+        setIsConversationSearchHistoryLoading(false);
+        return;
+      }
+
+      scheduleTimeoutRef(conversationSearchLoadDebounceTimerRef, () => {
+        void loadOlderForConversationSearch(normalizedQuery);
+      }, 180);
+    },
+    [clearScheduledConversationSearchHistoryLoad, loadOlderForConversationSearch]
+  );
+
+  useEffect(() => {
+    scheduleConversationSearchHistoryLoadRef.current = scheduleConversationSearchHistoryLoad;
+  }, [scheduleConversationSearchHistoryLoad]);
+
+  const focusConversationSearchMatch = useCallback(
+    (targetIndex: number, options?: { animated?: boolean }): boolean => {
+      if (conversationSearchMatchIds.length === 0) {
+        setConversationSearchActiveIndex(0);
+        setConversationSearchHighlightMessageId(null);
+        return false;
+      }
+
+      const activeIndex = clampChatConversationSearchIndex(targetIndex, conversationSearchMatchIds.length);
+      if (activeIndex < 0) {
+        return false;
+      }
+
+      const targetMessageId = conversationSearchMatchIds[activeIndex];
+      if (!targetMessageId) {
+        return false;
+      }
+
+      setConversationSearchActiveIndex(activeIndex);
+      setConversationSearchHighlightMessageId(targetMessageId);
+      markAutoScroll();
+      return scrollToMessage(targetMessageId, options?.animated ?? true);
+    },
+    [conversationSearchMatchIds, markAutoScroll, scrollToMessage]
+  );
+
+  const handleConversationSearchQueryChange = useCallback((value: string) => {
+    setConversationSearchQuery(value);
+    setConversationSearchActiveIndex(0);
+    setConversationSearchKeyboardSuggestionScope(null);
+  }, []);
+
+  const handleConversationSearchClearQuery = useCallback((source: string = 'clear-query-button') => {
+    recordConversationSearchNoResultRecovery(source, {
+      recoveryType: 'clear-query',
+    });
+    clearScheduledConversationSearchHistoryLoad();
+    conversationSearchLoadTokenRef.current += 1;
+    setIsConversationSearchHistoryLoading(false);
+    setConversationSearchQuery('');
+    setConversationSearchActiveIndex(0);
+    setConversationSearchHighlightMessageId(null);
+    setConversationSearchKeyboardSuggestionScope(null);
+
+    if (Platform.OS !== 'web') {
+      return;
+    }
+
+    try {
+      conversationSearchInputRef.current?.focus();
+    } catch {}
+  }, [clearScheduledConversationSearchHistoryLoad, recordConversationSearchNoResultRecovery]);
+
+  const handleConversationSearchScopeChange = useCallback((
+    nextScope: ChatConversationSearchScope,
+    source: string = 'manual'
+  ) => {
+    const currentScope = conversationSearchScopeRef.current;
+    if (currentScope !== nextScope) {
+      recordConversationSearchScopeSwitch(source, nextScope);
+      if (source.startsWith('shortcut')) {
+        triggerConversationSearchShortcutPulse(nextScope);
+      }
+    }
+
+    setConversationSearchScope((currentScope) =>
+      currentScope === nextScope ? currentScope : nextScope
+    );
+    setConversationSearchActiveIndex(0);
+
+    if (source === 'shortcut-best' || source === 'shortcut-ordinal') {
+      setConversationSearchKeyboardSuggestionScope(nextScope);
+      return;
+    }
+
+    setConversationSearchKeyboardSuggestionScope(null);
+  }, [
+    recordConversationSearchScopeSwitch,
+    triggerConversationSearchShortcutPulse,
+  ]);
+
+  const handleConversationSearchResetScope = useCallback((source: string = 'reset-button') => {
+    handleConversationSearchScopeChange('all', source);
+    if (Platform.OS !== 'web') {
+      return;
+    }
+
+    try {
+      conversationSearchInputRef.current?.focus();
+    } catch {}
+  }, [handleConversationSearchScopeChange]);
+
+  const handleConversationSearchLoadOlder = useCallback(
+    (source: string = 'load-older-button') => {
+      recordConversationSearchNoResultRecovery(source, {
+        recoveryType: 'load-older',
+      });
+      scheduleConversationSearchHistoryLoad(normalizedConversationSearchQuery);
+    },
+    [
+      normalizedConversationSearchQuery,
+      recordConversationSearchNoResultRecovery,
+      scheduleConversationSearchHistoryLoad,
+    ]
+  );
+
+  const handleConversationSearchNext = useCallback(() => {
+    const nextIndex = resolveChatConversationSearchNextIndex(
+      conversationSearchActiveIndex,
+      conversationSearchMatchIds.length,
+      'next'
+    );
+
+    if (nextIndex < 0) {
+      scheduleConversationSearchHistoryLoad(normalizedConversationSearchQuery);
+      return;
+    }
+
+    focusConversationSearchMatch(nextIndex, { animated: true });
+  }, [
+    conversationSearchActiveIndex,
+    conversationSearchMatchIds.length,
+    focusConversationSearchMatch,
+    scheduleConversationSearchHistoryLoad,
+    normalizedConversationSearchQuery,
+  ]);
+
+  const handleConversationSearchPrevious = useCallback(() => {
+    const nextIndex = resolveChatConversationSearchNextIndex(
+      conversationSearchActiveIndex,
+      conversationSearchMatchIds.length,
+      'previous'
+    );
+
+    if (nextIndex < 0) {
+      scheduleConversationSearchHistoryLoad(normalizedConversationSearchQuery);
+      return;
+    }
+
+    focusConversationSearchMatch(nextIndex, { animated: true });
+  }, [
+    conversationSearchActiveIndex,
+    conversationSearchMatchIds.length,
+    focusConversationSearchMatch,
+    scheduleConversationSearchHistoryLoad,
+    normalizedConversationSearchQuery,
+  ]);
+
+  const handleConversationSearchInputKeyPress = useCallback(
+    (event: any) => {
+      if (Platform.OS !== 'web') {
+        return;
+      }
+
+      const key = event?.nativeEvent?.key;
+      const shortcutAction = resolveChatConversationSearchScopeShortcutAction({
+        key,
+        code: event?.nativeEvent?.code,
+        altKey: event?.nativeEvent?.altKey === true,
+        shiftKey: event?.nativeEvent?.shiftKey === true,
+        ctrlKey: event?.nativeEvent?.ctrlKey === true,
+        metaKey: event?.nativeEvent?.metaKey === true,
+        hasMatches: conversationSearchMatchIds.length > 0,
+        hasQuery: normalizedConversationSearchQuery.length > 0,
+        hasMoreHistory: hasMore,
+        isLoadingHistory: isConversationSearchHistoryLoading,
+      });
+
+      if (shortcutAction) {
+        event?.preventDefault?.();
+        executeConversationSearchShortcutAction(shortcutAction, {
+          scope: conversationSearchScope,
+          keyboardSuggestionScope: conversationSearchKeyboardSuggestionScope,
+          normalizedQuery: normalizedConversationSearchQuery,
+        });
+        return;
+      }
+
+      if (key === 'Escape') {
+        event?.preventDefault?.();
+        closeConversationSearch();
+        return;
+      }
+
+      if (key !== 'Enter') {
+        return;
+      }
+
+      event?.preventDefault?.();
+      if (event?.nativeEvent?.shiftKey) {
+        handleConversationSearchPrevious();
+        return;
+      }
+
+      handleConversationSearchNext();
+    },
+    [
+      closeConversationSearch,
+      conversationSearchMatchIds.length,
+      conversationSearchKeyboardSuggestionScope,
+      conversationSearchScope,
+      executeConversationSearchShortcutAction,
+      hasMore,
+      isConversationSearchHistoryLoading,
+      handleConversationSearchNext,
+      handleConversationSearchPrevious,
+      normalizedConversationSearchQuery,
+    ]
+  );
+
+  const handleConversationSearchSnippetPress = useCallback(() => {
+    if (!conversationSearchActiveSnippet) {
+      return;
+    }
+
+    focusConversationSearchMatch(conversationSearchActiveIndex, { animated: true });
+  }, [conversationSearchActiveIndex, conversationSearchActiveSnippet, focusConversationSearchMatch]);
+
+  useEffect(() => {
+    if (!conversationSearchVisible) {
+      previousConversationSearchQueryRef.current = normalizedConversationSearchQuery;
+      previousConversationSearchScopeRef.current = conversationSearchScope;
+      setIsConversationSearchHistoryLoading(false);
+      conversationSearchLoadTokenRef.current += 1;
+      clearScheduledConversationSearchHistoryLoad();
+      return;
+    }
+
+    const didQueryChange =
+      normalizedConversationSearchQuery !== previousConversationSearchQueryRef.current;
+    const didScopeChange =
+      conversationSearchScope !== previousConversationSearchScopeRef.current;
+    previousConversationSearchQueryRef.current = normalizedConversationSearchQuery;
+    previousConversationSearchScopeRef.current = conversationSearchScope;
+
+    if (!didQueryChange && !didScopeChange) {
+      return;
+    }
+
+    clearScheduledConversationSearchHistoryLoad();
+
+    conversationSearchHistoryLoadAttemptsRef.current = 0;
+
+    if (!normalizedConversationSearchQuery || conversationSearchMatchIds.length === 0) {
+      setConversationSearchActiveIndex(0);
+      setConversationSearchHighlightMessageId(null);
+      if (normalizedConversationSearchQuery) {
+        scheduleConversationSearchHistoryLoad(normalizedConversationSearchQuery);
+      }
+      return;
+    }
+
+    conversationSearchLoadTokenRef.current += 1;
+    setIsConversationSearchHistoryLoading(false);
+    focusConversationSearchMatch(0, { animated: true });
+  }, [
+    conversationSearchMatchIds,
+    conversationSearchScope,
+    conversationSearchVisible,
+    clearScheduledConversationSearchHistoryLoad,
+    focusConversationSearchMatch,
+    scheduleConversationSearchHistoryLoad,
+    normalizedConversationSearchQuery,
+  ]);
+
+  useEffect(() => {
+    if (!conversationSearchVisible) {
+      return;
+    }
+
+    if (conversationSearchMatchIds.length === 0) {
+      setConversationSearchActiveIndex(0);
+      setConversationSearchHighlightMessageId(null);
+      if (normalizedConversationSearchQuery) {
+        scheduleConversationSearchHistoryLoad(normalizedConversationSearchQuery);
+      } else {
+        clearScheduledConversationSearchHistoryLoad();
+        conversationSearchLoadTokenRef.current += 1;
+        setIsConversationSearchHistoryLoading(false);
+      }
+      return;
+    }
+
+    clearScheduledConversationSearchHistoryLoad();
+    conversationSearchLoadTokenRef.current += 1;
+    setIsConversationSearchHistoryLoading(false);
+
+    const clampedIndex = clampChatConversationSearchIndex(
+      conversationSearchActiveIndex,
+      conversationSearchMatchIds.length
+    );
+
+    if (clampedIndex !== conversationSearchActiveIndex) {
+      setConversationSearchActiveIndex(clampedIndex);
+    }
+
+    const activeMessageId = conversationSearchMatchIds[clampedIndex];
+    if (activeMessageId && activeMessageId !== conversationSearchHighlightMessageId) {
+      setConversationSearchHighlightMessageId(activeMessageId);
+    }
+  }, [
+    conversationSearchActiveIndex,
+    conversationSearchHighlightMessageId,
+    conversationSearchMatchIds,
+    clearScheduledConversationSearchHistoryLoad,
+    scheduleConversationSearchHistoryLoad,
+    normalizedConversationSearchQuery,
+    conversationSearchVisible,
+  ]);
+
+  useEffect(() => {
+    if (!conversationSearchVisible) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        conversationSearchInputRef.current?.focus();
+      } catch {}
+    }, 30);
+
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [conversationSearchVisible]);
+
   const ensureAnchorPosition = useCallback(() => {
-    const anchor = anchoredTargetRef.current;
-    if (!anchor) return;
-    if (userInteractedRef.current) {
+    const anchorPlan = resolveChatEnsureAnchorActionPlan({
+      anchor: anchoredTargetRef.current,
+      hasUserInteracted: userInteractedRef.current,
+      startedAtMs: lastAnchoredAtRef.current || 0,
+      nowMs: Date.now(),
+      stabilizeMs: STABILIZE_MS,
+    });
+
+    if (anchorPlan.shouldStopStabilization) {
       stopAnchorStabilization();
       return;
     }
-    const startedAt = lastAnchoredAtRef.current || 0;
-    if (startedAt && Date.now() - startedAt >= STABILIZE_MS) {
-      stopAnchorStabilization();
-      return;
-    }
-    if (anchor.type === 'bottom') {
+
+    if (anchorPlan.shouldScrollBottom) {
       scrollToBottom(false, 0);
       isAtBottomRef.current = true;
-    } else if (anchor.type === 'message' && anchor.id) {
+    } else if (anchorPlan.shouldScrollMessage && anchorPlan.messageId) {
       markAutoScroll();
-      scrollToMessage(anchor.id, false);
+      scrollToMessage(anchorPlan.messageId, false);
     }
   }, [STABILIZE_MS, markAutoScroll, scrollToBottom, scrollToMessage, stopAnchorStabilization]);
 
@@ -4234,15 +6211,22 @@ export default function Chat() {
   );
 
   const tryAnchorToBottom = (force: boolean = false) => {
-    if (hasAnchoredInitialScrollRef.current && !force) {
+    const anchorAttemptPlan = resolveChatBottomAnchorAttemptPlan({
+      hasAnchoredInitialScroll: hasAnchoredInitialScrollRef.current,
+      force,
+      contentHeight: contentHeightRef.current || 0,
+      layoutHeight: layoutHeightRef.current || 0,
+    });
+
+    if (anchorAttemptPlan.shouldSkipAsAlreadyAnchored) {
       pendingInitialAnchorRef.current = false;
       if (CHAT_SCROLL_DEBUG) logger.debug('[CHAT-ANCHOR] skip bottom (already anchored)');
       return false;
     }
 
-    const contentH = contentHeightRef.current || 0;
-    const layoutH = layoutHeightRef.current || 0;
-    if (contentH <= 0 || layoutH <= 0) {
+    if (anchorAttemptPlan.shouldDeferForLayout) {
+      const contentH = contentHeightRef.current || 0;
+      const layoutH = layoutHeightRef.current || 0;
       pendingInitialAnchorRef.current = true;
       if (CHAT_SCROLL_DEBUG) logger.debug('[CHAT-ANCHOR] defer bottom (layout pending)', { contentH, layoutH });
       return false;
@@ -4302,12 +6286,15 @@ export default function Chat() {
           : 'initial';
       const startedAt = Date.now();
       const profile = concurrencyProfileRef.current;
-      renderTraceRef.current = { startedAt, conversationId, reason, profile };
-      logger.metric('chat.render.trace.start', {
-        conversationId,
-        reason,
-        messageCount: displayedMessagesRef.current?.length ?? 0,
-      });
+      renderTraceRef.current = createChatRenderTraceState(conversationId, reason, startedAt, profile);
+      logger.metric(
+        'chat.render.trace.start',
+        resolveChatRenderTraceStartPayload(
+          conversationId,
+          reason,
+          displayedMessagesRef.current?.length ?? 0
+        )
+      );
       if (!profile) {
         chatCacheService
           .getTelemetryContext()
@@ -4329,18 +6316,14 @@ export default function Chat() {
     if (!activeTrace) {
       return;
     }
-    const durationMs = Date.now() - activeTrace.startedAt;
-    const profile = activeTrace.profile || concurrencyProfileRef.current;
-    logger.metric('chat.render.trace.complete', {
-      conversationId: activeTrace.conversationId,
-      reason: activeTrace.reason,
-      durationMs,
-      messageCount: displayedMessagesRef.current?.length ?? 0,
-      hydrationConcurrency: profile?.hydration,
-      downloadConcurrency: profile?.downloads,
-      deviceType: profile?.deviceType ?? null,
-      totalMemoryBytes: profile?.totalMemory ?? null,
-    });
+    logger.metric(
+      'chat.render.trace.complete',
+      resolveChatRenderTraceCompletePayload(
+        activeTrace,
+        displayedMessagesRef.current?.length ?? 0,
+        concurrencyProfileRef.current
+      )
+    );
     renderTraceRef.current = null;
   }, [isInitialAnchorSettled, selectedTeamMember?.id, selectedTeamMember?.email]);
 
@@ -4349,9 +6332,22 @@ export default function Chat() {
     const scrollY = event.nativeEvent.contentOffset.y;
     lastScrollOffsetRef.current = scrollY;
     const isDragging = Boolean(event?.nativeEvent?.isDragging);
-    if (isInitialAnchorSettledRef.current && !isAutoScrollingRef.current && isDragging) {
+    const scrollInteractionPlan = resolveChatScrollInteractionPlan({
+      isInitialAnchorSettled: isInitialAnchorSettledRef.current,
+      isAutoScrolling: isAutoScrollingRef.current,
+      isDragging,
+      isCurrentlyScrolling: isScrollingRef.current,
+      scrollY,
+      stickyDateVisible,
+    });
+
+    if (scrollInteractionPlan.shouldMarkUserInteracted) {
       userInteractedRef.current = true;
-      allowTopAutoPaginationRef.current = true;
+      allowTopAutoPaginationRef.current =
+        scrollInteractionPlan.shouldAllowTopAutoPagination;
+    }
+
+    if (scrollInteractionPlan.shouldStopAnchorStabilization) {
       stopAnchorStabilization();
     }
     
@@ -4361,52 +6357,56 @@ export default function Chat() {
     }
     
     // Only update scrolling state if it actually changed
-    if (!isScrollingRef.current) {
+    if (scrollInteractionPlan.shouldSetScrollingTrue) {
       isScrollingRef.current = true;
     }
     
     // Early exit for shallow scrolls to reduce state updates
-    if (scrollY <= 50) {
-      if (stickyDateVisible) {
-        setStickyDateVisible(false);
+    if (scrollInteractionPlan.shouldExitEarly) {
+      if (scrollInteractionPlan.shouldHideStickyDateImmediate) {
+        setStickyDateVisibleSafely(false);
       }
       // Set timer to turn off scrolling
       scrollTimeoutRef.current = setTimeout(() => {
         isScrollingRef.current = false;
-      }, 200);
+      }, scrollInteractionPlan.idleHideDelayMs);
       return;
     }
 
-    const displayed = displayedMessagesRef.current;
-    const topInfo = topVisibleMessageRef.current;
-    let currentDate = '';
-    if (displayed && displayed.length && topInfo?.id) {
-      const idx = displayedMessageIndexRef.current.get(String(topInfo.id)) ?? -1;
-      if (idx >= 0) {
-        const msg = displayed[idx];
-        const prev = idx > 0 ? displayed[idx - 1] : undefined;
-        currentDate = getMessageDate(msg, prev);
-      }
+    const stickyDateScrollPlan = resolveChatStickyDateScrollPlan({
+      topVisibleMessageId: topVisibleMessageRef.current?.id,
+      previousSourceMessageId: stickyDateSourceMessageIdRef.current,
+      currentStickyDateText: stickyDateText,
+      currentStickyDateVisible: stickyDateVisible,
+      dateLabelById: messageDateLabelByIdRef.current,
+    });
+
+    if (stickyDateScrollPlan.shouldSetSourceMessageId) {
+      stickyDateSourceMessageIdRef.current = stickyDateScrollPlan.nextSourceMessageId;
+    } else if (stickyDateScrollPlan.shouldClearSourceMessageId) {
+      stickyDateSourceMessageIdRef.current = null;
     }
 
-    if (currentDate) {
-      if (currentDate !== stickyDateText) {
-        setStickyDateText(currentDate);
-      }
-      if (!stickyDateVisible) {
-        setStickyDateVisible(true);
-      }
-    } else if (stickyDateVisible) {
-      setStickyDateVisible(false);
+    if (stickyDateScrollPlan.shouldSetStickyDateText) {
+      setStickyDateTextSafely(stickyDateScrollPlan.nextStickyDateText);
+    }
+
+    if (stickyDateScrollPlan.shouldSetStickyDateVisible) {
+      setStickyDateVisibleSafely(stickyDateScrollPlan.nextStickyDateVisible);
     }
 
     // Set timer to turn off scrolling and hide header
     scrollTimeoutRef.current = setTimeout(() => {
       isScrollingRef.current = false;
-      if (stickyDateVisible) {
-        setStickyDateVisible(false);
+      const stickyDateIdleHidePlan = resolveChatStickyDateIdleHidePlan({
+        shouldHideStickyDateOnIdle:
+          scrollInteractionPlan.shouldHideStickyDateOnIdle,
+        currentStickyDateVisible: stickyDateVisible,
+      });
+      if (stickyDateIdleHidePlan.shouldHideStickyDate) {
+        setStickyDateVisibleSafely(false);
       }
-    }, 1500); // Hide after 1.5 seconds of no scrolling
+    }, scrollInteractionPlan.idleHideDelayMs); // Hide after 1.5 seconds of no scrolling
   };
 
   useEffect(() => {
@@ -4425,10 +6425,9 @@ export default function Chat() {
   useEffect(() => {
     if (!messages || messages.length === 0) {
       lastTailIdRef.current = null;
-      setUnseenCount(0);
-      setShowScrollToBottom(false);
-      setShowNewDivider(false);
-      setNewDividerMessageId(null);
+      resetUnseenCount();
+      setShowScrollToBottomSafely(false);
+      clearNewMessageDivider();
       hasAnchoredInitialScrollRef.current = false;
       pendingInitialAnchorRef.current = false;
       scrollToUnreadAttemptedRef.current = false;
@@ -4456,10 +6455,9 @@ export default function Chat() {
 
     if (isAtBottomRef.current) {
       lastTailIdRef.current = lastId;
-      setUnseenCount(0);
-      setShowScrollToBottom(false);
-      setShowNewDivider(false);
-      setNewDividerMessageId(null);
+      resetUnseenCount();
+      setShowScrollToBottomSafely(false);
+      clearNewMessageDivider();
       scheduleScrollToBottom({ animated: true, delay: 140 });
       return;
     }
@@ -4468,15 +6466,14 @@ export default function Chat() {
     const displayed = displayedMessagesRef.current;
     const idx = prevId ? (displayedMessageIndexRef.current.get(String(prevId)) ?? -1) : -1;
     const additional = idx >= 0 ? Math.max(0, displayed.length - (idx + 1)) : 1;
-    setUnseenCount((c) => c + additional);
-    setShowScrollToBottom(true);
+    incrementUnseenCount(additional);
+    setShowScrollToBottomSafely(true);
     const firstNewId = idx >= 0 ? (displayed[idx + 1]?.id ?? lastId) : lastId;
     if (firstNewId) {
-      setNewDividerMessageId(firstNewId);
-      setShowNewDivider(true);
+      showNewMessageDividerAt(firstNewId);
     }
     lastTailIdRef.current = lastId;
-  }, [messages]);
+  }, [messages, clearNewMessageDivider, incrementUnseenCount, resetUnseenCount, setShowScrollToBottomSafely, showNewMessageDividerAt]);
 
   // Auto scroll to bottom when typing indicator appears/disappears
   useEffect(() => {
@@ -4571,8 +6568,8 @@ export default function Chat() {
     markAutoScroll(320);
     tryAnchorToBottom(true);
     scheduleScrollToBottom({ animated: false, delay: 0 });
-    setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
-    setTimeout(() => scheduleScrollToBottom({ animated: false, delay: 0 }), 220);
+    scheduleTimeoutRef(forceAnchorRetryTimerRef1, () => scheduleScrollToBottom({ animated: false, delay: 0 }), 80);
+    scheduleTimeoutRef(forceAnchorRetryTimerRef2, () => scheduleScrollToBottom({ animated: false, delay: 0 }), 220);
     forceBottomAnchorChatKeyRef.current = null;
   }, [selectedTeamMember, displayedMessages, unreadSeparatorAnchorMessageId, markAutoScroll]);
 
@@ -4586,12 +6583,32 @@ export default function Chat() {
   }, [loadingMore, restorePrependAnchorIfNeeded, shouldUseManualAnchorPreservation]);
 
   useEffect(() => {
-    if (!selectedTeamMember?.email || !effectiveUser?.email || !isFocused || !isAppActive) {
-      return;
-    }
-
+    const foregroundQueueExecutionInput = {
+      partnerEmail: selectedTeamMember?.email,
+      userEmail: effectiveUser?.email,
+      isFocused,
+      isAppActive,
+      requestConversationDelivered: true,
+    };
+    const scheduledQueueGeneration = receiptSyncGenerationRef.current;
     const timer = setTimeout(() => {
-      queueConversationReceiptSync({ requestConversationDelivered: true });
+      const foregroundQueueExecutionPlan =
+        resolveChatReceiptForegroundQueueExecutionPlan({
+          ...foregroundQueueExecutionInput,
+          queueGeneration: scheduledQueueGeneration,
+          activeGeneration: receiptSyncGenerationRef.current,
+        });
+      if (
+        !foregroundQueueExecutionPlan.shouldApplyQueueInvocationExecutionPlan ||
+        !foregroundQueueExecutionPlan.shouldQueueSync
+      ) {
+        return;
+      }
+
+      queueConversationReceiptSync(
+        foregroundQueueExecutionPlan.queueOptions,
+        scheduledQueueGeneration
+      );
     }, 250);
 
     return () => clearTimeout(timer);
@@ -4710,6 +6727,7 @@ export default function Chat() {
     incomingUnreadCountRef.current = 0;
     previousIncomingUnreadRef.current = 0;
     unreadDividerSeedCountRef.current = 0;
+    lastNearBottomUnreadDismissAnchorRef.current = null;
     unreadSeedInitializedChatKeyRef.current = null;
     if (unreadSeparatorDismissTimeoutRef.current) {
       clearTimeout(unreadSeparatorDismissTimeoutRef.current);
@@ -4728,6 +6746,7 @@ export default function Chat() {
     lastScrollOffsetRef.current = 0;
     isAtBottomRef.current = true;
     topVisibleMessageRef.current = null;
+    stickyDateSourceMessageIdRef.current = null;
     messagePositionsRef.current = {};
     displayedMessagesRef.current = [];
     lastTailIdRef.current = null;
@@ -4738,7 +6757,7 @@ export default function Chat() {
     
     // Reset input height when switching chats (but not when sending messages)
     setInputHeight(40);
-    setLastTypingHeight(40);
+    setReplyingToMessage(null);
     
     // Manually hide keyboard when switching chats
     Keyboard.dismiss();
@@ -4797,37 +6816,64 @@ export default function Chat() {
   }, [selectedTeamMember?.id, selectedTeamMember?.email, conversationSummaries, normalizeParticipantEmail]);
 
   // Helper function to clear input field without affecting keyboard
-  const clearInputField = useCallback(() => {
-    logger.debug('clearInputField called, Platform:', Platform.OS);
-    
-    // CRITICAL FIX: Clear state first, then let React re-render, then force native sync
-    setEditingMessageInfo(null);
-    setMessage('');
-    latestMessageRef.current = '';
-    setShowSpecialCommand(false);
-    setIsComposingSpecial(false);
-    setInputHeight(40);
-    setLastTypingHeight(40);
-
+  const clearActiveTypingStatus = useCallback((reason: TypingStatusWriteReason = 'clear_active') => {
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = null;
     }
 
-    if (effectiveUserEmail && selectedMemberEmail) {
-      chatService.setTypingStatus(effectiveUserEmail, selectedMemberEmail, false);
-    }
-    
-    // Use setTimeout to ensure state update has propagated before native clearing
-    setTimeout(() => {
-      // Try to clear the mobile input using ref method AFTER state update
-      if (Platform.OS !== 'web' && mobileInputRef.current) {
-        logger.debug('Attempting to clear mobile input via ref');
-        mobileInputRef.current.clearInput();
+    const activeTypingPair = typingStatusPairRef.current;
+    setTypingStatusForPair(activeTypingPair, false, reason);
+
+    typingStatusPairRef.current = null;
+    typingStatusActiveRef.current = false;
+  }, [setTypingStatusForPair]);
+
+  const clearInputField = useCallback(() => {
+    logger.debug('clearInputField called, Platform:', Platform.OS);
+
+    setEditingMessageInfo(null);
+    setReplyingToMessage(null);
+    setMessage('');
+    latestMessageRef.current = '';
+    setShowSpecialCommand(false);
+    setIsComposingSpecial(false);
+    setInputHeight(40);
+
+    clearActiveTypingStatus();
+
+    mobileInputRef.current?.clearInput?.();
+
+    logger.debug('Message state cleared');
+  }, [clearActiveTypingStatus]);
+
+  const beginReplyToMessage = useCallback(
+    (targetMessage: any) => {
+      const replyContext = buildReplyContextFromMessage(targetMessage);
+      if (!replyContext) {
+        return;
       }
-      logger.debug('Message state cleared');
-    }, 0); // Immediate but after state update
-  }, [effectiveUserEmail, selectedMemberEmail]);
+
+      if (editingMessageInfo) {
+        clearInputField();
+      }
+
+      setReplyingToMessage(replyContext);
+
+      setTimeout(() => {
+        try {
+          mobileInputRef.current?.focusInput?.();
+        } catch (focusError) {
+          logger.debug('Failed to focus input after enabling reply mode', { focusError });
+        }
+      }, 0);
+    },
+    [buildReplyContextFromMessage, editingMessageInfo, clearInputField]
+  );
+
+  const cancelReplyingToMessage = useCallback(() => {
+    setReplyingToMessage(null);
+  }, []);
 
   const beginEditingMessage = useCallback(
     (message: any) => {
@@ -4850,28 +6896,20 @@ export default function Chat() {
         length: textValue.length,
         platform: Platform.OS,
       });
+      setReplyingToMessage(null);
       setEditingMessageInfo({ id: normalizeMessageId(message.id), originalText: textValue });
       setMessage(textValue);
       latestMessageRef.current = textValue;
 
-      if (Platform.OS !== 'web') {
-        try {
-          mobileInputRef.current?.syncValueFromParent?.(textValue);
-        } catch (syncError) {
-          logger.debug('Failed to sync mobile input value during edit', { syncError });
-        }
+      try {
+        mobileInputRef.current?.syncValueFromParent?.(textValue);
+      } catch (syncError) {
+        logger.debug('Failed to sync mobile input value during edit', { syncError });
       }
 
       setTimeout(() => {
         try {
-          if (Platform.OS === 'web') {
-            textInputRef.current?.focus?.();
-          } else if (mobileInputRef.current) {
-            mobileInputRef.current.focusInput?.();
-          } else {
-            // @ts-ignore focus may exist on custom input
-            richTextInputRef.current?.focus?.();
-          }
+          mobileInputRef.current?.focusInput?.();
         } catch (focusError) {
           logger.debug('Failed to focus input after starting edit', { focusError });
         }
@@ -4886,6 +6924,23 @@ export default function Chat() {
     }
     clearInputField();
   }, [editingMessageInfo, clearInputField]);
+
+  const handleEditLastOwnMessageShortcut = useCallback(() => {
+    if (editingMessageInfo) {
+      return;
+    }
+
+    if (typeof message === 'string' && message.trim().length > 0) {
+      return;
+    }
+
+    const latestEditable = findLatestEditableOwnMessage();
+    if (!latestEditable) {
+      return;
+    }
+
+    beginEditingMessage(latestEditable);
+  }, [editingMessageInfo, message, findLatestEditableOwnMessage, beginEditingMessage]);
 
   const performDeleteMessage = useCallback(
     async (message: any) => {
@@ -5016,173 +7071,16 @@ export default function Chat() {
     }
   }, [deleteConfirmState.message, performDeleteMessage]);
 
-  const processKeyboardMediaItem = useCallback(
-    async ({
-      fileUri,
-      mime,
-      guessedExt,
-      isGif,
-      tempId,
-      senderEmail,
-      recipientId,
-      recipientEmail,
-    }: {
-      fileUri: string;
-      mime?: string;
-      guessedExt: string;
-      isGif: boolean;
-      tempId: string;
-      senderEmail: string;
-      recipientId: string;
-      recipientEmail: string;
-    }) => {
-      try {
-        const isHttp = /^https?:\/\//i.test(fileUri);
-        let finalUrl = fileUri;
-        if (!isHttp) {
-          const name = `kb_${Date.now()}.${guessedExt}`;
-          const uploadMime = mime || (isGif ? 'image/gif' : 'image/png');
-          const { url } = await chatService.uploadFile(
-            fileUri,
-            name,
-            uploadMime,
-            {
-              senderEmail,
-              recipientEmail,
-            },
-            (progress) => {
-              setPendingMedia(prev => {
-                const next = new Map(prev);
-                const cur = next.get(tempId);
-                if (cur && cur.status === 'sending') {
-                  next.set(tempId, { ...cur, progress });
-                }
-                return next;
-              });
-            }
-          );
-          finalUrl = url;
-        }
-
-        if (isGif) {
-          const serverMessageId = await sendGif({ url: finalUrl, source: 'keyboard' } as any, recipientId);
-          setPendingMedia(prev => {
-            const next = new Map(prev);
-            const cur = next.get(tempId);
-            if (cur) {
-              next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
-            }
-            return next;
-          });
-        } else {
-          const serverMessageId = await sendSticker({ url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as any, recipientId);
-          setPendingMedia(prev => {
-            const next = new Map(prev);
-            const cur = next.get(tempId);
-            if (cur) {
-              next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
-            }
-            return next;
-          });
-        }
-      } catch (error) {
-        attachmentUploadCancelMap.current.delete(tempId);
-        setPendingMedia(prev => {
-          const next = new Map(prev);
-          const cur = next.get(tempId);
-          if (cur) next.set(tempId, { ...cur, status: 'failed' });
-          return next;
-        });
-        Toast.show({ type: 'error', text1: 'Send Failed', text2: 'Could not send media from keyboard', position: 'top' });
-      }
-    },
-    [sendGif, sendSticker]
-  );
-
-  // Handle rich content from mobile input
-  const handleRichContentFromMobile = useCallback(async (items: any[]) => {
-    if (!items || items.length === 0) return;
-    if (!selectedTeamMember || !effectiveUser?.email) return;
-
-    // Optimistic render: create pending media entries immediately and process in background
-    for (const it of items) {
-      try {
-        const fileUri: string | undefined = it?.fileUri || it?.uri;
-        const fileName: string | undefined = it?.fileName || it?.name;
-        const mime: string | undefined = it?.mimeType || it?.type;
-        if (!fileUri) continue;
-
-        const guessedExt = (mime && mime.split('/')[1]) || (fileName?.split('.').pop()) || 'bin';
-        const isGif = (mime || '').toLowerCase().includes('gif') || /\.gif$/i.test(fileName || '') || guessedExt.toLowerCase() === 'gif';
-
-        const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        const pendingItem: PendingMediaItem = {
-          id: tempId,
-          kind: isGif ? 'gif' : 'sticker',
-          previewUri: fileUri,
-          width: it?.width,
-          height: it?.height,
-          nameOrTitle: isGif ? (it?.title || 'GIF') : (it?.name || 'Sticker'),
-          timestamp: new Date().toISOString(),
-          recipientId: selectedTeamMember.id,
-          sender: effectiveUser.email,
-          status: 'sending',
-          mime,
-          source: 'keyboard',
-        };
-        setPendingMedia(prev => new Map(prev).set(tempId, pendingItem));
-
-        void processKeyboardMediaItem({
-          fileUri,
-          mime,
-          guessedExt,
-          isGif,
-          tempId,
-          senderEmail: effectiveUser.email,
-          recipientId: selectedTeamMember.id,
-          recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
-        });
-      } catch (err) {
-        logger.error('Error staging keyboard media:', err);
-      }
-    }
-    // Do not force auto-scroll; only anchor if user is already at bottom
-    if (isAtBottomRef.current) {
-      scheduleScrollToBottom({ animated: true, delay: 150 });
-    } else {
-      setShowScrollToBottom(true);
-    }
-  }, [effectiveUser?.email, processKeyboardMediaItem, selectedTeamMember]);
-
   const countMessageWords = useCallback((value?: string | null) => {
-    if (typeof value !== 'string') {
-      return 0;
-    }
-    const normalized = value.replace(/\s+/g, ' ').trim();
-    if (!normalized) {
-      return 0;
-    }
-    return normalized.split(' ').length;
+    return resolveChatComposerWordCount(value);
   }, []);
 
   const enforceMessageLimits = useCallback((value?: string | null) => {
-    let nextValue = typeof value === 'string' ? value : '';
-
-    if (nextValue.length > CHAT_MESSAGE_MAX_CHARS) {
-      nextValue = nextValue.slice(0, CHAT_MESSAGE_MAX_CHARS);
-    }
-
-    if (!nextValue.trim()) {
-      return nextValue;
-    }
-
-    const compact = nextValue.replace(/\s+/g, ' ').trim();
-    const words = compact.split(' ');
-    if (words.length > CHAT_MESSAGE_MAX_WORDS) {
-      return words.slice(0, CHAT_MESSAGE_MAX_WORDS).join(' ');
-    }
-
-    return nextValue;
+    return resolveChatComposerMessageWithinLimits({
+      value,
+      maxChars: CHAT_MESSAGE_MAX_CHARS,
+      maxWords: CHAT_MESSAGE_MAX_WORDS,
+    });
   }, []);
 
   const trimmedMessageValue = useMemo(() => {
@@ -5193,10 +7091,7 @@ export default function Chat() {
   }, [message]);
 
   const normalizeMessageValue = useCallback((value?: string | null) => {
-    if (typeof value !== 'string') {
-      return '';
-    }
-    return value.replace(/\s+/g, ' ').trim();
+    return resolveChatNormalizedMessageValue(value);
   }, []);
 
   const normalizedCurrentMessage = useMemo(() => normalizeMessageValue(message), [message, normalizeMessageValue]);
@@ -5242,76 +7137,105 @@ export default function Chat() {
     return normalized.length > 60 ? `${normalized.slice(0, 60)}…` : normalized;
   }, [editingMessageInfo]);
 
-  const canAttemptSend = useMemo(() => {
-    if (!trimmedMessageValue) return false;
-    if (!selectedTeamMember) return false;
-    if (processingKeyboardMedia) return false;
-    if (messageCharacterCount > CHAT_MESSAGE_MAX_CHARS) return false;
-    if (messageWordCount > CHAT_MESSAGE_MAX_WORDS) return false;
-    if (editingMessageInfo) {
-      return hasEditedMessageChanged;
+  const replyingPreviewText = useMemo(() => {
+    if (!replyingToMessage) {
+      return '';
     }
-    return true;
+
+    return resolveChatReplyPreviewText({
+      text: replyingToMessage.text,
+      isSpecial: replyingToMessage.isSpecial,
+      hasAttachments: replyingToMessage.hasAttachments,
+      attachmentCount: replyingToMessage.attachmentCount,
+      hasSticker: replyingToMessage.hasSticker,
+      hasGif: replyingToMessage.hasGif,
+      maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
+    });
+  }, [replyingToMessage]);
+
+  const replyingSenderLabel = useMemo(
+    () => resolveChatReplySenderLabel({
+      sender: replyingToMessage?.sender,
+      senderName: replyingToMessage?.senderName,
+      effectiveUserEmail,
+      selectedMemberEmail: selectedTeamMember?.email,
+      selectedMemberName: selectedTeamMember?.name,
+    }),
+    [effectiveUserEmail, replyingToMessage, selectedTeamMember?.email, selectedTeamMember?.name]
+  );
+
+  const canAttemptSend = useMemo(() => {
+    return canAttemptChatComposerSend({
+      trimmedMessage: trimmedMessageValue,
+      hasSelectedRecipient: !!selectedTeamMember,
+      messageCharacterCount,
+      messageWordCount,
+      maxChars: CHAT_MESSAGE_MAX_CHARS,
+      maxWords: CHAT_MESSAGE_MAX_WORDS,
+      isEditingMessage: !!editingMessageInfo,
+      hasEditedMessageChanged,
+    });
   }, [
     trimmedMessageValue,
     selectedTeamMember,
-    processingKeyboardMedia,
     messageCharacterCount,
     messageWordCount,
     editingMessageInfo,
     hasEditedMessageChanged,
   ]);
 
+  const isMessageOverLimit = useMemo(() => {
+    return isChatComposerMessageOverLimit({
+      messageCharacterCount,
+      messageWordCount,
+      maxChars: CHAT_MESSAGE_MAX_CHARS,
+      maxWords: CHAT_MESSAGE_MAX_WORDS,
+    });
+  }, [messageCharacterCount, messageWordCount]);
+
   const resolvePendingMessageStatus = useCallback((pendingMsg?: PendingMessage): NonNullable<PendingMessage['status']> => {
     return normalizePendingMessageStatus(pendingMsg?.status);
   }, []);
 
   const getPendingMessageBubbleOpacity = useCallback((tempId: string) => {
-    let opacity = pendingMessageBubbleOpacityRef.current.get(tempId);
-    if (!opacity) {
-      opacity = new Animated.Value(0.7);
-      pendingMessageBubbleOpacityRef.current.set(tempId, opacity);
-    }
-    return opacity;
+    return resolveChatPendingBubbleOpacityEntry(
+      pendingMessageBubbleOpacityRef.current,
+      tempId,
+      () => new Animated.Value(PENDING_MESSAGE_BUBBLE_OPACITY_DEFAULT)
+    );
   }, []);
 
   const getPendingRowAnimation = useCallback(
     (rowKey: string, direction: 'incoming' | 'outgoing' = 'outgoing') => {
-      let entry = pendingRowAnimationRef.current.get(rowKey);
-      const isIncoming = direction === 'incoming';
-      const enterOffset = isIncoming ? -12 : 8;
-      const enterScale = isIncoming ? 0.985 : 0.99;
-      const fadeDuration = isIncoming ? 260 : 180;
-      const slideDuration = isIncoming ? 280 : 210;
-      const scaleDuration = isIncoming ? 220 : 170;
-      if (!entry) {
-        entry = {
+      const timings = resolveChatPendingRowAnimationTimings(direction);
+      const entry = resolveChatPendingRowAnimationEntry(
+        pendingRowAnimationRef.current,
+        rowKey,
+        () => ({
           opacity: new Animated.Value(0),
-          translateX: new Animated.Value(enterOffset),
-          scale: new Animated.Value(enterScale),
-          started: false,
-        };
-        pendingRowAnimationRef.current.set(rowKey, entry);
-      }
+          translateX: new Animated.Value(timings.enterOffset),
+          scale: new Animated.Value(timings.enterScale),
+        })
+      );
 
-      if (!entry.started) {
-        entry.started = true;
+      if (shouldStartPendingRowAnimation(entry)) {
+        markPendingRowAnimationStarted(entry);
         Animated.parallel([
           Animated.timing(entry.opacity, {
             toValue: 1,
-            duration: fadeDuration,
+            duration: timings.fadeDuration,
             easing: Easing.out(Easing.cubic),
             useNativeDriver: Platform.OS !== 'web',
           }),
           Animated.timing(entry.translateX, {
             toValue: 0,
-            duration: slideDuration,
+            duration: timings.slideDuration,
             easing: Easing.out(Easing.cubic),
             useNativeDriver: Platform.OS !== 'web',
           }),
           Animated.timing(entry.scale, {
             toValue: 1,
-            duration: scaleDuration,
+            duration: timings.scaleDuration,
             easing: Easing.out(Easing.cubic),
             useNativeDriver: Platform.OS !== 'web',
           }),
@@ -5324,15 +7248,19 @@ export default function Chat() {
   );
 
   useEffect(() => {
-    const activeKeys = new Set<string>();
-    pendingMessages.forEach((_value, tempId) => activeKeys.add(`text:${tempId}`));
-    pendingMedia.forEach((_value, tempId) => activeKeys.add(`media:${tempId}`));
-    pendingAttachments.forEach((_value, tempId) => activeKeys.add(`attachment:${tempId}`));
+    const activeKeys = resolveChatActivePendingAnimationKeys({
+      pendingTextIds: pendingMessages.keys(),
+      pendingMediaIds: pendingMedia.keys(),
+      pendingAttachmentIds: pendingAttachments.keys(),
+    });
 
-    for (const key of Array.from(pendingRowAnimationRef.current.keys())) {
-      if (!activeKeys.has(key)) {
-        pendingRowAnimationRef.current.delete(key);
-      }
+    const inactiveKeys = resolveChatInactivePendingAnimationKeys(
+      pendingRowAnimationRef.current.keys() as any as Set<string>,
+      activeKeys
+    );
+
+    for (const key of inactiveKeys) {
+      pendingRowAnimationRef.current.delete(key);
     }
   }, [pendingMessages, pendingMedia, pendingAttachments]);
 
@@ -5412,7 +7340,7 @@ export default function Chat() {
       return;
     }
 
-    if (messageCharacterCount > CHAT_MESSAGE_MAX_CHARS || messageWordCount > CHAT_MESSAGE_MAX_WORDS) {
+    if (isMessageOverLimit) {
       const limited = enforceMessageLimits(message);
       if (limited !== message) {
         setMessage(limited);
@@ -5437,22 +7365,25 @@ export default function Chat() {
     }
 
     const senderEmail = effectiveUser?.email || user?.email || '';
+    const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
     const buildPendingTextMessage = (
       tempId: string,
       text: string,
-      status: NonNullable<PendingMessage['status']>
+      status: NonNullable<PendingMessage['status']>,
+      replyTo?: ChatReplyContext
     ): PendingMessage => ({
       id: tempId,
       text,
       timestamp: new Date().toISOString(),
       recipientId: recipient.id,
       sender: senderEmail,
+      replyTo,
       status,
     });
 
     if (isOffline) {
       const tempId = `pending_${Date.now()}_${Math.random()}`;
-      const pendingMessage = buildPendingTextMessage(tempId, trimmedMessage, 'queued');
+      const pendingMessage = buildPendingTextMessage(tempId, trimmedMessage, 'queued', activeReplyContext);
 
       setPendingMessages((prev) => {
         const next = new Map(prev);
@@ -5493,10 +7424,6 @@ export default function Chat() {
     setIsSendingMessage(false);
 
     try {
-      if (effectiveUserEmail && selectedMemberEmail) {
-        chatService.setTypingStatus(effectiveUserEmail, selectedMemberEmail, false);
-      }
-
       let messageText = trimmedMessage;
       let isSpecialMessage = false;
 
@@ -5508,13 +7435,13 @@ export default function Chat() {
       if (!isSpecialMessage) {
         const rich = await handleRichTextInput(messageText);
         if (rich.type === 'sticker' && typeof rich.content === 'object') {
-          await handleStickerSelect(rich.content);
+          await handleStickerSelect(rich.content, { replyTo: activeReplyContext });
           dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
           if (isAtBottomRef.current) {
               scheduleScrollToBottom();
           } else {
-            setShowScrollToBottom(true);
-            setUnseenCount((c) => c + 1);
+            setShowScrollToBottomSafely(true);
+            incrementUnseenCount();
           }
           return;
         }
@@ -5531,12 +7458,13 @@ export default function Chat() {
         latestMessageRef.current = originalMessage;
         setShowSpecialCommand(wasShowingSpecialCommand);
         setIsComposingSpecial(wasComposingSpecial);
+        setReplyingToMessage(activeReplyContext || null);
         return;
       }
 
       const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       optimisticTempId = tempId;
-      optimisticPendingMessage = buildPendingTextMessage(tempId, messageText, 'sending');
+      optimisticPendingMessage = buildPendingTextMessage(tempId, messageText, 'sending', activeReplyContext);
 
       setPendingMessages((prev) => {
         const next = new Map(prev);
@@ -5550,7 +7478,9 @@ export default function Chat() {
         logger.warn('Failed to persist sending pending message:', storageError);
       }
 
-      const serverMessageId = await sendMessage(messageText, isSpecialMessage, recipient.id);
+      const serverMessageId = await sendMessage(messageText, isSpecialMessage, recipient.id, {
+        replyTo: activeReplyContext,
+      });
 
       if (optimisticTempId) {
         const idToUpdate = optimisticTempId;
@@ -5596,8 +7526,8 @@ export default function Chat() {
       if (isAtBottomRef.current) {
         scheduleScrollToBottom({ animated: true, delay: 150 });
       } else {
-        setShowScrollToBottom(true);
-        setUnseenCount((c) => c + 1);
+        setShowScrollToBottomSafely(true);
+        incrementUnseenCount();
       }
     } catch (error) {
       if (optimisticTempId && optimisticPendingMessage) {
@@ -5639,6 +7569,7 @@ export default function Chat() {
           latestMessageRef.current = originalMessage;
           setShowSpecialCommand(wasShowingSpecialCommand);
           setIsComposingSpecial(wasComposingSpecial);
+          setReplyingToMessage(activeReplyContext || null);
         }
         return;
       }
@@ -5655,6 +7586,7 @@ export default function Chat() {
         latestMessageRef.current = originalMessage;
         setShowSpecialCommand(wasShowingSpecialCommand);
         setIsComposingSpecial(wasComposingSpecial);
+        setReplyingToMessage(activeReplyContext || null);
       }
     } finally {
       sendInFlightRef.current = false;
@@ -5676,20 +7608,32 @@ export default function Chat() {
     message,
     messageCharacterCount,
     messageWordCount,
+    isMessageOverLimit,
     enforceMessageLimits,
     showSpecialCommand,
     isComposingSpecial,
+    replyingToMessage,
     effectiveUserEmail,
     selectedMemberEmail,
     handleRichTextInput,
     handleStickerSelect,
     dismissUnreadDividerForCurrentBatch,
     isAtBottomRef,
+    incrementUnseenCount,
     scrollToBottom,
     sendMessage,
     sendMessageNotification,
+    setShowScrollToBottomSafely,
     hasEditedMessageChanged,
   ]);
+
+  const handleComposerBlur = useCallback(() => {
+    clearActiveTypingStatus('clear_active');
+  }, [clearActiveTypingStatus]);
+
+  useEffect(() => {
+    clearActiveTypingStatus('pair_change');
+  }, [effectiveUserEmail, selectedMemberEmail, clearActiveTypingStatus]);
 
   const handleTyping = useCallback((text: string) => {
     const limitedText = enforceMessageLimits(text);
@@ -5701,58 +7645,46 @@ export default function Chat() {
     // Only update input; conversion to sticker happens on send
     setMessage(limitedText);
     latestMessageRef.current = limitedText;
-    
-    // Check for /special command
-    if (limitedText.startsWith('/special')) {
-      if (limitedText === '/special') {
-        setShowSpecialCommand(true);
-        setIsComposingSpecial(false);
-      } else if (limitedText.startsWith('/special ')) {
-        setShowSpecialCommand(false);
-        setIsComposingSpecial(true);
-      } else {
-        setShowSpecialCommand(false);
-        setIsComposingSpecial(false);
-      }
-    } else {
-      setShowSpecialCommand(false);
-      setIsComposingSpecial(false);
-    }
-    
-    // Calculate height based on text content for better responsiveness
-    const lineHeight = 20; // Approximate line height
-    const padding = 20; // Top and bottom padding
-    const lines = limitedText.split('\n').length;
-    const estimatedHeight = Math.max(40, Math.min(120, (lines * lineHeight) + padding));
-    setInputHeight(estimatedHeight);
-    
-    // Remember the height when user is actively typing (non-empty text)
-    // Reset to minimum height if user manually clears all text
-    if (limitedText.trim().length > 0) {
-      setLastTypingHeight(estimatedHeight);
-    } else if (limitedText.length === 0) {
-      setLastTypingHeight(40);
-    }
 
-    if (!effectiveUserEmail || !selectedMemberEmail) {
-      if (typingTimeoutRef.current) {
-        clearTimeout(typingTimeoutRef.current);
-        typingTimeoutRef.current = null;
-      }
-      return;
-    }
+    updateSpecialComposerState(limitedText);
+
+    const nextTypingPair = createChatTypingPair(effectiveUserEmail, selectedMemberEmail);
+    const transition = resolveChatTypingTransition({
+      activePair: typingStatusPairRef.current,
+      isTypingActive: typingStatusActiveRef.current,
+      nextPair: nextTypingPair,
+      hasMessageContent: limitedText.trim().length > 0,
+    });
+
+    setTypingStatusForPair(transition.pairToClear, false, 'transition_clear');
     
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
 
-    chatService.setTypingStatus(effectiveUserEmail, selectedMemberEmail, true);
+    setTypingStatusForPair(transition.pairToActivate, true, 'transition_activate');
 
+    typingStatusPairRef.current = transition.nextActivePair;
+    typingStatusActiveRef.current = transition.nextIsTypingActive;
+
+    if (!transition.shouldScheduleTimeout || !transition.nextActivePair) {
+      return;
+    }
+
+    const timeoutTypingPair = transition.nextActivePair;
     typingTimeoutRef.current = setTimeout(() => {
-      chatService.setTypingStatus(effectiveUserEmail, selectedMemberEmail, false);
+      const trackedTypingPair = typingStatusPairRef.current;
+      const isMatchingPair = areChatTypingPairsEqual(trackedTypingPair, timeoutTypingPair);
+
+      if (isMatchingPair) {
+        setTypingStatusForPair(timeoutTypingPair, false, 'timeout_clear');
+        typingStatusPairRef.current = null;
+        typingStatusActiveRef.current = false;
+      }
+
       typingTimeoutRef.current = null;
     }, 1000);
-  }, [effectiveUserEmail, selectedMemberEmail, enforceMessageLimits]);
+    }, [effectiveUserEmail, selectedMemberEmail, enforceMessageLimits, setTypingStatusForPair, updateSpecialComposerState]);
 
   // Handle special command selection
   const handleSpecialCommandSelect = useCallback(() => {
@@ -5799,8 +7731,10 @@ export default function Chat() {
 
   const handleBackToChatList = useCallback(() => {
     Keyboard.dismiss();
+    closeMessageInfoModal();
+    closeConversationSearch();
     setSelectedTeamMember(null);
-  }, []);
+  }, [closeConversationSearch, closeMessageInfoModal]);
 
   // Android hardware back handling: close overlays first, otherwise go from chat detail back to chat list
   useFocusEffect(
@@ -5811,7 +7745,9 @@ export default function Chat() {
         if (attachmentModalVisible) { closeAttachmentModal(); return true; }
         if (imageViewerVisible) { closeImageViewer(); return true; }
         if (filePreviewVisible) { resetFilePreviewModal(); return true; }
+        if (messageInfoModalState.visible) { closeMessageInfoModal(); return true; }
         if (chatProfileModalVisible) { closeChatProfileModal(); return true; }
+        if (conversationSearchVisible) { closeConversationSearch(); return true; }
         if (selectedTeamMember) { handleBackToChatList(); return true; }
         return false;
       };
@@ -5823,33 +7759,21 @@ export default function Chat() {
       attachmentModalVisible,
       imageViewerVisible,
       filePreviewVisible,
+      messageInfoModalState.visible,
       chatProfileModalVisible,
+      conversationSearchVisible,
       selectedTeamMember,
       closeStickerGifPicker,
       closeAttachmentModal,
       closeImageViewer,
+      closeMessageInfoModal,
       closeChatProfileModal,
+      closeConversationSearch,
       closeEmojiPicker,
       handleBackToChatList,
       resetFilePreviewModal,
     ])
   );
-
-  // Handle input height change for auto-expanding text input (secondary fallback)
-  const handleInputSizeChange = (event: any) => {
-    const { height } = event.nativeEvent.contentSize;
-    const newHeight = Math.max(40, Math.min(120, height)); // Min 40px, max 120px
-    setInputHeight(newHeight);
-    
-    // If the input has content, remember this height
-    // Reset to minimum height if user manually clears all text
-    if (message.trim().length > 0) {
-      setLastTypingHeight(newHeight);
-    } else if (message.length === 0) {
-      // User manually cleared input - reset to minimum height
-      setLastTypingHeight(40);
-    }
-  };
 
   const buildWebDroppedFiles = useCallback(async (droppedFiles: any): Promise<any[]> => {
     const items = Array.from(droppedFiles || []);
@@ -6295,6 +8219,7 @@ export default function Chat() {
 
   const handleSendWithFiles = async () => {
     if (!selectedTeamMember || selectedFiles.length === 0) return;
+    const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
     
     setIsUploading(true);
     setUploadProgress(0);
@@ -6322,6 +8247,7 @@ export default function Chat() {
           messageText: message.trim(),
           recipientId: selectedTeamMember.id,
           sender: effectiveUser?.email || '',
+          replyTo: activeReplyContext,
           status: 'sending',
           progress: 0,
           cancelable: false,
@@ -6376,6 +8302,7 @@ export default function Chat() {
               return next;
             });
           },
+          replyTo: activeReplyContext,
         }
       );
       
@@ -6716,7 +8643,7 @@ export default function Chat() {
     pack?: string;
     width?: number;
     height?: number;
-  }) {
+  }, options?: { replyTo?: ChatReplyContext }) {
     if (!selectedTeamMember || !effectiveUser?.email) {
       Toast.show({
         type: 'error',
@@ -6726,6 +8653,8 @@ export default function Chat() {
       });
       return;
     }
+
+    const activeReplyContext = options?.replyTo ?? (replyingToMessage ? { ...replyingToMessage } : undefined);
 
     // Optimistic pending sticker
     const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -6740,11 +8669,14 @@ export default function Chat() {
         timestamp: new Date().toISOString(),
         recipientId: selectedTeamMember.id,
         sender: effectiveUser.email,
+        replyTo: activeReplyContext,
         status: 'sending',
         source: 'picker',
       }));
 
-      const serverMessageId = await sendSticker(sticker, selectedTeamMember.id);
+      const serverMessageId = await sendSticker(sticker, selectedTeamMember.id, {
+        replyTo: activeReplyContext,
+      });
       setPendingMedia(prev => {
         const next = new Map(prev);
         const cur = next.get(tempId);
@@ -6753,6 +8685,12 @@ export default function Chat() {
         }
         return next;
       });
+
+      if (activeReplyContext) {
+        setReplyingToMessage((current) =>
+          current && current.messageId === activeReplyContext.messageId ? null : current
+        );
+      }
       
       // Send notification to recipient for sticker
       await sendMessageNotification('Sent a sticker', false, sticker);
@@ -6768,8 +8706,8 @@ export default function Chat() {
       if (isAtBottomRef.current) {
         scheduleScrollToBottom();
       } else {
-        setShowScrollToBottom(true);
-        setUnseenCount((c) => c + 1);
+        setShowScrollToBottomSafely(true);
+        incrementUnseenCount();
       }
     } catch (error) {
       // Mark pending as failed
@@ -6810,7 +8748,7 @@ export default function Chat() {
     height?: number;
     title?: string;
     source?: string;
-  }) => {
+  }, options?: { replyTo?: ChatReplyContext }) => {
     if (!selectedTeamMember || !effectiveUser?.email) {
       Toast.show({
         type: 'error',
@@ -6820,6 +8758,8 @@ export default function Chat() {
       });
       return;
     }
+
+    const activeReplyContext = options?.replyTo ?? (replyingToMessage ? { ...replyingToMessage } : undefined);
 
     // Optimistic pending GIF
     const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -6834,11 +8774,14 @@ export default function Chat() {
         timestamp: new Date().toISOString(),
         recipientId: selectedTeamMember.id,
         sender: effectiveUser.email,
+        replyTo: activeReplyContext,
         status: 'sending',
         source: 'picker',
       }));
 
-      const serverMessageId = await sendGif(gif, selectedTeamMember.id);
+      const serverMessageId = await sendGif(gif, selectedTeamMember.id, {
+        replyTo: activeReplyContext,
+      });
       setPendingMedia(prev => {
         const next = new Map(prev);
         const cur = next.get(tempId);
@@ -6847,6 +8790,12 @@ export default function Chat() {
         }
         return next;
       });
+
+      if (activeReplyContext) {
+        setReplyingToMessage((current) =>
+          current && current.messageId === activeReplyContext.messageId ? null : current
+        );
+      }
       
       // Send notification to recipient for GIF
       await sendMessageNotification('Sent a GIF', false, undefined, gif);
@@ -6862,8 +8811,8 @@ export default function Chat() {
       if (isAtBottomRef.current) {
         scheduleScrollToBottom();
       } else {
-        setShowScrollToBottom(true);
-        setUnseenCount((c) => c + 1);
+        setShowScrollToBottomSafely(true);
+        incrementUnseenCount();
       }
     } catch (error) {
       // Mark pending as failed
@@ -6899,6 +8848,7 @@ export default function Chat() {
   // Process keyboard-provided URI into a chat message (GIF/image/sticker)
   const processKeyboardMediaUri = async (uri: string, mime?: string) => {
     if (!selectedTeamMember || !effectiveUser?.email) return;
+    const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
 
     try {
       const kind = detectMediaTypeFromUri(uri, mime);
@@ -6920,7 +8870,12 @@ export default function Chat() {
           finalUrl = uploaded.url;
         }
         const gif = { url: finalUrl, source: 'keyboard' } as const;
-        await sendGif(gif, selectedTeamMember.id);
+        await sendGif(gif, selectedTeamMember.id, { replyTo: activeReplyContext });
+        if (activeReplyContext) {
+          setReplyingToMessage((current) =>
+            current && current.messageId === activeReplyContext.messageId ? null : current
+          );
+        }
         await sendMessageNotification('Sent a GIF', false, undefined, gif as any);
         return;
       }
@@ -6943,7 +8898,12 @@ export default function Chat() {
           finalUrl = uploaded.url;
         }
         const sticker = { url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as const;
-        await sendSticker(sticker as any, selectedTeamMember.id);
+        await sendSticker(sticker as any, selectedTeamMember.id, { replyTo: activeReplyContext });
+        if (activeReplyContext) {
+          setReplyingToMessage((current) =>
+            current && current.messageId === activeReplyContext.messageId ? null : current
+          );
+        }
         await sendMessageNotification('Sent a sticker', false, sticker as any);
         return;
       }
@@ -6965,7 +8925,12 @@ export default function Chat() {
         finalUrl = uploaded.url;
       }
       const sticker = { url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as const;
-      await sendSticker(sticker as any, selectedTeamMember.id);
+      await sendSticker(sticker as any, selectedTeamMember.id, { replyTo: activeReplyContext });
+      if (activeReplyContext) {
+        setReplyingToMessage((current) =>
+          current && current.messageId === activeReplyContext.messageId ? null : current
+        );
+      }
       await sendMessageNotification('Sent a sticker', false, sticker as any);
     } catch (error) {
       if (error instanceof ChatRateLimitError) {
@@ -7129,25 +9094,15 @@ export default function Chat() {
 
   const removeSelectedFilePressHandlersRef = useRef<Map<number, () => void>>(new Map());
   const getRemoveSelectedFilePressHandler = useCallback((index: number) => {
-    const cached = removeSelectedFilePressHandlersRef.current.get(index);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      removeSelectedFileRef.current(index);
-    };
-    removeSelectedFilePressHandlersRef.current.set(index, handler);
-    return handler;
+    return resolveMapCacheEntry(removeSelectedFilePressHandlersRef.current, index, () => {
+      return () => {
+        removeSelectedFileRef.current(index);
+      };
+    });
   }, []);
 
   useEffect(() => {
-    const handlers = removeSelectedFilePressHandlersRef.current;
-    for (const index of Array.from(handlers.keys())) {
-      if (index < 0 || index >= selectedFiles.length) {
-        handlers.delete(index);
-      }
-    }
+    pruneMapByNumericRange(removeSelectedFilePressHandlersRef.current, selectedFiles.length);
   }, [selectedFiles.length]);
 
   const formatFileSize = (bytes: number): string => {
@@ -7158,134 +9113,93 @@ export default function Chat() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
   };
 
-  // Animated wrapper component for messages
-  const AnimatedMessageWrapper = React.memo(function AnimatedMessageWrapper({
-    children, 
-    isNewMessage, 
-    messageId,
-    isIncomingMessage = false 
-  }: { 
-    children: React.ReactNode; 
-    isNewMessage: boolean; 
-    messageId: string;
-    isIncomingMessage?: boolean;
-  }) {
-    const fadeAnim = useRef(new Animated.Value(1)).current; // Start as visible
-    const slideYAnim = useRef(new Animated.Value(0)).current; // Start in position
-    const slideXAnim = useRef(new Animated.Value(0)).current; // Start in position
-    const scaleAnim = useRef(new Animated.Value(1)).current; // Start at normal size
+  // AnimatedMessageWrapper – now imported from @/components/chat/AnimatedMessageWrapper
+  // MessageRow – now imported from @/components/chat/MessageRow
 
-    useEffect(() => {
-      // FlashList recycles rows; reset transforms for rows that should not animate.
-      if (!isNewMessage || !isFocused) {
-        fadeAnim.setValue(1);
-        slideYAnim.setValue(0);
-        slideXAnim.setValue(0);
-        scaleAnim.setValue(1);
-      }
-    }, [isNewMessage, isFocused, fadeAnim, slideYAnim, slideXAnim, scaleAnim]);
-
-    useEffect(() => {
-      // Check if this message should be animated
-      if (isNewMessage && !globalAnimatedMessages.current.has(messageId)) {
-        globalAnimatedMessages.current.add(messageId);
-        const enterOffsetX = isIncomingMessage ? -12 : 10;
-        const enterOffsetY = isIncomingMessage ? 6 : 4;
-        const enterScale = isIncomingMessage ? 0.985 : 0.99;
-        const fadeDuration = isIncomingMessage ? 320 : 220;
-        const slideXDuration = isIncomingMessage ? 340 : 240;
-        const slideYDuration = isIncomingMessage ? 320 : 220;
-        const scaleDuration = isIncomingMessage ? 270 : 190;
-        
-        // Reset animation values for entrance animation
-        fadeAnim.setValue(0);
-        slideYAnim.setValue(enterOffsetY);
-        slideXAnim.setValue(enterOffsetX);
-        scaleAnim.setValue(enterScale);
-        
-        // Animate the message entrance
-        Animated.parallel([
-          Animated.timing(fadeAnim, {
-            toValue: 1,
-            duration: fadeDuration,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: Platform.OS !== 'web',
-          }),
-          Animated.timing(slideXAnim, {
-            toValue: 0,
-            duration: slideXDuration,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: Platform.OS !== 'web',
-          }),
-          Animated.timing(slideYAnim, {
-            toValue: 0,
-            duration: slideYDuration,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: Platform.OS !== 'web',
-          }),
-          Animated.timing(scaleAnim, {
-            toValue: 1,
-            duration: scaleDuration,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: Platform.OS !== 'web',
-          }),
-        ]).start();
-      }
-    }, [
-      isNewMessage,
-      messageId,
-      fadeAnim,
-      slideXAnim,
-      slideYAnim,
-      scaleAnim,
-      isIncomingMessage,
-      isFocused,
-    ]);
-
-    return (
-      <Animated.View
-        style={{
-          opacity: fadeAnim,
-          transform: [
-            { translateX: slideXAnim },
-            { translateY: slideYAnim },
-            { scale: scaleAnim }
-          ],
-        }}
-      >
-        {children}
-      </Animated.View>
-    );
-  });
-
-  AnimatedMessageWrapper.displayName = 'AnimatedMessageWrapper';
-
-  const renderMessageRef = useRef(
-    (
-      _msg: any,
-      _reactionsOverride?: { [key: string]: Set<string> },
-      _isEditingOverride?: boolean
-    ) => null as React.ReactNode
+  // ── Stable wrappers for functions that are not useCallback (needed for ChatContext) ──
+  const handleMessageLongPressRef = useRef(handleMessageLongPress);
+  useEffect(() => { handleMessageLongPressRef.current = handleMessageLongPress; });
+  const stableHandleMessageLongPress = useCallback(
+    (messageId: string, event: any) => handleMessageLongPressRef.current(messageId, event),
+    []
   );
 
-  const MessageRow = useMemo(() => {
-    const Row = ({ item }: { item: any }) => {
-      const messageId = typeof item?.id === 'string' ? item.id : String(item?.id ?? '');
-      const uiState = useMessageUiState(messageId);
-      const renderedMessage = renderMessageRef.current(item, uiState.reactions, uiState.isEditing);
-      if (typeof renderedMessage === 'string') {
-        logger.warn('⚠️ renderMessage returned string:', JSON.stringify(renderedMessage));
-        logger.warn('⚠️ Message object:', JSON.stringify(item, null, 2));
-        return null;
-      }
-      return renderedMessage;
-    };
-
-    Row.displayName = 'MessageRow';
-    return Row;
-  }, []);
+  const handleImageErrorRef = useRef(handleImageError);
+  useEffect(() => { handleImageErrorRef.current = handleImageError; });
+  const stableHandleImageError = useCallback(
+    (url: string) => handleImageErrorRef.current(url),
+    []
+  );
 
   const noopPressHandler = useCallback(() => {}, []);
+  const focusConversationSearchMatchRef = useRef(focusConversationSearchMatch);
+  useEffect(() => {
+    focusConversationSearchMatchRef.current = focusConversationSearchMatch;
+  }, [focusConversationSearchMatch]);
+
+  const conversationSearchJumpHandlersRef = useRef<Map<number, () => void>>(new Map());
+  const getConversationSearchJumpHandler = useCallback((matchIndex: number) => {
+    if (!Number.isInteger(matchIndex) || matchIndex < 0) {
+      return noopPressHandler;
+    }
+
+    return resolveMapCacheEntry(conversationSearchJumpHandlersRef.current, matchIndex, () => {
+      return () => {
+        void focusConversationSearchMatchRef.current(matchIndex, { animated: true });
+      };
+    });
+  }, [noopPressHandler]);
+
+  useEffect(() => {
+    pruneMapByNumericRange(
+      conversationSearchJumpHandlersRef.current,
+      conversationSearchMatchIds.length
+    );
+  }, [conversationSearchMatchIds.length]);
+
+  const messageDateLabelByIdRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    messageDateLabelByIdRef.current = messageRowMetaById.dateLabelById;
+  }, [messageRowMetaById]);
+
+  const messageLayoutHandlersRef = useRef<Map<string, (event: any) => void>>(new Map());
+  const getMessageLayoutHandler = useCallback((messageId: string) => {
+    return resolveMapCacheEntry(messageLayoutHandlersRef.current, messageId, () => {
+      return (event: any) => {
+        const y = event?.nativeEvent?.layout?.y;
+        const height = event?.nativeEvent?.layout?.height;
+        if (typeof y !== 'number' || typeof height !== 'number') {
+          return;
+        }
+
+        const currentDate = messageDateLabelByIdRef.current.get(messageId) || '';
+        const newPosition = { y, height, date: currentDate };
+        const existing = messagePositionsRef.current[messageId];
+
+        if (
+          existing &&
+          existing.y === newPosition.y &&
+          existing.height === newPosition.height &&
+          existing.date === newPosition.date
+        ) {
+          return;
+        }
+
+        messagePositionsRef.current[messageId] = newPosition;
+      };
+    });
+  }, []);
+
+  const displayedMessageIdSet = useMemo(() => {
+    return resolveChatDisplayedMessageIdSet(displayedMessages, (message: any) => {
+      return normalizeMessageId(message?.id);
+    });
+  }, [displayedMessages, normalizeMessageId]);
+
+  useEffect(() => {
+    pruneMapByKeySet(messageLayoutHandlersRef.current, displayedMessageIdSet);
+  }, [displayedMessageIdSet]);
+
   const handleReactionRef = useRef(handleReaction);
   useEffect(() => {
     handleReactionRef.current = handleReaction;
@@ -7303,36 +9217,16 @@ export default function Chat() {
     }
 
     const cacheKey = `${normalizedMessageId}::${reactionType}`;
-    const cached = reactionPressHandlersRef.current.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void handleReactionRef.current(normalizedMessageId, reactionType);
-    };
-    reactionPressHandlersRef.current.set(cacheKey, handler);
-    return handler;
+    return resolveMapCacheEntry(reactionPressHandlersRef.current, cacheKey, () => {
+      return () => {
+        void handleReactionRef.current(normalizedMessageId, reactionType);
+      };
+    });
   }, [normalizeMessageId, noopPressHandler]);
 
   useEffect(() => {
-    const visibleMessageIds = new Set<string>();
-    displayedMessages.forEach((message: any) => {
-      const id = normalizeMessageId(message?.id);
-      if (id) {
-        visibleMessageIds.add(id);
-      }
-    });
-
-    const handlers = reactionPressHandlersRef.current;
-    for (const key of Array.from(handlers.keys())) {
-      const separatorIndex = key.indexOf('::');
-      const messageId = separatorIndex >= 0 ? key.slice(0, separatorIndex) : '';
-      if (!visibleMessageIds.has(messageId)) {
-        handlers.delete(key);
-      }
-    }
-  }, [displayedMessages, normalizeMessageId]);
+    pruneDelimitedMapByPrefixSet(reactionPressHandlersRef.current, displayedMessageIdSet, '::');
+  }, [displayedMessageIdSet]);
 
   const lastTapByMessageIdRef = useRef<Map<string, number>>(new Map());
   const quickTapReactionHandlersRef = useRef<Map<string, () => void>>(new Map());
@@ -7342,48 +9236,23 @@ export default function Chat() {
       return noopPressHandler;
     }
 
-    const cached = quickTapReactionHandlersRef.current.get(normalizedMessageId);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      const now = Date.now();
-      const lastTap = lastTapByMessageIdRef.current.get(normalizedMessageId) || 0;
-      const isDoubleTap = now - lastTap < 300;
-      lastTapByMessageIdRef.current.set(normalizedMessageId, isDoubleTap ? 0 : now);
-      if (isDoubleTap) {
-        void handleQuickReactionRef.current(normalizedMessageId);
-      }
-    };
-
-    quickTapReactionHandlersRef.current.set(normalizedMessageId, handler);
-    return handler;
+    return resolveMapCacheEntry(quickTapReactionHandlersRef.current, normalizedMessageId, () => {
+      return () => {
+        const now = Date.now();
+        const lastTap = lastTapByMessageIdRef.current.get(normalizedMessageId) || 0;
+        const isDoubleTap = now - lastTap < 300;
+        lastTapByMessageIdRef.current.set(normalizedMessageId, isDoubleTap ? 0 : now);
+        if (isDoubleTap) {
+          void handleQuickReactionRef.current(normalizedMessageId);
+        }
+      };
+    });
   }, [normalizeMessageId, noopPressHandler]);
 
   useEffect(() => {
-    const visibleMessageIds = new Set<string>();
-    displayedMessages.forEach((message: any) => {
-      const id = normalizeMessageId(message?.id);
-      if (id) {
-        visibleMessageIds.add(id);
-      }
-    });
-
-    const handlers = quickTapReactionHandlersRef.current;
-    for (const messageId of Array.from(handlers.keys())) {
-      if (!visibleMessageIds.has(messageId)) {
-        handlers.delete(messageId);
-      }
-    }
-
-    const tapState = lastTapByMessageIdRef.current;
-    for (const messageId of Array.from(tapState.keys())) {
-      if (!visibleMessageIds.has(messageId)) {
-        tapState.delete(messageId);
-      }
-    }
-  }, [displayedMessages, normalizeMessageId]);
+    pruneMapByKeySet(quickTapReactionHandlersRef.current, displayedMessageIdSet);
+    pruneMapByKeySet(lastTapByMessageIdRef.current, displayedMessageIdSet);
+  }, [displayedMessageIdSet]);
 
   const handleImageViewRef = useRef(handleImageView);
   useEffect(() => {
@@ -7407,21 +9276,15 @@ export default function Chat() {
 
   const getAttachmentImageViewPressHandler = useCallback((attachment: HydratedAttachment) => {
     const cacheKey = getAttachmentPressKey(attachment);
-    const cached = attachmentImagePressHandlersRef.current.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void handleImageViewRef.current(
-        attachment.resolvedUrl || attachment.url,
-        attachment.url,
-        attachment.fileName
-      );
-    };
-
-    attachmentImagePressHandlersRef.current.set(cacheKey, handler);
-    return handler;
+    return resolveMapCacheEntry(attachmentImagePressHandlersRef.current, cacheKey, () => {
+      return () => {
+        void handleImageViewRef.current(
+          attachment.resolvedUrl || attachment.url,
+          attachment.url,
+          attachment.fileName
+        );
+      };
+    });
   }, [getAttachmentPressKey]);
 
   const getAttachmentDownloadPressHandler = useCallback((
@@ -7431,913 +9294,247 @@ export default function Chat() {
     const downloadName = fallbackFileName || attachment.fileName || 'File';
     const baseKey = getAttachmentPressKey(attachment);
     const cacheKey = `${baseKey}::download::${downloadName}`;
-    const cached = attachmentDownloadPressHandlersRef.current.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void handleDownloadFileRef.current(
-        attachment.url,
-        downloadName,
-        attachment.resolvedUrl
-      );
-    };
-
-    attachmentDownloadPressHandlersRef.current.set(cacheKey, handler);
-    return handler;
+    return resolveMapCacheEntry(attachmentDownloadPressHandlersRef.current, cacheKey, () => {
+      return () => {
+        void handleDownloadFileRef.current(
+          attachment.url,
+          downloadName,
+          attachment.resolvedUrl
+        );
+      };
+    });
   }, [getAttachmentPressKey]);
 
   useEffect(() => {
-    const activeAttachmentBaseKeys = new Set<string>();
-
-    displayedMessages.forEach((message: any) => {
-      if (!Array.isArray(message?.attachments)) {
-        return;
-      }
-
-      (message.attachments as HydratedAttachment[]).forEach((attachment) => {
+    const activeAttachmentBaseKeys = resolveChatAttachmentBaseKeySet(
+      displayedMessages.flatMap((message: any) => (Array.isArray(message?.attachments) ? message.attachments : [])),
+      (attachment: HydratedAttachment) => {
         if (!attachment?.url) {
-          return;
+          return '';
         }
-        activeAttachmentBaseKeys.add(getAttachmentPressKey(attachment));
-      });
-    });
-
-    const imageHandlers = attachmentImagePressHandlersRef.current;
-    for (const key of Array.from(imageHandlers.keys())) {
-      if (!activeAttachmentBaseKeys.has(key)) {
-        imageHandlers.delete(key);
+        return getAttachmentPressKey(attachment);
       }
-    }
+    );
 
-    const downloadHandlers = attachmentDownloadPressHandlersRef.current;
-    for (const key of Array.from(downloadHandlers.keys())) {
-      const separatorIndex = key.indexOf('::download::');
-      const baseKey = separatorIndex >= 0 ? key.slice(0, separatorIndex) : key;
-      if (!activeAttachmentBaseKeys.has(baseKey)) {
-        downloadHandlers.delete(key);
-      }
-    }
+    pruneMapByKeySet(attachmentImagePressHandlersRef.current, activeAttachmentBaseKeys);
+    pruneDelimitedMapByPrefixSet(
+      attachmentDownloadPressHandlersRef.current,
+      activeAttachmentBaseKeys,
+      '::download::'
+    );
   }, [displayedMessages, getAttachmentPressKey]);
 
-  const renderMessage = (
-    msg: any,
-    reactionsOverride?: { [key: string]: Set<string> },
-    isEditingOverride?: boolean
-  ) => {
-    // Defensive check for message validity
-    if (!msg || !msg.id) {
-      logger.warn('Invalid message object:', msg);
-      return null;
-    }
-    
-    // Use effectiveUser for proper message alignment
-    const msgSenderLower = (msg.sender || '').toLowerCase().trim();
-    const userEmailLower = (effectiveUser?.email || '').toLowerCase().trim();
-    const isOwnMessage = msgSenderLower === userEmailLower;
+  // ── ChatContext wiring ────────────────────────────────────────────────────────
+  // The stable value includes all callbacks and utilities. Memoized so it only
+  // changes when a callback identity changes (very infrequent).
+  // The reactive value includes per-render state (theme, flags, user, assets).
+  // ─────────────────────────────────────────────────────────────────────────────
 
-    // Simple animation state check (no useMemo in render functions)
-    const isNewMessage = animatedMessages.has(msg.id);
-    const actionPending = isMessageActionPending(msg.id);
-    const wasEdited = Boolean((msg.editCount && msg.editCount > 0) || msg.editedAt);
-    const isEditingTarget = typeof isEditingOverride === 'boolean'
-      ? isEditingOverride
-      : editingMessageInfo?.id === normalizeMessageId(msg.id);
-    const pendingOverlay = actionPending ? (
-      <View
-        style={[
-          styles.messagePendingOverlay,
-          { backgroundColor: isOwnMessage ? 'rgba(0, 0, 0, 0.35)' : 'rgba(0, 0, 0, 0.25)', pointerEvents: 'none' },
-        ]}
-      >
-        <ActivityIndicator size="small" color="#ffffff" />
-        <Text style={styles.messagePendingText}>Removing…</Text>
-      </View>
-    ) : null;
-
-    const hasAttachmentContent = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-    const attachmentsHydrating = !hasAttachmentContent && (
-      Boolean(msg.hasAttachments) ||
-      (typeof msg.attachmentCount === 'number' && msg.attachmentCount > 0)
-    );
-    const shouldRenderAttachmentSection = hasAttachmentContent || attachmentsHydrating;
-    let attachmentHydrationLabel = '';
-    if (attachmentsHydrating) {
-      const attachmentCount = typeof msg.attachmentCount === 'number' ? msg.attachmentCount : null;
-      if (attachmentCount && attachmentCount > 0) {
-        attachmentHydrationLabel = `Loading ${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}...`;
-      } else {
-        attachmentHydrationLabel = 'Loading attachments...';
-      }
-    }
-    const skeletonBackgroundColor = isOwnMessage ? 'rgba(255, 255, 255, 0.12)' : theme.surface;
-    const skeletonBorderColor = isOwnMessage ? 'rgba(255, 255, 255, 0.25)' : theme.border;
-    const skeletonTextColor = isOwnMessage ? 'rgba(255, 255, 255, 0.95)' : theme.text;
-    const skeletonSubtextColor = isOwnMessage ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary;
-
-    if (msg.deleted) {
-      const deletedTimestamp = msg.deletedAt || msg.timestamp;
-      const deletedBubbleThemeStyle = isDarkMode
-        ? styles.deletedMessageBubbleOwn
-        : styles.deletedMessageBubbleFriend;
-      const deletedMessageTextThemeStyle = isDarkMode
-        ? styles.deletedMessageTextOwn
-        : { color: theme.textSecondary };
-      const deletedTimestampThemeStyle = isDarkMode
-        ? styles.ownMessageTime
-        : [styles.friendMessageTime, { color: theme.textSecondary }];
-      const deletedIconColor = isDarkMode ? 'rgba(255, 255, 255, 0.75)' : theme.textSecondary;
-
-      return (
-        <AnimatedMessageWrapper
-          key={`deleted-${msg.id}`}
-          isNewMessage={isNewMessage}
-          messageId={msg.id}
-          isIncomingMessage={!isOwnMessage}
-        >
-          <View
-            key={`deleted-view-${msg.id}`}
-            style={[
-              styles.messageContainer,
-              isOwnMessage ? styles.ownMessage : styles.friendMessage,
-              styles.deletedMessageContainer,
-            ]}
-          >
-            <View
-              style={[
-                styles.deletedMessageBubble,
-                deletedBubbleThemeStyle,
-              ]}
-            >
-              <View style={styles.deletedMessageContent}>
-                <Trash2
-                  size={16}
-                  color={deletedIconColor}
-                  style={{ marginRight: 6 }}
-                />
-                <Text
-                  style={[
-                    styles.deletedMessageText,
-                    deletedMessageTextThemeStyle,
-                  ]}
-                >
-                  Message removed
-                </Text>
-              </View>
-              <Text
-                style={[
-                  styles.deletedMessageTime,
-                  deletedTimestampThemeStyle,
-                ]}
-              >
-                {formatMessageTimestamp(deletedTimestamp)}
-              </Text>
-            </View>
-          </View>
-        </AnimatedMessageWrapper>
-      );
-    }
-
-    const messageTimestampLabel = formatMessageTimestamp(msg.timestamp);
-    const reactionSummary = getMessageReactionSummary(msg.id, reactionsOverride);
-    const messageReactionPills = reactionSummary.pills;
-    const hasMessageReactionPills = messageReactionPills.length > 0;
-    const rawMessageText = typeof msg.text === 'string' ? msg.text : '';
-    const trimmedMessageText = rawMessageText.trim();
-    const shouldRenderRegularText = trimmedMessageText.length > 0 && trimmedMessageText !== '.';
-    const regularMessageText = shouldRenderRegularText
-      ? sanitizeMessageText(rawMessageText, 'Message')
-      : 'Message';
-
-    if (msg.isSpecial) {
-      const senderName = isOwnMessage ? 'You' : selectedTeamMember?.name || 'Someone';
-      const specialMessageText = sanitizeMessageText(msg.text, 'Special message');
-      const heartReactionStatus = reactionSummary.statusByType.get('heart') ?? EMPTY_REACTION_STATUS;
-      const starReactionStatus = reactionSummary.statusByType.get('star') ?? EMPTY_REACTION_STATUS;
-      const smileReactionStatus = reactionSummary.statusByType.get('smile') ?? EMPTY_REACTION_STATUS;
-      const heartShouldGlow = reactionSummary.glowByType.has('heart');
-      const starShouldGlow = reactionSummary.glowByType.has('star');
-      const smileShouldGlow = reactionSummary.glowByType.has('smile');
-      const specialReactionStatuses = [
-        { type: 'heart', status: heartReactionStatus },
-        { type: 'star', status: starReactionStatus },
-        { type: 'smile', status: smileReactionStatus },
-      ].filter((entry) => entry.status.count > 0);
-      
-      return (
-        <AnimatedMessageWrapper 
-          key={`special-${msg.id}`}
-          isNewMessage={isNewMessage} 
-          messageId={msg.id}
-          isIncomingMessage={!isOwnMessage}
-        >
-          <View key={msg.id} style={styles.specialMessageContainer}>
-            <View
-              style={[
-                styles.specialMessageBubble,
-                styles.messageActionAnchor,
-                { backgroundColor: theme.surface, borderColor: theme.warning },
-              ]}
-            >
-              <View style={styles.specialMessageHeader}>
-                <Star size={20} color={theme.warning} />
-                <Text style={[styles.specialMessageTitle, { color: theme.warning }]}>
-                  Special Message from {senderName || 'Unknown User'}
-                </Text>
-                <Star size={20} color={theme.warning} />
-              </View>
-              <StyledText
-                text={specialMessageText}
-                style={[styles.specialMessageText, { color: theme.text }]}
-                linkStyle={{
-                  color: theme.primary,
-                  fontWeight: '600'
-                }}
-              />
-              <Text style={[styles.specialMessageTime, { color: theme.textSecondary }]}>
-                {messageTimestampLabel}
-              </Text>
-              <View style={styles.specialReactions}>
-                <TouchableOpacity 
-                  style={[
-                    styles.reactionButton, 
-                    { backgroundColor: theme.background },
-                    heartShouldGlow && styles.glowingReaction
-                  ]}
-                  onPress={getReactionPressHandler(msg.id, 'heart')}
-                >
-                  <Heart 
-                    size={20} 
-                    color={heartReactionStatus.hasUserReacted ? '#ef4444' : theme.textSecondary}
-                  />
-                  {heartReactionStatus.count > 0 && (
-                    <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {heartReactionStatus.count}
-                    </Text>
-                  )}
-                </TouchableOpacity>
-                <TouchableOpacity 
-                  style={[
-                    styles.reactionButton, 
-                    { backgroundColor: theme.background },
-                    starShouldGlow && styles.glowingReaction
-                  ]}
-                  onPress={getReactionPressHandler(msg.id, 'star')}
-                >
-                  <Star 
-                    size={20} 
-                    color={starReactionStatus.hasUserReacted ? '#fbbf24' : theme.textSecondary}
-                  />
-                  {starReactionStatus.count > 0 && (
-                    <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {starReactionStatus.count}
-                    </Text>
-                  )}
-                </TouchableOpacity>
-                <TouchableOpacity 
-                  style={[
-                    styles.reactionButton, 
-                    { backgroundColor: theme.background },
-                    smileShouldGlow && styles.glowingReaction
-                  ]}
-                  onPress={getReactionPressHandler(msg.id, 'smile')}
-                >
-                  <Smile 
-                    size={20} 
-                    color={smileReactionStatus.hasUserReacted ? '#1e1c1cff' : theme.textSecondary}
-                  />
-                  {smileReactionStatus.count > 0 && (
-                    <Text style={[styles.reactionCount, { color: theme.text }]}>
-                      {smileReactionStatus.count}
-                    </Text>
-                  )}
-                </TouchableOpacity>
-              </View>
-              
-              {/* Profile pictures of users who reacted */}
-              <View style={styles.reactionProfilePics}>
-                {specialReactionStatuses.map(({ type: reactionType, status: reactionStatus }) => {
-                  
-                  return (
-                    <View key={reactionType} style={styles.reactionTypeContainer}>
-                      <View style={styles.reactionIcon}>
-                        {reactionType === 'heart' ? <Heart size={12} color="#ef4444" /> : reactionType === 'star' ? <Star size={12} color="#fbbf24" /> : reactionType === 'smile' ? <Smile size={12} color="#8b5cf6" /> : null}
-                      </View>
-                      <View style={styles.profilePicsRow}>
-                        {Array.isArray(reactionStatus.users) && reactionStatus.users
-                          .slice(0, 3)
-                          .filter((userEmail) => userEmail && typeof userEmail === 'string')
-                          .map((userEmail, index) => {
-                          // Find the team member for this email
-                          const teamMember = teamMembersByEmail.get(
-                            normalizeParticipantEmail(userEmail)
-                          );
-                          const profileUrl = getProfilePictureURL(teamMember);
-                          
-                          return (
-                            <View 
-                              key={`${userEmail}-${index}`} 
-                              style={[
-                                styles.miniProfilePic,
-                                { marginLeft: index > 0 ? -6 : 0 }
-                              ]}
-                            >
-                              {profileUrl ? (
-                                <Image 
-                                  source={{ uri: profileUrl }} 
-                                  style={styles.miniProfilePicImage}
-                                />
-                              ) : (
-                                <View style={[styles.miniProfilePicPlaceholder, { backgroundColor: theme.primary }]}>
-                                  <Text style={styles.miniProfilePicText}>
-                                    {getSafeDisplayInitial(teamMember?.name || userEmail || 'U')}
-                                  </Text>
-                                </View>
-                              )}
-                            </View>
-                          );
-                        })}
-                        {reactionStatus.count > 3 && (
-                          <View style={[styles.miniProfilePic, styles.miniProfilePicMore]}>
-                            <Text style={[styles.miniProfilePicText, { color: theme.text }]}>
-                              +{reactionStatus.count - 3}
-                            </Text>
-                          </View>
-                        )}
-                      </View>
-                    </View>
-                  );
-                })}
-              </View>
-            </View>
-          </View>
-        </AnimatedMessageWrapper>
-      );
-    }
-
-    // Handle sticker messages
-    if (msg.sticker) {
-      const originalStickerUrl = msg.sticker.url;
-      const stickerDisplayUrl =
-        Platform.OS === 'web'
-          ? originalStickerUrl
-          : (stickerUrlMap.get(originalStickerUrl) || originalStickerUrl);
-      const stickerIsUnavailable =
-        brokenFileUrls.has(stickerDisplayUrl) ||
-        (msg.sticker.pack === 'system' && !originalStickerUrl);
-
-      return (
-        <AnimatedMessageWrapper 
-          key={`sticker-${msg.id}`}
-          isNewMessage={isNewMessage} 
-          messageId={msg.id}
-          isIncomingMessage={!isOwnMessage}
-        >
-          <View
-            key={msg.id}
-            style={[
-              styles.messageContainer,
-              isOwnMessage ? styles.ownMessage : styles.friendMessage,
-            ]}
-          >
-            <TouchableOpacity
-              style={[
-                styles.stickerContainer,
-                styles.messageActionAnchor,
-                isOwnMessage ? styles.ownSticker : styles.friendSticker
-              ]}
-              onLongPress={(event) => handleMessageLongPress(msg.id, event)}
-              onPress={getQuickTapReactionHandler(msg.id)}
-              delayLongPress={500}
-              disabled={actionPending}
-            >
-              {stickerIsUnavailable ? (
-                // Show emoji text for system emoji stickers or placeholder for broken stickers
-                msg.sticker.pack === 'system' ? (
-                  <View style={styles.emojiStickerContainer}>
-                    <Text style={[
-                      styles.emojiStickerText,
-                      {
-                        fontSize: Math.min(msg.sticker.width || 100, 100) * 0.8, // Scale emoji based on size
-                      }
-                    ]}>
-                      {msg.sticker.name}
-                    </Text>
-                  </View>
-                ) : (
-                  <View style={[styles.deletedStickerPlaceholder, { backgroundColor: theme.background, borderColor: theme.border }]}>
-                    <AlertCircle size={32} color={theme.textSecondary} />
-                    <Text style={[styles.deletedStickerText, { color: theme.textSecondary }]}>
-                      Sticker unavailable
-                    </Text>
-                  </View>
-                )
-              ) : (
-                <ProgressiveImage
-                  uri={stickerDisplayUrl}
-                  style={[
-                    styles.stickerImage,
-                    {
-                      width: Math.min(msg.sticker.width || 200, 200),
-                      height: Math.min(msg.sticker.height || 200, 200),
-                    },
-                  ]}
-                  resizeMode="contain"
-                  onError={async () => {
-                    if (Platform.OS !== 'web') {
-                      const alt = await resolveNativeSafeStickerUrl(originalStickerUrl);
-                      if (alt && alt !== stickerDisplayUrl) return;
-                    }
-                    handleImageError(stickerDisplayUrl);
-                  }}
-                />
-              )}
-              
-              {/* Sticker timestamp and status */}
-              <View style={[
-                styles.stickerFooter,
-                isOwnMessage ? styles.ownStickerFooter : styles.friendStickerFooter
-              ]}>
-                <Text style={[
-                  styles.stickerTime,
-                  { color: theme.textSecondary }
-                ]}>
-                  {messageTimestampLabel}
-                </Text>
-                {/* Show status ticks only for own stickers */}
-                {isOwnMessage && (
-                  <MessageStatusTicks 
-                    delivered={msg.delivered}
-                    deliveredAt={msg.deliveredAt}
-                    read={msg.read}
-                    readAt={msg.readAt}
-                    color={theme.textSecondary}
-                    size={12}
-                    theme={isDarkMode ? 'dark' : 'light'}
-                  />
-                )}
-              </View>
-              {pendingOverlay}
-            </TouchableOpacity>
-            
-            {/* Sticker reactions display */}
-            {hasMessageReactionPills && (
-              <View style={[
-                styles.messageReactions,
-                isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
-              ]}>
-                {messageReactionPills.map((reaction, index) => (
-                  <TouchableOpacity
-                    key={index}
-                    style={[
-                      styles.messageReactionButton,
-                      { backgroundColor: theme.background, borderColor: theme.border },
-                      reaction.hasUserReacted && [styles.selectedMessageReaction, { backgroundColor: theme.primary + '20', borderColor: theme.primary }]
-                    ]}
-                    onPress={getReactionPressHandler(msg.id, reaction.emoji)}
-                  >
-                    <Text style={styles.messageReactionEmoji}>{reaction.emoji ? String(reaction.emoji) : '❤️'}</Text>
-                    <Text style={[styles.messageReactionCount, { color: reaction.hasUserReacted ? theme.primary : theme.textSecondary }]}>
-                      {Number(reaction.count || 0)}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-          </View>
-        </AnimatedMessageWrapper>
-      );
-    }
-
-    // Handle GIF messages (similar to stickers)
-    if (msg.gif) {
-      const originalGifUrl = msg.gif.url;
-      const gifDisplayUrl =
-        Platform.OS === 'web'
-          ? originalGifUrl
-          : (gifUrlMap.get(originalGifUrl) || originalGifUrl);
-      const gifIsUnavailable = brokenFileUrls.has(originalGifUrl);
-
-      return (
-        <AnimatedMessageWrapper 
-          key={`gif-${msg.id}`}
-          isNewMessage={isNewMessage} 
-          messageId={msg.id}
-          isIncomingMessage={!isOwnMessage}
-        >
-          <View
-            key={msg.id}
-            style={[
-              styles.messageContainer,
-              isOwnMessage ? styles.ownMessage : styles.friendMessage,
-            ]}
-          >
-            <TouchableOpacity
-              style={[
-                styles.stickerContainer,
-                styles.messageActionAnchor,
-                isOwnMessage ? styles.ownSticker : styles.friendSticker
-              ]}
-              onLongPress={(event) => handleMessageLongPress(msg.id, event)}
-              onPress={getQuickTapReactionHandler(msg.id)}
-              delayLongPress={500}
-              disabled={actionPending}
-            >
-              {gifIsUnavailable ? (
-                // Show placeholder for broken/missing GIFs
-                <View style={[styles.deletedStickerPlaceholder, { backgroundColor: theme.background, borderColor: theme.border }]}>
-                  <AlertCircle size={32} color={theme.textSecondary} />
-                  <Text style={[styles.deletedStickerText, { color: theme.textSecondary }]}>
-                    GIF unavailable
-                  </Text>
-                </View>
-              ) : (
-                <ProgressiveImage
-                  uri={gifDisplayUrl}
-                  style={[
-                    styles.stickerImage,
-                    {
-                      width: Math.min(msg.gif.width || 200, 200),
-                      height: Math.min(msg.gif.height || 200, 200),
-                    },
-                  ]}
-                  resizeMode="contain"
-                  onError={async () => {
-                    if (Platform.OS !== 'web') {
-                      const alt = await resolveOptimizedGifUrl(originalGifUrl);
-                      if (alt && alt !== gifDisplayUrl) return;
-                    }
-                    handleImageError(originalGifUrl);
-                  }}
-                />
-              )}
-              
-              {/* GIF timestamp and status */}
-              <View style={[
-                styles.stickerFooter,
-                isOwnMessage ? styles.ownStickerFooter : styles.friendStickerFooter
-              ]}>
-                <Text style={[
-                  styles.stickerTime,
-                  { color: theme.textSecondary }
-                ]}>
-                  {messageTimestampLabel}
-                </Text>
-                {/* Show status ticks only for own GIFs */}
-                {isOwnMessage && (
-                  <MessageStatusTicks 
-                    delivered={msg.delivered}
-                    deliveredAt={msg.deliveredAt}
-                    read={msg.read}
-                    readAt={msg.readAt}
-                    color={theme.textSecondary}
-                    size={12}
-                    theme={isDarkMode ? 'dark' : 'light'}
-                  />
-                )}
-              </View>
-              {pendingOverlay}
-            </TouchableOpacity>
-            
-            {/* GIF reactions display */}
-            {hasMessageReactionPills && (
-              <View style={[
-                styles.messageReactions,
-                isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
-              ]}>
-                {messageReactionPills.map((reaction, index) => (
-                  <TouchableOpacity
-                    key={index}
-                    style={[
-                      styles.messageReactionButton,
-                      { backgroundColor: theme.background, borderColor: theme.border },
-                      reaction.hasUserReacted && [styles.selectedMessageReaction, { backgroundColor: theme.primary + '20', borderColor: theme.primary }]
-                    ]}
-                    onPress={getReactionPressHandler(msg.id, reaction.emoji)}
-                  >
-                    <Text style={styles.messageReactionEmoji}>{reaction.emoji ? String(reaction.emoji) : '❤️'}</Text>
-                    <Text style={[styles.messageReactionCount, { color: reaction.hasUserReacted ? theme.primary : theme.textSecondary }]}>
-                      {Number(reaction.count || 0)}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-          </View>
-        </AnimatedMessageWrapper>
-      );
-    }
-
-    // Regular text messages
-    return (
-      <AnimatedMessageWrapper 
-        key={`message-${msg.id}`}
-        isNewMessage={isNewMessage} 
-        messageId={msg.id}
-        isIncomingMessage={!isOwnMessage}
-      >
-        <View
-          key={msg.id}
-          style={[
-            styles.messageContainer,
-            isOwnMessage ? styles.ownMessage : styles.friendMessage,
-          ]}
-        >
-          <TouchableOpacity
-            style={[
-              styles.messageBubble,
-              styles.messageActionAnchor,
-              isOwnMessage
-                ? [styles.ownBubble, { backgroundColor: theme.primary }]
-                : [
-                    styles.friendBubble,
-                    { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border },
-                  ],
-              isEditingTarget && {
-                borderWidth: 2,
-                borderColor: isOwnMessage ? 'rgba(255, 255, 255, 0.7)' : theme.primary,
-              },
-              isEditingTarget && styles.editingMessageGlow,
-            ]}
-            onLongPress={(event) => handleMessageLongPress(msg.id, event)}
-            onPress={getQuickTapReactionHandler(msg.id)}
-            delayLongPress={500}
-            disabled={actionPending}
-          >
-            {isEditingTarget && (
-              <View style={styles.editingTag}>
-                <Edit3 size={14} color="#ffffff" />
-                <Text style={styles.editingTagText}>Editing</Text>
-              </View>
-            )}
-            {/* File attachments */}
-            {shouldRenderAttachmentSection && (
-              <View style={styles.fileContainer}>
-                {attachmentsHydrating && (
-                  <View style={[styles.attachmentSkeleton, { backgroundColor: skeletonBackgroundColor, borderColor: skeletonBorderColor }]}>
-                    <ActivityIndicator size="small" color={theme.primary} />
-                    <View style={{ marginLeft: 12 }}>
-                      <Text style={[styles.attachmentSkeletonText, { color: skeletonTextColor }]}>{attachmentHydrationLabel}</Text>
-                      <Text style={[styles.attachmentSkeletonSubtext, { color: skeletonSubtextColor }]}>Large files may take a moment to appear.</Text>
-                    </View>
-                  </View>
-                )}
-
-                {hasAttachmentContent && (
-                  <>
-                    {/* Handle new multiple attachments format */}
-                    {Array.isArray(msg.attachments) && msg.attachments.length > 0 && (msg.attachments as HydratedAttachment[]).map((attachment, index: number) => (
-                      <View
-                        key={index}
-                        style={{
-                          marginBottom: index < msg.attachments.length - 1 ? 8 : 0,
-                          width: '100%',
-                          alignItems: 'stretch',
-                        }}
-                      >
-                        {brokenFileUrls.has(attachment.url) ? (
-                          // Show placeholder for deleted/missing files
-                          <View style={[styles.deletedFileAttachment, { backgroundColor: theme.background, borderColor: theme.border }]}>
-                            <AlertCircle size={24} color={theme.textSecondary} />
-                            <View style={styles.fileInfo}>
-                              <Text style={[styles.fileName, { color: theme.textSecondary }]} numberOfLines={1}>
-                                {sanitizeAttachmentFileName(attachment.fileName)}
-                              </Text>
-                              <Text style={[styles.fileSize, { color: theme.textSecondary }]}> 
-                                File no longer available
-                              </Text>
-                            </View>
-                          </View>
-                        ) : isVideoFile(attachment.fileType, attachment.fileName) ? (
-                          <FileViewer
-                            fileUrl={attachment.resolvedUrl || attachment.url}
-                            fileName={attachment.fileName || 'Video File'}
-                            fileType={attachment.fileType}
-                            fileSize={attachment.fileSize}
-                            onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'Video File')}
-                            downloadKey={getDownloadKey(attachment.url)}
-                            remoteFileUrl={attachment.url}
-                            // Use FileViewer's built-in ShareModal
-                          />
-                        ) : isImageFile(attachment.fileType, attachment.fileName) ? (
-                          <TouchableOpacity onPress={getAttachmentImageViewPressHandler(attachment)}>
-                            <ProgressiveImage
-                              uri={attachment.resolvedUrl || attachment.url}
-                              style={styles.imageAttachment}
-                              onError={() => handleImageError(attachment.url)}
-                            />
-                            <View style={styles.imageOverlay}>
-                              <Eye size={20} color="#ffffff" />
-                            </View>
-                          </TouchableOpacity>
-                        ) : (
-                          <FileViewer
-                            fileUrl={attachment.resolvedUrl || attachment.url}
-                            fileName={attachment.fileName}
-                            fileType={attachment.fileType}
-                            fileSize={attachment.fileSize}
-                            onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'File')}
-                            downloadKey={getDownloadKey(attachment.url)}
-                            remoteFileUrl={attachment.url}
-                            // Use FileViewer's built-in ShareModal
-                          />
-                        )}
-                        {networkErrorUrls.has(attachment.url) && !brokenFileUrls.has(attachment.url) && (
-                          <View style={[styles.networkErrorAttachment, { backgroundColor: theme.background, borderColor: theme.border }]}>
-                            <View style={styles.networkErrorInfo}>
-                              <AlertCircle size={16} color={theme.textSecondary} />
-                              <Text style={[styles.networkErrorText, { color: theme.textSecondary }]}>Network error. Tap retry.</Text>
-                            </View>
-                            <TouchableOpacity
-                              style={[styles.networkErrorRetryButton, { borderColor: theme.primary }]}
-                              onPress={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'File')}
-                            >
-                              <RotateCcw size={14} color={theme.primary} />
-                              <Text style={[styles.networkErrorRetryText, { color: theme.primary }]}>Retry</Text>
-                            </TouchableOpacity>
-                          </View>
-                        )}
-                      </View>
-                    ))}
-                  </>
-                )}
-              </View>
-            )}
-            
-            {/* Message text */}
-            {shouldRenderRegularText && (
-              <StyledText
-                text={regularMessageText}
-                style={[
-                  styles.messageText,
-                  isOwnMessage ? styles.ownMessageText : [styles.friendMessageText, { color: theme.text }]
-                ]}
-                linkStyle={{
-                  color: isOwnMessage ? 'rgba(255, 255, 255, 0.9)' : theme.primary,
-                  fontWeight: '600'
-                }}
-              />
-            )}
-            
-            {/* Message timestamp and status */}
-            <View style={[
-              styles.messageFooter,
-              isOwnMessage ? styles.ownMessageFooter : styles.friendMessageFooter
-            ]}>
-              {wasEdited && (
-                <Text
-                  style={[
-                    styles.messageMeta,
-                    isOwnMessage ? styles.messageMetaOwn : styles.messageMetaFriend,
-                  ]}
-                >
-                  Edited
-                </Text>
-              )}
-              <Text style={[
-                styles.messageTime,
-                isOwnMessage ? styles.ownMessageTime : [styles.friendMessageTime, { color: theme.textSecondary }]
-              ]}>
-                {messageTimestampLabel}
-              </Text>
-              {/* Show status ticks only for own messages */}
-              {isOwnMessage && (
-                <MessageStatusTicks 
-                  delivered={msg.delivered}
-                  deliveredAt={msg.deliveredAt}
-                  read={msg.read}
-                  readAt={msg.readAt}
-                  color={isOwnMessage ? 'rgba(255, 255, 255, 0.7)' : theme.textSecondary}
-                  size={12}
-                  theme={isDarkMode ? 'dark' : 'light'}
-                />
-              )}
-            </View>
-            {pendingOverlay}
-          </TouchableOpacity>
-          
-          {/* Message reactions display */}
-          {hasMessageReactionPills && (
-            <View style={[
-              styles.messageReactions,
-              isOwnMessage ? { alignSelf: 'flex-end' } : { alignSelf: 'flex-start' }
-            ]}>
-              {messageReactionPills.map((reaction, index) => (
-                <TouchableOpacity
-                  key={index}
-                  style={[
-                    styles.messageReactionButton,
-                    { backgroundColor: theme.background, borderColor: theme.border },
-                    reaction.hasUserReacted && [styles.selectedMessageReaction, { backgroundColor: theme.primary + '20', borderColor: theme.primary }]
-                  ]}
-                  onPress={getReactionPressHandler(msg.id, reaction.emoji)}
-                >
-                  <Text style={styles.messageReactionEmoji}>{reaction.emoji ? String(reaction.emoji) : '❤️'}</Text>
-                  <Text style={[styles.messageReactionCount, { color: reaction.hasUserReacted ? theme.primary : theme.textSecondary }]}>
-                    {Number(reaction.count || 0)}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
-        </View>
-      </AnimatedMessageWrapper>
-    );
-  };
-
-  renderMessageRef.current = renderMessage;
+  const chatStableContextValue: ChatStableContextValue = useMemo(() => ({
+    normalizeMessageId,
+    getReactionPressHandler,
+    getQuickTapReactionHandler,
+    getAttachmentImageViewPressHandler,
+    getAttachmentDownloadPressHandler,
+    getDownloadKey,
+    handleMessageLongPress: stableHandleMessageLongPress,
+    handleImageError: stableHandleImageError,
+    jumpToReplyMessage,
+    isMessageActionPending,
+    getMessageReactionSummary,
+    formatMessageTimestamp,
+    sanitizeMessageText,
+    sanitizeAttachmentFileName,
+    resolveChatReplyPreviewText,
+    resolveChatReplySenderLabel,
+    resolveNativeSafeStickerUrl,
+    resolveOptimizedGifUrl,
+    isImageFile,
+    isVideoFile,
+    normalizeParticipantEmail,
+    getProfilePictureURL,
+    getSafeDisplayInitial,
+    logger,
+    styles,
+    CHAT_REPLY_PREVIEW_MAX_CHARS,
+  }), [
+    normalizeMessageId,
+    getReactionPressHandler,
+    getQuickTapReactionHandler,
+    getAttachmentImageViewPressHandler,
+    getAttachmentDownloadPressHandler,
+    getDownloadKey,
+    stableHandleMessageLongPress,
+    stableHandleImageError,
+    jumpToReplyMessage,
+    isMessageActionPending,
+    getMessageReactionSummary,
+    resolveNativeSafeStickerUrl,
+    resolveOptimizedGifUrl,
+    // Module-level imports never change identity — omitted from deps intentionally
+  ]);
 
   const renderMessageItem = useCallback(
-    ({ item, index }: { item: any; index: number }) => {
-      const previousMsg = index > 0 ? displayedMessages[index - 1] : undefined;
-      const dateSeparator = getChatDateSeparator(item.timestamp, previousMsg?.timestamp);
+    ({ item }: { item: any; index: number }) => {
       const itemId = normalizeMessageId(item?.id);
 
+      // ── Read volatile state from refs (Phase 4 stabilization) ──
+      const metaById = messageRowMetaByIdRef.current;
+      const dateSeparatorLabel = itemId
+        ? (metaById?.separatorLabelById?.get(itemId) ?? '')
+        : '';
+
+      const searchVisible = conversationSearchVisibleRef.current;
+      const hasSearchQuery = normalizedConversationSearchQueryRef.current.length > 0;
+      const showConversationSearchResultTimeline = searchVisible && hasSearchQuery;
+
+      const matchIdSet = conversationSearchMatchIdSetRef.current;
+      const matchIndexById = conversationSearchMatchIndexByIdRef.current;
+      const highlightId = conversationSearchHighlightMessageIdRef.current;
+
+      const isConversationSearchResultMatch = Boolean(
+        showConversationSearchResultTimeline &&
+        itemId &&
+        matchIdSet.has(itemId)
+      );
+      const conversationSearchMatchIndex = itemId
+        ? (matchIndexById.get(itemId) ?? -1)
+        : -1;
+      const isConversationSearchResultActive =
+        isConversationSearchResultMatch &&
+        Boolean(itemId && highlightId === itemId);
+
+      const unreadSepId = unreadSeparatorMessageIdRef.current;
       const shouldShowUnreadSeparator = Boolean(
-        showUnreadSeparator && unreadSeparatorMessageId && itemId && unreadSeparatorMessageId === itemId
+        showUnreadSeparatorRef.current && unreadSepId && itemId && unreadSepId === itemId
       );
       const shouldShowNewDivider = Boolean(
-        showNewDivider && newDividerMessageId && itemId && newDividerMessageId === itemId && !shouldShowUnreadSeparator
+        showNewDividerRef.current && newDividerMessageIdRef.current && itemId && newDividerMessageIdRef.current === itemId && !shouldShowUnreadSeparator
       );
+      const currentUnreadDividerLabel = unreadDividerLabelRef.current;
+      const searchMatchCount = conversationSearchMatchIdsRef.current.length;
 
       return (
-        <View
-          onLayout={shouldUseManualAnchorPreservation
-            ? (event) => {
-                const { y, height } = event.nativeEvent.layout;
-                if (!item?.id) {
-                  return;
-                }
-
-                const currentDate = getMessageDate(item, previousMsg);
-                const messageId = String(item.id);
-                const newPosition = { y, height, date: currentDate || '' };
-                const existing = messagePositionsRef.current[messageId];
-
-                if (
-                  existing &&
-                  existing.y === newPosition.y &&
-                  existing.height === newPosition.height &&
-                  existing.date === newPosition.date
-                ) {
-                  return;
-                }
-
-                messagePositionsRef.current[messageId] = newPosition;
-              }
-            : undefined}
-        >
-          {dateSeparator && typeof dateSeparator === 'string' && dateSeparator.trim().length > 0 && (
-            <View style={styles.dateSeparatorContainer}>
-              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
-              <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.textSecondary }]}>
-                {sanitizeDateSeparatorLabel(dateSeparator)}
-              </Text>
-              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.border }]} />
+        <View style={styles.messageListItemWithGutter}>
+          {showConversationSearchResultTimeline ? (
+            <View style={styles.conversationSearchResultGutter}>
+              <View
+                style={[
+                  styles.conversationSearchResultGutterRail,
+                  {
+                    backgroundColor: isDarkMode
+                      ? 'rgba(148, 163, 184, 0.34)'
+                      : 'rgba(148, 163, 184, 0.4)',
+                  },
+                ]}
+              />
+              {isConversationSearchResultMatch ? (
+                <TouchableOpacity
+                  style={[
+                    styles.conversationSearchResultMarkerButton,
+                    isConversationSearchResultActive
+                      ? themedStyles.searchMarkerActive
+                      : themedStyles.searchMarkerInactive,
+                  ]}
+                  onPress={getConversationSearchJumpHandler(conversationSearchMatchIndex)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Jump to search result ${conversationSearchMatchIndex + 1} of ${searchMatchCount}`}
+                >
+                  <View
+                    style={[
+                      styles.conversationSearchResultMarkerDot,
+                      isConversationSearchResultActive
+                        ? themedStyles.searchDotActive
+                        : themedStyles.searchDotInactive,
+                    ]}
+                  />
+                </TouchableOpacity>
+              ) : null}
             </View>
-          )}
+          ) : null}
 
-          {shouldShowUnreadSeparator && unreadSeparatorMessageId && (
-            <View style={styles.dateSeparatorContainer}>
-              <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
-              <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: isDarkMode ? '#FF4444' : '#FF0000', fontWeight: '600' }]}> 
-                {unreadDividerLabel}
-              </Text>
-              <View style={[styles.dateSeparatorLine, { backgroundColor: isDarkMode ? '#FF4444' : '#FF0000' }]} />
-            </View>
-          )}
+          <View
+            style={styles.messageListItemContent}
+            onLayout={
+              shouldUseManualAnchorPreservation && itemId
+                ? getMessageLayoutHandler(itemId)
+                : undefined
+            }
+          >
+            {dateSeparatorLabel.length > 0 && (
+              <View style={styles.dateSeparatorContainer}>
+                <View style={[styles.dateSeparatorLine, themedStyles.dateSepLine]} />
+                <Text style={[styles.dateSeparatorText, themedStyles.dateSepText]}> 
+                  {dateSeparatorLabel}
+                </Text>
+                <View style={[styles.dateSeparatorLine, themedStyles.dateSepLine]} />
+              </View>
+            )}
 
-          {shouldShowNewDivider && (
-            <View style={styles.dateSeparatorContainer}>
-              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.primary }]} />
-              <Text style={[styles.dateSeparatorText, { backgroundColor: theme.background, color: theme.primary, fontWeight: '600' }]}> 
-                New messages
-              </Text>
-              <View style={[styles.dateSeparatorLine, { backgroundColor: theme.primary }]} />
-            </View>
-          )}
+            {shouldShowUnreadSeparator && unreadSepId && (
+              <View style={styles.dateSeparatorContainer}>
+                <View style={[styles.dateSeparatorLine, themedStyles.unreadSepLine]} />
+                <Text style={[styles.dateSeparatorText, themedStyles.unreadSepText]}> 
+                  {currentUnreadDividerLabel}
+                </Text>
+                <View style={[styles.dateSeparatorLine, themedStyles.unreadSepLine]} />
+              </View>
+            )}
 
-          <MessageRow item={item} />
+            {shouldShowNewDivider && (
+              <View style={styles.dateSeparatorContainer}>
+                <View style={[styles.dateSeparatorLine, themedStyles.newDividerLine]} />
+                <Text style={[styles.dateSeparatorText, themedStyles.newDividerText]}> 
+                  New messages
+                </Text>
+                <View style={[styles.dateSeparatorLine, themedStyles.newDividerLine]} />
+              </View>
+            )}
+
+            <MessageRow item={item} />
+          </View>
         </View>
       );
     },
     [
-      displayedMessages,
-      getMessageDate,
-      getChatDateSeparator,
+      // ── Only stable / infrequently-changing deps remain ──
+      getConversationSearchJumpHandler,
+      getMessageLayoutHandler,
       isDarkMode,
-      newDividerMessageId,
-      showNewDivider,
-      showUnreadSeparator,
-      unreadDividerLabel,
-      unreadSeparatorMessageId,
-      normalizeMessageId,
-      theme.border,
-      theme.background,
-      theme.textSecondary,
-      theme.primary,
       shouldUseManualAnchorPreservation,
+      normalizeMessageId,
+      themedStyles,
+    ]
+  );
+
+  // ── FlashList extraData: tells FlashList to re-call renderItem for visible
+  //    rows when volatile decorator state changes (search, dividers, unread).
+  //    renderMessageItem reads from refs, so its identity stays stable, but
+  //    FlashList needs this signal to know *which renders* to trigger. ──
+  const listExtraData = useMemo(
+    () => ({
+      searchHighlight: conversationSearchHighlightMessageId,
+      searchVisible: conversationSearchVisible,
+      searchQuery: normalizedConversationSearchQuery.length,
+      matchCount: conversationSearchMatchIds.length,
+      showUnread: showUnreadSeparator,
+      unreadId: unreadSeparatorMessageId,
+      unreadLabel: unreadDividerLabel,
+      showNew: showNewDivider,
+      newDividerId: newDividerMessageId,
+      metaVersion: messageRowMetaById,
+    }),
+    [
+      conversationSearchHighlightMessageId,
+      conversationSearchVisible,
+      normalizedConversationSearchQuery.length,
+      conversationSearchMatchIds.length,
+      showUnreadSeparator,
+      unreadSeparatorMessageId,
+      unreadDividerLabel,
+      showNewDivider,
+      newDividerMessageId,
+      messageRowMetaById,
     ]
   );
 
@@ -8394,7 +9591,11 @@ export default function Chat() {
       void chatCacheService.getMediaForDownload(finalUrl, item.nameOrTitle || undefined, undefined, 'low').catch(() => undefined);
 
       if (item.kind === 'gif') {
-        const serverMessageId = await sendGif({ url: finalUrl, source: item.source || 'keyboard' } as any, selectedTeamMember.id);
+        const serverMessageId = await sendGif(
+          { url: finalUrl, source: item.source || 'keyboard' } as any,
+          selectedTeamMember.id,
+          { replyTo: item.replyTo }
+        );
         setPendingMedia(prev => {
           const next = new Map(prev);
           const cur = next.get(tempId);
@@ -8409,7 +9610,11 @@ export default function Chat() {
           return next;
         });
       } else {
-        const serverMessageId = await sendSticker({ url: finalUrl, name: item.nameOrTitle || 'Sticker', pack: 'keyboard' } as any, selectedTeamMember.id);
+        const serverMessageId = await sendSticker(
+          { url: finalUrl, name: item.nameOrTitle || 'Sticker', pack: 'keyboard' } as any,
+          selectedTeamMember.id,
+          { replyTo: item.replyTo }
+        );
         setPendingMedia(prev => {
           const next = new Map(prev);
           const cur = next.get(tempId);
@@ -8501,6 +9706,7 @@ export default function Chat() {
                 return next;
               });
             },
+            replyTo: entry.replyTo,
           }
         );
 
@@ -8610,26 +9816,16 @@ export default function Chat() {
 
   const retryPendingMediaPressHandlersRef = useRef<Map<string, () => void>>(new Map());
   const getRetryPendingMediaPressHandler = useCallback((tempId: string) => {
-    const cached = retryPendingMediaPressHandlersRef.current.get(tempId);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void retryPendingMediaRef.current(tempId);
-    };
-    retryPendingMediaPressHandlersRef.current.set(tempId, handler);
-    return handler;
+    return resolveMapCacheEntry(retryPendingMediaPressHandlersRef.current, tempId, () => {
+      return () => {
+        void retryPendingMediaRef.current(tempId);
+      };
+    });
   }, []);
 
   useEffect(() => {
-    const activeIds = new Set<string>(Array.from(pendingMedia.keys()));
-    const handlers = retryPendingMediaPressHandlersRef.current;
-    for (const tempId of Array.from(handlers.keys())) {
-      if (!activeIds.has(tempId)) {
-        handlers.delete(tempId);
-      }
-    }
+    const activeIds = resolveChatPendingActiveIdSet(pendingMedia.keys());
+    pruneMapByKeySet(retryPendingMediaPressHandlersRef.current, activeIds);
   }, [pendingMedia]);
 
   const retryPendingAttachmentRef = useRef(retryPendingAttachment);
@@ -8644,68 +9840,57 @@ export default function Chat() {
 
   const retryPendingAttachmentPressHandlersRef = useRef<Map<string, () => void>>(new Map());
   const getRetryPendingAttachmentPressHandler = useCallback((tempId: string) => {
-    const cached = retryPendingAttachmentPressHandlersRef.current.get(tempId);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void retryPendingAttachmentRef.current(tempId);
-    };
-    retryPendingAttachmentPressHandlersRef.current.set(tempId, handler);
-    return handler;
+    return resolveMapCacheEntry(retryPendingAttachmentPressHandlersRef.current, tempId, () => {
+      return () => {
+        void retryPendingAttachmentRef.current(tempId);
+      };
+    });
   }, []);
 
   const cancelPendingAttachmentPressHandlersRef = useRef<Map<string, () => void>>(new Map());
   const getCancelPendingAttachmentPressHandler = useCallback((tempId: string) => {
-    const cached = cancelPendingAttachmentPressHandlersRef.current.get(tempId);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void cancelPendingAttachmentRef.current(tempId);
-    };
-    cancelPendingAttachmentPressHandlersRef.current.set(tempId, handler);
-    return handler;
+    return resolveMapCacheEntry(cancelPendingAttachmentPressHandlersRef.current, tempId, () => {
+      return () => {
+        void cancelPendingAttachmentRef.current(tempId);
+      };
+    });
   }, []);
 
   useEffect(() => {
-    const activeIds = new Set<string>(Array.from(pendingAttachments.keys()));
+    const activeIds = resolveChatPendingActiveIdSet(pendingAttachments.keys());
 
-    const retryHandlers = retryPendingAttachmentPressHandlersRef.current;
-    for (const tempId of Array.from(retryHandlers.keys())) {
-      if (!activeIds.has(tempId)) {
-        retryHandlers.delete(tempId);
-      }
-    }
-
-    const cancelHandlers = cancelPendingAttachmentPressHandlersRef.current;
-    for (const tempId of Array.from(cancelHandlers.keys())) {
-      if (!activeIds.has(tempId)) {
-        cancelHandlers.delete(tempId);
-      }
-    }
+    pruneMapByKeySet(retryPendingAttachmentPressHandlersRef.current, activeIds);
+    pruneMapByKeySet(cancelPendingAttachmentPressHandlersRef.current, activeIds);
   }, [pendingAttachments]);
 
   // Render pending rich media (stickers/GIFs) with a clock icon until sent
   const renderPendingMedia = (tempId: string, item: PendingMediaItem) => {
-    if (!selectedTeamMember || item.recipientId !== selectedTeamMember.id) return null;
-    if (item.serverMessageId && isDeliveredServerMessage(item.serverMessageId)) {
+    if (!selectedTeamMember) return null;
+    const pendingMediaVisibilityState = resolveChatPendingServerMatchVisibility({
+      selectedRecipientId: selectedTeamMember.id,
+      itemRecipientId: item.recipientId,
+      serverMessageId: item.serverMessageId,
+      deliveredMessageIds,
+      normalizeMessageId,
+    });
+    if (!pendingMediaVisibilityState.shouldRender) {
       return null;
     }
 
-    const rowAnim = getPendingRowAnimation(`media:${tempId}`, 'outgoing');
-    const mediaStatus = item.status;
-    const statusLabel =
-      mediaStatus === 'sending'
-        ? 'Sending...'
-        : mediaStatus === 'sent'
-          ? 'Sent'
-          : mediaStatus === 'queued'
-            ? 'Queued'
-            : 'Not sent';
-    const canRetry = mediaStatus === 'failed' || (mediaStatus === 'queued' && !isOffline);
+    const rowAnim = getPendingRowAnimation(buildChatPendingRowAnimationKey('media', tempId), 'outgoing');
+    const pendingMediaStatusState = resolveChatPendingStatusDisplayState({
+      status: item.status,
+      isOffline,
+    });
+    const pendingMediaReplyPreviewState = resolveChatPendingReplyPreviewState({
+      replyTo: item.replyTo,
+      maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
+      resolvePreviewText: resolveChatReplyPreviewText,
+    });
+    const pendingReplyPreview = pendingMediaReplyPreviewState.previewText;
+    const pendingReplySenderLabel = pendingMediaReplyPreviewState.shouldShowPreview
+      ? resolveChatReplySenderLabel(item.replyTo)
+      : '';
     const isSticker = item.kind === 'sticker';
     const size = {
       width: Math.min(item.width || 200, 200),
@@ -8720,6 +9905,22 @@ export default function Chat() {
         }}
       >
       <View style={[styles.messageContainer, styles.ownMessage]}>
+        {pendingReplyPreview && (
+          <TouchableOpacity
+            style={[styles.replySnippet, styles.replySnippetOwn, { borderLeftColor: 'rgba(255, 255, 255, 0.7)' }]}
+            activeOpacity={0.85}
+            onPress={() => {
+              void jumpToReplyMessage(item.replyTo);
+            }}
+          >
+            <Text style={[styles.replySnippetSender, styles.replySnippetSenderOwn]} numberOfLines={1}>
+              {pendingReplySenderLabel}
+            </Text>
+            <Text style={[styles.replySnippetText, styles.replySnippetTextOwn]} numberOfLines={1}>
+              {pendingReplyPreview}
+            </Text>
+          </TouchableOpacity>
+        )}
         <View style={[styles.stickerContainer, styles.ownSticker]}>
           {isSticker && (!item.previewUri || item.previewUri.trim().length === 0) ? (
             <View style={styles.emojiStickerContainer}>
@@ -8739,58 +9940,46 @@ export default function Chat() {
           )}
           {/* Upload/progress overlay for pending media */}
           {item.status === 'sending' && typeof item.progress === 'number' && (
-            <View
-              style={{
-                position: 'absolute',
-                left: 8,
-                right: 8,
-                bottom: 8,
-                paddingVertical: 6,
-                paddingHorizontal: 8,
-                borderRadius: 8,
-                backgroundColor: 'rgba(0,0,0,0.5)'
-              }}
-            >
-              <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>
-                Uploading... {Math.round(item.progress)}%
-              </Text>
-              <View style={{ height: 4, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 4, marginTop: 4 }}>
-                <View style={{ height: 4, width: `${Math.max(0, Math.min(100, item.progress))}%`, backgroundColor: '#fff', borderRadius: 4 }} />
-              </View>
+            <View style={styles.pendingMediaOverlay}>
+              <PendingUploadProgressBar
+                progress={item.progress}
+                label="Uploading..."
+                textStyle={{ color: '#fff', fontSize: 12, fontWeight: '600' }}
+                trackStyle={{
+                  height: 4,
+                  backgroundColor: 'rgba(255,255,255,0.3)',
+                  borderRadius: 4,
+                  marginTop: 4,
+                }}
+                fillStyle={{
+                  height: 4,
+                  backgroundColor: '#fff',
+                  borderRadius: 4,
+                }}
+              />
             </View>
           )}
 
-          <View style={[styles.stickerFooter, styles.ownStickerFooter, { alignItems: 'center' }]}>
-            <Text style={[styles.stickerTime, { color: theme.textSecondary }]}>
-              {statusLabel}
+          <View style={[styles.stickerFooter, styles.ownStickerFooter, styles.alignItemsCenter]}>
+            <Text style={[styles.stickerTime, themedStyles.colorTextSecondary]}>
+              {pendingMediaStatusState.statusLabel}
             </Text>
-            {item.status === 'sending' ? (
+            {pendingMediaStatusState.effectiveStatus === 'sending' ? (
               <Clock size={12} color={theme.textSecondary} />
-            ) : item.status === 'sent' ? (
+            ) : pendingMediaStatusState.effectiveStatus === 'sent' ? (
               <CheckCircle2 size={12} color={theme.textSecondary} />
-            ) : item.status === 'queued' ? (
+            ) : pendingMediaStatusState.effectiveStatus === 'queued' ? (
               <Clock size={12} color={theme.textSecondary} />
             ) : (
               <AlertCircle size={12} color={theme.error} />
             )}
-            {canRetry && (
+            {pendingMediaStatusState.canRetry && (
               <TouchableOpacity
                 onPress={getRetryPendingMediaPressHandler(tempId)}
                 disabled={isOffline}
-                style={{
-                  marginLeft: 8,
-                  paddingHorizontal: 8,
-                  paddingVertical: 4,
-                  borderRadius: 8,
-                  backgroundColor: theme.background,
-                  borderWidth: 1,
-                  borderColor: theme.border,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  opacity: isOffline ? 0.6 : 1,
-                }}
+                style={isOffline ? themedStyles.retryButtonDisabled : themedStyles.retryButton}
               >
-                <Text style={{ color: theme.primary, fontWeight: '600' }}>Retry</Text>
+                <Text style={themedStyles.retryText}>Retry</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -8802,13 +9991,29 @@ export default function Chat() {
 
   // Render pending file attachments message (optimistic bubble)
   const renderPendingAttachments = (tempId: string, item: PendingAttachmentItem) => {
-    if (!selectedTeamMember || item.recipientId !== selectedTeamMember.id) return null;
-    if (item.serverMessageId && isDeliveredServerMessage(item.serverMessageId)) {
+    if (!selectedTeamMember) return null;
+    const pendingAttachmentVisibilityState = resolveChatPendingServerMatchVisibility({
+      selectedRecipientId: selectedTeamMember.id,
+      itemRecipientId: item.recipientId,
+      serverMessageId: item.serverMessageId,
+      deliveredMessageIds,
+      normalizeMessageId,
+    });
+    if (!pendingAttachmentVisibilityState.shouldRender) {
       return null;
     }
 
-    const rowAnim = getPendingRowAnimation(`attachment:${tempId}`, 'outgoing');
+    const rowAnim = getPendingRowAnimation(buildChatPendingRowAnimationKey('attachment', tempId), 'outgoing');
     const showRetry = item.status === 'failed';
+    const pendingAttachmentReplyPreviewState = resolveChatPendingReplyPreviewState({
+      replyTo: item.replyTo,
+      maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
+      resolvePreviewText: resolveChatReplyPreviewText,
+    });
+    const pendingReplyPreview = pendingAttachmentReplyPreviewState.previewText;
+    const pendingReplySenderLabel = pendingAttachmentReplyPreviewState.shouldShowPreview
+      ? resolveChatReplySenderLabel(item.replyTo)
+      : '';
 
     return (
       <Animated.View
@@ -8820,16 +10025,34 @@ export default function Chat() {
       >
       <View style={[styles.messageContainer, styles.ownMessage]}>        
         <View style={[styles.messageBubble, styles.ownBubble, { backgroundColor: theme.primary }]}>          
+          {pendingReplyPreview && (
+            <TouchableOpacity
+              style={[styles.replySnippet, styles.replySnippetOwn, { borderLeftColor: 'rgba(255, 255, 255, 0.7)' }]}
+              activeOpacity={0.85}
+              onPress={() => {
+                void jumpToReplyMessage(item.replyTo);
+              }}
+            >
+              <Text style={[styles.replySnippetSender, styles.replySnippetSenderOwn]} numberOfLines={1}>
+                {pendingReplySenderLabel}
+              </Text>
+              <Text style={[styles.replySnippetText, styles.replySnippetTextOwn]} numberOfLines={1}>
+                {pendingReplyPreview}
+              </Text>
+            </TouchableOpacity>
+          )}
           {item.messageText ? (
             <StyledText
               text={item.messageText}
               style={[styles.messageText, styles.ownMessageText]}
               linkStyle={{ color: 'rgba(255,255,255,0.9)', fontWeight: '600' }}
+              highlightQuery={inlineConversationSearchHighlightQuery}
+              highlightStyle={styles.searchInlineHighlightOwn}
             />
           ) : null}
-          <View style={{ marginTop: item.messageText ? 8 : 0 }}>
+          <View style={item.messageText ? styles.marginTop8 : null}>
             {item.files.map((f, idx) => (
-              <View key={idx} style={{ marginBottom: idx < item.files.length - 1 ? 8 : 0 }}>
+              <View key={idx} style={idx < item.files.length - 1 ? styles.marginBottom8 : null}>
                 <View style={[styles.deletedFileAttachment, { backgroundColor: theme.background, borderColor: theme.border }]}> 
                   <View style={styles.fileInfo}>
                     <Text style={[styles.fileName, { color: theme.text }]} numberOfLines={1}>{f.fileName}</Text>
@@ -8843,79 +10066,64 @@ export default function Chat() {
           </View>
           {/* Upload/progress overlay */}
           {item.status === 'sending' && (
-            <View style={{ marginTop: 8 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 12, fontWeight: '600' }}>
-                  {item.cancelRequested ? 'Canceling...' : `Uploading... ${Math.round(item.progress)}%`}
-                </Text>
+            <View style={styles.marginTop8}>
+              <View style={styles.pendingAttachmentHeader}>
+                <View style={styles.flex1}>
+                  <PendingUploadProgressBar
+                    progress={item.progress}
+                    label={item.cancelRequested ? 'Canceling...' : 'Uploading...'}
+                    showPercent={!item.cancelRequested}
+                    textStyle={styles.pendingSentText}
+                    trackStyle={styles.pendingProgressBarOuter}
+                    fillStyle={styles.pendingProgressBarInner}
+                  />
+                </View>
                 {item.cancelable && !item.cancelRequested && (
                   <TouchableOpacity
                     onPress={getCancelPendingAttachmentPressHandler(tempId)}
-                    style={{
-                      marginLeft: 10,
-                      paddingHorizontal: 8,
-                      paddingVertical: 4,
-                      borderRadius: 8,
-                      backgroundColor: 'rgba(255,255,255,0.15)',
-                    }}
+                    style={styles.pendingAttachmentCancelButton}
                     accessibilityRole="button"
                     accessibilityLabel="Cancel upload"
                   >
-                    <Text style={{ color: '#fff', fontWeight: '600', fontSize: 12 }}>Cancel</Text>
+                    <Text style={styles.pendingAttachmentCancelButtonText}>Cancel</Text>
                   </TouchableOpacity>
                 )}
-              </View>
-              <View style={{ height: 4, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 4, marginTop: 4 }}>
-                <View
-                  style={{
-                    height: 4,
-                    width: `${Math.max(0, Math.min(100, item.progress))}%`,
-                    backgroundColor: '#fff',
-                    borderRadius: 4,
-                  }}
-                />
               </View>
             </View>
           )}
           {item.status === 'finalizing' && (
-            <View style={{ marginTop: 8 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 12, fontWeight: '600' }}>
+            <View style={styles.marginTop8}>
+              <View style={styles.pendingAttachmentHeader}>
+                <Text style={styles.pendingSentText}>
                   Sent
                 </Text>
                 <CheckCircle2 size={14} color={'#fff'} />
               </View>
-              <View style={{ height: 4, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 4, marginTop: 4 }}>
-                <View style={{ height: 4, width: '100%', backgroundColor: '#fff', borderRadius: 4 }} />
+              <View style={styles.pendingProgressBarOuter}>
+                <View style={styles.pendingProgressBarInner} />
               </View>
             </View>
           )}
           {item.status === 'failed' && (
-            <View style={{ marginTop: 8, flexDirection: 'row', alignItems: 'center' }}>
+            <View style={styles.pendingFailedContainer}>
               <AlertCircle size={14} color={'#fff'} />
-              <Text style={{ marginLeft: 6, color: 'rgba(255,255,255,0.9)' }}>
+              <Text style={styles.pendingFailedText}>
                 {item.failureReason === 'canceled' ? 'Canceled' : 'Failed'}
               </Text>
             </View>
           )}
           {showRetry && (
-            <View style={{ marginTop: 8, flexDirection: 'row', alignItems: 'center' }}>
+            <View style={styles.pendingFailedContainer}>
               <TouchableOpacity
                 onPress={getRetryPendingAttachmentPressHandler(tempId)}
                 disabled={isOffline}
-                style={{
-                  marginLeft: 10,
-                  paddingHorizontal: 8,
-                  paddingVertical: 4,
-                  borderRadius: 8,
-                  backgroundColor: 'rgba(255,255,255,0.15)',
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  opacity: isOffline ? 0.6 : 1,
-                }}
+                style={[
+                  styles.pendingRetryButton,
+                  { opacity: isOffline ? 0.6 : 1 }
+                ]}
               >
                 <RotateCcw size={12} color={'#fff'} />
-                <Text style={{ marginLeft: 4, color: '#fff', fontWeight: '600' }}>Retry</Text>
+                <Text style={styles.pendingRetryButtonText}>Retry</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -8926,381 +10134,400 @@ export default function Chat() {
   };
 
 
-
-  const renderAttachmentModal = () => (
-    <Modal
-      visible={attachmentModalVisible}
-      transparent
-      animationType="fade"
-  onRequestClose={closeAttachmentModal}
-    >
-      <Pressable 
-        style={styles.attachmentModalOverlay}
-  onPress={closeAttachmentModal}
-      >
-        <View style={[styles.attachmentModal, { backgroundColor: theme.surface }]}>
-          <Text style={[styles.attachmentModalTitle, { color: theme.text }]}>Send Attachment</Text>
-          
-          <TouchableOpacity
-            style={styles.attachmentOption}
-            onPress={handleSelectImageAttachment}
-          >
-            <ImageIcon size={24} color={theme.primary} />
-            <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Photo Library</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity
-            style={styles.attachmentOption}
-            onPress={handleSelectCameraAttachment}
-          >
-            <Camera size={24} color={theme.primary} />
-            <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Camera</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity
-            style={styles.attachmentOption}
-            onPress={handleSelectVideoAttachment}
-          >
-            <Play size={24} color={theme.primary} />
-            <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Video Library</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity
-            style={styles.attachmentOption}
-            onPress={handleSelectVideoCameraAttachment}
-          >
-            <Camera size={24} color={theme.primary} />
-            <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Record Video</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity
-            style={styles.attachmentOption}
-            onPress={handleSelectDocumentAttachment}
-          >
-            <FileIcon size={24} color={theme.primary} />
-            <Text style={[styles.attachmentOptionText, { color: theme.text }]}>Document</Text>
-          </TouchableOpacity>
-        </View>
-      </Pressable>
-    </Modal>
-  );
-
-  const renderFilePreviewModal = () => (
-    <Modal
-      visible={filePreviewVisible}
-      transparent
-      animationType="slide"
-      onRequestClose={resetFilePreviewModal}
-    >
-      <View style={styles.filePreviewOverlay}>
-        <SafeAreaView style={styles.filePreviewContainer}>
-          <View style={[styles.filePreviewHeader, { backgroundColor: theme.surface }]}>
-            <Text style={[styles.filePreviewTitle, { color: theme.text }]}>
-              Preview Files ({selectedFiles.length})
-            </Text>
-            <TouchableOpacity
-              onPress={resetFilePreviewModal}
-              style={styles.closeButton}
-            >
-              <X size={24} color={theme.text} />
-            </TouchableOpacity>
-          </View>
-
-          {skippedPreviewFiles.length > 0 && (
-            <View style={{ marginHorizontal: 20, marginTop: 10, backgroundColor: '#FFFBEB', borderColor: '#F59E0B', borderWidth: 1, borderRadius: 8, padding: 10 }}>
-              <Text style={{ color: '#92400E', fontWeight: '600', fontSize: 13, marginBottom: 4 }}>
-                Skipped while adding files ({skippedPreviewFiles.length})
-              </Text>
-              <ScrollView style={{ maxHeight: 140 }} nestedScrollEnabled>
-                {groupedSkippedPreviewFiles.folder.length > 0 && (
-                  <>
-                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 2, marginBottom: 2 }}>
-                      Folders ({groupedSkippedPreviewFiles.folder.length})
-                    </Text>
-                    {groupedSkippedPreviewFiles.folder.map((entry, idx) => (
-                      <Text key={`folder_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
-                        • {entry}
-                      </Text>
-                    ))}
-                  </>
-                )}
-                {groupedSkippedPreviewFiles.duplicate.length > 0 && (
-                  <>
-                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
-                      Duplicates ({groupedSkippedPreviewFiles.duplicate.length})
-                    </Text>
-                    {groupedSkippedPreviewFiles.duplicate.map((entry, idx) => (
-                      <Text key={`duplicate_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
-                        • {entry}
-                      </Text>
-                    ))}
-                  </>
-                )}
-                {groupedSkippedPreviewFiles.tooLarge.length > 0 && (
-                  <>
-                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
-                      Too Large ({groupedSkippedPreviewFiles.tooLarge.length})
-                    </Text>
-                    {groupedSkippedPreviewFiles.tooLarge.map((entry, idx) => (
-                      <Text key={`too_large_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
-                        • {entry}
-                      </Text>
-                    ))}
-                  </>
-                )}
-                {groupedSkippedPreviewFiles.other.length > 0 && (
-                  <>
-                    <Text style={{ color: '#92400E', fontWeight: '700', fontSize: 12, marginTop: 6, marginBottom: 2 }}>
-                      Other ({groupedSkippedPreviewFiles.other.length})
-                    </Text>
-                    {groupedSkippedPreviewFiles.other.map((entry, idx) => (
-                      <Text key={`other_${entry}_${idx}`} style={{ color: '#B45309', fontSize: 12 }} numberOfLines={1}>
-                        • {entry}
-                      </Text>
-                    ))}
-                  </>
-                )}
-              </ScrollView>
-            </View>
-          )}
-
-          <ScrollView
-            style={styles.filePreviewContent}
-            contentContainerStyle={{ paddingBottom: Platform.select({ web: 0, default: 20 }) }}
-          >
-            {selectedFiles.map((file, index) => {
-              const mimeType = String(file.mimeType || file.type || file.fileType || '').toLowerCase();
-              const safePreviewNameCandidate = String(file.fileName || file.name || 'Unknown file').trim();
-              const safePreviewName = !safePreviewNameCandidate || safePreviewNameCandidate === '.'
-                ? 'Unknown file'
-                : safePreviewNameCandidate;
-              const fileSizeValue = file.fileSize || file.size;
-              const isImage = isImageFile(mimeType, safePreviewName);
-              const isVideo = isVideoFile(mimeType, safePreviewName);
-              const previewImageUri = String(file.previewUri || file.uri || '');
-              const thumbnailUri = file.thumbnail || file.preview || file.poster || null;
-
-              return (
-                <View key={index} style={[styles.filePreviewItem, { backgroundColor: theme.background }]}>
-                  <View style={[styles.filePreviewInfo, isVideo ? styles.filePreviewInfoVideo : null]}>
-                    {isImage && previewImageUri ? (
-                      <Image source={{ uri: previewImageUri }} style={styles.previewImage} />
-                    ) : isVideo ? (
-                      <View style={styles.videoPreviewContainer}>
-                        <VideoPlayer
-                          uri={file.uri}
-                          fileName={safePreviewName}
-                          thumbnailUrl={thumbnailUri || undefined}
-                          style={styles.videoPreviewPlayer}
-                          maxHeight={140}
-                          controlVariant="minimal"
-                        />
-                      </View>
-                    ) : (
-                      <View style={styles.fileIconContainer}>
-                        <FileIcon size={32} color={theme.primary} />
-                      </View>
-                    )}
-                    <View style={styles.filePreviewDetails}>
-                      <Text style={[styles.previewFileName, { color: theme.text }]} numberOfLines={2}>
-                        {safePreviewName}
-                      </Text>
-                      {fileSizeValue ? (
-                        <Text style={[styles.previewFileSize, { color: theme.textSecondary }]}>
-                          {formatFileSize(fileSizeValue)}
-                        </Text>
-                      ) : null}
-                    </View>
-                  </View>
-                  <TouchableOpacity
-                    onPress={getRemoveSelectedFilePressHandler(index)}
-                    style={styles.removeFileButton}
-                  >
-                    <Trash2 size={20} color={theme.error} />
-                  </TouchableOpacity>
-                </View>
-              );
-            })}
-          </ScrollView>
-
-          <View style={[styles.filePreviewFooter, { backgroundColor: theme.surface }]}>
-            <TextInput
-              style={[styles.previewMessageInput, { 
-                backgroundColor: theme.background, 
-                borderColor: theme.border,
-                color: theme.text 
-              }]}
-              value={message}
-              onChangeText={handleTyping}
-              placeholder="Add a message (optional)..."
-              placeholderTextColor={theme.textSecondary}
-              multiline
-              numberOfLines={3}
-              maxLength={CHAT_MESSAGE_MAX_CHARS}
-            />
-            
-            {isUploading ? (
-              <View style={styles.uploadProgressContainer}>
-                <Text style={[styles.uploadProgressText, { color: theme.text }]}>
-                  Uploading... {Math.round(uploadProgress)}%
-                </Text>
-                <View style={[styles.progressBar, { backgroundColor: theme.border }]}>
-                  <View 
-                    style={[
-                      styles.progressFill, 
-                      { 
-                        backgroundColor: theme.primary,
-                        width: `${uploadProgress}%`
-                      }
-                    ]} 
-                  />
-                </View>
-              </View>
-            ) : (
-              <TouchableOpacity
-                style={[styles.sendFilesButton, { backgroundColor: theme.primary }]}
-                onPress={handleSendWithFiles}
-                disabled={selectedFiles.length === 0}
-              >
-                <Send size={20} color="#ffffff" />
-                <Text style={styles.sendFilesButtonText}>
-                  Send {selectedFiles.length} file{selectedFiles.length > 1 ? 's' : ''}
-                </Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        </SafeAreaView>
-      </View>
-    </Modal>
-  );
-
-  const ImageViewerDownloadButtonBase = ({ sourceUri, localHint }: { sourceUri: string; localHint?: string }) => {
-    const downloadKey = getDownloadKey(sourceUri);
-    const downloadState = useDownloadState(downloadKey);
-    const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadState.progress ?? 0)));
-    const downloadLabel = downloadState.isDownloading
-      ? `Downloading ${normalizedProgress}%`
-      : 'Download';
-    const handleDownloadPress = useCallback(() => {
-      const derived = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
-      const downloadName = derived && derived !== 'file' ? derived : 'image.jpg';
-      handleDownloadFile(sourceUri, downloadName, localHint);
-    }, [handleDownloadFile, localHint, sourceUri]);
-
-    return (
-      <TouchableOpacity
-        style={[styles.imageViewerActionButton, { opacity: downloadState.isDownloading ? 0.7 : 1 }]}
-        onPress={handleDownloadPress}
-        disabled={downloadState.isDownloading}
-      >
-        <Download size={20} color="#ffffff" />
-        <Text style={styles.imageViewerButtonText}>{downloadLabel}</Text>
-      </TouchableOpacity>
-    );
-  };
-
-  ImageViewerDownloadButtonBase.displayName = 'ImageViewerDownloadButtonBase';
-  const ImageViewerDownloadButton = React.memo(ImageViewerDownloadButtonBase);
-  ImageViewerDownloadButton.displayName = 'ImageViewerDownloadButton';
-
-  const renderImageViewerModal = () => {
-    const sourceUri = lastViewedRemoteImage || selectedImageUri;
-    const activeImageUri = sourceUri;
-    const isSelectedImageBroken = brokenFileUrls.has(selectedImageUri);
-    const hasActiveImageNetworkError = networkErrorUrls.has(activeImageUri);
-    const derivedSharedImageFileName = normalizeSharedFileName({ fileUrl: sourceUri, fileName: '' });
-    const sharedImageFileName =
-      derivedSharedImageFileName && derivedSharedImageFileName !== 'file'
-        ? derivedSharedImageFileName
-        : 'image.jpg';
-    const retryActiveImage = () => {
-      clearNetworkError(activeImageUri);
-      setSelectedImageUri(activeImageUri);
-    };
-    const downloadSharedImage = () => {
-      const src = lastViewedRemoteImage || selectedImageUri;
-      handleDownloadFile(src, sharedImageFileName, selectedImageUri);
-    };
-
+  const renderMessageInfoModal = () => {
     return (
       <Modal
-        visible={imageViewerVisible}
+        visible={messageInfoModalState.visible}
         transparent
         animationType="fade"
-        onRequestClose={closeImageViewer}
+        onRequestClose={closeMessageInfoModal}
       >
-        <View style={styles.imageViewerOverlay}>
-          <TouchableOpacity
-            style={styles.imageViewerCloseButton}
-            onPress={closeImageViewer}
+        <Pressable style={styles.messageInfoModalOverlay} onPress={closeMessageInfoModal}>
+          <Pressable
+            style={[
+              styles.messageInfoModalCard,
+              { backgroundColor: theme.surface, borderColor: theme.border },
+            ]}
+            onPress={() => {}}
           >
-            <X size={30} color="#ffffff" />
-          </TouchableOpacity>
-          {isSelectedImageBroken ? (
-            <View style={styles.brokenImageContainer}>
-              <AlertCircle size={64} color="#ffffff" />
-              <Text style={styles.brokenImageText}>
-                Image no longer available
-              </Text>
-              <Text style={styles.brokenImageSubtext}>
-                This image has been deleted or is no longer accessible
-              </Text>
-            </View>
-          ) : (
-            <View style={styles.imageViewerContent}>
-              <ProgressiveImage
-                uri={selectedImageUri}
-                style={styles.fullScreenImage}
-                resizeMode="contain"
-                onError={() => handleImageError(activeImageUri)}
-              />
-              {hasActiveImageNetworkError && (
+            <View
+              style={[
+                styles.messageInfoModalHeader,
+                { borderBottomColor: theme.border },
+              ]}
+            >
+              <Text style={[styles.messageInfoModalTitle, { color: theme.text }]}>Message info</Text>
+              <View style={styles.messageInfoModalHeaderActions}>
                 <TouchableOpacity
-                  style={styles.imageRetryBadge}
-                  onPress={retryActiveImage}
+                  style={[
+                    styles.messageInfoCopyAllButton,
+                    {
+                      borderColor: messageInfoCopiedRowKey === '__all__' ? theme.primary : theme.border,
+                      backgroundColor: messageInfoCopiedRowKey === '__all__'
+                        ? isDarkMode
+                          ? 'rgba(59, 130, 246, 0.22)'
+                          : 'rgba(59, 130, 246, 0.12)'
+                        : theme.background,
+                    },
+                  ]}
+                  onPress={() => {
+                    void handleMessageInfoCopyAll();
+                  }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy all message details"
                 >
-                  <RotateCcw size={14} color="#ffffff" />
-                  <Text style={styles.imageRetryText}>Retry</Text>
+                  {messageInfoCopiedRowKey === '__all__' ? (
+                    <CheckCircle2 size={12} color={theme.primary} />
+                  ) : (
+                    <Copy size={12} color={theme.textSecondary} />
+                  )}
+                  <Text
+                    style={[
+                      styles.messageInfoCopyAllButtonText,
+                      { color: messageInfoCopiedRowKey === '__all__' ? theme.primary : theme.textSecondary },
+                    ]}
+                  >
+                    {messageInfoCopiedRowKey === '__all__' ? 'Copied' : 'Copy all'}
+                  </Text>
+                  {Platform.OS === 'web' ? (
+                    <View
+                      style={[
+                        styles.messageInfoShortcutBadge,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.surface,
+                        },
+                      ]}
+                    >
+                      <Text style={[styles.messageInfoShortcutBadgeText, { color: theme.textSecondary }]}>
+                        Alt+Shift+C
+                      </Text>
+                    </View>
+                  ) : null}
                 </TouchableOpacity>
-              )}
-            </View>
-          )}
-          {!isSelectedImageBroken && hasActiveImageNetworkError && (
-            <View style={[styles.imageViewerNetworkError, { backgroundColor: 'rgba(0, 0, 0, 0.55)', borderColor: 'rgba(255, 255, 255, 0.2)' }]}> 
-              <View style={styles.networkErrorInfo}>
-                <AlertCircle size={16} color="#ffffff" />
-                <Text style={[styles.networkErrorText, { color: '#ffffff' }]}>Network error. Tap retry.</Text>
+                <View style={styles.messageInfoCloseActionWrap}>
+                  <TouchableOpacity
+                    style={styles.messageInfoModalCloseButton}
+                    onPress={closeMessageInfoModal}
+                    accessibilityRole="button"
+                    accessibilityLabel="Close message info"
+                  >
+                    <X size={18} color={theme.textSecondary} />
+                  </TouchableOpacity>
+                  {Platform.OS === 'web' ? (
+                    <View
+                      style={[
+                        styles.messageInfoShortcutBadge,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.surface,
+                        },
+                      ]}
+                    >
+                      <Text style={[styles.messageInfoShortcutBadgeText, { color: theme.textSecondary }]}>
+                        Esc
+                      </Text>
+                    </View>
+                  ) : null}
+                </View>
               </View>
-              <TouchableOpacity
-                style={[styles.networkErrorRetryButton, { borderColor: '#ffffff' }]}
-                onPress={retryActiveImage}
-              >
-                <RotateCcw size={14} color="#ffffff" />
-                <Text style={[styles.networkErrorRetryText, { color: '#ffffff' }]}>Retry</Text>
-              </TouchableOpacity>
             </View>
-          )}
-          {/* Action buttons positioned at the bottom with proper spacing */}
-          {!isSelectedImageBroken && (
-            <View style={styles.imageViewerButtonContainer}>
-              <ImageViewerDownloadButton sourceUri={sourceUri} localHint={selectedImageUri} />
-              <TouchableOpacity
-                style={styles.imageViewerActionButton}
-                onPress={openImageShareModal}
+
+            {showMessageInfoHint ? (
+              <View
+                style={[
+                  styles.messageInfoHintRow,
+                  {
+                    backgroundColor: isDarkMode ? 'rgba(59, 130, 246, 0.14)' : 'rgba(59, 130, 246, 0.08)',
+                    borderBottomColor: theme.border,
+                  },
+                ]}
               >
-                <Share size={20} color="#ffffff" />
-                <Text style={styles.imageViewerButtonText}>Share</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-          <ShareModal
-            visible={showImageShareModal}
-            onClose={closeImageShareModal}
-            fileUrl={lastViewedRemoteImage || selectedImageUri}
-            fileName={sharedImageFileName}
-            onDownload={downloadSharedImage}
-          />
-        </View>
+                <Text style={[styles.messageInfoHintText, { color: theme.textSecondary }]}>
+                  Tip: Tap Copy to copy one row, or long-press a value.
+                </Text>
+              </View>
+            ) : null}
+
+            {messageInfoCopyFeedbackLabel ? (
+              <View
+                style={[
+                  styles.messageInfoCopyFeedbackRow,
+                  {
+                    borderBottomColor: theme.border,
+                    backgroundColor: isDarkMode ? 'rgba(16, 185, 129, 0.14)' : 'rgba(16, 185, 129, 0.08)',
+                  },
+                ]}
+                accessible
+                accessibilityLabel={messageInfoCopyFeedbackAccessibilityLabel}
+              >
+                <CheckCircle2 size={12} color={theme.primary} />
+                <Text style={[styles.messageInfoCopyFeedbackText, { color: theme.primary }]}>
+                  {messageInfoCopyFeedbackLabel}
+                </Text>
+                {messageInfoCopyFeedbackSourceLabel ? (
+                  <View
+                    style={[
+                      styles.messageInfoCopyFeedbackSourceBadge,
+                      {
+                        borderColor: messageInfoCopyFeedbackSourcePalette?.borderColor || theme.border,
+                        backgroundColor: messageInfoCopyFeedbackSourcePalette?.backgroundColor || theme.surface,
+                      },
+                    ]}
+                    accessible
+                    accessibilityLabel={messageInfoCopyFeedbackSourceAccessibilityLabel}
+                  >
+                    <Text
+                      style={[
+                        styles.messageInfoCopyFeedbackSourceText,
+                        { color: messageInfoCopyFeedbackSourcePalette?.textColor || theme.textSecondary },
+                      ]}
+                    >
+                      {messageInfoCopyFeedbackSourceBadgeText}
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+
+            {Platform.OS === 'web' && messageInfoCopyToastNotice ? (
+              <View
+                style={[
+                  styles.messageInfoToastNoticeRow,
+                  {
+                    borderBottomColor: theme.border,
+                    backgroundColor: isDarkMode ? 'rgba(245, 158, 11, 0.16)' : 'rgba(245, 158, 11, 0.10)',
+                  },
+                ]}
+                accessible
+                accessibilityRole="alert"
+                accessibilityLabel={messageInfoCopyToastNoticeAccessibilityLabel}
+              >
+                <AlertCircle size={11} color={theme.textSecondary} />
+                <Text
+                  accessibilityLiveRegion="polite"
+                  style={[styles.messageInfoToastNoticeText, { color: theme.textSecondary }]}
+                >
+                  {messageInfoCopyToastNotice}
+                </Text>
+              </View>
+            ) : null}
+
+            {messageInfoExpandableRowKeys.length > 0 ? (
+              <View
+                style={[
+                  styles.messageInfoBulkActionsRow,
+                  { borderBottomColor: theme.border },
+                ]}
+              >
+                <TouchableOpacity
+                  style={[
+                    styles.messageInfoBulkToggleButton,
+                    {
+                      borderColor: theme.border,
+                      backgroundColor: theme.background,
+                    },
+                  ]}
+                  onPress={toggleAllMessageInfoDetailsExpanded}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    areAllMessageInfoDetailsExpanded
+                      ? 'Hide all recipient details'
+                      : 'Show all recipient details'
+                  }
+                  accessibilityState={{ expanded: areAllMessageInfoDetailsExpanded }}
+                >
+                  <ChevronDown
+                    size={14}
+                    color={theme.textSecondary}
+                    style={areAllMessageInfoDetailsExpanded ? styles.rotate180 : null}
+                  />
+                  <Text style={[styles.messageInfoBulkToggleButtonText, { color: theme.textSecondary }]}>
+                    {areAllMessageInfoDetailsExpanded
+                      ? 'Hide all recipient details'
+                      : 'Show all recipient details'}
+                  </Text>
+                  {Platform.OS === 'web' ? (
+                    <View
+                      style={[
+                        styles.messageInfoShortcutBadge,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: theme.surface,
+                        },
+                      ]}
+                    >
+                      <Text style={[styles.messageInfoShortcutBadgeText, { color: theme.textSecondary }]}>
+                        Alt+Shift+D
+                      </Text>
+                    </View>
+                  ) : null}
+                </TouchableOpacity>
+              </View>
+            ) : null}
+
+            {Platform.OS === 'web' ? (
+              <View
+                style={[
+                  styles.messageInfoShortcutHintRow,
+                  { borderBottomColor: theme.border },
+                ]}
+              >
+                <Text style={[styles.messageInfoShortcutHintText, { color: theme.textSecondary }]}>
+                  Shortcuts: Alt+Shift+C copy all, Alt+Shift+D toggle details, Esc close.
+                </Text>
+              </View>
+            ) : null}
+
+            <ScrollView
+              style={styles.messageInfoModalBody}
+              contentContainerStyle={styles.messageInfoModalBodyContent}
+            >
+              {messageInfoModalState.rows.length <= 0 ? (
+                <Text style={[styles.messageInfoEmptyText, { color: theme.textSecondary }]}>
+                  No message details available.
+                </Text>
+              ) : (
+                messageInfoModalState.rows.map((row, index) => {
+                  const rowKey = `${row.label}:${index}`;
+                  const isCopied = messageInfoCopiedRowKey === rowKey;
+                  const rowBadge = resolveMessageInfoRowBadge(row.label, row.value);
+                  const valueParts = resolveMessageInfoRowValueParts(row.value);
+                  const isExpandable = valueParts.details.length > 0;
+                  const isExpanded = Boolean(messageInfoExpandedRows[rowKey]);
+                  const displayedValue = isExpandable && !isExpanded ? valueParts.summary : row.value;
+
+                  const badgeBackgroundColor =
+                    rowBadge?.tone === 'success'
+                      ? isDarkMode
+                        ? 'rgba(52, 211, 153, 0.2)'
+                        : 'rgba(16, 185, 129, 0.14)'
+                      : rowBadge?.tone === 'warning'
+                        ? isDarkMode
+                          ? 'rgba(251, 191, 36, 0.2)'
+                          : 'rgba(245, 158, 11, 0.14)'
+                        : isDarkMode
+                          ? 'rgba(148, 163, 184, 0.2)'
+                          : 'rgba(148, 163, 184, 0.14)';
+                  const badgeTextColor =
+                    rowBadge?.tone === 'success'
+                      ? isDarkMode
+                        ? '#6ee7b7'
+                        : '#047857'
+                      : rowBadge?.tone === 'warning'
+                        ? isDarkMode
+                          ? '#fcd34d'
+                          : '#b45309'
+                        : theme.textSecondary;
+
+                  return (
+                    <View
+                      key={rowKey}
+                      style={[
+                        styles.messageInfoRow,
+                        {
+                          borderBottomWidth:
+                            index === messageInfoModalState.rows.length - 1 ? 0 : StyleSheet.hairlineWidth,
+                          borderBottomColor: theme.border,
+                        },
+                      ]}
+                    >
+                      <View style={styles.messageInfoRowHeader}>
+                        <Text style={[styles.messageInfoRowLabel, { color: theme.textSecondary }]}>
+                          {row.label}
+                        </Text>
+                        <View style={styles.messageInfoRowHeaderRight}>
+                          {rowBadge ? (
+                            <View
+                              style={[
+                                styles.messageInfoRowBadge,
+                                { backgroundColor: badgeBackgroundColor },
+                              ]}
+                            >
+                              <Text
+                                style={[
+                                  styles.messageInfoRowBadgeText,
+                                  { color: badgeTextColor },
+                                ]}
+                              >
+                                {rowBadge.text}
+                              </Text>
+                            </View>
+                          ) : null}
+                          <TouchableOpacity
+                            style={[
+                              styles.messageInfoRowCopyButton,
+                              {
+                                borderColor: isCopied ? theme.primary : theme.border,
+                                backgroundColor: isCopied
+                                  ? isDarkMode
+                                    ? 'rgba(59, 130, 246, 0.22)'
+                                    : 'rgba(59, 130, 246, 0.12)'
+                                  : theme.background,
+                              },
+                            ]}
+                            onPress={() => {
+                              void handleMessageInfoRowCopy(rowKey, row.value, row.label);
+                            }}
+                            accessibilityRole="button"
+                            accessibilityLabel={`Copy ${row.label} details`}
+                          >
+                            {isCopied ? (
+                              <CheckCircle2 size={12} color={theme.primary} />
+                            ) : (
+                              <Copy size={12} color={theme.textSecondary} />
+                            )}
+                            <Text
+                              style={[
+                                styles.messageInfoRowCopyButtonText,
+                                { color: isCopied ? theme.primary : theme.textSecondary },
+                              ]}
+                            >
+                              {isCopied ? 'Copied' : 'Copy'}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+
+                      <TouchableOpacity
+                        onLongPress={() => {
+                          void handleMessageInfoRowCopy(rowKey, row.value, row.label);
+                        }}
+                        delayLongPress={220}
+                        activeOpacity={0.86}
+                        style={styles.messageInfoRowValuePressArea}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Copy ${row.label} details`}
+                      >
+                        <Text style={[styles.messageInfoRowValue, { color: theme.text }]}>
+                          {displayedValue}
+                        </Text>
+                      </TouchableOpacity>
+
+                      {isExpandable ? (
+                        <TouchableOpacity
+                          style={styles.messageInfoRowToggleButton}
+                          onPress={() => toggleMessageInfoRowExpanded(rowKey)}
+                          accessibilityRole="button"
+                          accessibilityLabel={
+                            isExpanded
+                              ? `Hide ${row.label} recipient details`
+                              : `Show ${row.label} recipient details`
+                          }
+                          accessibilityState={{ expanded: isExpanded }}
+                        >
+                          <Text style={[styles.messageInfoRowToggleText, { color: theme.primary }]}>
+                            {isExpanded ? 'Hide recipient details' : 'Show recipient details'}
+                          </Text>
+                        </TouchableOpacity>
+                      ) : null}
+                    </View>
+                  );
+                })
+              )}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
       </Modal>
     );
   };
@@ -9314,6 +10541,38 @@ export default function Chat() {
 
     const extraActions: { label: string; onPress: () => void; icon?: React.ReactNode; variant?: 'default' | 'primary' | 'danger'; disabled?: boolean }[] = [];
     if (targetMessage) {
+      if (canReplyMessage(targetMessage)) {
+        extraActions.push({
+          label: 'Reply',
+          onPress: () => {
+            closeEmojiPicker();
+            beginReplyToMessage(targetMessage);
+          },
+          icon: <Reply size={16} color="#ffffff" />,
+          variant: 'primary',
+        });
+      }
+
+      if (resolveChatConversationSearchSeedQuery(targetMessage?.text)) {
+        extraActions.push({
+          label: 'Find in chat',
+          onPress: () => {
+            closeEmojiPicker();
+            beginConversationSearchFromMessage(targetMessage);
+          },
+          icon: <Search size={16} color={theme.text} />,
+        });
+      }
+
+      extraActions.push({
+        label: 'Info',
+        onPress: () => {
+          closeEmojiPicker();
+          showMessageInfo(targetMessage);
+        },
+        icon: <Eye size={16} color={theme.text} />,
+      });
+
       if (canEditMessage(targetMessage)) {
         extraActions.push({
           label: 'Edit',
@@ -9372,69 +10631,7 @@ export default function Chat() {
     );
   };
 
-  // Animated Typing Indicator Component
-  const AnimatedTypingIndicator: React.FC<{ color: string }> = ({ color }) => {
-    const dot1 = useRef(new Animated.Value(0.35)).current;
-    const dot2 = useRef(new Animated.Value(0.35)).current;
-    const dot3 = useRef(new Animated.Value(0.35)).current;
 
-    useEffect(() => {
-      const animateDot = (animatedValue: Animated.Value, delay: number) => {
-        return Animated.loop(
-          Animated.sequence([
-            Animated.delay(delay),
-            Animated.timing(animatedValue, {
-              toValue: 1,
-              duration: 260,
-              useNativeDriver: Platform.OS !== 'web',
-            }),
-            Animated.timing(animatedValue, {
-              toValue: 0.35,
-              duration: 260,
-              useNativeDriver: Platform.OS !== 'web',
-            }),
-            Animated.delay(120),
-          ])
-        );
-      };
-
-      const animation = Animated.parallel([
-        animateDot(dot1, 0),
-        animateDot(dot2, 200),
-        animateDot(dot3, 400),
-      ]);
-
-      animation.start();
-
-      return () => animation.stop();
-    }, [dot1, dot2, dot3]);
-
-    const dotStyle = (animatedValue: Animated.Value) => ({
-      opacity: animatedValue,
-      transform: [
-        {
-          translateY: animatedValue.interpolate({
-            inputRange: [0.35, 1],
-            outputRange: [0, -2],
-          }),
-        },
-        {
-          scale: animatedValue.interpolate({
-            inputRange: [0.35, 1],
-            outputRange: [0.9, 1.1],
-          }),
-        },
-      ],
-    });
-
-    return (
-      <View style={styles.typingIndicatorSmall}>
-        <Animated.View style={[styles.typingDot, { backgroundColor: color }, dotStyle(dot1)]} />
-        <Animated.View style={[styles.typingDot, { backgroundColor: color }, dotStyle(dot2)]} />
-        <Animated.View style={[styles.typingDot, { backgroundColor: color }, dotStyle(dot3)]} />
-      </View>
-    );
-  };
 
   // Update selected team member when team members list changes (for real-time status updates)
   useEffect(() => {
@@ -9468,11 +10665,6 @@ export default function Chat() {
     );
   }, [displayedMessages, normalizeMessageId]);
 
-  const isDeliveredServerMessage = useCallback((serverMessageId: unknown) => {
-    const normalizedServerMessageId = normalizeMessageId(serverMessageId);
-    return Boolean(normalizedServerMessageId && deliveredMessageIds.has(normalizedServerMessageId));
-  }, [deliveredMessageIds, normalizeMessageId]);
-
   const buildPendingTextMatchKey = useCallback((
     sender: string,
     recipient: string,
@@ -9480,47 +10672,17 @@ export default function Chat() {
   ) => `${sender}|${recipient}|${text}`, []);
 
   const pendingTextMessageCandidatesByKey = useMemo(() => {
-    const candidatesByKey = new Map<string, { id: string; timestampMs: number }[]>();
-
-    displayedMessages.forEach((msg: any) => {
-      if (!msg || msg.deleted) {
-        return;
-      }
-
-      const candidateId = normalizeMessageId(msg?.id);
-      if (!candidateId) {
-        return;
-      }
-
-      const candidateSender = normalizeParticipantEmail(msg?.sender);
-      const candidateRecipient = normalizeParticipantEmail(msg?.recipientId);
-      const candidateText = normalizeMessageValue(String(msg?.text || ''));
-      if (!candidateSender || !candidateRecipient || !candidateText) {
-        return;
-      }
-
-      const matchKey = buildPendingTextMatchKey(candidateSender, candidateRecipient, candidateText);
-      const bucket = candidatesByKey.get(matchKey);
-      const entry = {
-        id: candidateId,
-        timestampMs: parseMessageTimestampMs(msg?.timestamp),
-      };
-
-      if (bucket) {
-        bucket.push(entry);
-      } else {
-        candidatesByKey.set(matchKey, [entry]);
-      }
+    return resolveChatPendingMessageCandidatesByKey({
+      displayedMessages,
+      normalizeMessageId,
+      normalizeParticipantEmail,
+      normalizeMessageValue: normalizeMessageValue as (text: string | null | undefined) => string,
     });
-
-    return candidatesByKey;
   }, [
     displayedMessages,
     normalizeMessageId,
     normalizeParticipantEmail,
     normalizeMessageValue,
-    buildPendingTextMatchKey,
-    parseMessageTimestampMs,
   ]);
 
   const findLikelyServerMessageIdForPendingText = useCallback((pendingMsg?: PendingMessage): string => {
@@ -9529,66 +10691,34 @@ export default function Chat() {
     }
 
     const pendingStatus = resolvePendingMessageStatus(pendingMsg);
-    if (pendingStatus !== 'sending' && pendingStatus !== 'sent') {
-      return '';
-    }
-
     const normalizedPendingText = normalizeMessageValue(String(pendingMsg.text || ''));
-    if (!normalizedPendingText) {
-      return '';
-    }
-
     const normalizedSender = normalizeParticipantEmail(
       pendingMsg.sender || effectiveUser?.email || user?.email || ''
     );
     const normalizedRecipient = normalizeParticipantEmail(pendingMsg.recipientId);
-    if (!normalizedSender || !normalizedRecipient) {
-      return '';
-    }
-
-    const pendingTimestamp = parseMessageTimestampMs(pendingMsg.timestamp);
-    const matchKey = buildPendingTextMatchKey(
+    const pendingTimestamp = resolveTimestampMs(pendingMsg.timestamp);
+    const matchKey = buildChatPendingTextMatchKey(
       normalizedSender,
       normalizedRecipient,
       normalizedPendingText
     );
     const candidates = pendingTextMessageCandidatesByKey.get(matchKey);
-    if (!candidates || candidates.length === 0) {
-      return '';
-    }
 
-    let bestMatchId = '';
-    let bestMatchDelta = Number.POSITIVE_INFINITY;
-
-    for (const candidate of candidates) {
-      const candidateTimestamp = candidate.timestampMs;
-      if (Number.isFinite(pendingTimestamp) && Number.isFinite(candidateTimestamp)) {
-        const delta = Math.abs(candidateTimestamp - pendingTimestamp);
-        if (delta > 12000) {
-          continue;
-        }
-
-        if (delta < bestMatchDelta) {
-          bestMatchDelta = delta;
-          bestMatchId = candidate.id;
-        }
-        continue;
-      }
-
-      if (!bestMatchId) {
-        bestMatchId = candidate.id;
-      }
-    }
-
-    return bestMatchId;
+    return resolveChatPendingServerMessageIdFromCandidates({
+      pendingStatus,
+      normalizedPendingText,
+      normalizedSender,
+      normalizedRecipient,
+      pendingTimestampMs: pendingTimestamp,
+      candidates: candidates || [],
+      maxTimestampDeltaMs: 12000,
+    });
   }, [
     resolvePendingMessageStatus,
     normalizeMessageValue,
     normalizeParticipantEmail,
     effectiveUser?.email,
     user?.email,
-    parseMessageTimestampMs,
-    buildPendingTextMatchKey,
     pendingTextMessageCandidatesByKey,
   ]);
 
@@ -9662,14 +10792,14 @@ export default function Chat() {
       const status = resolvePendingMessageStatus(pendingMsg);
       const opacity = getPendingMessageBubbleOpacity(tempId);
       const previousStatus = pendingMessageLastStatusRef.current.get(tempId);
-      const targetOpacity = status === 'sent' ? 0.52 : 0.7;
+      const targetOpacity = resolveChatPendingBubbleOpacityTarget(status);
 
       if (!previousStatus) {
         opacity.setValue(targetOpacity);
-      } else if (previousStatus !== status) {
+      } else if (shouldAnimateChatPendingBubbleOpacity(previousStatus, status)) {
         Animated.timing(opacity, {
           toValue: targetOpacity,
-          duration: status === 'sent' ? 170 : 120,
+          duration: resolveChatPendingBubbleOpacityDuration(status),
           useNativeDriver: true,
         }).start();
       }
@@ -9677,12 +10807,13 @@ export default function Chat() {
       pendingMessageLastStatusRef.current.set(tempId, status);
     }
 
-    const opacityEntries = Array.from(pendingMessageBubbleOpacityRef.current.keys());
-    for (const tempId of opacityEntries) {
-      if (!activePendingIds.has(tempId)) {
-        pendingMessageBubbleOpacityRef.current.delete(tempId);
-        pendingMessageLastStatusRef.current.delete(tempId);
-      }
+    const staleOpacityIds = resolveChatInactivePendingBubbleOpacityIds(
+      pendingMessageBubbleOpacityRef.current.keys(),
+      activePendingIds
+    );
+    for (const tempId of staleOpacityIds) {
+      pendingMessageBubbleOpacityRef.current.delete(tempId);
+      pendingMessageLastStatusRef.current.delete(tempId);
     }
   }, [pendingMessages, resolvePendingMessageStatus, getPendingMessageBubbleOpacity]);
 
@@ -9718,7 +10849,8 @@ export default function Chat() {
         const serverMessageId = await sendMessage(
           pendingMsg.text,
           false,
-          pendingMsg.recipientId
+          pendingMsg.recipientId,
+          { replyTo: pendingMsg.replyTo }
         );
         successfulMessages.push(tempId);
 
@@ -9837,7 +10969,12 @@ export default function Chat() {
       });
 
       try {
-        const serverMessageId = await sendMessage(pendingMsg.text, false, pendingMsg.recipientId);
+        const serverMessageId = await sendMessage(
+          pendingMsg.text,
+          false,
+          pendingMsg.recipientId,
+          { replyTo: pendingMsg.replyTo }
+        );
 
         const sentPendingMessage: PendingMessage = {
           ...pendingMsg,
@@ -9909,134 +11046,58 @@ export default function Chat() {
   );
 
   const pendingConversationDerived = useMemo(() => {
-    if (!selectedTeamMember?.id) {
-      return {
-        mediaEntries: [] as [string, PendingMediaItem][],
-        messageEntries: [] as [string, PendingMessage][],
-        attachmentEntries: [] as [string, PendingAttachmentItem][],
-        retryableTextIds: [] as string[],
-        retryableMediaIds: [] as string[],
-        retryableAttachmentIds: [] as string[],
-        retryAllCount: 0,
-      };
-    }
-
-    const selectedMemberId = selectedTeamMember.id;
-    const mediaEntries: [string, PendingMediaItem][] = [];
-    const messageEntries: [string, PendingMessage][] = [];
-    const attachmentEntries: [string, PendingAttachmentItem][] = [];
-    const retryableTextIds: string[] = [];
-    const retryableMediaIds: string[] = [];
-    const retryableAttachmentIds: string[] = [];
-
-    pendingMessages.forEach((pendingMsg, tempId) => {
-      if (!pendingMsg || pendingMsg.recipientId !== selectedMemberId) {
-        return;
-      }
-      messageEntries.push([tempId, pendingMsg]);
-      const status = resolvePendingMessageStatus(pendingMsg);
-      if (status === 'failed' || status === 'queued') {
-        retryableTextIds.push(tempId);
-      }
+    return resolveChatPendingConversationDerivedState({
+      selectedRecipientId: selectedTeamMember?.id,
+      pendingMessages,
+      pendingMedia,
+      pendingAttachments,
+      resolvePendingMessageStatus,
     });
-
-    pendingMedia.forEach((item, tempId) => {
-      if (!item || item.recipientId !== selectedMemberId) {
-        return;
-      }
-      mediaEntries.push([tempId, item]);
-      if (item.status === 'failed' || item.status === 'queued') {
-        retryableMediaIds.push(tempId);
-      }
-    });
-
-    pendingAttachments.forEach((item, tempId) => {
-      if (!item || item.recipientId !== selectedMemberId) {
-        return;
-      }
-      attachmentEntries.push([tempId, item]);
-      if (item.status === 'failed') {
-        retryableAttachmentIds.push(tempId);
-      }
-    });
-
-    return {
-      mediaEntries,
-      messageEntries,
-      attachmentEntries,
-      retryableTextIds,
-      retryableMediaIds,
-      retryableAttachmentIds,
-      retryAllCount: retryableTextIds.length + retryableMediaIds.length + retryableAttachmentIds.length,
-    };
   }, [pendingMessages, pendingMedia, pendingAttachments, selectedTeamMember?.id, resolvePendingMessageStatus]);
 
   const retryAllPendingCount = pendingConversationDerived.retryAllCount;
 
   const retryAllPendingSends = useCallback(async () => {
-    if (!selectedTeamMember?.id) {
-      return;
-    }
-
-    if (isOffline) {
-      Toast.show({
-        type: 'info',
-        text1: 'Offline',
-        text2: 'Reconnect to retry pending messages.',
-        position: 'top',
-      });
-      return;
-    }
-
     const {
-      retryableTextIds: textIds,
-      retryableMediaIds: mediaIds,
-      retryableAttachmentIds: attachmentIds,
+      retryableTextIds,
+      retryableMediaIds,
+      retryableAttachmentIds,
     } = pendingConversationDerived;
-    const total = textIds.length + mediaIds.length + attachmentIds.length;
+    const retryBatchPlan = resolveChatPendingRetryBatchPlan({
+      retryableTextIds,
+      retryableMediaIds,
+      retryableAttachmentIds,
+    });
+    const total = retryBatchPlan.totalCount;
 
-    if (total === 0 || isRetryingAllPending) {
+    const retryAllGuard = resolveChatPendingRetryAllGuard({
+      selectedRecipientId: selectedTeamMember?.id,
+      isOffline,
+      totalCount: total,
+      isRetryingAllPending,
+    });
+    if (!retryAllGuard.shouldRun) {
+      if (retryAllGuard.toastPayload) {
+        Toast.show(retryAllGuard.toastPayload);
+      }
       return;
     }
 
     setIsRetryingAllPending(true);
 
     try {
-      const retryPromises: Promise<boolean>[] = [];
-      textIds.forEach((tempId) => retryPromises.push(retryPendingMessage(tempId, { silent: true })));
-      mediaIds.forEach((tempId) => retryPromises.push(retryPendingMedia(tempId, { silent: true })));
-      attachmentIds.forEach((tempId) => retryPromises.push(retryPendingAttachment(tempId, { silent: true })));
+      const retryPromises = resolveChatPendingRetryDispatchPromises({
+        orderedTargets: retryBatchPlan.orderedTargets,
+        handlers: {
+          text: (tempId) => retryPendingMessage(tempId, { silent: true }),
+          media: (tempId) => retryPendingMedia(tempId, { silent: true }),
+          attachment: (tempId) => retryPendingAttachment(tempId, { silent: true }),
+        },
+      });
 
       const settled = await Promise.allSettled(retryPromises);
-      const successCount = settled.reduce((count, result) => {
-        if (result.status === 'fulfilled' && result.value === true) {
-          return count + 1;
-        }
-        return count;
-      }, 0);
-
-      if (successCount === total) {
-        Toast.show({
-          type: 'success',
-          text1: 'Retry Complete',
-          text2: 'All pending items were sent.',
-          position: 'top',
-        });
-      } else if (successCount > 0) {
-        Toast.show({
-          type: 'info',
-          text1: 'Partial Retry Success',
-          text2: `${successCount} of ${total} pending items were sent.`,
-          position: 'top',
-        });
-      } else {
-        Toast.show({
-          type: 'error',
-          text1: 'Retry Failed',
-          text2: 'Could not resend pending items. Please try again.',
-          position: 'top',
-        });
-      }
+      const retryOutcomeSummary = resolveChatPendingRetryOutcomeSummary(settled, total);
+      Toast.show(retryOutcomeSummary.toastPayload);
     } finally {
       setIsRetryingAllPending(false);
     }
@@ -10044,106 +11105,87 @@ export default function Chat() {
 
   // Effect to retry pending messages when connection is restored
   useEffect(() => {
-  if (!isOffline && pendingMessages.size > 0) {
+    const pendingAutoRetryPlan = resolveChatPendingAutoRetryPlan({
+      isOffline,
+      pendingMessageCount: pendingMessages.size,
+      defaultDelayMs: 1000,
+    });
+
+    if (pendingAutoRetryPlan.shouldSchedule) {
       // Wait a moment for connection to stabilize
       const timer = setTimeout(() => {
         retryPendingMessages();
-      }, 1000);
+      }, pendingAutoRetryPlan.delayMs);
       return () => clearTimeout(timer);
     }
   }, [isOffline, pendingMessages.size]);
 
   // Clear optimistic text rows once their server message shows up in conversation data.
   useEffect(() => {
-    if (pendingMessages.size === 0 || deliveredMessageIds.size === 0) {
+    if (!shouldRunChatPendingDeliveredCleanup(pendingMessages.size, deliveredMessageIds.size)) {
       return;
     }
 
-    const resolvedPendingIds: string[] = [];
-    for (const [tempId, pendingMsg] of pendingMessages.entries()) {
-      const status = resolvePendingMessageStatus(pendingMsg);
-      if (status !== 'sending' && status !== 'sent') {
-        continue;
-      }
-      const serverMessageId = normalizeMessageId(pendingMsg.serverMessageId);
-      if (serverMessageId && isDeliveredServerMessage(serverMessageId)) {
-        resolvedPendingIds.push(tempId);
-      }
-    }
-
-    if (resolvedPendingIds.length === 0) {
-      return;
-    }
-
-    setPendingMessages((prev) => {
-      const next = new Map(prev);
-      resolvedPendingIds.forEach((tempId) => next.delete(tempId));
-      return next;
+    const resolvedPendingIds = resolveChatPendingTextMessageReconciledIds({
+      pendingMessages,
+      deliveredMessageIds,
+      normalizeMessageId,
+      resolvePendingMessageStatus,
     });
+
+    if (!hasChatPendingResolvedIds(resolvedPendingIds)) {
+      return;
+    }
+
+    setPendingMessages((prev) => resolveChatPendingMapAfterRemovingIds(prev, resolvedPendingIds));
 
     void PendingMessageStorage.removePendingMessages(resolvedPendingIds).catch((error) => {
       logger.warn('Failed to remove reconciled pending messages from storage:', error);
     });
-  }, [deliveredMessageIds, pendingMessages, normalizeMessageId, resolvePendingMessageStatus, isDeliveredServerMessage]);
+  }, [deliveredMessageIds, pendingMessages, normalizeMessageId, resolvePendingMessageStatus]);
 
   // Clear optimistic media rows once matching server message is present.
   useEffect(() => {
-    if (pendingMedia.size === 0 || deliveredMessageIds.size === 0) {
+    if (!shouldRunChatPendingDeliveredCleanup(pendingMedia.size, deliveredMessageIds.size)) {
       return;
     }
 
-    const resolvedIds: string[] = [];
-    for (const [tempId, item] of pendingMedia.entries()) {
-      if (item.status !== 'sent') {
-        continue;
-      }
-      const serverMessageId = normalizeMessageId(item.serverMessageId);
-      if (serverMessageId && isDeliveredServerMessage(serverMessageId)) {
-        resolvedIds.push(tempId);
-      }
-    }
-
-    if (resolvedIds.length === 0) {
-      return;
-    }
-
-    setPendingMedia((prev) => {
-      const next = new Map(prev);
-      resolvedIds.forEach((tempId) => next.delete(tempId));
-      return next;
+    const resolvedIds = resolveChatPendingMediaMessageReconciledIds({
+      pendingMedia,
+      deliveredMessageIds,
+      normalizeMessageId,
     });
-  }, [pendingMedia, deliveredMessageIds, normalizeMessageId, isDeliveredServerMessage]);
+
+    if (!hasChatPendingResolvedIds(resolvedIds)) {
+      return;
+    }
+
+    setPendingMedia((prev) => resolveChatPendingMapAfterRemovingIds(prev, resolvedIds));
+  }, [pendingMedia, deliveredMessageIds, normalizeMessageId]);
 
   // Clear optimistic attachment rows once matching server message is present.
   useEffect(() => {
-    if (pendingAttachments.size === 0 || deliveredMessageIds.size === 0) {
+    if (!shouldRunChatPendingDeliveredCleanup(pendingAttachments.size, deliveredMessageIds.size)) {
       return;
     }
 
-    const resolvedIds: string[] = [];
-    for (const [tempId, item] of pendingAttachments.entries()) {
-      if (item.status !== 'finalizing' && item.status !== 'sent') {
-        continue;
-      }
-      const serverMessageId = normalizeMessageId(item.serverMessageId);
-      if (serverMessageId && isDeliveredServerMessage(serverMessageId)) {
-        resolvedIds.push(tempId);
-      }
-    }
+    const resolvedIds = resolveChatPendingAttachmentMessageReconciledIds({
+      pendingAttachments,
+      deliveredMessageIds,
+      normalizeMessageId,
+    });
 
-    if (resolvedIds.length === 0) {
+    if (!hasChatPendingResolvedIds(resolvedIds)) {
       return;
     }
 
     setPendingAttachments((prev) => {
-      const next = new Map(prev);
       resolvedIds.forEach((tempId) => {
         clearAttachmentFinalizeTimer(tempId);
-        next.delete(tempId);
       });
-      return next;
+      return resolveChatPendingMapAfterRemovingIds(prev, resolvedIds);
     });
-  }, [pendingAttachments, deliveredMessageIds, normalizeMessageId, clearAttachmentFinalizeTimer, isDeliveredServerMessage]);
+  }, [pendingAttachments, deliveredMessageIds, normalizeMessageId, clearAttachmentFinalizeTimer]);
 
   const retryPendingMessageRef = useRef(retryPendingMessage);
   useEffect(() => {
@@ -10152,58 +11194,54 @@ export default function Chat() {
 
   const retryPendingMessagePressHandlersRef = useRef<Map<string, () => void>>(new Map());
   const getRetryPendingMessagePressHandler = useCallback((tempId: string) => {
-    const cached = retryPendingMessagePressHandlersRef.current.get(tempId);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      void retryPendingMessageRef.current(tempId);
-    };
-    retryPendingMessagePressHandlersRef.current.set(tempId, handler);
-    return handler;
+    return resolveMapCacheEntry(retryPendingMessagePressHandlersRef.current, tempId, () => {
+      return () => {
+        void retryPendingMessageRef.current(tempId);
+      };
+    });
   }, []);
 
   useEffect(() => {
-    const activeIds = new Set<string>(Array.from(pendingMessages.keys()));
-    const handlers = retryPendingMessagePressHandlersRef.current;
-    for (const tempId of Array.from(handlers.keys())) {
-      if (!activeIds.has(tempId)) {
-        handlers.delete(tempId);
-      }
-    }
+    const activeIds = resolveChatPendingActiveIdSet(pendingMessages.keys());
+    pruneMapByKeySet(retryPendingMessagePressHandlersRef.current, activeIds);
   }, [pendingMessages]);
 
   // Render pending messages with visual indicators
   const renderPendingMessage = (tempId: string, pendingMsg: PendingMessage) => {
     // Only show pending messages for the currently selected team member
-    if (!selectedTeamMember || pendingMsg.recipientId !== selectedTeamMember.id) return null;
+    if (!selectedTeamMember) return null;
     const baseStatus = resolvePendingMessageStatus(pendingMsg);
-    let normalizedServerMessageId = normalizeMessageId(pendingMsg.serverMessageId);
-    if (!normalizedServerMessageId && (baseStatus === 'sending' || baseStatus === 'sent')) {
-      normalizedServerMessageId = findLikelyServerMessageIdForPendingText(pendingMsg);
-    }
-    if (
-      normalizedServerMessageId &&
-      deliveredMessageIds.has(normalizedServerMessageId) &&
-      (baseStatus === 'sending' || baseStatus === 'sent')
-    ) {
+    const pendingTextVisibilityState = resolveChatPendingTextVisibilityState({
+      selectedRecipientId: selectedTeamMember.id,
+      itemRecipientId: pendingMsg.recipientId,
+      status: baseStatus,
+      serverMessageId: pendingMsg.serverMessageId,
+      deliveredMessageIds,
+      normalizeMessageId,
+      resolveFallbackServerMessageId: () => findLikelyServerMessageIdForPendingText(pendingMsg),
+    });
+    if (!pendingTextVisibilityState.shouldRender) {
       return null;
     }
 
-    const rowAnim = getPendingRowAnimation(`text:${tempId}`, 'outgoing');
+    const rowAnim = getPendingRowAnimation(buildChatPendingRowAnimationKey('text', tempId), 'outgoing');
     const isRetrying = retryingPendingMessages.has(tempId);
-    const effectiveStatus: NonNullable<PendingMessage['status']> = isRetrying ? 'sending' : baseStatus;
+    const pendingTextStatusState = resolveChatPendingStatusDisplayState({
+      status: baseStatus,
+      isOffline,
+      isRetrying,
+    });
+    const effectiveStatus = pendingTextStatusState.effectiveStatus;
     const bubbleOpacity = getPendingMessageBubbleOpacity(tempId);
-    const statusLabel =
-      effectiveStatus === 'sending'
-        ? (isRetrying ? 'Retrying...' : 'Sending...')
-        : effectiveStatus === 'sent'
-          ? 'Sent'
-          : effectiveStatus === 'failed'
-            ? 'Not sent'
-            : 'Queued';
-    const canRetry = !isRetrying && (effectiveStatus === 'failed' || (effectiveStatus === 'queued' && !isOffline));
+    const pendingTextReplyPreviewState = resolveChatPendingReplyPreviewState({
+      replyTo: pendingMsg.replyTo,
+      maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
+      resolvePreviewText: resolveChatReplyPreviewText,
+    });
+    const pendingReplyPreview = pendingTextReplyPreviewState.previewText;
+    const pendingReplySenderLabel = pendingTextReplyPreviewState.shouldShowPreview
+      ? resolveChatReplySenderLabel(pendingMsg.replyTo)
+      : '';
     
     return (
       <Animated.View
@@ -10222,6 +11260,22 @@ export default function Chat() {
           styles.ownBubble,
           { backgroundColor: theme.primary, opacity: bubbleOpacity }
         ]}>
+          {pendingReplyPreview && (
+            <TouchableOpacity
+              style={[styles.replySnippet, styles.replySnippetOwn, { borderLeftColor: 'rgba(255, 255, 255, 0.7)' }]}
+              activeOpacity={0.85}
+              onPress={() => {
+                void jumpToReplyMessage(pendingMsg.replyTo);
+              }}
+            >
+              <Text style={[styles.replySnippetSender, styles.replySnippetSenderOwn]} numberOfLines={1}>
+                {pendingReplySenderLabel}
+              </Text>
+              <Text style={[styles.replySnippetText, styles.replySnippetTextOwn]} numberOfLines={1}>
+                {pendingReplyPreview}
+              </Text>
+            </TouchableOpacity>
+          )}
           <StyledText
             text={sanitizeMessageText(pendingMsg.text, 'Sending message...')}
             style={[
@@ -10232,15 +11286,17 @@ export default function Chat() {
               color: 'rgba(255, 255, 255, 0.9)',
               fontWeight: '600'
             }}
+            highlightQuery={inlineConversationSearchHighlightQuery}
+            highlightStyle={styles.searchInlineHighlightOwn}
           />
           
           <View style={[styles.messageFooter, styles.ownMessageFooter]}>
             <Text style={[
               styles.messageTime,
               styles.ownMessageTime,
-              { color: 'rgba(255, 255, 255, 0.85)' }
+              styles.pendingTextMessageTime
             ]}>
-              {statusLabel}
+              {pendingTextStatusState.statusLabel}
             </Text>
             <View style={{ marginLeft: 6 }}>
               {effectiveStatus === 'sending' ? (
@@ -10253,23 +11309,17 @@ export default function Chat() {
                 <Clock size={12} color="rgba(255, 255, 255, 0.85)" />
               )}
             </View>
-            {canRetry && (
+            {pendingTextStatusState.canRetry && (
               <TouchableOpacity
                 onPress={getRetryPendingMessagePressHandler(tempId)}
                 disabled={isRetrying}
-                style={{
-                  marginLeft: 10,
-                  paddingHorizontal: 8,
-                  paddingVertical: 4,
-                  borderRadius: 8,
-                  backgroundColor: 'rgba(255,255,255,0.15)',
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  opacity: isRetrying ? 0.6 : 1,
-                }}
+                style={[
+                  styles.pendingTextRetryButton,
+                  isRetrying ? { opacity: 0.6 } : null
+                ]}
               >
                 <RotateCcw size={12} color="#ffffff" />
-                <Text style={{ marginLeft: 4, color: '#ffffff', fontWeight: '600' }}>Retry</Text>
+                <Text style={styles.pendingTextRetryButtonText}>Retry</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -10282,21 +11332,17 @@ export default function Chat() {
   // Load pending messages when component mounts or team member changes
   useEffect(() => {
     const loadPendingMessages = async () => {
-      if (selectedTeamMember && (effectiveUser?.email || user?.email)) {
-        const senderEmail = effectiveUser?.email || user?.email || '';
-        
+      const senderEmail = resolveChatPendingSenderEmail(effectiveUser?.email, user?.email);
+      if (shouldLoadChatPendingMessages(selectedTeamMember?.id, senderEmail)) {
         const storedPendingMessages = await PendingMessageStorage.getPendingMessagesForRecipient(
-          selectedTeamMember.id,
+          selectedTeamMember?.id || '',
           senderEmail
         );
 
-        const normalizedPendingMessages = new Map<string, PendingMessage>();
-        for (const [id, message] of storedPendingMessages.entries()) {
-          normalizedPendingMessages.set(id, {
-            ...message,
-            status: resolvePendingMessageStatus(message),
-          });
-        }
+        const normalizedPendingMessages = resolveChatNormalizedPendingMessages(
+          storedPendingMessages,
+          resolvePendingMessageStatus
+        ) as Map<string, PendingMessage>;
 
         setPendingMessages(normalizedPendingMessages);
       } else {
@@ -10313,24 +11359,13 @@ export default function Chat() {
   );
 
   const scrollToBottomButtonStyle = useMemo(
-    () => ({
-      position: 'absolute' as const,
-      right: 12,
-      bottom: 12 + Math.max(0, (inputHeight || 40) - 40),
-      backgroundColor: theme.surface,
-      borderColor: theme.border,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderRadius: 20,
-      paddingHorizontal: 12,
-      paddingVertical: 10,
-      flexDirection: 'row' as const,
-      alignItems: 'center' as const,
-      shadowColor: '#000',
-      shadowOpacity: 0.1,
-      shadowRadius: 4,
-      shadowOffset: { width: 0, height: 2 },
-      elevation: 2,
-    }),
+    () =>
+      resolveChatScrollToBottomButtonStyleState({
+        inputHeight,
+        surfaceColor: theme.surface,
+        borderColor: theme.border,
+        borderWidth: StyleSheet.hairlineWidth,
+      }),
     [inputHeight, theme.border, theme.surface]
   );
 
@@ -10347,13 +11382,21 @@ export default function Chat() {
   );
 
   const handleScrollToBottomPress = useCallback(() => {
-    setUnseenCount(0);
-    setShowScrollToBottom(false);
-    setShowNewDivider(false);
-    setNewDividerMessageId(null);
+    const nextFabState = resolveReplyJumpStateForLatestReturn();
+    resetUnseenCount();
+    setShowScrollToBottomSafely(nextFabState.showScrollToBottom);
+    setShowReplyJumpToLatestSafely(nextFabState.showReplyJumpToLatest);
+    clearNewMessageDivider();
     dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
     scrollToBottom();
-  }, [dismissUnreadDividerForCurrentBatch, scrollToBottom]);
+  }, [
+    clearNewMessageDivider,
+    dismissUnreadDividerForCurrentBatch,
+    resetUnseenCount,
+    scrollToBottom,
+    setShowReplyJumpToLatestSafely,
+    setShowScrollToBottomSafely,
+  ]);
 
   const handleSpecialIndicatorClose = useCallback(() => {
     clearInputField();
@@ -10368,46 +11411,15 @@ export default function Chat() {
     handleTyping(`${baseText}${suffix}`);
   }, [handleTyping]);
 
-  const handleQuickFormatExtraBold = useCallback(() => {
-    appendFormattingText('***extra bold***');
-  }, [appendFormattingText]);
-
-  const handleQuickFormatBold = useCallback(() => {
-    appendFormattingText('**bold**');
-  }, [appendFormattingText]);
-
-  const handleQuickFormatItalic = useCallback(() => {
-    appendFormattingText('*italic*');
-  }, [appendFormattingText]);
-
-  const handleQuickFormatUnderline = useCallback(() => {
-    appendFormattingText('__underline__');
-  }, [appendFormattingText]);
-
-  const handleQuickFormatStrike = useCallback(() => {
-    appendFormattingText('~~strike~~');
-  }, [appendFormattingText]);
-
-  const handleQuickFormatCode = useCallback(() => {
-    appendFormattingText('`code`');
-  }, [appendFormattingText]);
-
-  const handleQuickFormatSpecial = useCallback(() => {
-    appendFormattingText('/special ');
-  }, [appendFormattingText]);
 
   const handleSelectTeamMemberFromList = useCallback((member: TeamMember) => {
     forceBottomAnchorChatKeyRef.current = String(member.id || member.email || '');
     setSelectedTeamMember(member);
-    setTimeout(() => {
-      if (Platform.OS === 'ios' && textInputRef.current) {
-        textInputRef.current.focus();
-      } else if (Platform.OS === 'android' && richTextInputRef.current) {
-        try {
-          richTextInputRef.current.focus?.();
-        } catch (e) {
-          logger.debug('Android focus not available');
-        }
+    scheduleTimeoutRef(selectMemberFocusTimerRef, () => {
+      try {
+        mobileInputRef.current?.focusInput?.();
+      } catch (e) {
+        logger.debug('Mobile input focus not available');
       }
     }, 500);
   }, []);
@@ -10430,17 +11442,12 @@ export default function Chat() {
     }
 
     teamMemberByPressKeyRef.current.set(key, member);
-    const cached = teamMemberSelectPressHandlersRef.current.get(key);
-    if (cached) {
-      return cached;
-    }
-
-    const handler = () => {
-      const latestMember = teamMemberByPressKeyRef.current.get(key) || member;
-      handleSelectTeamMemberFromListRef.current(latestMember);
-    };
-    teamMemberSelectPressHandlersRef.current.set(key, handler);
-    return handler;
+    return resolveMapCacheEntry(teamMemberSelectPressHandlersRef.current, key, () => {
+      return () => {
+        const latestMember = teamMemberByPressKeyRef.current.get(key) || member;
+        handleSelectTeamMemberFromListRef.current(latestMember);
+      };
+    });
   }, [getTeamMemberPressKey, noopPressHandler]);
 
   useEffect(() => {
@@ -10633,7 +11640,7 @@ export default function Chat() {
                         {item.lastMessageTime}
                       </Text>
                     )}
-                    <TenantRoleBadge role={(item as any)?.tenantRole ?? null} style={{ marginLeft: 6 }} />
+                    <TenantRoleBadge role={(item as any)?.tenantRole ?? null} style={styles.marginLeft6} />
                   </View>
                 </View>
                 
@@ -10781,18 +11788,6 @@ export default function Chat() {
     return `Message ${safeName}...`;
   };
 
-  const messagePreviewText = sanitizeMessageText(message, 'Message preview');
-  const shouldShowFormatPreview =
-    typeof message === 'string' &&
-    message.trim().length > 0 &&
-    !message.includes('/special') &&
-    (message.includes('***') ||
-      message.includes('**') ||
-      message.includes('*') ||
-      message.includes('__') ||
-      message.includes('~~') ||
-      message.includes('`'));
-
   const alignMessageListAnchors = (hasLayout: boolean, hasContent: boolean) => {
     const forceChatKey = forceBottomAnchorChatKeyRef.current;
     const selectedChatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
@@ -10855,288 +11850,871 @@ export default function Chat() {
       const y = e.nativeEvent.contentOffset?.y ?? 0;
       const contentH = e.nativeEvent.contentSize?.height ?? 0;
       const layoutH = e.nativeEvent.layoutMeasurement?.height ?? 0;
-      const bottomBuffer = bottomVisibilityPadding;
-      const distanceFromBottom = Math.max(0, contentH - (y + layoutH));
-      const nearBottomThreshold = bottomBuffer + 32;
-      const nearBottom = distanceFromBottom <= nearBottomThreshold;
+      const wasNearBottom = isAtBottomRef.current;
+      const nearBottomState = resolveChatNearBottomState({
+        offsetY: y,
+        contentHeight: contentH,
+        layoutHeight: layoutH,
+        bottomVisibilityPadding,
+        wasNearBottom,
+        showUnreadSeparator: showUnreadSeparatorRef.current,
+        activeUnreadAnchorId: unreadSeparatorAnchorMessageId || unreadSeparatorMessageIdRef.current,
+        lastDismissedUnreadAnchorId: lastNearBottomUnreadDismissAnchorRef.current,
+      });
+      const nearBottom = nearBottomState.nearBottom;
       isAtBottomRef.current = nearBottom;
       if (nearBottom) {
-        setShowScrollToBottom(false);
-        setUnseenCount(0);
-        setShowNewDivider(false);
-        setNewDividerMessageId(null);
-        if (showUnreadSeparatorRef.current && unreadSeparatorAnchorMessageId) {
+        if (nearBottomState.enteredNearBottom) {
+          const nextFabState = resolveReplyJumpStateForNearBottom();
+          setShowScrollToBottomSafely(nextFabState.showScrollToBottom);
+          setShowReplyJumpToLatestSafely(nextFabState.showReplyJumpToLatest);
+          resetUnseenCount();
+          clearNewMessageDivider();
+        }
+
+        lastNearBottomUnreadDismissAnchorRef.current = nearBottomState.nextDismissedUnreadAnchorId;
+
+        if (
+          nearBottomState.shouldDismissUnreadDivider &&
+          nearBottomState.activeUnreadAnchorId
+        ) {
           dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
         }
       } else {
+        lastNearBottomUnreadDismissAnchorRef.current = nearBottomState.nextDismissedUnreadAnchorId;
+
         // Always show the FAB when user is not at the bottom
-        setShowScrollToBottom(true);
+        if (nearBottomState.leftNearBottom) {
+          setShowScrollToBottomSafely(true);
+        }
       }
     } catch {}
   };
 
-  return (
-    <KeyboardAvoidingView 
-      style={[styles.container, { backgroundColor: theme.background }]}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
-      {...(Platform.OS === 'web'
-        ? ({
-            onDragOver: handleChatPageDragOver,
-            onDragLeave: handleChatPageDragLeave,
-            onDrop: handleChatPageDrop,
-          } as any)
-        : {})}
-    >
-  {/* Header with User Selection */}
-  <View style={[styles.header, { backgroundColor: theme.surface, borderBottomColor: theme.border, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }]}>
-        <TouchableOpacity 
-          onPress={handleBackToChatList}
-          style={styles.backButton}
-        >
-          <ArrowLeft size={24} color={theme.text} />
-        </TouchableOpacity>
-        
-        <TouchableOpacity 
-          style={styles.friendInfo}
-          onPress={openChatProfileModal}
-          activeOpacity={0.7}
-        >
-          <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
-  {getProfilePictureURL(selectedTeamMember) ? (
-    <Image
-      source={{ uri: getProfilePictureURL(selectedTeamMember) }}
-      style={styles.avatarImage}
-    />
-  ) : (
-    <Text style={styles.avatarText}>
-      {getSafeDisplayInitial(selectedTeamMember?.name || 'T')}
-    </Text>
-  )}
-</View>
+  const chatListHeaderComponent = (
+    <View style={styles.alignItemsCenterMarginVertical8}>
+      {loadingMore ? (
+        <ActivityIndicator color={theme.primary} size="small" />
+      ) : reachedConversationStart ? (
+        <Text style={themedStyles.colorTextSecondary}>
+          {"You're at the beginning of this conversation"}
+        </Text>
+      ) : null}
+    </View>
+  );
 
-          <View>
-            <View style={styles.friendNameRow}>
-              <Text allowFontScaling={false} style={[styles.friendName, { color: theme.text }]}> 
-                {selectedTeamMember?.name || 'Select Team Member'}
-              </Text>
-              {!!selectedTeamMember && (
-                <TenantRoleBadge role={(selectedTeamMember as any)?.tenantRole ?? null} style={{ marginLeft: 8 }} />
-              )}
-            </View>
-            <View style={styles.friendStatusContainer}>
-              {isTyping ? (
-                <View style={styles.friendTypingRow}>
-                  <Text allowFontScaling={false} style={[styles.friendStatus, styles.friendTypingText, { color: theme.primary }]}>
-                    typing...
-                  </Text>
-                  <View style={{ marginLeft: 6 }}>
-                    <AnimatedTypingIndicator color={theme.primary} />
-                  </View>
-                </View>
-              ) : (
-                <>
-                  {selectedTeamMember?.isOnline !== undefined && (
-                    <View style={[
-                      styles.statusDot,
-                      { backgroundColor: selectedTeamMember.isOnline ? theme.success : theme.textSecondary }
-                    ]} />
-                  )}
-                  <Text allowFontScaling={false} style={[styles.friendStatus, { color: theme.textSecondary }]}>
-                    {formatOnlineStatus(selectedTeamMember?.isOnline, selectedTeamMember?.lastSeen)}
-                  </Text>
-                </>
-              )}
-            </View>
+  const chatListFooterComponent = (
+    <View>
+      {/* Optimistic pending media (stickers/GIFs) */}
+      {pendingConversationDerived.mediaEntries.map(([tempId, item]) => {
+        if (!tempId || !item) return null;
+        const rendered = renderPendingMedia(tempId, item);
+        if (typeof rendered === 'string') return null;
+        return rendered;
+      })}
+
+      {/* Pending text messages (queued/sending/sent/failed) */}
+      {pendingConversationDerived.messageEntries.map(([tempId, pendingMsg]) => {
+        if (!tempId || !pendingMsg) return null;
+        const renderedPending = renderPendingMessage(tempId, pendingMsg);
+        if (typeof renderedPending === 'string') {
+          logger.warn('⚠️ renderPendingMessage returned string:', JSON.stringify(renderedPending));
+          return null;
+        }
+        return renderedPending;
+      })}
+
+      {/* Optimistic pending file attachments */}
+      {pendingConversationDerived.attachmentEntries.map(([tempId, item]) => {
+        if (!tempId || !item) return null;
+        const rendered = renderPendingAttachments(tempId, item);
+        if (typeof rendered === 'string') return null;
+        return rendered;
+      })}
+
+      {/* Typing indicator */}
+      {isTyping && selectedTeamMember && (
+        <View style={[styles.messageContainer, styles.friendMessage, styles.typingIndicator]}>
+          <View
+            style={[
+              styles.messageBubble,
+              styles.friendBubble,
+              styles.typingBubble,
+              { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border },
+            ]}
+          >
+            <AnimatedTypingIndicator color={theme.textSecondary} />
           </View>
-        </TouchableOpacity>
+        </View>
+      )}
 
+      {/* Add extra padding at bottom to ensure typing indicator is visible */}
+      <View style={styles.height20} />
+    </View>
+  );
+
+  const renderChatListEmptyComponent = () => {
+    const hasPending =
+      pendingConversationDerived.mediaEntries.length > 0 ||
+      pendingConversationDerived.messageEntries.length > 0 ||
+      pendingConversationDerived.attachmentEntries.length > 0;
+    const hasLoadError = Boolean(error);
+    const shouldDeferEmptyState =
+      loading ||
+      loadingMore ||
+      !selectedTeamMember ||
+      hasMore ||
+      hasLoadError;
+
+    if (hasPending || shouldDeferEmptyState) {
+      if (selectedTeamMember && hasLoadError) {
+        if (showReconnectFallback) {
+          return (
+            <View style={styles.emptyState}>
+              <View style={[styles.reconnectCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
+                <Text style={[styles.reconnectTitle, { color: theme.text }]}>Could not load messages</Text>
+                <Text style={[styles.reconnectSubtext, { color: theme.textSecondary }]}> 
+                  {isOffline
+                    ? "You're offline right now. Reconnect to the internet, then try again."
+                    : 'Please check your connection and try reconnecting.'}
+                </Text>
+                <TouchableOpacity
+                  onPress={handleManualReconnect}
+                  activeOpacity={0.85}
+                  style={[styles.reconnectButton, { backgroundColor: theme.primary }]}
+                >
+                  <Text style={styles.reconnectButtonText}>Reconnect</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          );
+        }
+        return (
+          <View style={styles.emptyState}>
+            <ActivityIndicator color={theme.primary} size="small" />
+            <Text style={[styles.reconnectHintText, { color: theme.textSecondary }]}>Trying to reconnect…</Text>
+          </View>
+        );
+      }
+      return null;
+    }
+
+    const emptyStateTitle = selectedTeamMember ? 'No messages yet' : 'Select a team member';
+    const safeConversationName = selectedTeamMember
+      ? sanitizeMessageText(
+          typeof selectedTeamMember.name === 'string' ? selectedTeamMember.name : '',
+          'someone'
+        ).trim()
+      : '';
+    const emptyStateSubtext = selectedTeamMember
+      ? `Start a conversation with ${safeConversationName || 'someone'}!`
+      : 'Choose a team member from the list to start chatting';
+
+    return (
+      <View style={styles.emptyState}>
+        <Text style={[styles.emptyStateText, { color: theme.text }]}> 
+          {emptyStateTitle}
+        </Text>
+        <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}> 
+          {emptyStateSubtext}
+        </Text>
       </View>
+    );
+  };
 
-      {/* Messages */}
-      <View style={styles.messagesWrapper}>
-        {/* Sticky Date Header */}
-        {stickyDateVisible && (
-          <View style={[styles.stickyDateHeader, { backgroundColor: 'transparent', pointerEvents: 'none' }]}> 
-            <View style={[styles.stickyDateContainer, { 
-              backgroundColor: theme.surface, 
-              borderColor: theme.border,
-              ...(Platform.OS === 'web' ? {} : { shadowColor: theme.text })
-            }]}> 
-              <Text style={[styles.stickyDateText, { color: theme.textSecondary }]}> 
-                {sanitizeDateSeparatorLabel(stickyDateText)}
+  messageListScrollHandlerRef.current = handleMessageListScroll;
+  messageListContentSizeHandlerRef.current = handleMessageListContentSizeChange;
+  messageListLayoutHandlerRef.current = handleMessageListLayout;
+  messageListHeaderRendererRef.current = chatListHeaderComponent;
+  messageListFooterRendererRef.current = chatListFooterComponent;
+  messageListEmptyRendererRef.current = renderChatListEmptyComponent;
+
+  const listOnViewableItemsChanged = onViewableItemsChangedRef.current;
+  const listViewabilityConfig = viewabilityConfigRef.current;
+
+  const chatMessagesListPaneProps: ChatMessagesListPaneProps = {
+    stickyDateVisible,
+    stickyDateText,
+    sanitizeDateSeparatorLabel,
+    theme,
+    isInitialAnchorSettled,
+    flatListRef,
+    listKey: String(selectedTeamMember?.id || selectedTeamMember?.email || 'chat'),
+    displayedMessages,
+    estimatedItemSize,
+    getMessageKey,
+    estimatedListSize,
+    listDrawDistance,
+    onViewableItemsChanged: listOnViewableItemsChanged,
+    viewabilityConfig: listViewabilityConfig,
+    getMessageItemType,
+    overrideMessageLayout,
+    renderMessageItem,
+    listExtraData,
+    messagesContentContainerStyle,
+    onMessageListScroll: handleMessageListScrollStable,
+    onMessageListContentSizeChange: handleMessageListContentSizeChangeStable,
+    onMessageListLayout: handleMessageListLayoutStable,
+    maintainVisibleContentPositionConfig,
+    renderChatListHeader: renderMessageListHeaderStable,
+    renderChatListFooter: renderMessageListFooterStable,
+    renderChatListEmpty: renderMessageListEmptyStable,
+  };
+
+  const chatScrollToBottomButtonProps: ChatScrollToBottomButtonProps = {
+    showScrollToBottom,
+    handleScrollToBottomPress,
+    scrollToBottomButtonStyle,
+    showReplyJumpToLatest,
+    unseenCount,
+    unseenCountBadgeStyle,
+    theme,
+  };
+
+  const hasConversationSearchMatches = conversationSearchMatchIds.length > 0;
+  const inlineConversationSearchHighlightQuery = conversationSearchVisible
+    ? normalizedConversationSearchQuery
+    : '';
+
+  // Keep this as a plain object because this section is after conditional returns.
+  const chatReactiveContextValue: ChatReactiveContextValue = {
+    effectiveUser,
+    selectedTeamMember,
+    teamMembersByEmail,
+    theme,
+    themedStyles,
+    isDarkMode,
+    isFocused,
+    isOffline,
+    animatedMessages,
+    globalAnimatedMessages,
+    editingMessageInfo,
+    replyJumpHighlightMessageId,
+    conversationSearchHighlightMessageId,
+    inlineConversationSearchHighlightQuery,
+    brokenFileUrls,
+    networkErrorUrls,
+    stickerUrlMap,
+    gifUrlMap,
+  };
+
+  const showConversationSearchLoading =
+    isConversationSearchHistoryLoading &&
+    normalizedConversationSearchQuery.length > 0 &&
+    !hasConversationSearchMatches;
+  const conversationSearchScopeSuggestions = resolveChatConversationSearchScopeSuggestions(
+    conversationSearchScopeMatchCounts,
+    conversationSearchScope,
+    3
+  );
+  const conversationSearchBestScopeSuggestion = resolveChatConversationSearchBestScopeSuggestion(
+    conversationSearchScopeMatchCounts,
+    conversationSearchScope
+  );
+  const conversationSearchBestScopeHintLabel = (() => {
+    if (!conversationSearchBestScopeSuggestion) {
+      return '';
+    }
+
+    const scopeLabel = CONVERSATION_SEARCH_SCOPE_LABELS[conversationSearchBestScopeSuggestion.scope];
+    if (!scopeLabel) {
+      return '';
+    }
+
+    return `Most matches: ${scopeLabel} (${conversationSearchBestScopeSuggestion.count})`;
+  })();
+  const conversationSearchKeyboardSuggestionHintLabel = (() => {
+    if (conversationSearchKeyboardSuggestionScope == null) {
+      return '';
+    }
+
+    const keyboardSuggestion = conversationSearchScopeSuggestions.find(
+      (suggestion) => suggestion.scope === conversationSearchKeyboardSuggestionScope
+    );
+    if (!keyboardSuggestion) {
+      return '';
+    }
+
+    const scopeLabel = CONVERSATION_SEARCH_SCOPE_LABELS[keyboardSuggestion.scope];
+    if (!scopeLabel) {
+      return '';
+    }
+
+    return `Keyboard target: ${scopeLabel} (${keyboardSuggestion.count}). Press Alt+Shift+Enter to apply.`;
+  })();
+  const showConversationSearchScopeSuggestionActions =
+    normalizedConversationSearchQuery.length > 0 &&
+    !showConversationSearchLoading &&
+    !hasConversationSearchMatches &&
+    conversationSearchScopeSuggestions.length > 0;
+  const conversationSearchNoMatchesGuidanceLabel = resolveChatConversationSearchNoMatchesGuidance(
+    conversationSearchScope,
+    conversationSearchScopeMatchCounts
+  );
+  const showConversationSearchNoMatchesGuidance =
+    normalizedConversationSearchQuery.length > 0 &&
+    !showConversationSearchLoading &&
+    !hasConversationSearchMatches &&
+    conversationSearchNoMatchesGuidanceLabel.length > 0;
+  const showConversationSearchScopeResetAction =
+    normalizedConversationSearchQuery.length > 0 &&
+    !showConversationSearchLoading &&
+    !hasConversationSearchMatches &&
+    conversationSearchScope !== 'all';
+  const showConversationSearchClearQueryAction =
+    normalizedConversationSearchQuery.length > 0 &&
+    !showConversationSearchLoading &&
+    !hasConversationSearchMatches;
+  const showConversationSearchLoadOlderAction =
+    normalizedConversationSearchQuery.length > 0 &&
+    !showConversationSearchLoading &&
+    !hasConversationSearchMatches &&
+    hasMore;
+  const conversationSearchNoMatchesLabel = resolveChatConversationSearchNoMatchesLabel(
+    conversationSearchScope
+  );
+  const conversationSearchActiveSnippetMetaLabel = (() => {
+    if (!conversationSearchActiveSnippet) {
+      return '';
+    }
+
+    const activeMessage = getDisplayedMessageById(conversationSearchActiveSnippet.messageId);
+    if (!activeMessage) {
+      return '';
+    }
+
+    const senderEmail = normalizeParticipantEmail(activeMessage?.sender);
+    const isOwnMessage =
+      Boolean(senderEmail) &&
+      Boolean(effectiveUserEmail) &&
+      senderEmail === normalizeParticipantEmail(effectiveUserEmail);
+
+    const senderName =
+      typeof activeMessage?.senderName === 'string' ? activeMessage.senderName.trim() : '';
+    const fallbackPeerName =
+      typeof selectedTeamMember?.name === 'string' ? selectedTeamMember.name.trim() : '';
+    const senderLabel =
+      isOwnMessage
+        ? 'You'
+        : senderName || fallbackPeerName || senderEmail || 'Participant';
+
+    const formattedTimestamp = formatMessageTimestamp(activeMessage?.timestamp);
+    const timestampLabel = typeof formattedTimestamp === 'string' ? formattedTimestamp.trim() : '';
+    if (!timestampLabel || timestampLabel.toLowerCase() === 'invalid date') {
+      return senderLabel;
+    }
+
+    return `${senderLabel} • ${timestampLabel}`;
+  })();
+  const conversationSearchActiveSnippetTypeLabel = (() => {
+    if (!conversationSearchActiveSnippet) {
+      return '';
+    }
+
+    return resolveChatConversationSearchSnippetTypeLabel(conversationSearchActiveSnippet.matchType);
+  })();
+  const conversationSearchPreviewStatusLabel = (() => {
+    if (!normalizedConversationSearchQuery) {
+      return '';
+    }
+
+    if (showConversationSearchLoading) {
+      return 'Searching older messages...';
+    }
+
+    if (!hasConversationSearchMatches) {
+      if (hasMore) {
+        return `${conversationSearchNoMatchesLabel} Load older messages to continue.`;
+      }
+
+      return conversationSearchNoMatchesLabel;
+    }
+
+    if (!conversationSearchActiveSnippet) {
+      return 'Match found. Preview unavailable for this message.';
+    }
+
+    return '';
+  })();
+
+  return (
+    <ChatContextProvider stable={chatStableContextValue} reactive={chatReactiveContextValue}>
+      <KeyboardAvoidingView 
+        style={[styles.container, { backgroundColor: theme.background }]}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+        {...(Platform.OS === 'web'
+          ? ({
+              onDragOver: handleChatPageDragOver,
+              onDragLeave: handleChatPageDragLeave,
+              onDrop: handleChatPageDrop,
+            } as any)
+          : {})}
+      >
+      <ChatHeader
+        sharedTopPadding={sharedTopPadding}
+        effectiveHeaderComp={effectiveHeaderComp}
+        handleBackToChatList={handleBackToChatList}
+        openChatProfileModal={openChatProfileModal}
+        isTyping={isTyping}
+        toggleConversationSearch={toggleConversationSearch}
+        conversationSearchVisible={conversationSearchVisible}
+      />
+
+      {conversationSearchVisible && (
+        <View
+          style={[
+            styles.conversationSearchBar,
+            { backgroundColor: theme.surface, borderBottomColor: theme.border },
+          ]}
+          accessibilityRole="search"
+        >
+          <View style={styles.conversationSearchTopRow}>
+            <View
+              style={[
+                styles.conversationSearchInputWrap,
+                { backgroundColor: theme.background, borderColor: theme.border },
+              ]}
+            >
+              <Search size={16} color={theme.textSecondary} />
+              <TextInput
+                ref={conversationSearchInputRef}
+                style={[styles.conversationSearchInput, { color: theme.text }]}
+                placeholder="Search in conversation..."
+                placeholderTextColor={theme.textSecondary}
+                value={conversationSearchQuery}
+                onChangeText={handleConversationSearchQueryChange}
+                autoCorrect={false}
+                autoCapitalize="none"
+                returnKeyType="search"
+                onKeyPress={handleConversationSearchInputKeyPress}
+                onSubmitEditing={Platform.OS === 'web' ? undefined : handleConversationSearchNext}
+              />
+              {conversationSearchQuery.trim().length > 0 && (
+                <TouchableOpacity
+                  style={styles.conversationSearchClearButton}
+                  onPress={() => handleConversationSearchQueryChange('')}
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear conversation search query"
+                >
+                  <X size={14} color={theme.textSecondary} />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <View style={styles.conversationSearchActions}>
+              {showConversationSearchLoading && (
+                <ActivityIndicator size="small" color={theme.primary} style={styles.conversationSearchLoadingIndicator} />
+              )}
+              <Text
+                style={[
+                  styles.conversationSearchCounter,
+                  { color: hasConversationSearchMatches ? theme.text : theme.textSecondary },
+                ]}
+              >
+                {conversationSearchCounterLabel}
               </Text>
+              <TouchableOpacity
+                onPress={handleConversationSearchPrevious}
+                disabled={!hasConversationSearchMatches}
+                style={[
+                  styles.conversationSearchNavButton,
+                  {
+                    backgroundColor: theme.background,
+                    borderColor: theme.border,
+                    opacity: hasConversationSearchMatches ? 1 : 0.5,
+                  },
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Previous search result"
+              >
+                <View style={styles.rotate180}>
+                  <ChevronDown size={14} color={theme.text} />
+                </View>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={handleConversationSearchNext}
+                disabled={!hasConversationSearchMatches}
+                style={[
+                  styles.conversationSearchNavButton,
+                  {
+                    backgroundColor: theme.background,
+                    borderColor: theme.border,
+                    opacity: hasConversationSearchMatches ? 1 : 0.5,
+                  },
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Next search result"
+              >
+                <ChevronDown size={14} color={theme.text} />
+              </TouchableOpacity>
             </View>
           </View>
-        )}
-        
-        <View
-          style={[styles.messagesContainer, !isInitialAnchorSettled && styles.messagesContainerHidden]}
-        >
-          <FlashList
-            ref={flatListRef}
-            key={selectedTeamMember?.id || selectedTeamMember?.email || 'chat'}
-            data={displayedMessages}
-            estimatedItemSize={estimatedItemSize}
-            keyExtractor={getMessageKey}
-            estimatedListSize={estimatedListSize}
-            drawDistance={listDrawDistance}
-            onViewableItemsChanged={onViewableItemsChangedRef.current}
-            viewabilityConfig={viewabilityConfigRef.current}
-            getItemType={getMessageItemType}
-            overrideItemLayout={overrideMessageLayout}
-            renderItem={renderMessageItem}
-            removeClippedSubviews={Platform.OS !== 'web'}
-            contentContainerStyle={messagesContentContainerStyle}
-            showsVerticalScrollIndicator={false}
-            onScroll={handleMessageListScroll}
-            scrollEventThrottle={32}
-            onContentSizeChange={handleMessageListContentSizeChange}
-            onLayout={handleMessageListLayout}
-            maintainVisibleContentPosition={maintainVisibleContentPositionConfig}
-            ListHeaderComponent={(
-              <View style={{ alignItems: 'center', marginVertical: 8 }}>
-                {loadingMore ? (
-                  <ActivityIndicator color={theme.primary} size="small" />
-                ) : reachedConversationStart ? (
-                  <Text style={{ color: theme.textSecondary }}>
-                    {"You're at the beginning of this conversation"}
-                  </Text>
-                ) : null}
-              </View>
-            )}
-            ListFooterComponent={(
-              <View>
-                {/* Optimistic pending media (stickers/GIFs) */}
-                {pendingConversationDerived.mediaEntries.map(([tempId, item]) => {
-                  if (!tempId || !item) return null;
-                  const rendered = renderPendingMedia(tempId, item);
-                  if (typeof rendered === 'string') return null;
-                  return rendered;
-                })}
 
-                {/* Pending text messages (queued/sending/sent/failed) */}
-                {pendingConversationDerived.messageEntries.map(([tempId, pendingMsg]) => {
-                  if (!tempId || !pendingMsg) return null;
-                  const renderedPending = renderPendingMessage(tempId, pendingMsg);
-                  if (typeof renderedPending === 'string') {
-                    logger.warn('⚠️ renderPendingMessage returned string:', JSON.stringify(renderedPending));
-                    return null;
-                  }
-                  return renderedPending;
-                })}
-
-                {/* Optimistic pending file attachments */}
-                {pendingConversationDerived.attachmentEntries.map(([tempId, item]) => {
-                  if (!tempId || !item) return null;
-                  const rendered = renderPendingAttachments(tempId, item);
-                  if (typeof rendered === 'string') return null;
-                  return rendered;
-                })}
-
-                {/* Typing indicator */}
-                {isTyping && selectedTeamMember && (
-                  <View style={[styles.messageContainer, styles.friendMessage, styles.typingIndicator]}> 
-                    <View style={[
-                      styles.messageBubble,
-                      styles.friendBubble,
-                      styles.typingBubble,
-                      { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border },
-                    ]}> 
-                      <AnimatedTypingIndicator color={theme.textSecondary} />
-                    </View>
-                  </View>
-                )}
-
-                {/* Add extra padding at bottom to ensure typing indicator is visible */}
-                <View style={{ height: 20 }} />
-              </View>
-            )}
-            ListEmptyComponent={() => {
-              const hasPending =
-                (pendingMedia && pendingMedia.size > 0) ||
-                (pendingMessages && pendingMessages.size > 0) ||
-                (pendingAttachments && pendingAttachments.size > 0);
-              const hasLoadError = Boolean(error);
-              const shouldDeferEmptyState =
-                loading ||
-                loadingMore ||
-                !selectedTeamMember ||
-                hasMore ||
-                hasLoadError;
-
-              if (hasPending || shouldDeferEmptyState) {
-                if (selectedTeamMember && hasLoadError) {
-                  if (showReconnectFallback) {
-                    return (
-                      <View style={styles.emptyState}>
-                        <View style={[styles.reconnectCard, { backgroundColor: theme.surface, borderColor: theme.border }]}> 
-                          <Text style={[styles.reconnectTitle, { color: theme.text }]}>Could not load messages</Text>
-                          <Text style={[styles.reconnectSubtext, { color: theme.textSecondary }]}>
-                            {isOffline
-                              ? "You're offline right now. Reconnect to the internet, then try again."
-                              : 'Please check your connection and try reconnecting.'}
-                          </Text>
-                          <TouchableOpacity
-                            onPress={handleManualReconnect}
-                            activeOpacity={0.85}
-                            style={[styles.reconnectButton, { backgroundColor: theme.primary }]}
-                          >
-                            <Text style={styles.reconnectButtonText}>Reconnect</Text>
-                          </TouchableOpacity>
-                        </View>
-                      </View>
-                    );
-                  }
-                  return (
-                    <View style={styles.emptyState}>
-                      <ActivityIndicator color={theme.primary} size="small" />
-                      <Text style={[styles.reconnectHintText, { color: theme.textSecondary }]}>Trying to reconnect…</Text>
-                    </View>
-                  );
-                }
-                return null;
-              }
-
-              const emptyStateTitle = selectedTeamMember ? 'No messages yet' : 'Select a team member';
-              const safeConversationName = selectedTeamMember
-                ? sanitizeMessageText(
-                    typeof selectedTeamMember.name === 'string' ? selectedTeamMember.name : '',
-                    'someone'
-                  ).trim()
-                : '';
-              const emptyStateSubtext = selectedTeamMember
-                ? `Start a conversation with ${safeConversationName || 'someone'}!`
-                : 'Choose a team member from the list to start chatting';
+          <View style={styles.conversationSearchScopeRow}>
+            {CONVERSATION_SEARCH_SCOPE_OPTIONS.map((scopeOption) => {
+              const isSelected = conversationSearchScope === scopeOption.key;
+              const isShortcutPulseActive =
+                conversationSearchShortcutPulseScope === scopeOption.key;
+              const scopeShortcutKey = CONVERSATION_SEARCH_SCOPE_SHORTCUT_LABELS[scopeOption.key];
+              const scopeMatchCount = conversationSearchScopeMatchCounts[scopeOption.key] || 0;
+              const shouldDimScopeChip =
+                normalizedConversationSearchQuery.length > 0 &&
+                scopeMatchCount <= 0 &&
+                !isSelected;
+              const scopeChipLabel = normalizedConversationSearchQuery
+                ? `${scopeOption.label} (${scopeMatchCount})`
+                : scopeOption.label;
 
               return (
-                <View style={styles.emptyState}>
-                  <Text style={[styles.emptyStateText, { color: theme.text }]}> 
-                    {emptyStateTitle}
-                  </Text>
-                  <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}> 
-                    {emptyStateSubtext}
-                  </Text>
-                </View>
+                <TouchableOpacity
+                  key={scopeOption.key}
+                  onPress={() => handleConversationSearchScopeChange(scopeOption.key, 'scope-chip')}
+                  style={[
+                    styles.conversationSearchScopeChip,
+                    {
+                      backgroundColor: isShortcutPulseActive
+                        ? isDarkMode
+                          ? 'rgba(59, 130, 246, 0.3)'
+                          : 'rgba(59, 130, 246, 0.18)'
+                        : isSelected
+                        ? isDarkMode
+                          ? 'rgba(59, 130, 246, 0.22)'
+                          : 'rgba(59, 130, 246, 0.12)'
+                        : theme.background,
+                      borderColor:
+                        isSelected || isShortcutPulseActive ? theme.primary : theme.border,
+                      opacity: shouldDimScopeChip ? 0.56 : 1,
+                    },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    Platform.OS === 'web'
+                      ? normalizedConversationSearchQuery
+                        ? `Filter search by ${scopeOption.label}, ${scopeMatchCount} matches, shortcut Alt+Shift+${scopeShortcutKey}`
+                        : `Filter search by ${scopeOption.label}, shortcut Alt+Shift+${scopeShortcutKey}`
+                      : normalizedConversationSearchQuery
+                        ? `Filter search by ${scopeOption.label}, ${scopeMatchCount} matches`
+                        : `Filter search by ${scopeOption.label}`
+                  }
+                  accessibilityState={{ selected: isSelected }}
+                >
+                  <View style={styles.conversationSearchScopeChipContent}>
+                    <Text
+                      allowFontScaling={false}
+                      style={[
+                        styles.conversationSearchScopeChipText,
+                        { color: isSelected ? theme.primary : theme.textSecondary },
+                      ]}
+                    >
+                      {scopeChipLabel}
+                    </Text>
+                    {Platform.OS === 'web' ? (
+                      <View
+                        style={[
+                          styles.conversationSearchScopeChipShortcutBadge,
+                          {
+                            borderColor: isSelected
+                              ? theme.primary
+                              : isDarkMode
+                                ? 'rgba(148, 163, 184, 0.45)'
+                                : 'rgba(100, 116, 139, 0.35)',
+                            backgroundColor: isSelected
+                              ? isDarkMode
+                                ? 'rgba(59, 130, 246, 0.25)'
+                                : 'rgba(59, 130, 246, 0.14)'
+                              : theme.background,
+                          },
+                        ]}
+                      >
+                        <Text
+                          allowFontScaling={false}
+                          style={[
+                            styles.conversationSearchScopeChipShortcutBadgeText,
+                            { color: isSelected ? theme.primary : theme.textSecondary },
+                          ]}
+                        >
+                          {scopeShortcutKey}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+                </TouchableOpacity>
               );
-            }}
-          />
+            })}
+          </View>
+          {Platform.OS === 'web' ? (
+            <Text
+              allowFontScaling={false}
+              style={[styles.conversationSearchScopeHint, { color: theme.textSecondary }]}
+            >
+              Tip: Alt+Shift+A/T/F/R/M picks scopes; Alt+Shift+Up/Down cycles scopes; Alt+Shift+Left/Right cycles suggestion chips; Alt+Shift+Enter applies highlighted suggestion (or best); Alt+Shift+1-3 picks suggestions; Alt+Shift+L loads older; Alt+Shift+X clears query; Alt+Shift+0 or Backspace resets
+            </Text>
+          ) : null}
+
+          {normalizedConversationSearchQuery.length > 0 && (
+            <View style={styles.conversationSearchSnippetRow}>
+              {conversationSearchActiveSnippet ? (
+                <TouchableOpacity
+                  style={styles.conversationSearchSnippetPressArea}
+                  onPress={handleConversationSearchSnippetPress}
+                  activeOpacity={0.8}
+                  accessibilityRole="button"
+                  accessibilityLabel="Jump to current search result"
+                >
+                  {(conversationSearchActiveSnippetTypeLabel || conversationSearchActiveSnippetMetaLabel) ? (
+                    <View style={styles.conversationSearchSnippetMetaRow}>
+                      {conversationSearchActiveSnippetTypeLabel ? (
+                        <View
+                          style={[
+                            styles.conversationSearchSnippetTypeBadge,
+                            {
+                              backgroundColor: isDarkMode
+                                ? 'rgba(59, 130, 246, 0.25)'
+                                : 'rgba(59, 130, 246, 0.14)',
+                              borderColor: isDarkMode
+                                ? 'rgba(147, 197, 253, 0.35)'
+                                : 'rgba(59, 130, 246, 0.24)',
+                            },
+                          ]}
+                        >
+                          <Text
+                            allowFontScaling={false}
+                            numberOfLines={1}
+                            style={[styles.conversationSearchSnippetTypeBadgeText, { color: theme.primary }]}
+                          >
+                            {conversationSearchActiveSnippetTypeLabel}
+                          </Text>
+                        </View>
+                      ) : null}
+                      {conversationSearchActiveSnippetMetaLabel ? (
+                        <Text
+                          allowFontScaling={false}
+                          numberOfLines={1}
+                          style={[styles.conversationSearchSnippetMeta, { color: theme.textSecondary }]}
+                        >
+                          {conversationSearchActiveSnippetMetaLabel}
+                        </Text>
+                      ) : null}
+                    </View>
+                  ) : null}
+                  <Text
+                    allowFontScaling={false}
+                    numberOfLines={1}
+                    style={[styles.conversationSearchSnippetText, { color: theme.textSecondary }]}
+                  >
+                    {conversationSearchActiveSnippet.beforeText}
+                    <Text
+                      style={[
+                        styles.conversationSearchSnippetMatch,
+                        {
+                          color: theme.text,
+                          backgroundColor: isDarkMode
+                            ? 'rgba(96, 165, 250, 0.3)'
+                            : 'rgba(59, 130, 246, 0.2)',
+                        },
+                      ]}
+                    >
+                      {conversationSearchActiveSnippet.matchText}
+                    </Text>
+                    {conversationSearchActiveSnippet.afterText}
+                  </Text>
+                </TouchableOpacity>
+              ) : (
+                <View style={styles.conversationSearchSnippetStatusContainer}>
+                  <View style={styles.conversationSearchSnippetStatusRow}>
+                    <Text
+                      allowFontScaling={false}
+                      numberOfLines={1}
+                      style={[styles.conversationSearchSnippetStatus, { color: theme.textSecondary }]}
+                    >
+                      {conversationSearchPreviewStatusLabel}
+                    </Text>
+                    {showConversationSearchScopeResetAction ? (
+                      <TouchableOpacity
+                        onPress={() => handleConversationSearchResetScope('reset-button')}
+                        style={[
+                          styles.conversationSearchSnippetResetScopeButton,
+                          {
+                            borderColor: isDarkMode
+                              ? 'rgba(96, 165, 250, 0.45)'
+                              : 'rgba(59, 130, 246, 0.35)',
+                            backgroundColor: isDarkMode
+                              ? 'rgba(59, 130, 246, 0.18)'
+                              : 'rgba(59, 130, 246, 0.1)',
+                          },
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel="Switch search filter to All"
+                      >
+                        <Text
+                          allowFontScaling={false}
+                          style={[
+                            styles.conversationSearchSnippetResetScopeButtonText,
+                            { color: theme.primary },
+                          ]}
+                        >
+                          Switch to All
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
+                    {showConversationSearchLoadOlderAction ? (
+                      <TouchableOpacity
+                        onPress={() => handleConversationSearchLoadOlder('load-older-button')}
+                        style={[
+                          styles.conversationSearchSnippetLoadOlderButton,
+                          {
+                            borderColor: isDarkMode
+                              ? 'rgba(147, 197, 253, 0.38)'
+                              : 'rgba(59, 130, 246, 0.28)',
+                            backgroundColor: isDarkMode
+                              ? 'rgba(59, 130, 246, 0.14)'
+                              : 'rgba(59, 130, 246, 0.07)',
+                          },
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel="Search older messages"
+                      >
+                        <Text
+                          allowFontScaling={false}
+                          style={[
+                            styles.conversationSearchSnippetLoadOlderButtonText,
+                            { color: theme.primary },
+                          ]}
+                        >
+                          Load older
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
+                    {showConversationSearchClearQueryAction ? (
+                      <TouchableOpacity
+                        onPress={() => handleConversationSearchClearQuery('clear-query-button')}
+                        style={[
+                          styles.conversationSearchSnippetClearQueryButton,
+                          {
+                            borderColor: isDarkMode
+                              ? 'rgba(148, 163, 184, 0.45)'
+                              : 'rgba(100, 116, 139, 0.35)',
+                            backgroundColor: isDarkMode
+                              ? 'rgba(71, 85, 105, 0.22)'
+                              : 'rgba(148, 163, 184, 0.16)',
+                          },
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel="Clear conversation search query"
+                      >
+                        <Text
+                          allowFontScaling={false}
+                          style={[
+                            styles.conversationSearchSnippetClearQueryButtonText,
+                            { color: theme.textSecondary },
+                          ]}
+                        >
+                          Clear query
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                  {showConversationSearchNoMatchesGuidance ? (
+                    <Text
+                      allowFontScaling={false}
+                      style={[
+                        styles.conversationSearchNoMatchesGuidance,
+                        { color: theme.textSecondary },
+                      ]}
+                    >
+                      {conversationSearchNoMatchesGuidanceLabel}
+                    </Text>
+                  ) : null}
+                  {showConversationSearchScopeSuggestionActions ? (
+                    <View style={styles.conversationSearchScopeSuggestionsRow}>
+                      {conversationSearchBestScopeHintLabel ? (
+                        <Text
+                          allowFontScaling={false}
+                          style={[
+                            styles.conversationSearchScopeSuggestionHint,
+                            { color: theme.textSecondary },
+                          ]}
+                        >
+                          {conversationSearchBestScopeHintLabel}
+                        </Text>
+                      ) : null}
+                      {conversationSearchKeyboardSuggestionHintLabel ? (
+                        <Text
+                          allowFontScaling={false}
+                          style={[
+                            styles.conversationSearchScopeSuggestionKeyboardHint,
+                            { color: theme.textSecondary },
+                          ]}
+                        >
+                          {conversationSearchKeyboardSuggestionHintLabel}
+                        </Text>
+                      ) : null}
+                      {conversationSearchScopeSuggestions.map((suggestion, suggestionIndex) => {
+                        const suggestionScopeLabel = CONVERSATION_SEARCH_SCOPE_LABELS[suggestion.scope];
+                        const isKeyboardSuggestionActive =
+                          conversationSearchKeyboardSuggestionScope === suggestion.scope;
+                        const suggestionShortcutOrdinal = suggestionIndex + 1;
+                        const suggestionChipLabel = Platform.OS === 'web'
+                          ? `${suggestionShortcutOrdinal}. ${suggestionScopeLabel} (${suggestion.count})`
+                          : `${suggestionScopeLabel} (${suggestion.count})`;
+
+                        return (
+                          <TouchableOpacity
+                            key={`search-scope-suggestion-${suggestion.scope}`}
+                            onPress={() => handleConversationSearchScopeChange(suggestion.scope, 'suggestion-chip')}
+                            style={[
+                              styles.conversationSearchScopeSuggestionChip,
+                              {
+                                borderColor: isKeyboardSuggestionActive
+                                  ? theme.primary
+                                  : isDarkMode
+                                    ? 'rgba(147, 197, 253, 0.38)'
+                                    : 'rgba(59, 130, 246, 0.28)',
+                                backgroundColor: isKeyboardSuggestionActive
+                                  ? isDarkMode
+                                    ? 'rgba(59, 130, 246, 0.26)'
+                                    : 'rgba(59, 130, 246, 0.16)'
+                                  : isDarkMode
+                                    ? 'rgba(59, 130, 246, 0.14)'
+                                    : 'rgba(59, 130, 246, 0.07)',
+                              },
+                            ]}
+                            accessibilityRole="button"
+                            accessibilityLabel={
+                              Platform.OS === 'web'
+                                ? `Try ${suggestionScopeLabel} filter, ${suggestion.count} matches, shortcut Alt+Shift+${suggestionShortcutOrdinal}`
+                                : `Try ${suggestionScopeLabel} filter, ${suggestion.count} matches`
+                            }
+                          >
+                            <Text
+                              allowFontScaling={false}
+                              style={[
+                                styles.conversationSearchScopeSuggestionChipText,
+                                {
+                                  color: isKeyboardSuggestionActive ? theme.text : theme.primary,
+                                },
+                              ]}
+                            >
+                              {suggestionChipLabel}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  ) : null}
+                </View>
+              )}
+            </View>
+          )}
         </View>
-        {showScrollToBottom && (
-          <TouchableOpacity
-            onPress={handleScrollToBottomPress}
-            activeOpacity={0.8}
-            style={scrollToBottomButtonStyle}
-          >
-            <ChevronDown size={18} color={theme.text} />
-            {unseenCount > 0 && (
-              <View style={unseenCountBadgeStyle}>
-                <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600', textAlign: 'center' }}>{unseenCount}</Text>
-              </View>
-            )}
-          </TouchableOpacity>
-        )}
-      </View>
+      )}
+
+      {/* Messages */}
+      <ChatMessagesListShell
+        listPaneProps={chatMessagesListPaneProps}
+        scrollButtonProps={chatScrollToBottomButtonProps}
+      />
 
       {/* Special Command Suggestion */}
       {Platform.OS === 'web' && showSpecialCommand && (
@@ -11173,328 +12751,86 @@ export default function Chat() {
         </View>
       )}
 
-      {/* Formatting Guide */}
-      {showFormattingGuide && (
-        <View style={[styles.formattingGuide, { backgroundColor: theme.surface, borderTopColor: theme.border }]}>
-          <View style={styles.formattingHeader}>
-            <Text style={[styles.formattingTitle, { color: theme.text }]}>Text Formatting</Text>
-            <TouchableOpacity onPress={hideFormattingGuide}>
-              <X size={18} color={theme.textSecondary} />
-            </TouchableOpacity>
-          </View>
-          
-          {/* Quick format buttons */}
-          {Platform.OS === 'web' && (
-            <View style={styles.quickFormatButtons}>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={handleQuickFormatExtraBold}
-              >
-                <Text style={[styles.quickFormatButtonText, { color: theme.text, fontWeight: '900' }]}>B+</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={handleQuickFormatBold}
-              >
-                <Text style={[styles.quickFormatButtonText, { color: theme.text, fontWeight: 'bold' }]}>B</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={handleQuickFormatItalic}
-              >
-                <Text style={[styles.quickFormatButtonText, { color: theme.text, fontStyle: 'italic' }]}>I</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={handleQuickFormatUnderline}
-              >
-                <Text style={[styles.quickFormatButtonText, { color: theme.text, textDecorationLine: 'underline' }]}>U</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={handleQuickFormatStrike}
-              >
-                <Text style={[styles.quickFormatButtonText, { color: theme.text, textDecorationLine: 'line-through' }]}>S</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: theme.background }]}
-                onPress={handleQuickFormatCode}
-              >
-                <Text style={[styles.quickFormatButtonText, { 
-                  color: theme.text, 
-                  fontFamily: 'monospace' 
-                }]}>{'<>'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={[styles.quickFormatButton, { backgroundColor: '#FFF7CC', borderColor: '#FFD24C' }]}
-                onPress={handleQuickFormatSpecial}
-              >
-                <Text style={[styles.quickFormatButtonText, { color: '#B8860B', fontWeight: 'bold' }]}>⭐</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-          
-          <View style={styles.formattingOptions}>
-            <View style={[styles.formattingRow, { flexDirection: 'row', alignItems: 'center' }]}> 
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>***extra bold***</Text>
-              <Text style={[styles.formattingResult, { color: theme.text, fontWeight: '900', fontSize: 16 }]}>extra bold</Text>
-            </View>
-            <View style={styles.formattingRow}>
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>**bold text**</Text>
-              <Text style={[styles.formattingResult, { color: theme.text, fontWeight: 'bold' }]}>bold text</Text>
-            </View>
-            <View style={styles.formattingRow}>
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>*italic text*</Text>
-              <Text style={[styles.formattingResult, { color: theme.text, fontStyle: 'italic' }]}>italic text</Text>
-            </View>
-            <View style={styles.formattingRow}>
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>__underline__</Text>
-              <Text style={[styles.formattingResult, { color: theme.text, textDecorationLine: 'underline' }]}>underline</Text>
-            </View>
-            <View style={styles.formattingRow}>
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>~~strikethrough~~</Text>
-              <Text style={[styles.formattingResult, { color: theme.text, textDecorationLine: 'line-through' }]}>strikethrough</Text>
-            </View>
-            <View style={styles.formattingRow}>
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>`code text`</Text>
-              <Text style={[styles.formattingResult, {
-                color: theme.text,
-                fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-                backgroundColor: theme.background,
-                paddingHorizontal: 4,
-                paddingVertical: 1,
-                borderRadius: 3,
-                alignSelf: 'flex-start'
-              }]}>code text</Text>
-            </View>
-            <View style={styles.formattingRow}>
-              <Text style={[styles.formattingExample, { color: theme.textSecondary }]}>/special</Text>
-              <Text style={[styles.formattingResult, {
-                color: '#FFD700',
-                fontWeight: 'bold',
-                backgroundColor: 'rgba(255, 215, 0, 0.2)',
-                paddingHorizontal: 4,
-                paddingVertical: 1,
-                borderRadius: 3,
-                borderWidth: 1,
-                borderColor: '#FFD700',
-                alignSelf: 'flex-start'
-              }]}>✨special text✨</Text>
-            </View>
-          </View>
-        </View>
-      )}
-      {selectedTeamMember && retryAllPendingCount > 0 && (
-        <View
-          style={[
-            styles.retryAllBanner,
-            {
-              backgroundColor: isDarkMode ? theme.surface : '#f5f8ff',
-              borderColor: theme.border,
-            },
-          ]}
-        >
-          <View style={styles.retryAllBannerLeft}>
-            <AlertCircle size={14} color={theme.warning} />
-            <Text style={[styles.retryAllBannerText, { color: theme.text }]}>
-              {retryAllPendingCount} pending {retryAllPendingCount === 1 ? 'item' : 'items'} not sent
-            </Text>
-          </View>
-          <TouchableOpacity
-            onPress={handleRetryAllPendingPress}
-            disabled={isRetryingAllPending || isOffline}
-            style={[
-              styles.retryAllBannerButton,
-              {
-                backgroundColor: theme.primary,
-                opacity: isRetryingAllPending || isOffline ? 0.65 : 1,
-              },
-            ]}
-          >
-            {isRetryingAllPending ? (
-              <ActivityIndicator size="small" color="#ffffff" />
-            ) : (
-              <RotateCcw size={14} color="#ffffff" />
-            )}
-            <Text style={styles.retryAllBannerButtonText}>
-              {isRetryingAllPending ? 'Retrying...' : 'Retry all'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
-      {/* Input Area - Mobile vs Web */}
-      {editingMessageInfo && (
-        <View
-          style={[
-            styles.editingBanner,
-            {
-              borderColor: theme.primary,
-              backgroundColor: isDarkMode ? theme.primary + '33' : theme.primary + '18',
-            },
-          ]}
-        >
-          <Edit3 size={16} color={theme.primary} style={styles.editingBannerIcon} />
-          <View style={styles.editingBannerCopy}>
-            <Text style={[styles.editingBannerTitle, { color: theme.primary }]}>Editing message</Text>
-            <Text
-              style={[
-                styles.editingBannerDescription,
-                { color: editingPreviewText ? theme.text : theme.textSecondary },
-              ]}
-              numberOfLines={1}
-            >
-              {editingPreviewText || 'Make your changes below'}
-            </Text>
-          </View>
-          <TouchableOpacity
-            style={[styles.editingBannerClose, { borderColor: theme.primary }]}
-            onPress={cancelEditingMessage}
-            hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}
-            accessibilityRole="button"
-            accessibilityLabel="Cancel editing"
-          >
-            <X size={14} color={theme.primary} />
-            <Text style={[styles.editingBannerCloseText, { color: theme.primary }]}>Cancel</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-      {Platform.OS === 'web' ? (
-        /* Web Input (Original) */
-        <View style={[styles.inputContainer, { backgroundColor: theme.surface, borderTopColor: theme.border }]}>
-          <View style={[styles.inputWrapper, { backgroundColor: theme.background, borderColor: theme.border }]}>
-            <TouchableOpacity 
-              style={styles.attachButton}
-              onPress={openAttachmentModal}
-            >
-              <Paperclip size={20} color={theme.primary} />
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={styles.stickerButton}
-              onPress={openStickerGifPicker}
-            >
-              <Smile size={20} color={theme.primary} />
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={[styles.formattingButton, showFormattingGuide && { backgroundColor: theme.primary + '20' }]}
-              onPress={toggleFormattingGuide}
-            >
-              <Edit3 size={18} color={showFormattingGuide ? theme.primary : theme.textSecondary} />
-            </TouchableOpacity>
-            <TextInput
-              ref={textInputRef}
-              style={[styles.textInput, { color: theme.text, height: inputHeight }]}
-              value={message}
-              onChangeText={handleTyping}
-              onContentSizeChange={handleInputSizeChange}
-              underlineColorAndroid="transparent"
-              placeholder={getComposerPlaceholder()}
-              placeholderTextColor={isOffline ? theme.warning : theme.textSecondary}
-              multiline={true}
-              numberOfLines={1}
-              textAlignVertical="top"
-              maxLength={CHAT_MESSAGE_MAX_CHARS}
-              editable={!!selectedTeamMember}
-              blurOnSubmit={false}
-              enablesReturnKeyAutomatically={false}
-              returnKeyType="send"
-              onSubmitEditing={handleSendMessage}
-            />
-            
-            {/* Format Preview */}
-            {shouldShowFormatPreview && (
-              <View style={[styles.formatPreview, { backgroundColor: theme.background, borderColor: theme.border }]}>
-                <Text style={[styles.formatPreviewLabel, { color: theme.textSecondary }]}>Preview:</Text>
-                <StyledText
-                  text={messagePreviewText}
-                  style={[styles.formatPreviewText, { color: theme.text }]}
-                  linkStyle={{ color: theme.primary }}
-                />
-              </View>
-            )}
-            
-            <TouchableOpacity 
-              style={[
-                styles.sendButton,
-                {
-                  backgroundColor: canAttemptSend
-                    ? (isOffline
-                        ? theme.warning
-                        : isComposingSpecial
-                          ? theme.warning
-                          : theme.primary)
-                    : theme.border,
-                }
-              ]}
-              onPress={handleSendMessage}
-              disabled={!canAttemptSend}
-            >
-              {isOffline && canAttemptSend ? (
-                <Clock size={20} color="#ffffff" />
-              ) : isComposingSpecial && canAttemptSend ? (
-                <Star size={20} color="#ffffff" />
-              ) : (
-                <Send size={20} color={canAttemptSend ? '#ffffff' : theme.textSecondary} />
-              )}
-            </TouchableOpacity>
-          </View>
-        </View>
-      ) : (
-        /* Mobile Input (New Component) */
-        <MobileChatInput
-          ref={mobileInputRef}
-          message={message}
-          onMessageChange={handleTyping}
-          onSendMessage={handleSendMessage}
-          onAttachmentPress={openAttachmentModal}
-          onStickerPress={openStickerGifPicker}
-          selectedTeamMember={selectedTeamMember}
-          isOffline={isOffline}
-          isComposingSpecial={isComposingSpecial}
-          processingKeyboardMedia={processingKeyboardMedia}
-          onRichContent={handleRichContentFromMobile}
-          showFormattingGuide={showFormattingGuide}
-          onFormattingToggle={toggleFormattingGuide}
-          maxLength={CHAT_MESSAGE_MAX_CHARS}
-          showCharacterCount={false}
-          isSendingMessage={isSendingMessage}
-          canSend={canAttemptSend}
-        />
-      )}
-
-      {showInputLimitCounter && (
-        <View style={styles.inputLimitCounter}>
-          <Text
-            style={[
-              styles.inputLimitCounterText,
-              {
-                color:
-                  messageCharacterCount >= CHAT_MESSAGE_MAX_CHARS || messageWordCount >= CHAT_MESSAGE_MAX_WORDS
-                    ? theme.error
-                    : theme.textSecondary,
-              },
-            ]}
-          >
-            {messageCharacterCount}/{CHAT_MESSAGE_MAX_CHARS} chars · {messageWordCount}/{CHAT_MESSAGE_MAX_WORDS} words
-          </Text>
-        </View>
-      )}
-
-      {Platform.OS === 'web' && isChatDropActive && selectedTeamMember && (
-        <View pointerEvents="none" style={styles.chatDropOverlay}>
-          <View style={[styles.chatDropCard, { backgroundColor: theme.surface, borderColor: theme.primary }]}> 
-            <FileIcon size={26} color={theme.primary} />
-            <Text style={[styles.chatDropTitle, { color: theme.text }]}>Drop files to send</Text>
-            <Text style={[styles.chatDropSubtitle, { color: theme.textSecondary }]}>Files will open in preview before sending</Text>
-          </View>
-        </View>
-      )}
+      <ChatComposer
+        theme={theme}
+        isDarkMode={isDarkMode}
+        selectedTeamMember={selectedTeamMember}
+        isOffline={isOffline}
+        message={message}
+        handleTyping={handleTyping}
+        handleSendMessage={handleSendMessage}
+        isSendingMessage={isSendingMessage}
+        canAttemptSend={canAttemptSend}
+        appendFormattingText={appendFormattingText}
+        showFormattingGuide={showFormattingGuide}
+        toggleFormattingGuide={toggleFormattingGuide}
+        hideFormattingGuide={hideFormattingGuide}
+        retryAllPendingCount={retryAllPendingCount}
+        isRetryingAllPending={isRetryingAllPending}
+        handleRetryAllPendingPress={handleRetryAllPendingPress}
+        replyingToMessage={replyingToMessage}
+        replyingSenderLabel={replyingSenderLabel}
+        replyingPreviewText={replyingPreviewText}
+        cancelReplyingToMessage={cancelReplyingToMessage}
+        editingMessageInfo={editingMessageInfo}
+        editingPreviewText={editingPreviewText}
+        cancelEditingMessage={cancelEditingMessage}
+        handleEditLastOwnMessageShortcut={handleEditLastOwnMessageShortcut}
+        mobileInputRef={mobileInputRef}
+        openAttachmentModal={openAttachmentModal}
+        openStickerGifPicker={openStickerGifPicker}
+        isComposingSpecial={isComposingSpecial}
+        setInputHeight={setInputHeight}
+        handleComposerBlur={handleComposerBlur}
+        getComposerPlaceholder={getComposerPlaceholder}
+        showInputLimitCounter={showInputLimitCounter}
+        messageCharacterCount={messageCharacterCount}
+        messageWordCount={messageWordCount}
+        isChatDropActive={isChatDropActive}
+      />
 
       {/* Modals */}
-      {renderAttachmentModal()}
-      {renderFilePreviewModal()}
-      {renderImageViewerModal()}
+      <ChatAttachmentModal
+        visible={attachmentModalVisible}
+        onClose={closeAttachmentModal}
+        onSelectImage={handleSelectImageAttachment}
+        onSelectCamera={handleSelectCameraAttachment}
+        onSelectVideo={handleSelectVideoAttachment}
+        onSelectVideoCamera={handleSelectVideoCameraAttachment}
+        onSelectDocument={handleSelectDocumentAttachment}
+        theme={theme}
+      />
+      <ChatFilePreviewModal
+        visible={filePreviewVisible}
+        onClose={resetFilePreviewModal}
+        selectedFiles={selectedFiles}
+        skippedPreviewFiles={skippedPreviewFiles}
+        groupedSkippedPreviewFiles={groupedSkippedPreviewFiles}
+        message={message}
+        onTyping={handleTyping}
+        isUploading={isUploading}
+        easedUploadProgress={easedUploadProgress}
+        onSendWithFiles={handleSendWithFiles}
+        onRemoveFile={getRemoveSelectedFilePressHandler}
+        theme={theme}
+      />
+      <ChatImageViewerModal
+        visible={imageViewerVisible}
+        onClose={closeImageViewer}
+        selectedImageUri={selectedImageUri}
+        lastViewedRemoteImage={lastViewedRemoteImage}
+        brokenFileUrls={brokenFileUrls}
+        networkErrorUrls={networkErrorUrls}
+        onImageError={handleImageError}
+        onClearNetworkError={clearNetworkError}
+        onSetSelectedImageUri={setSelectedImageUri}
+        onDownloadFile={handleDownloadFile}
+        getDownloadKey={getDownloadKey}
+        showImageShareModal={showImageShareModal}
+        onOpenImageShareModal={openImageShareModal}
+        onCloseImageShareModal={closeImageShareModal}
+      />
+        {renderMessageInfoModal()}
   {renderEmojiPickerModal()}
 
       <ConfirmationModal
@@ -11541,7 +12877,8 @@ export default function Chat() {
         </View>
       )}
 
-    </KeyboardAvoidingView>
+      </KeyboardAvoidingView>
+    </ChatContextProvider>
   );
 }
 
@@ -11549,6 +12886,12 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
+  // ── Layout utilities (eliminates recurring inline object allocations) ──
+  alignItemsCenter: { alignItems: 'center' as const },
+  alignSelfEnd: { alignSelf: 'flex-end' as const },
+  alignSelfStart: { alignSelf: 'flex-start' as const },
+  flexRow: { flexDirection: 'row' as const },
+  flexRowCenter: { flexDirection: 'row' as const, alignItems: 'center' as const },
   centered: {
     justifyContent: 'center',
     alignItems: 'center',
@@ -11703,9 +13046,257 @@ const styles = StyleSheet.create({
     paddingVertical: Platform.OS === 'ios' ? 0 : 2,
     height: Platform.OS === 'ios' ? 28 : 34,
   },
+  conversationSearchBar: {
+    alignItems: 'stretch',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+  },
+  conversationSearchTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    width: '100%',
+  },
+  conversationSearchInputWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    minHeight: 38,
+  },
+  conversationSearchInput: {
+    flex: 1,
+    marginLeft: 8,
+    fontSize: 14,
+    fontFamily: 'Inter-Regular',
+    paddingVertical: Platform.OS === 'ios' ? 0 : 2,
+    height: Platform.OS === 'ios' ? 28 : 32,
+  },
+  conversationSearchClearButton: {
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+    marginLeft: 6,
+  },
+  conversationSearchActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 10,
+  },
+  conversationSearchLoadingIndicator: {
+    marginRight: 6,
+  },
+  conversationSearchCounter: {
+    minWidth: 38,
+    textAlign: 'center',
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+    marginRight: 4,
+  },
+  conversationSearchNavButton: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 4,
+  },
+  conversationSearchScopeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginTop: 8,
+    marginHorizontal: -2,
+  },
+  conversationSearchScopeChip: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    marginHorizontal: 2,
+    marginBottom: 4,
+  },
+  conversationSearchScopeChipContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  conversationSearchScopeChipText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchScopeChipShortcutBadge: {
+    marginLeft: 6,
+    borderWidth: 1,
+    borderRadius: 999,
+    minWidth: 17,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  conversationSearchScopeChipShortcutBadgeText: {
+    fontSize: 10,
+    fontFamily: 'Inter-Bold',
+    lineHeight: 12,
+  },
+  conversationSearchScopeHint: {
+    marginTop: 2,
+    paddingHorizontal: 2,
+    fontSize: 10,
+    fontFamily: 'Inter-Regular',
+  },
+  conversationSearchSnippetRow: {
+    marginTop: 5,
+    paddingHorizontal: 2,
+  },
+  conversationSearchSnippetPressArea: {
+    paddingVertical: 1,
+  },
+  conversationSearchSnippetStatusContainer: {
+    width: '100%',
+  },
+  conversationSearchSnippetStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  conversationSearchNoMatchesGuidance: {
+    fontSize: 11,
+    fontFamily: 'Inter-Regular',
+    marginTop: 6,
+  },
+  conversationSearchScopeSuggestionsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginTop: 6,
+  },
+  conversationSearchScopeSuggestionHint: {
+    width: '100%',
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+    marginBottom: 4,
+  },
+  conversationSearchScopeSuggestionKeyboardHint: {
+    width: '100%',
+    fontSize: 10,
+    fontFamily: 'Inter-Medium',
+    marginBottom: 4,
+  },
+  conversationSearchScopeSuggestionChip: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    marginRight: 6,
+    marginBottom: 4,
+  },
+  conversationSearchScopeSuggestionChipText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchSnippetMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 2,
+  },
+  conversationSearchSnippetTypeBadge: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    marginRight: 6,
+  },
+  conversationSearchSnippetTypeBadgeText: {
+    fontSize: 10,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchSnippetMeta: {
+    flexShrink: 1,
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchSnippetText: {
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+  },
+  conversationSearchSnippetStatus: {
+    flex: 1,
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+  },
+  conversationSearchSnippetResetScopeButton: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    marginLeft: 8,
+  },
+  conversationSearchSnippetResetScopeButtonText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchSnippetLoadOlderButton: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    marginLeft: 6,
+  },
+  conversationSearchSnippetLoadOlderButtonText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchSnippetClearQueryButton: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    marginLeft: 6,
+  },
+  conversationSearchSnippetClearQueryButtonText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  conversationSearchSnippetMatch: {
+    fontFamily: 'Inter-SemiBold',
+  },
   messagesContent: {
     paddingVertical: 20,
     paddingHorizontal: 16,
+  },
+  messageListItemWithGutter: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+  },
+  messageListItemContent: {
+    flex: 1,
+  },
+  conversationSearchResultGutter: {
+    width: 16,
+    marginRight: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  conversationSearchResultGutterRail: {
+    position: 'absolute',
+    top: 2,
+    bottom: 2,
+    width: 2,
+    borderRadius: 999,
+  },
+  conversationSearchResultMarkerButton: {
+    width: 14,
+    height: 14,
+    borderRadius: 999,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  conversationSearchResultMarkerDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 999,
   },
   messageContainer: {
     marginBottom: 16,
@@ -11734,6 +13325,28 @@ const styles = StyleSheet.create({
           shadowOpacity: 0.3,
           shadowRadius: 6,
           elevation: 5,
+        }),
+  },
+  replyJumpHighlightGlow: {
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '0 0 0 3px rgba(245, 158, 11, 0.3), 0 10px 22px rgba(245, 158, 11, 0.2)' }
+      : {
+          shadowColor: 'rgba(245, 158, 11, 0.9)',
+          shadowOffset: { width: 0, height: 4 },
+          shadowOpacity: 0.38,
+          shadowRadius: 8,
+          elevation: 8,
+        }),
+  },
+  messageSearchHighlightGlow: {
+    ...(Platform.OS === 'web'
+      ? { boxShadow: '0 0 0 2px rgba(59, 130, 246, 0.24), 0 8px 18px rgba(59, 130, 246, 0.16)' }
+      : {
+          shadowColor: 'rgba(59, 130, 246, 0.85)',
+          shadowOffset: { width: 0, height: 3 },
+          shadowOpacity: 0.26,
+          shadowRadius: 7,
+          elevation: 7,
         }),
   },
   editingTag: {
@@ -11797,8 +13410,40 @@ const styles = StyleSheet.create({
   ownMessageText: {
     color: '#ffffff',
   },
+  searchInlineHighlightOwn: {
+    backgroundColor: 'rgba(255, 255, 255, 0.24)',
+  },
   friendMessageText: {
     // Color will be set dynamically
+  },
+  replySnippet: {
+    borderLeftWidth: 3,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    marginBottom: 8,
+  },
+  replySnippetOwn: {
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+  },
+  replySnippetFriend: {
+    borderWidth: 1,
+    borderColor: 'rgba(59, 130, 246, 0.2)',
+  },
+  replySnippetSender: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+  },
+  replySnippetSenderOwn: {
+    color: 'rgba(255, 255, 255, 0.95)',
+  },
+  replySnippetText: {
+    marginTop: 2,
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+  },
+  replySnippetTextOwn: {
+    color: 'rgba(255, 255, 255, 0.85)',
   },
   messageMeta: {
     fontSize: 11,
@@ -12083,49 +13728,217 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: 'Inter-Bold',
   },
-  
-  // Attachment modal styles
-  attachmentModalOverlay: {
+
+  messageInfoModalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0, 0, 0, 0.48)',
   },
-  attachmentModal: {
-    margin: 20,
-    borderRadius: 20,
-    padding: 24,
-    alignItems: 'center',
-    ...(Platform.OS === 'web' ? {
-      boxShadow: '0 4px 12px rgba(0, 0, 0, 0.25)'
-    } : {
-      shadowColor: '#000',
-      shadowOffset: {
-        width: 0,
-        height: 4,
-      },
-      shadowOpacity: 0.25,
-      shadowRadius: 12,
-      elevation: 8,
-    }),
+  messageInfoModalCard: {
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderWidth: 1,
+    borderBottomWidth: 0,
+    maxHeight: '72%',
   },
-  attachmentModalTitle: {
-    fontSize: 18,
-    fontFamily: 'Poppins-SemiBold',
-    marginBottom: 20,
-  },
-  attachmentOption: {
+  messageInfoModalHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-    width: '100%',
+    justifyContent: 'space-between',
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  attachmentOptionText: {
-    fontSize: 16,
+  messageInfoModalTitle: {
+    fontSize: 17,
+    fontFamily: 'Poppins-SemiBold',
+  },
+  messageInfoModalHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoCopyAllButton: {
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 8,
+  },
+  messageInfoCopyAllButtonText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+    marginLeft: 5,
+  },
+  messageInfoShortcutBadge: {
+    marginLeft: 7,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 999,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  messageInfoShortcutBadgeText: {
+    fontSize: 9,
     fontFamily: 'Inter-Medium',
-    marginLeft: 16,
   },
+  messageInfoCloseActionWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoModalCloseButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  messageInfoHintRow: {
+    paddingHorizontal: 18,
+    paddingVertical: 9,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  messageInfoHintText: {
+    fontSize: 12,
+    fontFamily: 'Inter-Medium',
+  },
+  messageInfoCopyFeedbackRow: {
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoCopyFeedbackText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+    marginLeft: 8,
+  },
+  messageInfoCopyFeedbackSourceBadge: {
+    marginLeft: 'auto',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 999,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  },
+  messageInfoCopyFeedbackSourceText: {
+    fontSize: 10,
+    fontFamily: 'Inter-Medium',
+  },
+  messageInfoToastNoticeRow: {
+    paddingHorizontal: 18,
+    paddingVertical: 7,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoToastNoticeText: {
+    fontSize: 10,
+    fontFamily: 'Inter-Regular',
+    marginLeft: 7,
+  },
+  messageInfoBulkActionsRow: {
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  messageInfoBulkToggleButton: {
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoBulkToggleButtonText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+    marginLeft: 6,
+  },
+  messageInfoShortcutHintRow: {
+    paddingHorizontal: 18,
+    paddingVertical: 7,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  messageInfoShortcutHintText: {
+    fontSize: 11,
+    fontFamily: 'Inter-Regular',
+  },
+  messageInfoModalBody: {
+    flexGrow: 0,
+  },
+  messageInfoModalBodyContent: {
+    paddingBottom: 14,
+  },
+  messageInfoRow: {
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+  messageInfoRowHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  messageInfoRowHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoRowLabel: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+    textTransform: 'uppercase',
+    letterSpacing: 0.35,
+  },
+  messageInfoRowBadge: {
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  messageInfoRowBadgeText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  messageInfoRowCopyButton: {
+    marginLeft: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  messageInfoRowCopyButtonText: {
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+    marginLeft: 5,
+  },
+  messageInfoRowValuePressArea: {
+    borderRadius: 8,
+    paddingVertical: 2,
+  },
+  messageInfoRowValue: {
+    fontSize: 14,
+    fontFamily: 'Inter-Regular',
+    lineHeight: 21,
+  },
+  messageInfoRowToggleButton: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    paddingVertical: 2,
+  },
+  messageInfoRowToggleText: {
+    fontSize: 13,
+    fontFamily: 'Inter-SemiBold',
+  },
+  messageInfoEmptyText: {
+    fontSize: 14,
+    fontFamily: 'Inter-Regular',
+    paddingHorizontal: 18,
+    paddingVertical: 18,
+  },
+  
   
   // Special message styles
   specialMessageContainer: {
@@ -12258,12 +14071,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
   },
-  inputContainer: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderTopWidth: 1,
-    minHeight: 64,
-  },
   inputLimitCounter: {
     paddingHorizontal: 22,
     paddingTop: 2,
@@ -12274,57 +14081,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: 'Inter-Regular',
   },
-  inputWrapper: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    borderRadius: 24,
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-    borderWidth: 1,
-    minHeight: 48,
-    position: 'relative',
-  },
-  attachButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 4,
-  },
-  stickerButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 8,
-  },
-  formattingButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 8,
-  },
-  textInput: {
-    flex: 1,
-    fontSize: 16,
-    fontFamily: 'Inter-Regular',
-    minHeight: 40,
-    maxHeight: 120,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    textAlignVertical: 'top',
-  },
-  sendButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginLeft: 4,
+  scrollToBottomLatestLabel: {
+    marginLeft: 8,
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
   },
   refreshButton: {
     marginTop: 20,
@@ -12407,6 +14167,45 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: 'Inter-SemiBold',
   },
+  replyBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    borderRadius: 18,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  replyBannerIcon: {
+    marginRight: 10,
+  },
+  replyBannerCopy: {
+    flex: 1,
+  },
+  replyBannerTitle: {
+    fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+  },
+  replyBannerDescription: {
+    fontSize: 13,
+    fontFamily: 'Inter-Regular',
+    marginTop: 2,
+  },
+  replyBannerClose: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    marginLeft: 12,
+  },
+  replyBannerCloseText: {
+    fontSize: 13,
+    fontFamily: 'Inter-Medium',
+    marginLeft: 6,
+  },
   editingBanner: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -12455,269 +14254,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
     borderRadius: 16,
     padding: 4,
-  },
-  
-  // File preview modal styles
-  filePreviewOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.9)',
-  },
-  filePreviewContainer: {
-    flex: 1,
-  },
-  filePreviewHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
-  },
-  filePreviewTitle: {
-    fontSize: 18,
-    fontFamily: 'Poppins-SemiBold',
-  },
-  closeButton: {
-    padding: 8,
-  },
-  filePreviewContent: {
-    flex: 1,
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-  },
-  filePreviewItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    marginBottom: 12,
-    borderRadius: 12,
-    elevation: 2,
-    ...(Platform.OS === 'web' ? {
-      boxShadow: '0 2px 4px rgba(0, 0, 0, 0.1)'
-    } : {
-      shadowColor: '#000',
-      shadowOffset: { width: 0, height: 2 },
-      shadowOpacity: 0.1,
-      shadowRadius: 4,
-    }),
-  },
-  filePreviewInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-  },
-  previewImage: {
-    width: 60,
-    height: 60,
-    borderRadius: 8,
-    marginRight: 12,
-  },
-  fileIconContainer: {
-    width: 60,
-    height: 60,
-    borderRadius: 8,
-    backgroundColor: 'rgba(0, 122, 255, 0.1)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
-  },
-  filePreviewDetails: {
-    flex: 1,
-  },
-  previewFileName: {
-    fontSize: 16,
-    fontFamily: 'Inter-Medium',
-    marginBottom: 4,
-  },
-  previewFileSize: {
-    fontSize: 14,
-    fontFamily: 'Inter-Regular',
-  },
-  removeFileButton: {
-    padding: 8,
-    marginLeft: 8,
-  },
-  filePreviewFooter: {
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 255, 255, 0.1)',
-  },
-  previewMessageInput: {
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 16,
-    fontSize: 16,
-    fontFamily: 'Inter-Regular',
-    maxHeight: 100,
-    textAlignVertical: 'top',
-  },
-  uploadProgressContainer: {
-    marginVertical: 16,
-  },
-  uploadProgressText: {
-    fontSize: 16,
-    fontFamily: 'Inter-Medium',
-    textAlign: 'center',
-    marginBottom: 8,
-  },
-  progressBar: {
-    height: 6,
-    borderRadius: 3,
-    overflow: 'hidden',
-  },
-  progressFill: {
-    height: '100%',
-    borderRadius: 3,
-  },
-  sendFilesButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 24,
-    borderRadius: 12,
-  },
-  sendFilesButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontFamily: 'Inter-SemiBold',
-    marginLeft: 8,
-  },
-  
-  // Image viewer modal styles
-  imageViewerOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.95)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  imageViewerContent: {
-    width: '100%',
-    height: '100%',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  imageViewerCloseButton: {
-    position: 'absolute',
-    top: 60,
-    right: 20,
-    zIndex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    borderRadius: 20,
-    padding: 10,
-  },
-  fullScreenImage: {
-    width: '100%',
-    height: '100%',
-  },
-  imageRetryBadge: {
-    position: 'absolute',
-    bottom: 110,
-    right: 20,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 16,
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-  },
-  imageRetryText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontFamily: 'Inter-Medium',
-    marginLeft: 6,
-  },
-  imageViewerButtonContainer: {
-    position: 'absolute',
-    bottom: 60,
-    left: 0,
-    right: 0,
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    gap: 24,
-  },
-  imageViewerActionButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderRadius: 25,
-  },
-  imageViewerNetworkError: {
-    position: 'absolute',
-    top: 110,
-    left: 20,
-    right: 20,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 12,
-    borderWidth: 1,
-  },
-  imageViewerButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontFamily: 'Inter-Medium',
-    marginLeft: 8,
-  },
-  // Keep old styles for backward compatibility
-  imageViewerDownloadButton: {
-    position: 'absolute',
-    bottom: 60,
-    alignSelf: 'center',
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderRadius: 25,
-  },
-  imageViewerDownloadText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontFamily: 'Inter-Medium',
-    marginLeft: 8,
-  },
-  brokenImageContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    flex: 1,
-  },
-  brokenImageText: {
-    color: '#ffffff',
-    fontSize: 20,
-    fontFamily: 'Inter-SemiBold',
-    marginTop: 16,
-    textAlign: 'center',
-  },
-  brokenImageSubtext: {
-    color: 'rgba(255, 255, 255, 0.7)',
-    fontSize: 16,
-    fontFamily: 'Inter-Regular',
-    marginTop: 8,
-    textAlign: 'center',
-    paddingHorizontal: 40,
-  },
-  videoPreviewContainer: {
-    width: 160,
-    borderRadius: 8,
-    overflow: 'hidden',
-    marginRight: 12,
-    flexShrink: 0,
-  },
-  videoPreviewPlayer: {
-    marginVertical: 0,
-  },
-  filePreviewInfoVideo: {
-    alignItems: 'flex-start',
   },
   
   // Date separator styles
@@ -13029,40 +14565,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: 'Inter-Regular',
   },
-  
-  // Format preview styles
-  formatPreview: {
-    position: 'absolute',
-    bottom: '100%',
-    left: 0,
-    right: 0,
-    marginBottom: 8,
-    padding: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    zIndex: 1000,
-    elevation: 10,
-    ...(Platform.OS === 'web' ? {
-      boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)'
-    } : {
-      shadowColor: '#000',
-      shadowOffset: {
-        width: 0,
-        height: 4,
-      },
-      shadowOpacity: 0.15,
-      shadowRadius: 12,
-    }),
-  },
-  formatPreviewLabel: {
-    fontSize: 12,
-    fontFamily: 'Inter-SemiBold',
-    marginBottom: 4,
-  },
-  formatPreviewText: {
-    fontSize: 14,
-    fontFamily: 'Inter-Regular',
-  },
   // Reaction system styles
   glowingReaction: {
     ...(Platform.OS === 'web' ? {
@@ -13175,5 +14677,130 @@ const styles = StyleSheet.create({
   messageReactionCount: {
     fontSize: 12,
     fontFamily: 'Inter-Medium',
+  },
+  pendingAttachmentHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  flex1: {
+    flex: 1,
+  },
+  pendingAttachmentCancelButton: {
+    marginLeft: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+  },
+  pendingAttachmentCancelButtonText: {
+    color: '#fff',
+    fontWeight: '600',
+    fontSize: 12,
+  },
+  pendingSentText: {
+    color: 'rgba(255,255,255,0.9)',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  pendingProgressBarOuter: {
+    height: 4,
+    backgroundColor: 'rgba(255,255,255,0.3)',
+    borderRadius: 4,
+    marginTop: 4,
+  },
+  pendingProgressBarInner: {
+    height: 4,
+    width: '100%',
+    backgroundColor: '#fff',
+    borderRadius: 4,
+  },
+  pendingFailedContainer: {
+    marginTop: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  pendingFailedText: {
+    marginLeft: 6,
+    color: 'rgba(255,255,255,0.9)',
+  },
+  pendingRetryButton: {
+    marginLeft: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  pendingRetryButtonText: {
+    marginLeft: 4,
+    color: '#fff',
+    fontWeight: '600',
+  },
+  unreadBadgeText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  deletedIcon: {
+    marginRight: 6,
+  },
+  attachmentSkeletonTextContainer: {
+    marginLeft: 12,
+  },
+  attachmentWrapper: {
+    width: '100%',
+    alignItems: 'stretch',
+  },
+  marginTop8: {
+    marginTop: 8,
+  },
+  marginBottom8: {
+    marginBottom: 8,
+  },
+  marginLeft6: {
+    marginLeft: 6,
+  },
+  marginLeft8: {
+    marginLeft: 8,
+  },
+  height20: {
+    height: 20,
+  },
+  rotate180: {
+    transform: [{ rotate: '180deg' }],
+  },
+  alignItemsCenterMarginVertical8: {
+    alignItems: 'center',
+    marginVertical: 8,
+  },
+  pendingTextMessageTime: {
+    color: 'rgba(255, 255, 255, 0.85)',
+  },
+  pendingTextRetryButton: {
+    marginLeft: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  pendingTextRetryButtonText: {
+    marginLeft: 4,
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  pendingMediaOverlay: {
+    position: 'absolute',
+    left: 8,
+    right: 8,
+    bottom: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,0,0,0.5)',
   },
 });

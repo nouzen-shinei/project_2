@@ -1,6 +1,7 @@
 import { logger } from '@/lib/logger';
 import React from 'react';
 import { Text, Linking, Alert, StyleSheet, Platform } from 'react-native';
+import { splitChatTextForHighlight } from '../lib/chatSearchHighlight';
 
 /**
  * StyledText component that supports markdown-like formatting:
@@ -18,6 +19,8 @@ interface StyledTextProps {
   text: string;
   style?: any;
   linkStyle?: any;
+  highlightQuery?: string;
+  highlightStyle?: any;
 }
 
 interface TextSegment {
@@ -27,7 +30,13 @@ interface TextSegment {
   styles?: any[];
 }
 
-export default function StyledText({ text, style, linkStyle }: StyledTextProps) {
+export default function StyledText({
+  text,
+  style,
+  linkStyle,
+  highlightQuery,
+  highlightStyle,
+}: StyledTextProps) {
   // Regular expressions for different formatting
   const extraBoldRegex = /\*\*\*(.*?)\*\*\*/g;
   const boldRegex = /\*\*(.*?)\*\*/g;
@@ -384,7 +393,15 @@ export default function StyledText({ text, style, linkStyle }: StyledTextProps) 
         onPress={isClickable ? handlePress : undefined}
         suppressHighlighting
       >
-        {segment.text}
+        {splitChatTextForHighlight(segment.text, highlightQuery).map((part, partIndex) => (
+          <Text
+            key={`${index}:${partIndex}`}
+            style={part.highlighted ? [styles.searchHighlight, highlightStyle] : undefined}
+            suppressHighlighting
+          >
+            {part.text}
+          </Text>
+        ))}
       </Text>
     );
   };
@@ -491,5 +508,8 @@ const styles = StyleSheet.create({
   hashtag: {
     color: '#1DA1F2',
     fontWeight: '600',
+  },
+  searchHighlight: {
+    backgroundColor: 'rgba(250, 204, 21, 0.38)',
   },
 });

@@ -24,7 +24,13 @@ import * as FileSystem from 'expo-file-system';
 import { useEvent } from 'expo';
 import { useVideoPlayer, VideoView, type VideoSource } from 'expo-video';
 import { useDownloadState } from '@/hooks/useDownloadState';
+import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
 import { setDownloadState } from '@/lib/downloadStateStore';
+import {
+  resolveDownloadProgressLabel,
+  normalizeUploadProgressDisplayPercent,
+  resolveProgressPercentText,
+} from '@/lib/uploadProgressDisplayEasing';
 
 interface AudioPlayerProps {
   fileUrl: string;
@@ -42,6 +48,8 @@ interface InternalAudioPlayerProps extends AudioPlayerProps {
   resolvedUrl: string | null;
   resolving: boolean;
 }
+
+const AUDIO_PLAYBACK_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
 const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   fileUrl,
@@ -64,8 +72,20 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   const [playbackRate, setPlaybackRate] = useState<number>(1);
   const [hasEnded, setHasEnded] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
   const downloadInFlight = Boolean(isDownloading || downloading);
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    downloadProgress,
+    downloadInFlight
+  );
+  const downloadButtonA11yLabel = resolveDownloadProgressLabel(
+    downloadInFlight,
+    normalizedProgress,
+    'Download audio file'
+  );
+  const shareButtonA11yLabel = 'Share audio file';
+  const closeShareModal = useCallback(() => {
+    setShowShareModal(false);
+  }, []);
 
   const progressBarRef = useRef<any>(null);
   const progressMetricsRef = useRef({ width: 0, pageX: 0 });
@@ -94,6 +114,10 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   );
 
   const effectiveResolvedUrl = useMemo(() => sanitizeResolvedUri(resolvedUrl), [sanitizeResolvedUri, resolvedUrl]);
+  const downloadActionButtonStyle = useMemo(
+    () => [styles.actionButton, { opacity: downloadInFlight ? 0.6 : 1 }],
+    [styles, downloadInFlight]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -254,9 +278,9 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
         }
       }
 
-  const playbackDuration = duration ?? 0;
-  const currentTime = Number.isFinite(player.currentTime) ? player.currentTime : 0;
-  const shouldRestart = hasEnded || (playbackDuration > 0 && currentTime >= playbackDuration - 0.1);
+      const playbackDuration = duration ?? 0;
+      const currentTime = Number.isFinite(player.currentTime) ? player.currentTime : 0;
+      const shouldRestart = hasEnded || (playbackDuration > 0 && currentTime >= playbackDuration - 0.1);
       if (shouldRestart) {
         try {
           player.currentTime = 0;
@@ -473,15 +497,13 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
   const elapsedLabel = useMemo(() => formatTime(displayedPosition), [displayedPosition, formatTime]);
   const durationLabel = useMemo(() => (duration > 0 ? formatTime(duration) : '0:00'), [duration, formatTime]);
 
-  const playbackRates = useMemo(() => [0.75, 1, 1.25, 1.5, 1.75, 2], []);
-
   const cyclePlaybackRate = useCallback(() => {
     const currentRate = playbackRate;
-    const currentIndex = playbackRates.findIndex((rate) => Math.abs(rate - currentRate) < 0.001);
-    const fallbackIndex = Math.max(playbackRates.indexOf(1), 0);
+    const currentIndex = AUDIO_PLAYBACK_RATES.findIndex((rate) => Math.abs(rate - currentRate) < 0.001);
+    const fallbackIndex = Math.max(AUDIO_PLAYBACK_RATES.indexOf(1), 0);
     const safeIndex = currentIndex >= 0 ? currentIndex : fallbackIndex;
-    const nextIndex = (safeIndex + 1) % playbackRates.length;
-    const nextRate = playbackRates[nextIndex];
+    const nextIndex = (safeIndex + 1) % AUDIO_PLAYBACK_RATES.length;
+    const nextRate = AUDIO_PLAYBACK_RATES[nextIndex];
 
     try {
       player.preservesPitch = true;
@@ -490,7 +512,7 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
     } catch (err) {
       logger.error('AudioPlayer: failed to change playback speed', err);
     }
-  }, [playbackRate, playbackRates, player]);
+  }, [playbackRate, player]);
 
   const playbackRateLabel = useMemo(() => {
     const rounded = Math.round(playbackRate * 100) / 100;
@@ -577,17 +599,24 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
         <View style={styles.bottomRow}>
           <View style={styles.actionButtons}>
             <TouchableOpacity
-              style={[styles.actionButton, { opacity: downloadInFlight ? 0.6 : 1 }]}
+              style={downloadActionButtonStyle}
               onPress={handleDownload}
               disabled={downloadInFlight}
+              accessibilityRole="button"
+              accessibilityLabel={downloadButtonA11yLabel}
             >
-              {isDownloading ? (
-                <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              {downloadInFlight ? (
+                <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
               ) : (
                 <Download size={20} color={theme.textSecondary} />
               )}
             </TouchableOpacity>
-            <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
+              <TouchableOpacity
+                style={styles.actionButton}
+                onPress={handleShare}
+                accessibilityRole="button"
+                accessibilityLabel={shareButtonA11yLabel}
+              >
               <Share size={20} color={theme.textSecondary} />
             </TouchableOpacity>
           </View>
@@ -606,7 +635,7 @@ const ExpoVideoAudioPlayer: React.FC<InternalAudioPlayerProps> = ({
 
       <ShareModal
         visible={showShareModal}
-        onClose={() => setShowShareModal(false)}
+        onClose={closeShareModal}
         fileUrl={shareUrl || resolvedUrl || fileUrl}
         fileName={fileName}
         fileSize={fileSize}
@@ -825,6 +854,22 @@ function AudioPlayerInner(props: AudioPlayerProps) {
   const downloadState = useDownloadState(resolvedDownloadKey);
   const effectiveIsDownloading = props.isDownloading ?? downloadState.isDownloading;
   const effectiveProgress = props.downloadProgress ?? downloadState.progress;
+  const normalizedDownloadProgress = useEasedDownloadProgressPercent(
+    effectiveProgress,
+    effectiveIsDownloading
+  );
+  const fallbackDownloadButtonA11yLabel = resolveDownloadProgressLabel(
+    effectiveIsDownloading,
+    normalizedDownloadProgress,
+    'Download audio file'
+  );
+  const fallbackShareButtonA11yLabel = 'Share audio file';
+  const handleUnsupportedPlaybackNotice = useCallback(() => {
+    Alert.alert('Info', 'Audio playback not supported on this platform');
+  }, []);
+  const handleFallbackShare = useCallback(() => {
+    props.onShare?.();
+  }, [props.onShare]);
 
   const defaultDownload = useCallback(async () => {
     const candidateUrl = props.shareUrl || resolvedUrl || props.fileUrl;
@@ -840,7 +885,7 @@ function AudioPlayerInner(props: AudioPlayerProps) {
           candidateUrl,
           props.fileName || 'audio',
           (percent) => {
-            const bounded = Math.max(0, Math.min(100, Math.round(percent)));
+            const bounded = normalizeUploadProgressDisplayPercent(percent);
             setDownloadState(resolvedDownloadKey, {
               isDownloading: bounded < 100,
               progress: bounded,
@@ -884,6 +929,14 @@ function AudioPlayerInner(props: AudioPlayerProps) {
       Alert.alert('Download', 'Failed to download audio. Please try again.');
     }
   }, [props.fileName, props.fileUrl, props.shareUrl, resolvedDownloadKey, resolvedUrl]);
+  const fallbackDownloadHandler = useCallback(() => {
+    if (props.onDownload) {
+      props.onDownload();
+      return;
+    }
+
+    void defaultDownload();
+  }, [defaultDownload, props.onDownload]);
 
   useEffect(() => {
     let cancelled = false;
@@ -931,21 +984,19 @@ function AudioPlayerInner(props: AudioPlayerProps) {
   }, [props.fileUrl, props.fileName]);
   
   // Check if audio is supported based on platform and available APIs
-  const isSupported = (() => {
+  const isSupported = useMemo(() => {
     if (Platform.OS === 'web') {
       // For web, check if we have document API (browser environment)
       return typeof window !== 'undefined' && typeof document !== 'undefined';
-    } else {
-      // For native, assume audio support
-      return true;
     }
-  })();
+
+    // For native, assume audio support.
+    return true;
+  }, []);
 
   // If audio is not supported, show a simple file attachment
   if (!isSupported) {
     const styles = createStyles(theme);
-    const downloadHandler = props.onDownload ?? (() => void defaultDownload());
-    const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
     
     return (
       <View style={styles.container}>
@@ -963,7 +1014,7 @@ function AudioPlayerInner(props: AudioPlayerProps) {
         <View style={styles.actions}>
           <TouchableOpacity 
             style={[styles.primaryButton, { backgroundColor: theme.border }]} 
-            onPress={() => Alert.alert('Info', 'Audio playback not supported on this platform')}
+            onPress={handleUnsupportedPlaybackNotice}
           >
             <Play size={20} color={theme.textSecondary} />
             <Text style={[styles.primaryButtonText, { color: theme.textSecondary }]}>
@@ -974,16 +1025,23 @@ function AudioPlayerInner(props: AudioPlayerProps) {
           <View style={styles.actionButtons}>
             <TouchableOpacity
               style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
-              onPress={downloadHandler}
+              onPress={fallbackDownloadHandler}
               disabled={effectiveIsDownloading}
+              accessibilityRole="button"
+              accessibilityLabel={fallbackDownloadButtonA11yLabel}
             >
               {effectiveIsDownloading ? (
-                <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+                <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedDownloadProgress)}</Text>
               ) : (
                 <Download size={20} color={theme.textSecondary} />
               )}
             </TouchableOpacity>
-            <TouchableOpacity style={styles.actionButton} onPress={() => props.onShare?.()}>
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={handleFallbackShare}
+              accessibilityRole="button"
+              accessibilityLabel={fallbackShareButtonA11yLabel}
+            >
               <Share size={20} color={theme.textSecondary} />
             </TouchableOpacity>
           </View>

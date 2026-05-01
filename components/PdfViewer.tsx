@@ -9,6 +9,11 @@ import * as FileSystem from 'expo-file-system';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { PdfNativeRenderer } from './PdfNativeRenderer';
 import { useDownloadState } from '@/hooks/useDownloadState';
+import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
+import {
+  resolveDownloadProgressLabel,
+  resolveProgressPercentText,
+} from '@/lib/uploadProgressDisplayEasing';
 
 const sanitizeFileName = (name: string) => name.replace(/[^a-zA-Z0-9._-]/g, '_');
 const ensurePdfExtension = (name: string) =>
@@ -177,7 +182,16 @@ function PdfViewerInner({
   const downloadState = useDownloadState(resolvedDownloadKey);
   const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
   const effectiveProgress = downloadProgress ?? downloadState.progress;
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    effectiveProgress,
+    effectiveIsDownloading
+  );
+  const downloadButtonA11yLabel = resolveDownloadProgressLabel(
+    effectiveIsDownloading,
+    normalizedProgress,
+    'Download PDF file'
+  );
+  const shareButtonA11yLabel = 'Share PDF file';
   const isLocalFile = Platform.OS !== 'web' && fileUrl.startsWith('file://');
   const remoteUrl = remoteFileUrl || fileUrl;
   const shareUrl = isLocalFile ? fileUrl : remoteUrl;
@@ -193,7 +207,7 @@ function PdfViewerInner({
     } else {
       setLocalFileUri(null);
     }
-  }, [fileUrl, isLocalFile, remoteUrl]);
+  }, [fileUrl, isLocalFile]);
 
   const remoteSignature = useMemo(() => {
     if (!remoteUrl) return '';
@@ -281,17 +295,21 @@ function PdfViewerInner({
     };
   }, [ensureLocalFile, remoteUrl]);
 
-  const handleDownload = () => {
+  const handleDownload = useCallback(() => {
     if (onDownload) {
       onDownload();
     } else {
       Alert.alert('Download', 'Download functionality not implemented');
     }
-  };
+  }, [onDownload]);
 
-  const handleShare = () => {
+  const handleShare = useCallback(() => {
     setShowShareModal(true);
-  };
+  }, []);
+
+  const closeShareModal = useCallback(() => {
+    setShowShareModal(false);
+  }, []);
 
   const handleOpenExternal = async () => {
     try {
@@ -323,6 +341,11 @@ function PdfViewerInner({
 
   const styles = useMemo(() => createPdfViewerStyles(theme, previewHeight), [theme, previewHeight]);
   const IFrame = useMemo(() => ('iframe' as any), []);
+  const iframeStyle = useMemo(() => ({ width: '100%', height: '100%', border: 'none' }), []);
+  const downloadActionButtonStyle = useMemo(
+    () => [styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }],
+    [styles, effectiveIsDownloading]
+  );
 
   return (
     <View style={styles.container}>
@@ -344,7 +367,7 @@ function PdfViewerInner({
               <IFrame
                 src={remoteUrl}
                 title={fileName}
-                style={{ width: '100%', height: '100%', border: 'none' }}
+                style={iframeStyle}
               />
             </View>
           ) : (
@@ -378,17 +401,24 @@ function PdfViewerInner({
 
         <View style={styles.actionButtons}>
           <TouchableOpacity
-            style={[styles.actionButton, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            style={downloadActionButtonStyle}
             onPress={handleDownload}
             disabled={effectiveIsDownloading}
+            accessibilityRole="button"
+            accessibilityLabel={downloadButtonA11yLabel}
           >
             {effectiveIsDownloading ? (
-              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
             ) : (
               <Download size={20} color={theme.textSecondary} />
             )}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={handleShare}
+            accessibilityRole="button"
+            accessibilityLabel={shareButtonA11yLabel}
+          >
             <Share size={20} color={theme.textSecondary} />
           </TouchableOpacity>
         </View>
@@ -400,7 +430,7 @@ function PdfViewerInner({
 
       <ShareModal
         visible={showShareModal}
-        onClose={() => setShowShareModal(false)}
+        onClose={closeShareModal}
         fileUrl={shareUrl}
         fileName={fileName}
         fileSize={fileSize}

@@ -242,6 +242,11 @@ export function StickerGifPickerMobile({
   const [nextGifPos, setNextGifPos] = useState<string | null>(null);
   const [hasMoreStickers, setHasMoreStickers] = useState(true);
   const [hasMoreGifs, setHasMoreGifs] = useState(true);
+  const stickerLoadMoreInFlightRef = useRef(false);
+  const gifLoadMoreInFlightRef = useRef(false);
+  const trimmedSearchQuery = searchQuery.trim();
+  const normalizedSearchQuery = trimmedSearchQuery.toLowerCase();
+  const hasSearchQuery = normalizedSearchQuery.length > 0;
 
   // Convert Tenor result to Sticker format
   // Important: React Native Image has limited/varied WebP support on mobile builds.
@@ -444,51 +449,85 @@ export function StickerGifPickerMobile({
   };
 
   // Filter stickers based on search
-  const filteredStickers = stickers.filter((sticker: Sticker) => {
-    if (!searchQuery.trim()) return true; // Show all when no search query
-    const searchLower = searchQuery.toLowerCase();
-    return (
-      sticker.name.toLowerCase().includes(searchLower) ||
-      sticker.pack.toLowerCase().includes(searchLower)
-    );
-  });
+  const filteredStickers = useMemo(() => {
+    if (!hasSearchQuery) {
+      return stickers;
+    }
+
+    return stickers.filter((sticker: Sticker) => {
+      return (
+        sticker.name.toLowerCase().includes(normalizedSearchQuery) ||
+        sticker.pack.toLowerCase().includes(normalizedSearchQuery)
+      );
+    });
+  }, [hasSearchQuery, normalizedSearchQuery, stickers]);
 
   // Filter GIFs based on search
-  const filteredGifs = gifs.filter((gif: GifData) => {
-    if (!searchQuery.trim()) return true; // Show all when no search query
-    const searchLower = searchQuery.toLowerCase();
-    return (
-      gif.title.toLowerCase().includes(searchLower) ||
-      gif.source.toLowerCase().includes(searchLower)
-    );
-  });
+  const filteredGifs = useMemo(() => {
+    if (!hasSearchQuery) {
+      return gifs;
+    }
+
+    return gifs.filter((gif: GifData) => {
+      return (
+        gif.title.toLowerCase().includes(normalizedSearchQuery) ||
+        gif.source.toLowerCase().includes(normalizedSearchQuery)
+      );
+    });
+  }, [gifs, hasSearchQuery, normalizedSearchQuery]);
+
+  const handleSearchQueryChange = useCallback((value: string) => {
+    setSearchQuery((current) => (current === value ? current : value));
+  }, []);
 
   // Handle load more for stickers
   const handleLoadMoreStickers = () => {
-    if (hasMoreStickers && !isLoadingMore && !isLoadingStickers) {
-      fetchStickers(searchQuery || undefined, true);
+    if (!hasMoreStickers || isLoadingMore || isLoadingStickers || stickerLoadMoreInFlightRef.current) {
+      return;
     }
+
+    stickerLoadMoreInFlightRef.current = true;
+    const loadMoreQuery = hasSearchQuery ? trimmedSearchQuery : undefined;
+
+    Promise.resolve(fetchStickers(loadMoreQuery, true))
+      .catch((error) => {
+        logger.error('Error loading more stickers:', error);
+      })
+      .finally(() => {
+        stickerLoadMoreInFlightRef.current = false;
+      });
   };
 
   // Handle load more for gifs
   const handleLoadMoreGifs = () => {
-    if (hasMoreGifs && !isLoadingMore && !isLoadingGifs) {
-      fetchGifs(searchQuery || undefined, true);
+    if (!hasMoreGifs || isLoadingMore || isLoadingGifs || gifLoadMoreInFlightRef.current) {
+      return;
     }
+
+    gifLoadMoreInFlightRef.current = true;
+    const loadMoreQuery = hasSearchQuery ? trimmedSearchQuery : undefined;
+
+    Promise.resolve(fetchGifs(loadMoreQuery, true))
+      .catch((error) => {
+        logger.error('Error loading more GIFs:', error);
+      })
+      .finally(() => {
+        gifLoadMoreInFlightRef.current = false;
+      });
   };
 
   // Handle search with debouncing
   useEffect(() => {
     const timeoutId = setTimeout(() => {
       if (activeTab === 'stickers') {
-        if (searchQuery.trim()) {
-          fetchStickers(searchQuery);
+        if (hasSearchQuery) {
+          fetchStickers(trimmedSearchQuery);
         } else {
           fetchStickers();
         }
       } else {
-        if (searchQuery.trim()) {
-          fetchGifs(searchQuery);
+        if (hasSearchQuery) {
+          fetchGifs(trimmedSearchQuery);
         } else {
           fetchGifs();
         }
@@ -496,7 +535,7 @@ export function StickerGifPickerMobile({
     }, 300);
 
     return () => clearTimeout(timeoutId);
-  }, [searchQuery, activeTab, selectedCategory]);
+  }, [activeTab, hasSearchQuery, selectedCategory, trimmedSearchQuery]);
 
   // Load initial content when tab changes or category changes
   useEffect(() => {
@@ -645,6 +684,10 @@ export function StickerGifPickerMobile({
       paddingVertical: 4,
       flexGrow: 1,
     },
+    gridColumn: {
+      justifyContent: 'space-between',
+      paddingHorizontal: 8,
+    },
     gridItem: {
       width: ITEM_SIZE,
       height: ITEM_SIZE,
@@ -694,6 +737,43 @@ export function StickerGifPickerMobile({
       textAlign: 'center',
     },
   }), [theme]);
+
+  const loadingMoreFooterComponent = useMemo(() => {
+    if (!isLoadingMore) {
+      return null;
+    }
+
+    return (
+      <View style={styles.loadingMoreContainer}>
+        <ActivityIndicator size="small" color={theme.primary} />
+        <Text style={styles.loadingMoreText}>Loading more...</Text>
+      </View>
+    );
+  }, [isLoadingMore, styles, theme.primary]);
+
+  const stickersEmptyComponent = useMemo(() => {
+    return (
+      <View style={styles.emptyContainer}>
+        <Text style={styles.emptyText}>
+          {hasSearchQuery
+            ? `No stickers found for "${trimmedSearchQuery}"`
+            : 'No stickers available'}
+        </Text>
+      </View>
+    );
+  }, [hasSearchQuery, styles, trimmedSearchQuery]);
+
+  const gifsEmptyComponent = useMemo(() => {
+    return (
+      <View style={styles.emptyContainer}>
+        <Text style={styles.emptyText}>
+          {hasSearchQuery
+            ? `No GIFs found for "${trimmedSearchQuery}"`
+            : 'No GIFs available'}
+        </Text>
+      </View>
+    );
+  }, [hasSearchQuery, styles, trimmedSearchQuery]);
 
   // Event handlers
   const handleStickerSelect = (sticker: Sticker) => {
@@ -791,7 +871,7 @@ export function StickerGifPickerMobile({
               placeholder={`Search ${activeTab}...`}
               placeholderTextColor={theme.textSecondary}
               value={searchQuery}
-              onChangeText={setSearchQuery}
+              onChangeText={handleSearchQueryChange}
             />
             <View style={[styles.searchIconContainer, { pointerEvents: 'none' }]}>
               <Search size={20} color={theme.textSecondary} />
@@ -846,7 +926,7 @@ export function StickerGifPickerMobile({
                   numColumns={NUM_COLUMNS}
                   key={NUM_COLUMNS} // Force re-render when columns change
                   contentContainerStyle={styles.grid}
-                  columnWrapperStyle={NUM_COLUMNS > 1 ? { justifyContent: 'space-between', paddingHorizontal: 8 } : undefined}
+                  columnWrapperStyle={NUM_COLUMNS > 1 ? styles.gridColumn : undefined}
                   showsVerticalScrollIndicator={false}
                   removeClippedSubviews={true}
                   maxToRenderPerBatch={NUM_COLUMNS * 2} // 2 rows at a time
@@ -856,23 +936,8 @@ export function StickerGifPickerMobile({
                   onEndReached={handleLoadMoreStickers}
                   onEndReachedThreshold={0.3} // Higher threshold for more reliable triggering
                   getItemLayout={undefined} // Let FlatList calculate dynamically for better performance
-                  ListFooterComponent={() => 
-                    isLoadingMore ? (
-                      <View style={styles.loadingMoreContainer}>
-                        <ActivityIndicator size="small" color={theme.primary} />
-                        <Text style={styles.loadingMoreText}>Loading more...</Text>
-                      </View>
-                    ) : null
-                  }
-                  ListEmptyComponent={() => (
-                    <View style={styles.emptyContainer}>
-                      <Text style={styles.emptyText}>
-                        {searchQuery
-                          ? `No stickers found for "${searchQuery}"`
-                          : 'No stickers available'}
-                      </Text>
-                    </View>
-                  )}
+                  ListFooterComponent={loadingMoreFooterComponent}
+                  ListEmptyComponent={stickersEmptyComponent}
                 />
               )}
             </>
@@ -891,7 +956,7 @@ export function StickerGifPickerMobile({
                 numColumns={NUM_COLUMNS}
                 key={`gifs-${NUM_COLUMNS}`} // Force re-render when columns change
                 contentContainerStyle={styles.grid}
-                columnWrapperStyle={NUM_COLUMNS > 1 ? { justifyContent: 'space-between', paddingHorizontal: 8 } : undefined}
+                columnWrapperStyle={NUM_COLUMNS > 1 ? styles.gridColumn : undefined}
                 showsVerticalScrollIndicator={false}
                 removeClippedSubviews={true}
                 maxToRenderPerBatch={NUM_COLUMNS * 2} // 2 rows at a time
@@ -901,23 +966,8 @@ export function StickerGifPickerMobile({
                 onEndReached={handleLoadMoreGifs}
                 onEndReachedThreshold={0.3} // Higher threshold for more reliable triggering
                 getItemLayout={undefined} // Let FlatList calculate dynamically for better performance
-                ListFooterComponent={() => 
-                  isLoadingMore ? (
-                    <View style={styles.loadingMoreContainer}>
-                      <ActivityIndicator size="small" color={theme.primary} />
-                      <Text style={styles.loadingMoreText}>Loading more...</Text>
-                    </View>
-                  ) : null
-                }
-                ListEmptyComponent={() => (
-                  <View style={styles.emptyContainer}>
-                    <Text style={styles.emptyText}>
-                      {searchQuery
-                        ? `No GIFs found for "${searchQuery}"`
-                        : 'No GIFs available'}
-                    </Text>
-                  </View>
-                )}
+                ListFooterComponent={loadingMoreFooterComponent}
+                ListEmptyComponent={gifsEmptyComponent}
               />
             )
           )}

@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Alert, ScrollView } from 'react-native';
 import { FileCode, Eye, Download, Share, Copy } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
@@ -7,6 +7,11 @@ import { formatFileSize } from '../lib/fileUtils';
 import * as Clipboard from 'expo-clipboard';
 import { ShareModal } from './ShareModal';
 import { useDownloadState } from '@/hooks/useDownloadState';
+import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
+import {
+  resolveDownloadProgressLabel,
+  resolveProgressPercentText,
+} from '@/lib/uploadProgressDisplayEasing';
 
 interface CodeViewerProps {
   fileUrl: string;
@@ -206,11 +211,28 @@ function CodeViewerInner({
   const downloadState = useDownloadState(resolvedDownloadKey);
   const effectiveIsDownloading = isDownloading ?? downloadState.isDownloading;
   const effectiveProgress = downloadProgress ?? downloadState.progress;
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(effectiveProgress ?? 0)));
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    effectiveProgress,
+    effectiveIsDownloading
+  );
+  const downloadButtonA11yLabel = resolveDownloadProgressLabel(
+    effectiveIsDownloading,
+    normalizedProgress,
+    'Download code file'
+  );
+  const shareButtonA11yLabel = 'Share code file';
+  const resolvedLanguage = useMemo(() => getLanguageFromFileName(fileName), [fileName]);
 
   const styles = useMemo(() => createCodeViewerStyles(theme, showPreview), [theme, showPreview]);
+  const downloadActionButtonStyle = useMemo(
+    () => [styles.actionButton, styles.actionButtonFirst, { opacity: effectiveIsDownloading ? 0.6 : 1 }],
+    [styles, effectiveIsDownloading]
+  );
+  const closeShareModal = useCallback(() => {
+    setShowShareModal(false);
+  }, []);
 
-  const loadContent = async () => {
+  const loadContent = useCallback(async () => {
     try {
       setIsLoading(true);
       setError(null);
@@ -229,9 +251,9 @@ function CodeViewerInner({
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [fileUrl]);
 
-  const handlePreview = () => {
+  const handlePreview = useCallback(() => {
     if (showPreview) {
       setShowPreview(false);
       return;
@@ -243,9 +265,9 @@ function CodeViewerInner({
     }
 
     void loadContent();
-  };
+  }, [content, loadContent, showPreview]);
 
-  const handleCopyContent = async () => {
+  const handleCopyContent = useCallback(async () => {
     if (!content) {
       return;
     }
@@ -257,23 +279,23 @@ function CodeViewerInner({
       logger.error('Error copying to clipboard:', copyError);
       Alert.alert('Error', 'Failed to copy content');
     }
-  };
+  }, [content]);
 
-  const handleDownload = () => {
+  const handleDownload = useCallback(() => {
     if (onDownload) {
       onDownload();
     } else {
       Alert.alert('Download', 'Download functionality not implemented');
     }
-  };
+  }, [onDownload]);
 
-  const handleShare = () => {
+  const handleShare = useCallback(() => {
     if (onShare) {
       onShare();
     } else {
       setShowShareModal(true);
     }
-  };
+  }, [onShare]);
 
   return (
     <View style={styles.container}>
@@ -281,7 +303,7 @@ function CodeViewerInner({
         <FileCode size={24} color="#7C3AED" style={styles.icon} />
         <View style={styles.fileInfo}>
           <Text style={styles.fileName}>{fileName}</Text>
-          <Text style={styles.fileType}>{getLanguageFromFileName(fileName)}</Text>
+          <Text style={styles.fileType}>{resolvedLanguage}</Text>
           {fileSize ? <Text style={styles.fileSize}>{formatFileSize(fileSize)}</Text> : null}
         </View>
       </View>
@@ -294,17 +316,24 @@ function CodeViewerInner({
 
         <View style={styles.actionButtons}>
           <TouchableOpacity
-            style={[styles.actionButton, styles.actionButtonFirst, { opacity: effectiveIsDownloading ? 0.6 : 1 }]}
+            style={downloadActionButtonStyle}
             onPress={handleDownload}
             disabled={effectiveIsDownloading}
+            accessibilityRole="button"
+            accessibilityLabel={downloadButtonA11yLabel}
           >
             {effectiveIsDownloading ? (
-              <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+              <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
             ) : (
               <Download size={20} color={theme.textSecondary} />
             )}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.actionButton} onPress={handleShare}>
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={handleShare}
+            accessibilityRole="button"
+            accessibilityLabel={shareButtonA11yLabel}
+          >
             <Share size={20} color={theme.textSecondary} />
           </TouchableOpacity>
         </View>
@@ -313,7 +342,7 @@ function CodeViewerInner({
       {showPreview && content ? (
         <View style={styles.previewContainer}>
           <View style={styles.previewHeader}>
-            <Text style={styles.previewTitle}>{getLanguageFromFileName(fileName)} Code Preview</Text>
+            <Text style={styles.previewTitle}>{resolvedLanguage} Code Preview</Text>
             <TouchableOpacity style={styles.copyButton} onPress={handleCopyContent}>
               <Copy size={16} color="white" />
             </TouchableOpacity>
@@ -332,7 +361,7 @@ function CodeViewerInner({
 
       <ShareModal
         visible={showShareModal}
-        onClose={() => setShowShareModal(false)}
+        onClose={closeShareModal}
         fileUrl={fileUrl}
         fileName={fileName}
         fileSize={fileSize}

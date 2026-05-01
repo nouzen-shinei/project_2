@@ -1,4 +1,10 @@
 import { logger } from '@/lib/logger';
+import { resolveChatAttachmentAutoText } from '@/lib/chatAttachmentMessage';
+import {
+  createChatUploadProgressEmitter,
+  normalizeChatUploadProgressPercent,
+  resolveChatUploadProgressPercentFromBytes,
+} from '@/lib/chatUploadProgress';
 import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chatUploadUtils';
 import { sharedFileService } from '@/services/sharedFileService';
 import { database, storage, auth } from '@/config/firebase';
@@ -6,16 +12,6 @@ import { Alert, Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import { ref, push, set, get, onValue, onChildAdded, onChildChanged, off, query, orderByChild, child, update, endAt, limitToLast, runTransaction, equalTo } from 'firebase/database';
 import { ref as storageRef, deleteObject } from 'firebase/storage';
-type AuthServiceType = typeof import('../hooks/useAuthUnified').authService;
-let __authService: AuthServiceType | null = null;
-function getAuthService(): AuthServiceType {
-  if (!__authService) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = require('../hooks/useAuthUnified');
-    __authService = mod.authService as AuthServiceType;
-  }
-  return __authService;
-}
 import { internalTokenManager } from './internalTokenManager';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 import { maybeShowStorageLimitReachedAlert } from './storageLimitAlert';
@@ -23,6 +19,16 @@ import { tryPresentModalAlert } from './modalAlertService';
 import { chatRealtimeStream, type ChatRealtimeCallbacks } from './chatRealtimeStream';
 import { tenantService } from './tenantService';
 import { runtimeEndpoints } from './runtimeEndpoints';
+type AuthServiceType = typeof import('../hooks/useAuthUnified').authService;
+let __authService: AuthServiceType | null = null;
+function getAuthService(): AuthServiceType {
+  if (!__authService) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('../hooks/useAuthUnified');
+    __authService = mod.authService as AuthServiceType;
+  }
+  return __authService;
+}
 
 export interface FileAttachment {
   url: string;
@@ -30,6 +36,18 @@ export interface FileAttachment {
   fileType: string;
   fileSize: number;
   thumbnailUrl?: string;
+}
+
+export interface ChatReplyContext {
+  messageId: string;
+  sender: string;
+  senderName?: string;
+  text?: string;
+  isSpecial?: boolean;
+  hasAttachments?: boolean;
+  attachmentCount?: number;
+  hasSticker?: boolean;
+  hasGif?: boolean;
 }
 
 export type ChatDeliverySource = 'presence' | 'push';
@@ -69,6 +87,7 @@ export interface ChatMessage {
   thumbnailUrl?: string; // For images and videos
   // New multiple files support
   attachments?: FileAttachment[];
+  replyTo?: ChatReplyContext;
   // Sticker and GIF support (WhatsApp-style)
   sticker?: {
     url: string;
@@ -259,6 +278,46 @@ function normalizeChatDeliveryProvenance(input: unknown): ChatDeliveryProvenance
   return normalized;
 }
 
+function normalizeChatReplyContext(input: unknown): ChatReplyContext | undefined {
+  if (!input || typeof input !== 'object') {
+    return undefined;
+  }
+
+  const raw = input as Record<string, unknown>;
+  const messageId = typeof raw.messageId === 'string' ? raw.messageId.trim() : '';
+  const sender = typeof raw.sender === 'string' ? raw.sender.trim().toLowerCase() : '';
+  if (!messageId || !sender) {
+    return undefined;
+  }
+
+  const senderName = typeof raw.senderName === 'string' ? raw.senderName.trim() : '';
+  const normalizedText = typeof raw.text === 'string'
+    ? raw.text.replace(/\s+/g, ' ').trim()
+    : '';
+
+  const attachmentCountCandidate = Number(raw.attachmentCount);
+  const attachmentCount = Number.isFinite(attachmentCountCandidate) && attachmentCountCandidate > 0
+    ? Math.trunc(attachmentCountCandidate)
+    : undefined;
+
+  const hasAttachments = Boolean(raw.hasAttachments) || Boolean(attachmentCount);
+  const hasSticker = Boolean(raw.hasSticker);
+  const hasGif = Boolean(raw.hasGif);
+  const normalized: ChatReplyContext = {
+    messageId,
+    sender,
+    senderName: senderName || undefined,
+    text: normalizedText || undefined,
+    isSpecial: raw.isSpecial === true ? true : undefined,
+    hasAttachments: hasAttachments ? true : undefined,
+    attachmentCount,
+    hasSticker: hasSticker ? true : undefined,
+    hasGif: hasGif ? true : undefined,
+  };
+
+  return normalized;
+}
+
 export class ChatRateLimitError extends Error {
   retryAfterMs: number;
   blockedUntil?: number | null;
@@ -414,6 +473,7 @@ class ChatService {
       fileSize: typeof payload.fileSize === 'number' ? payload.fileSize : undefined,
       thumbnailUrl: typeof payload.thumbnailUrl === 'string' ? payload.thumbnailUrl : undefined,
       attachments,
+      replyTo: normalizeChatReplyContext(payload.replyTo),
       sticker: payload.sticker,
       gif: payload.gif,
       delivered: typeof payload.delivered === 'boolean' ? payload.delivered : undefined,
@@ -846,6 +906,7 @@ class ChatService {
       recipientId: this.normalizeEmail(message?.recipientId) || undefined,
       conversationKey: indexRecord.conversationKey,
       tenantId: indexRecord.tenantId ?? message.tenantId,
+      replyTo: normalizeChatReplyContext((message as any)?.replyTo),
       deliveryProvenance: normalizeChatDeliveryProvenance(message?.deliveryProvenance ?? indexRecord.deliveryProvenance),
     };
 
@@ -1055,6 +1116,7 @@ class ChatService {
         sender: this.normalizeEmail(value?.sender),
         recipientId: this.normalizeEmail(value?.recipientId) || undefined,
         tenantId: typeof value?.tenantId === 'string' ? value.tenantId : undefined,
+        replyTo: normalizeChatReplyContext(value?.replyTo),
       });
     });
 
@@ -1162,7 +1224,7 @@ class ChatService {
       }
     }
     const partnerEmails = new Set<string>();
-    const summaryWrites: Array<Promise<void>> = [];
+    const summaryWrites: Promise<void>[] = [];
 
     for (const [conversationKey, entry] of Object.entries(conversationIndex)) {
       let partnerEmail = this.normalizeEmail(entry?.partnerEmail);
@@ -1358,7 +1420,7 @@ class ChatService {
 
     await Promise.all(summaryWrites);
 
-    const pruneWrites: Array<Promise<void>> = [];
+    const pruneWrites: Promise<void>[] = [];
     Object.entries(existingSummaries).forEach(([partnerKey, value]: [string, any]) => {
       const partnerEmail = this.normalizeEmail(value?.partnerEmail);
       if (!partnerEmail || partnerEmails.has(partnerEmail)) {
@@ -2089,6 +2151,20 @@ class ChatService {
         throw new Error('Authentication token missing. Please sign in again.');
       }
 
+      const progressEmitter = createChatUploadProgressEmitter({ onProgress });
+      progressEmitter.emit(0, { force: true });
+      const emitUploadProgressFromBytes = (sentBytes: unknown, totalBytes: unknown): void => {
+        const progressPercent = resolveChatUploadProgressPercentFromBytes(
+          sentBytes,
+          totalBytes
+        );
+        if (progressPercent === null) {
+          return;
+        }
+
+        progressEmitter.emit(progressPercent);
+      };
+
       const uploadUrl = new URL(`${baseUrl}/storage/upload`);
       uploadUrl.searchParams.set('tenantId', tenantId);
       uploadUrl.searchParams.set('purpose', 'chat');
@@ -2112,9 +2188,8 @@ class ChatService {
             xhr.setRequestHeader('Authorization', `Bearer ${token}`);
 
             xhr.upload.onprogress = (evt) => {
-              if (!onProgress) return;
               if (!evt.lengthComputable) return;
-              onProgress((evt.loaded / evt.total) * 100);
+              emitUploadProgressFromBytes(evt.loaded, evt.total);
             };
 
             xhr.onerror = () => {
@@ -2146,9 +2221,8 @@ class ChatService {
                   xhr.setRequestHeader('Authorization', `Bearer ${retryToken}`);
                 }
                 xhr.upload.onprogress = (evt) => {
-                  if (!onProgress) return;
                   if (!evt.lengthComputable) return;
-                  onProgress((evt.loaded / evt.total) * 100);
+                  emitUploadProgressFromBytes(evt.loaded, evt.total);
                 };
                 xhr.onerror = () => {
                   if (cancelled) {
@@ -2186,6 +2260,7 @@ class ChatService {
                       // Best-effort: ensure a cached share link exists for later.
                       void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: sanitizedFileName, fileType, fileSize: size, tenantId });
                     }
+                    progressEmitter.emit(100, { force: true });
                     resolve({ url, size });
                   } catch (e) {
                     reject(e);
@@ -2217,6 +2292,7 @@ class ChatService {
                 } else if (url && tenantId) {
                   void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: sanitizedFileName, fileType, fileSize: size, tenantId });
                 }
+                progressEmitter.emit(100, { force: true });
                 resolve({ url, size });
               } catch (e) {
                 reject(e);
@@ -2274,10 +2350,10 @@ class ChatService {
             uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
           },
           (progressEvent) => {
-            if (onProgress && progressEvent.totalBytesExpectedToSend) {
-              const progress = (progressEvent.totalBytesSent / progressEvent.totalBytesExpectedToSend) * 100;
-              onProgress(Math.max(0, Math.min(100, progress)));
-            }
+            emitUploadProgressFromBytes(
+              progressEvent.totalBytesSent,
+              progressEvent.totalBytesExpectedToSend
+            );
           }
         );
 
@@ -2336,6 +2412,8 @@ class ChatService {
         void sharedFileService.ensureSmartShareLink({ fileUrl: finalUrl, fileName: sanitizedFileName, fileType, fileSize: finalSize, tenantId });
       }
 
+      progressEmitter.emit(100, { force: true });
+
       return { url: finalUrl, size: finalSize };
       
     } catch (error) {
@@ -2363,8 +2441,19 @@ class ChatService {
       if (!token) {
         throw new Error('Authentication token missing. Please sign in again.');
       }
+      const progressEmitter = createChatUploadProgressEmitter({ onProgress });
+      progressEmitter.emit(0, { force: true });
+      const emitUploadProgressFromBytes = (sentBytes: unknown, totalBytes: unknown): void => {
+        const progressPercent = resolveChatUploadProgressPercentFromBytes(
+          sentBytes,
+          totalBytes
+        );
+        if (progressPercent === null) {
+          return;
+        }
 
-      if (onProgress) onProgress(0);
+        progressEmitter.emit(progressPercent);
+      };
 
       const uploadUrl = new URL(`${baseUrl}/storage/upload`);
       uploadUrl.searchParams.set('tenantId', tenantId);
@@ -2391,9 +2480,8 @@ class ChatService {
               xhr.setRequestHeader('Authorization', `Bearer ${authToken}`);
             }
             xhr.upload.onprogress = (evt) => {
-              if (!onProgress) return;
               if (!evt.lengthComputable) return;
-              onProgress((evt.loaded / evt.total) * 100);
+              emitUploadProgressFromBytes(evt.loaded, evt.total);
             };
             xhr.onerror = () => reject(new Error('upload_failed'));
             xhr.onload = async () => {
@@ -2419,7 +2507,7 @@ class ChatService {
                   reject(new Error('upload_failed_missing_url'));
                   return;
                 }
-                if (onProgress) onProgress(100);
+                progressEmitter.emit(100, { force: true });
                 resolve(finalUrl);
               } catch (e) {
                 reject(e);
@@ -2460,10 +2548,10 @@ class ChatService {
             uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
           },
           (progressEvent) => {
-            if (onProgress && progressEvent.totalBytesExpectedToSend) {
-              const progress = (progressEvent.totalBytesSent / progressEvent.totalBytesExpectedToSend) * 100;
-              onProgress(Math.max(0, Math.min(100, progress)));
-            }
+            emitUploadProgressFromBytes(
+              progressEvent.totalBytesSent,
+              progressEvent.totalBytesExpectedToSend
+            );
           }
         );
         return await task.uploadAsync();
@@ -2495,7 +2583,7 @@ class ChatService {
       if (!finalUrl) {
         throw new Error('upload_failed_missing_url');
       }
-      if (onProgress) onProgress(100);
+      progressEmitter.emit(100, { force: true });
       return finalUrl;
     } catch (error) {
       logger.error('Error uploading profile picture:', error);
@@ -2572,6 +2660,7 @@ class ChatService {
         timestamp,
         conversationKey,
         tenantId,
+        replyTo: normalizeChatReplyContext(message.replyTo),
         delivered: Boolean(message.delivered),
         read: Boolean(message.read),
         isSpecial: Boolean(message.isSpecial),
@@ -2646,6 +2735,7 @@ class ChatService {
       fileSize: message.fileSize,
       thumbnailUrl: message.thumbnailUrl,
       attachments: message.attachments,
+      replyTo: normalizeChatReplyContext(message.replyTo),
       sticker: message.sticker,
       gif: message.gif,
       delivered: message.delivered,
@@ -2755,7 +2845,8 @@ class ChatService {
     sender: string,
     recipientId?: string,
     onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions
+    options?: UploadSessionOptions,
+    replyTo?: ChatReplyContext
   ): Promise<string> {
     try {
       const { url, size } = await this.uploadFile(
@@ -2769,10 +2860,14 @@ class ChatService {
       
       // Normalize sender and recipientId to lowercase
       return this.sendMessage({
-        text: text || `Sent ${fileType.includes('image') ? 'an image' : 'a file'}`,
+        text: resolveChatAttachmentAutoText({
+          text,
+          files: [{ fileType, fileName }],
+        }),
         sender: sender.toLowerCase(),
         recipientId: recipientId?.toLowerCase(),
         isSpecial: false,
+        replyTo: normalizeChatReplyContext(replyTo),
         fileUrl: url,
         fileName,
         fileType,
@@ -2792,17 +2887,18 @@ class ChatService {
 
   async sendMessageWithMultipleFiles(
     text: string,
-    files: Array<{
+    files: {
       uri: string;
       fileName: string;
       fileType: string;
       fileSize?: number;
       webFile?: Blob;
-    }>,
+    }[],
     sender: string,
     recipientId?: string,
     onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions
+    options?: UploadSessionOptions,
+    replyTo?: ChatReplyContext
   ): Promise<string> {
     try {
       if (files.length === 0) {
@@ -2821,18 +2917,24 @@ class ChatService {
         throw new Error(`The following file(s) exceed the 50 MB limit: ${fileNames}`);
       }
 
-      let totalProgress = 0;
-      const fileProgressMap = new Map<number, number>();
-      
-      // Function to update overall progress
-      const updateOverallProgress = () => {
-        const avgProgress = Array.from(fileProgressMap.values()).reduce((sum, progress) => sum + progress, 0) / files.length;
-        if (onProgress) {
-          onProgress(avgProgress);
+      const progressEmitter = createChatUploadProgressEmitter({ onProgress });
+      const fileProgress = new Array(files.length).fill(0);
+      let progressTotal = 0;
+      progressEmitter.emit(0, { force: true });
+
+      const updateOverallProgress = (index: number, progress: unknown): void => {
+        const nextProgress = normalizeChatUploadProgressPercent(progress);
+        const previousProgress = fileProgress[index] || 0;
+        if (nextProgress <= previousProgress) {
+          return;
         }
+
+        fileProgress[index] = nextProgress;
+        progressTotal += nextProgress - previousProgress;
+        progressEmitter.emit(progressTotal / files.length);
       };
 
-      const cancelFns: Array<(() => void | Promise<void>) | undefined> = [];
+      const cancelFns: ((() => void | Promise<void>) | undefined)[] = [];
       if (options?.registerCancel) {
         options.registerCancel(async () => {
           const executions = cancelFns
@@ -2858,8 +2960,7 @@ class ChatService {
           file.fileType,
           { senderEmail: sender, recipientEmail: recipientId },
           (progress: number) => {
-            fileProgressMap.set(index, progress);
-            updateOverallProgress();
+            updateOverallProgress(index, progress);
           },
           {
             registerCancel: (fn: () => void | Promise<void>) => {
@@ -2871,6 +2972,7 @@ class ChatService {
       );
       
       const uploadResults = await Promise.all(uploadPromises);
+      progressEmitter.emit(100, { force: true });
       
       // Create attachments array
       const attachments: FileAttachment[] = files.map((file, index) => ({
@@ -2880,25 +2982,10 @@ class ChatService {
         fileSize: uploadResults[index].size,
       }));
 
-      // Generate appropriate message text if none provided
-      let messageText = text;
-      if (!messageText.trim()) {
-        if (files.length === 1) {
-          const file = files[0];
-          messageText = `Sent ${file.fileType.includes('image') ? 'an image' : file.fileType.includes('video') ? 'a video' : 'a file'}`;
-        } else {
-          const imageCount = files.filter(f => f.fileType.includes('image')).length;
-          const videoCount = files.filter(f => f.fileType.includes('video')).length;
-          const docCount = files.length - imageCount - videoCount;
-          
-          const parts = [];
-          if (imageCount > 0) parts.push(`${imageCount} image${imageCount > 1 ? 's' : ''}`);
-          if (videoCount > 0) parts.push(`${videoCount} video${videoCount > 1 ? 's' : ''}`);
-          if (docCount > 0) parts.push(`${docCount} file${docCount > 1 ? 's' : ''}`);
-          
-          messageText = `Sent ${parts.join(', ')}`;
-        }
-      }
+      const messageText = resolveChatAttachmentAutoText({
+        text,
+        files,
+      });
       
       // Send message with attachments
       return this.sendMessage({
@@ -2907,6 +2994,7 @@ class ChatService {
         recipientId: recipientId?.toLowerCase(),
         isSpecial: false,
         attachments,
+        replyTo: normalizeChatReplyContext(replyTo),
       });
     } catch (error) {
       if (error instanceof ChatUploadCanceledError) {
@@ -2930,7 +3018,8 @@ class ChatService {
       height?: number;
     },
     sender: string,
-    recipientId?: string
+    recipientId?: string,
+    options?: { replyTo?: ChatReplyContext }
   ): Promise<string> {
     try {
       return this.sendMessage({
@@ -2938,6 +3027,7 @@ class ChatService {
         sender: sender.toLowerCase(),
         recipientId: recipientId?.toLowerCase(),
         isSpecial: false,
+        replyTo: normalizeChatReplyContext(options?.replyTo),
         sticker,
       });
     } catch (error) {
@@ -2957,7 +3047,8 @@ class ChatService {
       source?: string;
     },
     sender: string,
-    recipientId?: string
+    recipientId?: string,
+    options?: { replyTo?: ChatReplyContext }
   ): Promise<string> {
     try {
       return this.sendMessage({
@@ -2965,6 +3056,7 @@ class ChatService {
         sender: sender.toLowerCase(),
         recipientId: recipientId?.toLowerCase(),
         isSpecial: false,
+        replyTo: normalizeChatReplyContext(options?.replyTo),
         gif,
       });
     } catch (error) {
@@ -3190,6 +3282,7 @@ class ChatService {
           fileSize: msg.fileSize,
           thumbnailUrl: msg.thumbnailUrl,
           attachments: msg.attachments,
+          replyTo: normalizeChatReplyContext(msg.replyTo),
           sticker: msg.sticker,
           gif: msg.gif,
           delivered: msg.delivered,
@@ -3258,6 +3351,7 @@ class ChatService {
           fileSize: msg.fileSize,
           thumbnailUrl: msg.thumbnailUrl,
           attachments: msg.attachments,
+          replyTo: normalizeChatReplyContext(msg.replyTo),
           sticker: msg.sticker,
           gif: msg.gif,
           delivered: msg.delivered,

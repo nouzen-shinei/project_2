@@ -7,8 +7,21 @@ export interface PendingMessage {
   timestamp: string;
   recipientId: string;
   sender: string;
+  replyTo?: PendingMessageReplyContext;
   status?: 'queued' | 'sending' | 'sent' | 'failed';
   serverMessageId?: string;
+}
+
+export interface PendingMessageReplyContext {
+  messageId: string;
+  sender: string;
+  senderName?: string;
+  text?: string;
+  isSpecial?: boolean;
+  hasAttachments?: boolean;
+  attachmentCount?: number;
+  hasSticker?: boolean;
+  hasGif?: boolean;
 }
 
 export interface PendingMediaMessage {

@@ -32,6 +32,11 @@ import {
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
 import { useDownloadState } from '@/hooks/useDownloadState';
+import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
+import {
+  resolveDownloadProgressLabel,
+  resolveProgressPercentText,
+} from '@/lib/uploadProgressDisplayEasing';
 import { useEvent } from 'expo';
 import { useVideoPlayer, VideoView, type VideoSource, type VideoPlayer as ExpoVideoPlayer } from 'expo-video';
 import { ShareModal } from './ShareModal';
@@ -438,6 +443,14 @@ function VideoPlayer({
     setPlayRequestId((id) => id + 1);
   }, []);
 
+  const handlePreviewAvailable = useCallback((nextUri: string) => {
+    setPreviewUri((existing) => existing || nextUri);
+  }, []);
+
+  const closeShareModal = useCallback(() => {
+    setShowShareModal(false);
+  }, []);
+
   const handleSharePress = useCallback(
     (event?: GestureResponderEvent) => {
       event?.stopPropagation?.();
@@ -453,7 +466,28 @@ function VideoPlayer({
     [onShare]
   );
 
+  const handlePlaceholderSharePress = useCallback(
+    (event?: GestureResponderEvent) => {
+      event?.stopPropagation?.();
+      handleSharePress(event);
+    },
+    [handleSharePress]
+  );
+
+  const handlePlaceholderPlayPress = useCallback(
+    (event?: GestureResponderEvent) => {
+      event?.stopPropagation?.();
+      handlePlayRequest();
+    },
+    [handlePlayRequest]
+  );
+
   const formattedDuration = displayDuration && displayDuration > 0 ? formatTime(displayDuration) : null;
+  const shareButtonA11yLabel = 'Share video';
+  const placeholderVideoContainerStyle = useMemo(
+    () => [styles.videoContainer, { height: maxHeight }],
+    [styles, maxHeight]
+  );
 
   useEffect(() => {
     if (Platform.OS !== 'web') {
@@ -495,7 +529,7 @@ function VideoPlayer({
       <TouchableOpacity
         activeOpacity={0.85}
         onPress={handlePlayRequest}
-        style={[styles.videoContainer, { height: maxHeight }]}
+        style={placeholderVideoContainerStyle}
       >
         {showPreviewImage ? (
           <Image source={{ uri: previewUri as string }} style={styles.thumbnailImage} resizeMode="cover" />
@@ -518,10 +552,9 @@ function VideoPlayer({
 
                 <TouchableOpacity
                   style={styles.controlButton}
-                  onPress={(event) => {
-                    event.stopPropagation?.();
-                    handleSharePress(event);
-                  }}
+                  onPress={handlePlaceholderSharePress}
+                  accessibilityRole="button"
+                  accessibilityLabel={shareButtonA11yLabel}
                 >
                   <Share2 size={20} color="white" />
                 </TouchableOpacity>
@@ -529,10 +562,7 @@ function VideoPlayer({
 
               <TouchableOpacity
                 style={[styles.controlButton, styles.placeholderPlayButton]}
-                onPress={(event) => {
-                  event.stopPropagation?.();
-                  handlePlayRequest();
-                }}
+                onPress={handlePlaceholderPlayPress}
               >
                 <Play size={36} color="white" />
               </TouchableOpacity>
@@ -542,10 +572,7 @@ function VideoPlayer({
           ) : (
             <TouchableOpacity
               style={[styles.controlButton, styles.placeholderPlayButtonMinimal]}
-              onPress={(event) => {
-                event.stopPropagation?.();
-                handlePlayRequest();
-              }}
+              onPress={handlePlaceholderPlayPress}
             >
               <Play size={36} color="white" />
             </TouchableOpacity>
@@ -567,9 +594,7 @@ function VideoPlayer({
       playRequestId={playRequestId}
       onResolvedUriChange={setResolvedVideoUri}
       onDurationChange={setDisplayDuration}
-      onPreviewAvailable={(uri) => {
-        setPreviewUri((existing) => existing || uri);
-      }}
+      onPreviewAvailable={handlePreviewAvailable}
       controlVariant={controlVariant}
       cacheKey={cacheKey}
       initialPlaybackPosition={cachedInitialPosition}
@@ -598,7 +623,7 @@ function VideoPlayer({
 
       <ShareModal
         visible={showShareModal}
-        onClose={() => setShowShareModal(false)}
+        onClose={closeShareModal}
         fileUrl={shareUrl || resolvedVideoUri || uri}
         fileName={fileName}
         onDownload={onDownload}
@@ -606,23 +631,23 @@ function VideoPlayer({
     </View>
   );
 }
- 
-   const areVideoPlayerPropsEqual = (prev: VideoPlayerProps, next: VideoPlayerProps) => {
-     if (prev.uri !== next.uri) return false;
-     if ((prev.fileName ?? '') !== (next.fileName ?? '')) return false;
-     if ((prev.shareUrl ?? '') !== (next.shareUrl ?? '')) return false;
-     if ((prev.thumbnailUrl ?? '') !== (next.thumbnailUrl ?? '')) return false;
-     if ((prev.controlVariant ?? 'full') !== (next.controlVariant ?? 'full')) return false;
-     if ((prev.maxHeight ?? 0) !== (next.maxHeight ?? 0)) return false;
-     if ((prev.autoPlay ?? false) !== (next.autoPlay ?? false)) return false;
-     if ((prev.showControlsProp ?? true) !== (next.showControlsProp ?? true)) return false;
-     if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
-     if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
-     if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
-     return true;
-   };
- 
-   export default React.memo(VideoPlayer, areVideoPlayerPropsEqual);
+
+const areVideoPlayerPropsEqual = (prev: VideoPlayerProps, next: VideoPlayerProps) => {
+  if (prev.uri !== next.uri) return false;
+  if ((prev.fileName ?? '') !== (next.fileName ?? '')) return false;
+  if ((prev.shareUrl ?? '') !== (next.shareUrl ?? '')) return false;
+  if ((prev.thumbnailUrl ?? '') !== (next.thumbnailUrl ?? '')) return false;
+  if ((prev.controlVariant ?? 'full') !== (next.controlVariant ?? 'full')) return false;
+  if ((prev.maxHeight ?? 0) !== (next.maxHeight ?? 0)) return false;
+  if ((prev.autoPlay ?? false) !== (next.autoPlay ?? false)) return false;
+  if ((prev.showControlsProp ?? true) !== (next.showControlsProp ?? true)) return false;
+  if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
+  if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
+  if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+  return true;
+};
+
+export default React.memo(VideoPlayer, areVideoPlayerPropsEqual);
 
 function VideoPlayerLoaded({
   uri,
@@ -683,6 +708,16 @@ function VideoPlayerLoaded({
   const pauseRequestedRef = useRef(false);
   const lastCacheSyncRef = useRef(0);
   const pendingCacheSyncRef = useRef<number | null>(null);
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    downloadProgress,
+    isDownloading
+  );
+  const downloadButtonA11yLabel = resolveDownloadProgressLabel(
+    isDownloading,
+    normalizedProgress,
+    'Download video'
+  );
+  const shareButtonA11yLabel = 'Share video';
 
   useEffect(() => {
     cacheKeyRef.current = cacheKey;
@@ -1319,6 +1354,41 @@ function VideoPlayerLoaded({
     }
   };
 
+  const handleInlineWebSeeked = useCallback(() => {
+    if (!videoRef.current) {
+      return;
+    }
+
+    const nextTime = videoRef.current.currentTime;
+    if (!Number.isFinite(nextTime)) {
+      return;
+    }
+
+    currentTimeRef.current = nextTime;
+    const key = cacheKeyRef.current;
+    if (key) {
+      patchVideoCacheEntry(key, {
+        lastKnownTime: nextTime,
+        lastKnownWasPlaying: intendedPlayingRef.current,
+        lastPosition: nextTime,
+      });
+    }
+  }, []);
+
+  const handleInlineWebPlay = useCallback(() => {
+    intendedPlayingRef.current = true;
+    pauseRequestedRef.current = false;
+    setIsPlayingSafe(true);
+  }, [setIsPlayingSafe]);
+
+  const handleInlineWebPause = useCallback(() => {
+    setIsPlayingSafe(false);
+    if (pauseRequestedRef.current) {
+      intendedPlayingRef.current = false;
+      pauseRequestedRef.current = false;
+    }
+  }, [setIsPlayingSafe]);
+
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof document === 'undefined') {
       return;
@@ -1385,9 +1455,14 @@ function VideoPlayerLoaded({
     };
   }, [syncPlaybackCache]);
 
-  const handleVideoPress = () => {
+  const handleVideoPress = useCallback(() => {
     setShowControlsVisible(!showControlsProp || !showControlsVisible);
-  };
+  }, [showControlsProp, showControlsVisible]);
+
+  const handleInlineSharePress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    onSharePress(event);
+  }, [onSharePress]);
 
   const handleWebFullscreenDismiss = useCallback(
     (state: FullscreenReturnState) => {
@@ -1815,35 +1890,10 @@ function VideoPlayerLoaded({
         src={resolvedUri}
         style={{ width: '100%', height: '100%', backgroundColor: '#000', borderRadius: 8 }}
         onTimeUpdate={handleTimeUpdate}
-        onSeeked={() => {
-          if (videoRef.current) {
-            const t = videoRef.current.currentTime;
-            if (Number.isFinite(t)) {
-              currentTimeRef.current = t;
-              const key = cacheKeyRef.current;
-              if (key) {
-                patchVideoCacheEntry(key, {
-                  lastKnownTime: t,
-                  lastKnownWasPlaying: intendedPlayingRef.current,
-                  lastPosition: t,
-                });
-              }
-            }
-          }
-        }}
+        onSeeked={handleInlineWebSeeked}
         onLoadedMetadata={handleLoadedMetadata}
-        onPlay={() => {
-          intendedPlayingRef.current = true;
-          pauseRequestedRef.current = false;
-          setIsPlayingSafe(true);
-        }}
-        onPause={() => {
-          setIsPlayingSafe(false);
-          if (pauseRequestedRef.current) {
-            intendedPlayingRef.current = false;
-            pauseRequestedRef.current = false;
-          }
-        }}
+        onPlay={handleInlineWebPlay}
+        onPause={handleInlineWebPause}
         muted={isMuted}
         playsInline
         preload="auto"
@@ -1856,7 +1906,6 @@ function VideoPlayerLoaded({
   const shouldShowLoading = isLoading || resolving || !resolvedUri || !(effectiveDuration > 0);
   const shouldShowControls = showControlsProp && showControlsVisible && !shouldShowLoading;
   const disableSpeedControl = shouldShowLoading || !resolvedUri;
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
@@ -1899,10 +1948,9 @@ function VideoPlayerLoaded({
         <View style={styles.topControls}>
           <TouchableOpacity
             style={styles.controlButton}
-            onPress={(event) => {
-              event.stopPropagation?.();
-              onSharePress(event);
-            }}
+            onPress={handleInlineSharePress}
+            accessibilityRole="button"
+            accessibilityLabel={shareButtonA11yLabel}
           >
             <Share2 size={20} color="white" />
           </TouchableOpacity>
@@ -1953,9 +2001,11 @@ function VideoPlayerLoaded({
                   style={[styles.controlButton, isDownloading ? styles.controlButtonDisabled : null]}
                   onPress={onDownload}
                   disabled={isDownloading}
+                  accessibilityRole="button"
+                  accessibilityLabel={downloadButtonA11yLabel}
                 >
                   {isDownloading ? (
-                    <Text style={styles.downloadProgressText}>{normalizedProgress}%</Text>
+                    <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
                   ) : (
                     <Download size={20} color="white" />
                   )}
@@ -2107,7 +2157,16 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
       : rounded.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
     return `${formatted}x`;
   }, [playbackSpeed]);
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    downloadProgress,
+    isDownloading
+  );
+  const downloadButtonA11yLabel = resolveDownloadProgressLabel(
+    isDownloading,
+    normalizedProgress,
+    'Download video'
+  );
+  const shareButtonA11yLabel = 'Share video';
 
   const player = useVideoPlayer({ uri: sourceUri }, (p: ExpoVideoPlayer) => {
     p.loop = false;
@@ -2573,6 +2632,21 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
     }, 0);
   }, [handleClose, onSharePress]);
 
+  const handleClosePress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    handleClose();
+  }, [handleClose]);
+
+  const handleSharePress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    handleShare();
+  }, [handleShare]);
+
+  const handleDownloadPress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    onDownload?.();
+  }, [onDownload]);
+
   const shouldShowLoading = isLoading || !(effectiveDuration > 0);
   const shouldShowControls = showControls && !shouldShowLoading;
   const disableSpeedControl = shouldShowLoading;
@@ -2620,20 +2694,16 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                 <View style={styles.fullscreenTopRow}>
                   <TouchableOpacity
                     style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
-                    onPress={(event) => {
-                      event.stopPropagation?.();
-                      handleClose();
-                    }}
+                    onPress={handleClosePress}
                   >
                     <X size={20} color="white" />
                   </TouchableOpacity>
 
                   <TouchableOpacity
                     style={styles.fullscreenControlButton}
-                    onPress={(event) => {
-                      event.stopPropagation?.();
-                      handleShare();
-                    }}
+                    onPress={handleSharePress}
+                    accessibilityRole="button"
+                    accessibilityLabel={shareButtonA11yLabel}
                   >
                     <Share2 size={20} color="white" />
                   </TouchableOpacity>
@@ -2686,14 +2756,13 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                       {onDownload ? (
                         <TouchableOpacity
                           style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
-                          onPress={(event) => {
-                            event.stopPropagation?.();
-                            onDownload();
-                          }}
+                            onPress={handleDownloadPress}
                           disabled={isDownloading}
+                          accessibilityRole="button"
+                          accessibilityLabel={downloadButtonA11yLabel}
                         >
                           {isDownloading ? (
-                            <Text style={styles.fullscreenDownloadProgressText}>{normalizedProgress}%</Text>
+                            <Text style={styles.fullscreenDownloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
                           ) : (
                             <Download size={20} color="white" />
                           )}
@@ -2742,7 +2811,16 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
   const [duration, setDuration] = useState(0);
   const [showControls, setShowControls] = useState(true);
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
-  const normalizedProgress = Math.max(0, Math.min(100, Math.round(downloadProgress ?? 0)));
+  const normalizedProgress = useEasedDownloadProgressPercent(
+    downloadProgress,
+    isDownloading
+  );
+  const downloadButtonA11yLabel = resolveDownloadProgressLabel(
+    isDownloading,
+    normalizedProgress,
+    'Download video'
+  );
+  const shareButtonA11yLabel = 'Share video';
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const intendedPlayingRef = useRef(wasPlaying);
@@ -3064,6 +3142,50 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
     }, 0);
   }, [handleClose, onSharePress]);
 
+  const handleToggleControls = useCallback(() => {
+    setShowControls((visible) => !visible);
+  }, []);
+
+  const handleVideoSeeked = useCallback(() => {
+    if (!videoRef.current) {
+      return;
+    }
+
+    const nextTime = videoRef.current.currentTime;
+    if (Number.isFinite(nextTime)) {
+      setCurrentTimeSafe(nextTime);
+    }
+  }, [setCurrentTimeSafe]);
+
+  const handleVideoPlay = useCallback(() => {
+    intendedPlayingRef.current = true;
+    pauseRequestedRef.current = false;
+    setIsPlaying(true);
+  }, []);
+
+  const handleVideoPause = useCallback(() => {
+    setIsPlaying(false);
+    if (pauseRequestedRef.current) {
+      intendedPlayingRef.current = false;
+      pauseRequestedRef.current = false;
+    }
+  }, []);
+
+  const handleClosePress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    handleClose();
+  }, [handleClose]);
+
+  const handleSharePress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    handleShare();
+  }, [handleShare]);
+
+  const handleDownloadPress = useCallback((event?: GestureResponderEvent) => {
+    event?.stopPropagation?.();
+    onDownload?.();
+  }, [onDownload]);
+
   const shouldShowLoading = !(duration > 0);
   const shouldShowControls = showControls && !shouldShowLoading;
   const formattedProgressLabel = useMemo(() => {
@@ -3079,7 +3201,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
       statusBarTranslucent
     >
       <SafeAreaView style={styles.webFullscreenRoot}>
-        <TouchableOpacity activeOpacity={1} style={styles.webFullscreenTouchable} onPress={() => setShowControls((v) => !v)}>
+        <TouchableOpacity activeOpacity={1} style={styles.webFullscreenTouchable} onPress={handleToggleControls}>
           <View style={styles.webFullscreenVideoWrapper}>
             <video
               ref={videoRef}
@@ -3087,26 +3209,9 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
               style={{ width: '100%', height: '100%', backgroundColor: '#000' }}
               onLoadedMetadata={handleLoadedMetadata}
               onTimeUpdate={handleTimeUpdate}
-              onSeeked={() => {
-                if (videoRef.current) {
-                  const t = videoRef.current.currentTime;
-                  if (Number.isFinite(t)) {
-                    setCurrentTimeSafe(t);
-                  }
-                }
-              }}
-              onPlay={() => {
-                intendedPlayingRef.current = true;
-                pauseRequestedRef.current = false;
-                setIsPlaying(true);
-              }}
-              onPause={() => {
-                setIsPlaying(false);
-                if (pauseRequestedRef.current) {
-                  intendedPlayingRef.current = false;
-                  pauseRequestedRef.current = false;
-                }
-              }}
+              onSeeked={handleVideoSeeked}
+              onPlay={handleVideoPlay}
+              onPause={handleVideoPause}
               muted={isMuted}
               playsInline
               preload="auto"
@@ -3129,20 +3234,16 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                 <View style={styles.fullscreenTopRow}>
                   <TouchableOpacity
                     style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
-                    onPress={(event) => {
-                      event.stopPropagation?.();
-                      handleClose();
-                    }}
+                    onPress={handleClosePress}
                   >
                     <X size={20} color="white" />
                   </TouchableOpacity>
 
                   <TouchableOpacity
                     style={styles.fullscreenControlButton}
-                    onPress={(event) => {
-                      event.stopPropagation?.();
-                      handleShare();
-                    }}
+                    onPress={handleSharePress}
+                    accessibilityRole="button"
+                    accessibilityLabel={shareButtonA11yLabel}
                   >
                     <Share2 size={20} color="white" />
                   </TouchableOpacity>
@@ -3194,14 +3295,13 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                       {onDownload ? (
                         <TouchableOpacity
                           style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
-                          onPress={(event) => {
-                            event.stopPropagation?.();
-                            onDownload();
-                          }}
+                            onPress={handleDownloadPress}
                           disabled={isDownloading}
+                          accessibilityRole="button"
+                          accessibilityLabel={downloadButtonA11yLabel}
                         >
                           {isDownloading ? (
-                            <Text style={styles.fullscreenDownloadProgressText}>{normalizedProgress}%</Text>
+                            <Text style={styles.fullscreenDownloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
                           ) : (
                             <Download size={20} color="white" />
                           )}
