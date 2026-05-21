@@ -13,7 +13,7 @@ spec:
         spec:
           serviceAccountName: billing-stale-pending-job@tution-app-6c0c3.iam.gserviceaccount.com
           maxRetries: 0
-          timeoutSeconds: 600
+          timeoutSeconds: 180
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
               command: ["npm"]
@@ -45,7 +45,7 @@ spec:
                 - name: PLAY_BILLING_RECONCILE_VERBOSE
                   value: "0"
                 - name: PLAY_BILLING_RECONCILE_MAX_TENANTS
-                  value: "10"
+                  value: "1"
                 - name: PLAY_BILLING_RECONCILE_TENANT_IDS
                   value: ""
                 - name: PLAY_BILLING_RECONCILE_LOCK_ENABLED

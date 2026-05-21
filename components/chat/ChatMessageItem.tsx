@@ -215,7 +215,7 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
     }
 
     const messageTimestampLabel = formatMessageTimestamp(msg.timestamp);
-    const reactionSummary = getMessageReactionSummary(msg.id, reactionsOverride);
+    const reactionSummary = getMessageReactionSummary(msg, reactionsOverride);
     const messageReactionPills = reactionSummary.pills;
     const hasMessageReactionPills = messageReactionPills.length > 0;
     const rawMessageText = typeof msg.text === 'string' ? msg.text : '';

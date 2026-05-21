@@ -6362,6 +6362,43 @@ function withEnv(overrides, callback) {
     resolveChatConversationSearchMatchIds(
       [
         {
+          id: 'url1',
+          text: '',
+          attachments: [
+            {
+              fileName: 'Receipt.pdf',
+              url: 'https://firebasestorage.googleapis.com/v0/b/app/o/abc',
+            },
+          ],
+        },
+        {
+          id: 'url2',
+          text: '',
+          fileName: 'Invoice.pdf',
+          fileUrl: 'https://firebasestorage.googleapis.com/v0/b/app/o/xyz',
+        },
+        {
+          id: 'url3',
+          text: '',
+          attachments: [
+            {
+              fileName: 'Fire Drill Notice.pdf',
+              url: 'https://firebasestorage.googleapis.com/v0/b/app/o/lmn',
+            },
+          ],
+        },
+      ],
+      'fire',
+      (value) => (typeof value === 'string' && value.trim() ? value.trim() : null)
+    ),
+    ['url3'],
+    'Conversation search should ignore backend storage URLs and only match user-visible attachment metadata'
+  );
+
+  assert.deepStrictEqual(
+    resolveChatConversationSearchMatchIds(
+      [
+        {
           id: 'r1',
           text: '',
           replyTo: { text: 'Need invoice copy from previous reminder' },

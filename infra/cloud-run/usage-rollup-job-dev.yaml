@@ -13,7 +13,7 @@ spec:
         spec:
           serviceAccountName: usage-rollup-job@tution-app-6c0c3.iam.gserviceaccount.com
           maxRetries: 0
-          timeoutSeconds: 900
+          timeoutSeconds: 180
           containers:
             - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:e4ab7b609daef15e71242e3b4f7481924eaaae3957930300e87fcf14c4dcb425
               command: ["npm"]
@@ -44,7 +44,7 @@ spec:
                 - name: USAGE_ROLLUP_DRY_RUN
                   value: "1"
                 - name: USAGE_ROLLUP_REQUIRE_WRITE
-                  value: "1"
+                  value: "0"
                 - name: USAGE_ROLLUP_VERBOSE
                   value: "0"
                 - name: USAGE_ROLLUP_SKIP_REMINDERS
@@ -52,9 +52,9 @@ spec:
                 - name: USAGE_ROLLUP_SKIP_PAYMENTS
                   value: "1"
                 - name: USAGE_ROLLUP_SKIP_CHAT
-                  value: "0"
+                  value: "1"
                 - name: USAGE_ROLLUP_SKIP_STORAGE
-                  value: "0"
+                  value: "1"
                 - name: USAGE_ALERT_UNCHANGED_REMINDER_DAYS
                   value: "14"
 

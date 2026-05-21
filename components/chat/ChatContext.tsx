@@ -83,7 +83,7 @@ export interface ChatStableContextValue {
   handleImageError: (url: string) => void;
   jumpToReplyMessage: (replyContext: any) => void;
   isMessageActionPending: (messageId: string) => boolean;
-  getMessageReactionSummary: (messageId: string, reactionsOverride?: { [key: string]: Set<string> }) => any;
+  getMessageReactionSummary: (message: any, reactionsOverride?: { [key: string]: Set<string> }) => any;
 
   // ── Utility functions (module-level imports, never change) ──
   formatMessageTimestamp: (timestamp: any) => string;

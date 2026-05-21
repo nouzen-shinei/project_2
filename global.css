@@ -106,4 +106,31 @@
     @apply bg-background text-foreground;
     font-family: var(--tm-font-fallback-sans);
   }
+  [data-tm-video-player='true'] {
+    outline: none !important;
+    caret-color: transparent;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  [data-tm-video-player='true']:focus,
+  [data-tm-video-player='true']:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
+  }
+  [data-tm-video-player='true'] * {
+    user-select: none;
+  }
+  [data-tm-video-player='true'] ::selection {
+    background: transparent;
+  }
+  html[data-tm-video-focus='true'],
+  body[data-tm-video-focus='true'] {
+    caret-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  html[data-tm-video-focus='true'] *,
+  body[data-tm-video-focus='true'] * {
+    caret-color: transparent;
+  }
 }

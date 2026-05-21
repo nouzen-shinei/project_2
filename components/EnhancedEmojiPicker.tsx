@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -11,8 +11,9 @@ import {
   TextInput,
   StyleSheet,
   FlatList,
+  LayoutChangeEvent,
 } from 'react-native';
-import { X, Search, Clipboard as ClipboardIcon, Check } from 'lucide-react-native';
+import { X, Search, Clipboard as ClipboardIcon, Check, ChevronLeft, ChevronRight } from 'lucide-react-native';
 import * as Clipboard from 'expo-clipboard';
 
 type QuickActionVariant = 'default' | 'primary' | 'danger';
@@ -59,6 +60,8 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
   const [showFullPicker, setShowFullPicker] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [copied, setCopied] = useState(false);
+  const [quickActionsPage, setQuickActionsPage] = useState(0);
+  const [quickReactionsHeight, setQuickReactionsHeight] = useState<number | null>(null);
   
   // Quick reactions in 2 rows for better visibility
   const quickReactions = [
@@ -210,11 +213,32 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
   
   const screenWidth = Dimensions.get('window').width;
   const screenHeight = Dimensions.get('window').height;
-  const hasQuickActions = extraActions.length > 0;
+
+  const isSecondaryActionLabel = (label: string) => {
+    const normalized = label.trim().toLowerCase();
+    return normalized === 'find in chat' || normalized === 'info';
+  };
+
+  const primaryActions = useMemo(
+    () => extraActions.filter(action => !isSecondaryActionLabel(action.label)),
+    [extraActions]
+  );
+
+  const secondaryActions = useMemo(
+    () => extraActions.filter(action => isSecondaryActionLabel(action.label)),
+    [extraActions]
+  );
+
+  const hasPrimaryActions = primaryActions.length > 0;
+  const hasSecondaryActions = secondaryActions.length > 0;
+  const hasQuickActions = hasPrimaryActions || hasSecondaryActions;
+  const showQuickActionsNavLabel = true;
   
   // Calculate position for the picker
   const pickerWidth = 340;
-  const pickerHeight = showFullPicker ? 420 : hasQuickActions ? 228 : 180;
+  const estimatedQuickHeight = hasQuickActions ? 236 : 188;
+  const measuredQuickHeight = quickReactionsHeight ?? estimatedQuickHeight;
+  const pickerHeight = showFullPicker ? 420 : Math.min(measuredQuickHeight, screenHeight - 120);
   
   const calculatedPosition = {
     top: Math.max(50, Math.min(position.y - pickerHeight / 2, screenHeight - pickerHeight - 50)),
@@ -226,8 +250,38 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
     if (!visible) {
       setShowFullPicker(false);
       setSearchQuery('');
+      setQuickActionsPage(0);
+      setQuickReactionsHeight(null);
     }
   }, [visible]);
+
+  useEffect(() => {
+    if (!hasSecondaryActions && quickActionsPage !== 0) {
+      setQuickActionsPage(0);
+      return;
+    }
+
+    if (!hasPrimaryActions && hasSecondaryActions && quickActionsPage === 0) {
+      setQuickActionsPage(1);
+    }
+  }, [hasPrimaryActions, hasSecondaryActions, quickActionsPage]);
+
+  useEffect(() => {
+    if (!visible || showFullPicker || !hasSecondaryActions || Platform.OS !== 'web') {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowLeft') {
+        setQuickActionsPage(0);
+      } else if (event.key === 'ArrowRight') {
+        setQuickActionsPage(1);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [visible, showFullPicker, hasSecondaryActions]);
 
   const handleEmojiSelect = (emoji: string) => {
     onEmojiSelect(emoji);
@@ -243,9 +297,23 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
     } catch {}
   };
 
+  const handleQuickReactionsLayout = (event: LayoutChangeEvent) => {
+    const nextHeight = Math.ceil(event.nativeEvent.layout.height);
+    if (quickReactionsHeight !== nextHeight) {
+      setQuickReactionsHeight(nextHeight);
+    }
+  };
+
   const renderQuickReactions = () => {
+    const quickActionsToRender = quickActionsPage === 1 ? secondaryActions : primaryActions;
+    const canGoPrev = hasSecondaryActions && quickActionsPage > 0;
+    const canGoNext = hasSecondaryActions && quickActionsPage === 0;
+
     return (
-      <View style={[styles.quickReactionsContainer, { position: 'relative' }]}>
+      <View
+        style={[styles.quickReactionsContainer, { position: 'relative' }]}
+        onLayout={handleQuickReactionsLayout}
+      >
         <Text style={[styles.pickerTitle, { color: theme.text }]}>
           Quick Reactions
         </Text>
@@ -260,9 +328,6 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
             contentContainerStyle={styles.quickReactionsContent}
           >
             {row.map((emoji, index) => {
-              const reactionStatus = selectedMessageId && getReactionStatus ? 
-                getReactionStatus(selectedMessageId, emoji) : { count: 0, hasUserReacted: false };
-              
               return (
                 <TouchableOpacity
                   key={`${rowIndex}-${index}`}
@@ -277,40 +342,79 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
         ))}
 
         {hasQuickActions && (
-          <View style={styles.quickActionsRow}>
-            {extraActions.map((action, index) => {
-              const variant: QuickActionVariant = action.variant || 'default';
-              const isDisabled = action.disabled;
-              const baseStyle = [
-                styles.quickActionButton,
-                variant === 'primary' && { backgroundColor: theme.primary },
-                variant === 'danger' && { backgroundColor: '#ef4444' },
-                variant === 'default' && { backgroundColor: theme.background, borderColor: theme.border, borderWidth: 1 },
-                isDisabled && styles.quickActionButtonDisabled,
-              ];
-
-              const textStyle = [
-                styles.quickActionText,
-                variant === 'default' && { color: theme.text },
-              ];
-
-              return (
+          <View style={styles.quickActionsSection}>
+            {hasSecondaryActions && (
+              <View style={styles.quickActionsNavRow}>
                 <TouchableOpacity
-                  key={`${action.label}-${index}`}
-                  style={baseStyle}
+                  accessibilityLabel="Previous actions"
+                  style={[
+                    styles.quickActionsNavButton,
+                    !canGoPrev && styles.quickActionsNavButtonDisabled,
+                    { backgroundColor: theme.background, borderColor: theme.border }
+                  ]}
                   onPress={() => {
-                    if (!isDisabled) {
-                      action.onPress();
-                    }
+                    if (canGoPrev) setQuickActionsPage(0);
                   }}
-                  disabled={isDisabled}
-                  accessibilityRole="button"
+                  disabled={!canGoPrev}
                 >
-                  {action.icon}
-                  <Text style={textStyle}>{action.label}</Text>
+                  <ChevronLeft size={16} color={theme.textSecondary} />
                 </TouchableOpacity>
-              );
-            })}
+                {showQuickActionsNavLabel && (
+                  <Text style={[styles.quickActionsNavText, { color: theme.textSecondary }]}>
+                    {quickActionsPage === 0 ? 'More actions' : 'Message options'}
+                  </Text>
+                )}
+                <TouchableOpacity
+                  accessibilityLabel="Next actions"
+                  style={[
+                    styles.quickActionsNavButton,
+                    !canGoNext && styles.quickActionsNavButtonDisabled,
+                    { backgroundColor: theme.background, borderColor: theme.border }
+                  ]}
+                  onPress={() => {
+                    if (canGoNext) setQuickActionsPage(1);
+                  }}
+                  disabled={!canGoNext}
+                >
+                  <ChevronRight size={16} color={theme.textSecondary} />
+                </TouchableOpacity>
+              </View>
+            )}
+            <View style={styles.quickActionsRow}>
+              {quickActionsToRender.map((action, index) => {
+                const variant: QuickActionVariant = action.variant || 'default';
+                const isDisabled = action.disabled;
+                const baseStyle = [
+                  styles.quickActionButton,
+                  variant === 'primary' && { backgroundColor: theme.primary },
+                  variant === 'danger' && { backgroundColor: '#ef4444' },
+                  variant === 'default' && { backgroundColor: theme.background, borderColor: theme.border, borderWidth: 1 },
+                  isDisabled && styles.quickActionButtonDisabled,
+                ];
+
+                const textStyle = [
+                  styles.quickActionText,
+                  variant === 'default' && { color: theme.text },
+                ];
+
+                return (
+                  <TouchableOpacity
+                    key={`${action.label}-${index}`}
+                    style={baseStyle}
+                    onPress={() => {
+                      if (!isDisabled) {
+                        action.onPress();
+                      }
+                    }}
+                    disabled={isDisabled}
+                    accessibilityRole="button"
+                  >
+                    {action.icon}
+                    <Text style={textStyle}>{action.label}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
           </View>
         )}
         
@@ -434,7 +538,8 @@ const EnhancedEmojiPicker: React.FC<EnhancedEmojiPickerProps> = ({
               backgroundColor: theme.surface,
               borderColor: theme.border,
               width: pickerWidth,
-              height: pickerHeight,
+              height: showFullPicker ? pickerHeight : undefined,
+              maxHeight: showFullPicker ? undefined : screenHeight - 120,
               ...calculatedPosition,
             }
           ]}
@@ -492,7 +597,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   quickReactionsContainer: {
-    flex: 1,
+    alignSelf: 'stretch',
   },
   pickerTitle: {
     fontSize: 16,
@@ -557,11 +662,35 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
   },
+  quickActionsSection: {
+    marginTop: 8,
+  },
+  quickActionsNavRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 6,
+  },
+  quickActionsNavButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  quickActionsNavButtonDisabled: {
+    opacity: 0.4,
+  },
+  quickActionsNavText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
   quickActionsRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
-    marginTop: 8,
     justifyContent: 'center',
   },
   quickActionButton: {
@@ -593,7 +722,7 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
-  marginTop: 8,
+    marginTop: 8,
   },
   fullPickerContainer: {
     flex: 1,

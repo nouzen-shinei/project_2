@@ -4,12 +4,15 @@ import {
   View,
   Text,
   StyleSheet,
+  Animated,
   TouchableOpacity,
+  Pressable,
   Platform,
   ActivityIndicator,
   PanResponder,
   Image,
   GestureResponderEvent,
+  AccessibilityActionEvent,
   LayoutChangeEvent,
   Modal,
   SafeAreaView,
@@ -41,6 +44,8 @@ import { useEvent } from 'expo';
 import { useVideoPlayer, VideoView, type VideoSource, type VideoPlayer as ExpoVideoPlayer } from 'expo-video';
 import { ShareModal } from './ShareModal';
 import { chatCacheService } from '../services/chatCacheService';
+import * as Haptics from 'expo-haptics';
+import { DEFAULT_SEEK_STEP_SECONDS, useVideoSeekConfig } from '../hooks/useVideoSeekConfig';
 
 const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 const MAX_THUMBNAIL_DIMENSION = 640;
@@ -193,7 +198,397 @@ const formatTime = (time: number) => {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 };
 
+const formatSeekHint = (seconds: number) => {
+  const safeSeconds = Number.isFinite(seconds) ? seconds : SEEK_STEP_SECONDS;
+  const rounded = Number.isInteger(safeSeconds)
+    ? safeSeconds.toString()
+    : safeSeconds.toFixed(1).replace(/\.0$/, '');
+  const unit = Math.abs(safeSeconds) === 1 ? 'second' : 'seconds';
+  return `Double tap left or right to seek ${rounded} ${unit}.`;
+};
+
+const clearWebSelection = () => {
+  if (Platform.OS !== 'web' || typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    const selection = window.getSelection?.();
+    if (!selection) {
+      return;
+    }
+    if (typeof selection.removeAllRanges === 'function') {
+      selection.removeAllRanges();
+    }
+    if (typeof (selection as any).empty === 'function') {
+      (selection as any).empty();
+    }
+  } catch {
+    // ignore
+  }
+};
+
+const isKeyboardEventFromEditable = (event: any) => {
+  const target = event?.target as any;
+  if (!target) {
+    return false;
+  }
+
+  const tag = (target.tagName || '').toString().toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    return true;
+  }
+
+  return Boolean(target.isContentEditable);
+};
+
 const clamp = (value: number, min = 0, max = 1) => Math.min(max, Math.max(min, value));
+
+const SEEK_STEP_SECONDS = DEFAULT_SEEK_STEP_SECONDS;
+const DOUBLE_TAP_WINDOW_MS = 260;
+const SINGLE_TAP_DELAY_MS = 280;
+const SEEK_SEQUENCE_WINDOW_MS = 650;
+const SEEK_OVERLAY_HIDE_MS = 700;
+const HAPTIC_MIN_INTERVAL_MS = 120;
+
+type PauseHandler = () => void;
+
+const videoPlaybackRegistry = new Map<string, PauseHandler>();
+let playbackIdCounter = 0;
+
+const createPlaybackId = () => {
+  playbackIdCounter += 1;
+  return `video-playback-${playbackIdCounter}`;
+};
+
+const registerPlaybackHandler = (id: string, pause: PauseHandler) => {
+  videoPlaybackRegistry.set(id, pause);
+  return () => {
+    if (videoPlaybackRegistry.get(id) === pause) {
+      videoPlaybackRegistry.delete(id);
+    }
+  };
+};
+
+const pauseOtherVideos = (activeId: string) => {
+  videoPlaybackRegistry.forEach((pause, id) => {
+    if (id !== activeId) {
+      pause();
+    }
+  });
+};
+
+type SeekDirection = 'backward' | 'forward';
+
+type SeekOverlayState = {
+  visible: boolean;
+  direction: SeekDirection;
+  amountSeconds: number;
+};
+
+type SeekGestureConfig = {
+  enabled: boolean;
+  stepSeconds?: number;
+  onSingleTap?: () => void;
+  onSeekBySeconds: (deltaSeconds: number) => boolean;
+};
+
+const useSeekGesture = ({
+  enabled,
+  stepSeconds = SEEK_STEP_SECONDS,
+  onSingleTap,
+  onSeekBySeconds,
+}: SeekGestureConfig) => {
+  const overlayOpacity = useRef(new Animated.Value(0)).current;
+  const overlayScale = useRef(new Animated.Value(0.92)).current;
+  const overlayAnimationRef = useRef<Animated.CompositeAnimation | null>(null);
+  const overlayHideRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sequenceResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSingleTapRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTapAtRef = useRef(0);
+  const lastTapDirectionRef = useRef<SeekDirection | null>(null);
+  const sequenceActiveRef = useRef(false);
+  const accumulatedRef = useRef(0);
+  const lastHapticAtRef = useRef(0);
+
+  const [overlayState, setOverlayState] = useState<SeekOverlayState>({
+    visible: false,
+    direction: 'forward',
+    amountSeconds: stepSeconds,
+  });
+
+  const clearPendingSingleTap = useCallback(() => {
+    if (pendingSingleTapRef.current) {
+      clearTimeout(pendingSingleTapRef.current);
+      pendingSingleTapRef.current = null;
+    }
+  }, []);
+
+  const clearSequenceReset = useCallback(() => {
+    if (sequenceResetRef.current) {
+      clearTimeout(sequenceResetRef.current);
+      sequenceResetRef.current = null;
+    }
+  }, []);
+
+  const clearOverlayHide = useCallback(() => {
+    if (overlayHideRef.current) {
+      clearTimeout(overlayHideRef.current);
+      overlayHideRef.current = null;
+    }
+  }, []);
+
+  const resetSequence = useCallback(() => {
+    sequenceActiveRef.current = false;
+    accumulatedRef.current = 0;
+    clearSequenceReset();
+  }, [clearSequenceReset]);
+
+  const scheduleSequenceReset = useCallback(() => {
+    clearSequenceReset();
+    sequenceResetRef.current = setTimeout(() => {
+      resetSequence();
+    }, SEEK_SEQUENCE_WINDOW_MS);
+  }, [clearSequenceReset, resetSequence]);
+
+  const scheduleSingleTap = useCallback(() => {
+    if (!onSingleTap) {
+      return;
+    }
+
+    clearPendingSingleTap();
+    pendingSingleTapRef.current = setTimeout(() => {
+      pendingSingleTapRef.current = null;
+      if (!sequenceActiveRef.current) {
+        onSingleTap();
+      }
+    }, SINGLE_TAP_DELAY_MS);
+  }, [clearPendingSingleTap, onSingleTap]);
+
+  const triggerHaptic = useCallback(() => {
+    if (Platform.OS === 'web') {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastHapticAtRef.current < HAPTIC_MIN_INTERVAL_MS) {
+      return;
+    }
+    lastHapticAtRef.current = now;
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+  }, []);
+
+  const runOverlayAnimation = useCallback(
+    (direction: SeekDirection, amountSeconds: number) => {
+      setOverlayState({ visible: true, direction, amountSeconds });
+      clearOverlayHide();
+
+      overlayAnimationRef.current?.stop?.();
+      overlayOpacity.setValue(0);
+      overlayScale.setValue(0.92);
+
+      overlayAnimationRef.current = Animated.parallel([
+        Animated.timing(overlayOpacity, {
+          toValue: 1,
+          duration: 120,
+          useNativeDriver: true,
+        }),
+        Animated.spring(overlayScale, {
+          toValue: 1,
+          speed: 18,
+          bounciness: 6,
+          useNativeDriver: true,
+        }),
+      ]);
+
+      overlayAnimationRef.current.start(() => {
+        clearOverlayHide();
+        overlayHideRef.current = setTimeout(() => {
+          Animated.timing(overlayOpacity, {
+            toValue: 0,
+            duration: 180,
+            useNativeDriver: true,
+          }).start(() => {
+            setOverlayState((prev) => ({ ...prev, visible: false }));
+          });
+        }, SEEK_OVERLAY_HIDE_MS);
+      });
+    },
+    [clearOverlayHide, overlayOpacity, overlayScale]
+  );
+
+  const applySeek = useCallback(
+    (direction: SeekDirection, amountSeconds: number) => {
+      const delta = direction === 'forward' ? stepSeconds : -stepSeconds;
+      const applied = onSeekBySeconds(delta);
+      if (!applied) {
+        return false;
+      }
+      clearWebSelection();
+      runOverlayAnimation(direction, amountSeconds);
+      triggerHaptic();
+      return true;
+    },
+    [onSeekBySeconds, runOverlayAnimation, stepSeconds, triggerHaptic]
+  );
+
+  const handleSeekTap = useCallback(
+    (direction: SeekDirection) => {
+      if (!enabled) {
+        scheduleSingleTap();
+        return;
+      }
+
+      const now = Date.now();
+      const lastTapAt = lastTapAtRef.current;
+      const lastDirection = lastTapDirectionRef.current;
+      const sameSide = lastDirection === direction;
+      const withinDouble = now - lastTapAt <= DOUBLE_TAP_WINDOW_MS;
+
+      if (sequenceActiveRef.current && !sameSide) {
+        resetSequence();
+      }
+
+      if (sequenceActiveRef.current) {
+        accumulatedRef.current += stepSeconds;
+        lastTapAtRef.current = now;
+        lastTapDirectionRef.current = direction;
+        if (applySeek(direction, accumulatedRef.current)) {
+          scheduleSequenceReset();
+        }
+        return;
+      }
+
+      if (withinDouble && sameSide) {
+        clearPendingSingleTap();
+        sequenceActiveRef.current = true;
+        accumulatedRef.current = stepSeconds;
+        lastTapAtRef.current = now;
+        lastTapDirectionRef.current = direction;
+        if (applySeek(direction, accumulatedRef.current)) {
+          scheduleSequenceReset();
+        }
+        return;
+      }
+
+      lastTapAtRef.current = now;
+      lastTapDirectionRef.current = direction;
+      scheduleSingleTap();
+    },
+    [
+      enabled,
+      onSingleTap,
+      applySeek,
+      clearPendingSingleTap,
+      resetSequence,
+      scheduleSequenceReset,
+      scheduleSingleTap,
+      stepSeconds,
+    ]
+  );
+
+  const handleKeyboardSeek = useCallback(
+    (direction: SeekDirection) => {
+      if (!enabled) {
+        return;
+      }
+
+      const now = Date.now();
+      const lastDirection = lastTapDirectionRef.current;
+      const withinWindow = now - lastTapAtRef.current <= SEEK_SEQUENCE_WINDOW_MS;
+      const sameSide = lastDirection === direction;
+
+      if (!sequenceActiveRef.current || !withinWindow || !sameSide) {
+        accumulatedRef.current = stepSeconds;
+      } else {
+        accumulatedRef.current += stepSeconds;
+      }
+
+      sequenceActiveRef.current = true;
+      lastTapAtRef.current = now;
+      lastTapDirectionRef.current = direction;
+
+      if (applySeek(direction, accumulatedRef.current)) {
+        scheduleSequenceReset();
+      }
+    },
+    [applySeek, enabled, scheduleSequenceReset, stepSeconds]
+  );
+
+  const handleAccessibilityAction = useCallback(
+    (event: AccessibilityActionEvent) => {
+      const { actionName } = event.nativeEvent;
+      if (actionName === 'increment') {
+        handleKeyboardSeek('forward');
+      } else if (actionName === 'decrement') {
+        handleKeyboardSeek('backward');
+      }
+    },
+    [handleKeyboardSeek]
+  );
+
+  const overlayAnimatedStyle = useMemo(
+    () => ({
+      opacity: overlayOpacity,
+      transform: [{ scale: overlayScale }],
+    }),
+    [overlayOpacity, overlayScale]
+  );
+
+  useEffect(() => () => {
+    clearPendingSingleTap();
+    clearSequenceReset();
+    clearOverlayHide();
+    overlayAnimationRef.current?.stop?.();
+  }, [clearOverlayHide, clearPendingSingleTap, clearSequenceReset]);
+
+  useEffect(() => {
+    if (enabled) {
+      return;
+    }
+    clearPendingSingleTap();
+    resetSequence();
+  }, [clearPendingSingleTap, enabled, resetSequence]);
+
+  return {
+    overlayState,
+    overlayAnimatedStyle,
+    handleSeekTap,
+    handleKeyboardSeek,
+    handleAccessibilityAction,
+  };
+};
+
+type SeekOverlayProps = {
+  state: SeekOverlayState;
+  animatedStyle: { opacity: Animated.Value; transform: { scale: Animated.Value }[] };
+  variant?: 'inline' | 'fullscreen';
+};
+
+function SeekOverlay({ state, animatedStyle, variant = 'inline' }: SeekOverlayProps) {
+  if (!state.visible) {
+    return null;
+  }
+
+  const isBackward = state.direction === 'backward';
+  const displaySeconds = Math.abs(state.amountSeconds);
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[
+        styles.seekOverlay,
+        variant === 'fullscreen' ? styles.seekOverlayFullscreen : null,
+        isBackward ? styles.seekOverlayLeft : styles.seekOverlayRight,
+        animatedStyle,
+      ]}
+    >
+      <Text style={styles.seekOverlayArrow}>{isBackward ? '<<' : '>>'}</Text>
+      <Text style={styles.seekOverlayText}>{`${displaySeconds}s`}</Text>
+    </Animated.View>
+  );
+}
 
 interface VideoPlayerProps {
   uri: string;
@@ -203,6 +598,7 @@ interface VideoPlayerProps {
   autoPlay?: boolean;
   showControlsProp?: boolean;
   maxHeight?: number;
+  seekStepSeconds?: number;
   onShare?: () => void;
   shareUrl?: string;
   thumbnailUrl?: string;
@@ -264,6 +660,7 @@ interface VideoPlayerLoadedProps {
   initialWasPlaying: boolean;
   showControlsProp: boolean;
   maxHeight: number;
+  seekStepSeconds?: number;
   onSharePress: (event?: GestureResponderEvent) => void;
   playRequestId: number;
   onResolvedUriChange?: (uri: string | null) => void;
@@ -304,6 +701,7 @@ interface FullscreenVideoModalProps {
   onDismiss: (state: FullscreenReturnState) => void;
   onSharePress: (event?: GestureResponderEvent) => void;
   onDownload?: () => void;
+  seekStepSeconds?: number;
   isDownloading?: boolean;
   downloadProgress?: number;
 }
@@ -313,6 +711,7 @@ interface WebFullscreenModalProps {
   onDismiss: (state: FullscreenReturnState) => void;
   onSharePress: (event?: GestureResponderEvent) => void;
   onDownload?: () => void;
+  seekStepSeconds?: number;
   isDownloading?: boolean;
   downloadProgress?: number;
 }
@@ -325,6 +724,7 @@ function VideoPlayer({
   autoPlay = false,
   showControlsProp = true,
   maxHeight = 300,
+  seekStepSeconds,
   onShare,
   shareUrl,
   thumbnailUrl,
@@ -334,8 +734,10 @@ function VideoPlayer({
   downloadKey,
 }: VideoPlayerProps) {
   const { theme } = useTheme();
+  const { seekStepSeconds: globalSeekStepSeconds } = useVideoSeekConfig();
   const isWeb = Platform.OS === 'web';
   const isMinimalControls = controlVariant === 'minimal';
+  const effectiveSeekStepSeconds = seekStepSeconds ?? globalSeekStepSeconds ?? SEEK_STEP_SECONDS;
   const downloadState = useDownloadState(downloadKey || shareUrl || uri);
   const effectiveIsDownloading = typeof isDownloading === 'boolean'
     ? isDownloading
@@ -590,6 +992,7 @@ function VideoPlayer({
       autoPlay={autoPlay}
       showControlsProp={showControlsProp}
       maxHeight={maxHeight}
+      seekStepSeconds={effectiveSeekStepSeconds}
       onSharePress={handleSharePress}
       playRequestId={playRequestId}
       onResolvedUriChange={setResolvedVideoUri}
@@ -639,6 +1042,7 @@ const areVideoPlayerPropsEqual = (prev: VideoPlayerProps, next: VideoPlayerProps
   if ((prev.thumbnailUrl ?? '') !== (next.thumbnailUrl ?? '')) return false;
   if ((prev.controlVariant ?? 'full') !== (next.controlVariant ?? 'full')) return false;
   if ((prev.maxHeight ?? 0) !== (next.maxHeight ?? 0)) return false;
+  if ((prev.seekStepSeconds ?? 0) !== (next.seekStepSeconds ?? 0)) return false;
   if ((prev.autoPlay ?? false) !== (next.autoPlay ?? false)) return false;
   if ((prev.showControlsProp ?? true) !== (next.showControlsProp ?? true)) return false;
   if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
@@ -657,6 +1061,7 @@ function VideoPlayerLoaded({
   initialWasPlaying,
   showControlsProp,
   maxHeight,
+  seekStepSeconds,
   onSharePress,
   playRequestId,
   onResolvedUriChange,
@@ -684,6 +1089,7 @@ function VideoPlayerLoaded({
   const [pendingPlayRequest, setPendingPlayRequest] = useState(autoPlay || initialWasPlaying);
   const videoRef = useRef<any>(null);
   const videoViewRef = useRef<React.ElementRef<typeof VideoView> | null>(null);
+  const playbackIdRef = useRef<string>(createPlaybackId());
   const controlsTimeoutRef = useRef<number | null>(null);
   const progressBarRef = useRef<View>(null);
   const progressBarWidthRef = useRef(1);
@@ -838,6 +1244,30 @@ function VideoPlayerLoaded({
     } catch {}
   });
 
+  const pauseSelf = useCallback(() => {
+    if (Platform.OS === 'web' && videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch (error) {
+        logger.debug?.('VideoPlayer: pause other video failed', error);
+      }
+    } else if (Platform.OS !== 'web') {
+      try {
+        player.pause();
+      } catch (error) {
+        logger.debug?.('VideoPlayer: pause other video failed', error);
+      }
+    }
+
+    intendedPlayingRef.current = false;
+    pauseRequestedRef.current = false;
+    setPendingPlayRequest(false);
+    setIsPlayingSafe(false);
+    syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
+  }, [player, setIsPlayingSafe, setPendingPlayRequest, syncPlaybackCache]);
+
+  useEffect(() => registerPlaybackHandler(playbackIdRef.current, pauseSelf), [pauseSelf]);
+
   const restoreFromBackground = useCallback(() => {
     if (Platform.OS === 'web') {
       return;
@@ -856,6 +1286,7 @@ function VideoPlayerLoaded({
 
     if (snapshot.wasPlaying) {
       try {
+        pauseOtherVideos(playbackIdRef.current);
         player.play();
         setIsPlayingSafe(true);
       } catch (error) {
@@ -1231,6 +1662,7 @@ function VideoPlayerLoaded({
         intendedPlayingRef.current = false;
         syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
       } else {
+        pauseOtherVideos(playbackIdRef.current);
         restartIfEnded();
         const playPromise = videoRef.current.play();
         if (playPromise?.catch) {
@@ -1247,6 +1679,7 @@ function VideoPlayerLoaded({
         if (isPlaying) {
           player.pause();
         } else {
+          pauseOtherVideos(playbackIdRef.current);
           restartIfEnded();
           player.play();
         }
@@ -1265,6 +1698,48 @@ function VideoPlayerLoaded({
     setIsMuted(!isMuted);
     setShowControlsVisible(true);
   };
+
+  const handleSingleTap = useCallback(() => {
+    setShowControlsVisible((prev) => (!showControlsProp ? true : !prev));
+  }, [showControlsProp]);
+
+  const seekBySeconds = useCallback(
+    (deltaSeconds: number) => {
+      const durationSource =
+        Platform.OS === 'web'
+          ? videoRef.current?.duration ?? durationRef.current ?? duration ?? 0
+          : player.duration || durationRef.current || duration || 0;
+      if (!durationSource || !Number.isFinite(durationSource)) {
+        return false;
+      }
+
+      const baseTime = Number.isFinite(currentTimeRef.current) ? currentTimeRef.current : 0;
+      const nextTime = clamp(baseTime + deltaSeconds, 0, durationSource);
+      if (!Number.isFinite(nextTime)) {
+        return false;
+      }
+
+      if (Platform.OS === 'web' && videoRef.current) {
+        try {
+          videoRef.current.currentTime = nextTime;
+        } catch (error) {
+          logger.debug?.('VideoPlayer: web seek failed', error);
+        }
+      } else if (Platform.OS !== 'web') {
+        try {
+          player.currentTime = nextTime;
+        } catch (error) {
+          logger.debug?.('VideoPlayer: native seek failed', error);
+        }
+      }
+
+      setCurrentTimeSafe(nextTime);
+      currentTimeRef.current = nextTime;
+      syncPlaybackCache(true, { time: nextTime, wasPlaying: intendedPlayingRef.current });
+      return true;
+    },
+    [duration, player, setCurrentTimeSafe, syncPlaybackCache]
+  );
 
   const handleTimeUpdate = () => {
     if (Platform.OS === 'web' && videoRef.current) {
@@ -1300,6 +1775,7 @@ function VideoPlayerLoaded({
         return;
       }
       try {
+        pauseOtherVideos(playbackIdRef.current);
         const playPromise = element.play();
         if (playPromise && typeof playPromise.then === 'function') {
           playPromise
@@ -1326,6 +1802,7 @@ function VideoPlayerLoaded({
     }
 
     try {
+      pauseOtherVideos(playbackIdRef.current);
       player.play();
       setPendingPlayRequest(false);
     } catch (error) {
@@ -1376,6 +1853,7 @@ function VideoPlayerLoaded({
   }, []);
 
   const handleInlineWebPlay = useCallback(() => {
+    pauseOtherVideos(playbackIdRef.current);
     intendedPlayingRef.current = true;
     pauseRequestedRef.current = false;
     setIsPlayingSafe(true);
@@ -1455,10 +1933,6 @@ function VideoPlayerLoaded({
     };
   }, [syncPlaybackCache]);
 
-  const handleVideoPress = useCallback(() => {
-    setShowControlsVisible(!showControlsProp || !showControlsVisible);
-  }, [showControlsProp, showControlsVisible]);
-
   const handleInlineSharePress = useCallback((event?: GestureResponderEvent) => {
     event?.stopPropagation?.();
     onSharePress(event);
@@ -1481,6 +1955,7 @@ function VideoPlayerLoaded({
           videoRef.current.playbackRate = state.playbackSpeed;
           videoRef.current.currentTime = state.currentTime;
           if (state.wasPlaying) {
+            pauseOtherVideos(playbackIdRef.current);
             const playPromise = videoRef.current.play?.();
             if (playPromise?.catch) {
               playPromise.catch(() => undefined);
@@ -1649,6 +2124,7 @@ function VideoPlayerLoaded({
 
       if (result.wasPlaying) {
         try {
+          pauseOtherVideos(playbackIdRef.current);
           player.play();
           setIsPlayingSafe(true);
         } catch (error) {
@@ -1771,6 +2247,12 @@ function VideoPlayerLoaded({
   }, [nativePlaying, setIsPlayingSafe]);
 
   useEffect(() => {
+    if (isPlaying) {
+      pauseOtherVideos(playbackIdRef.current);
+    }
+  }, [isPlaying]);
+
+  useEffect(() => {
     if (Platform.OS !== 'web') {
       setCurrentTimeSafe(timeUpdate?.currentTime ?? 0);
     }
@@ -1879,16 +2361,242 @@ function VideoPlayerLoaded({
       ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100))
       : 0;
 
+  const shouldShowLoading = isLoading || resolving || !resolvedUri || !(effectiveDuration > 0);
+  const shouldShowControls = showControlsProp && showControlsVisible && !shouldShowLoading;
+  const disableSpeedControl = shouldShowLoading || !resolvedUri;
+  const formattedProgressLabel = useMemo(() => {
+    return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
+  }, [currentTime, effectiveDuration]);
+  const seekHint = useMemo(
+    () => formatSeekHint(seekStepSeconds ?? SEEK_STEP_SECONDS),
+    [seekStepSeconds]
+  );
+
+  const seekGestureEnabled = !shouldShowLoading && !isDraggingProgress;
+  const { overlayState, overlayAnimatedStyle, handleSeekTap, handleKeyboardSeek, handleAccessibilityAction } =
+    useSeekGesture({
+      enabled: seekGestureEnabled,
+      stepSeconds: seekStepSeconds,
+      onSingleTap: handleSingleTap,
+      onSeekBySeconds: seekBySeconds,
+    });
+
+  const handleKeyboardShortcut = useCallback(
+    (event: any) => {
+      if (Platform.OS !== 'web') {
+        return false;
+      }
+
+      if (webFullscreenConfig) {
+        return false;
+      }
+
+      if (event?.defaultPrevented) {
+        return false;
+      }
+
+      if (event?.metaKey || event?.ctrlKey || event?.altKey) {
+        return false;
+      }
+
+      if (isKeyboardEventFromEditable(event)) {
+        return false;
+      }
+
+      const key = event?.key;
+      const code = event?.code;
+      const lower = typeof key === 'string' ? key.toLowerCase() : '';
+
+      const markHandled = () => {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        clearWebSelection();
+        setShowControlsVisible(true);
+      };
+
+      if (key === 'ArrowLeft' || lower === 'j') {
+        markHandled();
+        handleKeyboardSeek('backward');
+        return true;
+      }
+
+      if (key === 'ArrowRight' || lower === 'l') {
+        markHandled();
+        handleKeyboardSeek('forward');
+        return true;
+      }
+
+      const isSpace = code === 'Space' || key === ' ' || key === 'Spacebar';
+      if (isSpace || lower === 'k') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        togglePlayPause();
+        return true;
+      }
+
+      if (lower === 'm') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        toggleMute();
+        return true;
+      }
+
+      if (lower === 'f') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        handleFullscreenPress();
+        return true;
+      }
+
+      return false;
+    },
+    [handleFullscreenPress, handleKeyboardSeek, toggleMute, togglePlayPause, webFullscreenConfig]
+  );
+
+  const webFocusStyle = useMemo(
+    () =>
+      Platform.OS === 'web'
+        ? ({ outline: 'none', caretColor: 'transparent', WebkitTapHighlightColor: 'transparent' } as any)
+        : null,
+    []
+  );
+
+  const handleWebFocus = useCallback(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+    try {
+      document.documentElement?.setAttribute('data-tm-video-focus', 'true');
+      document.body?.setAttribute('data-tm-video-focus', 'true');
+    } catch {
+      // ignore
+    }
+    clearWebSelection();
+  }, []);
+
+  const handleWebBlur = useCallback(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+    try {
+      document.documentElement?.removeAttribute('data-tm-video-focus');
+      document.body?.removeAttribute('data-tm-video-focus');
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const webWrapperRef = useRef<any>(null);
+  const webKeyboardActiveRef = useRef(false);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (webFullscreenConfig) {
+        return;
+      }
+      const target = event.target as Node | null;
+      const container = webWrapperRef.current as Node | null;
+      const isInside = !!(container && target && (container as any).contains?.(target));
+
+      if (isInside) {
+        webKeyboardActiveRef.current = true;
+        handleWebFocus();
+      } else {
+        webKeyboardActiveRef.current = false;
+        handleWebBlur();
+      }
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+    };
+  }, [handleWebBlur, handleWebFocus, webFullscreenConfig]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      return;
+    }
+
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
+      if (webFullscreenConfig) {
+        return;
+      }
+      if (!webKeyboardActiveRef.current) {
+        return;
+      }
+      handleKeyboardShortcut(event);
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown, true);
+    return () => {
+      window.removeEventListener('keydown', handleGlobalKeyDown, true);
+    };
+  }, [handleKeyboardShortcut, webFullscreenConfig]);
+
+  const handleKeyDown = useCallback(
+    (event: any) => {
+      if (handleKeyboardShortcut(event)) {
+        clearWebSelection();
+      }
+    },
+    [handleKeyboardShortcut]
+  );
+
+  const renderSeekGestureLayer = (variant: 'inline' | 'fullscreen' = 'inline') => (
+    <View style={styles.seekGestureLayer} pointerEvents="box-none">
+      <Pressable
+        style={[styles.seekZone, styles.seekZoneLeft]}
+        onPress={() => handleSeekTap('backward')}
+        accessible={false}
+      />
+      <Pressable
+        style={[styles.seekZone, styles.seekZoneRight]}
+        onPress={() => handleSeekTap('forward')}
+        accessible={false}
+      />
+      <SeekOverlay state={overlayState} animatedStyle={overlayAnimatedStyle} variant={variant} />
+    </View>
+  );
+
   const renderWebVideo = () => (
-    <TouchableOpacity
-      style={[styles.videoContainer, { height: maxHeight }]}
-      onPress={handleVideoPress}
-      activeOpacity={1}
+    <View
+      ref={webWrapperRef}
+      style={[styles.videoContainer, webFocusStyle, { height: maxHeight }]}
+      accessibilityRole="adjustable"
+      accessibilityLabel="Video player"
+      accessibilityHint={seekHint}
+      accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+      onAccessibilityAction={handleAccessibilityAction}
+      {...(Platform.OS === 'web'
+        ? ({
+            onKeyDown: handleKeyDown,
+            onFocus: handleWebFocus,
+            onBlur: handleWebBlur,
+            onMouseDown: (event: any) => event.preventDefault?.(),
+            tabIndex: -1,
+            dataSet: { tmVideoPlayer: 'true' },
+          } as any)
+        : {})}
     >
       <video
         ref={videoRef}
         src={resolvedUri}
-        style={{ width: '100%', height: '100%', backgroundColor: '#000', borderRadius: 8 }}
+        style={{ width: '100%', height: '100%', backgroundColor: '#000', borderRadius: 8, outline: 'none' }}
+        onMouseDown={(event) => event.preventDefault?.()}
         onTimeUpdate={handleTimeUpdate}
         onSeeked={handleInlineWebSeeked}
         onLoadedMetadata={handleLoadedMetadata}
@@ -1897,18 +2605,13 @@ function VideoPlayerLoaded({
         muted={isMuted}
         playsInline
         preload="auto"
+        tabIndex={-1}
       />
+      {renderSeekGestureLayer()}
       {renderLoadingOverlay()}
       {renderControlsOverlay()}
-    </TouchableOpacity>
+    </View>
   );
-
-  const shouldShowLoading = isLoading || resolving || !resolvedUri || !(effectiveDuration > 0);
-  const shouldShowControls = showControlsProp && showControlsVisible && !shouldShowLoading;
-  const disableSpeedControl = shouldShowLoading || !resolvedUri;
-  const formattedProgressLabel = useMemo(() => {
-    return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
-  }, [currentTime, effectiveDuration]);
 
   const renderLoadingOverlay = () => {
     if (!shouldShowLoading) {
@@ -1935,7 +2638,7 @@ function VideoPlayerLoaded({
 
     if (isMinimalControls) {
       return (
-        <View style={[styles.controlsOverlay, styles.controlsOverlayMinimal]}>
+        <View style={[styles.controlsOverlay, styles.controlsOverlayMinimal]} pointerEvents="box-none">
           <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={togglePlayPause}>
             {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
           </TouchableOpacity>
@@ -1944,8 +2647,8 @@ function VideoPlayerLoaded({
     }
 
     return (
-      <View style={styles.controlsOverlay}>
-        <View style={styles.topControls}>
+      <View style={styles.controlsOverlay} pointerEvents="box-none">
+        <View style={styles.topControls} pointerEvents="box-none">
           <TouchableOpacity
             style={styles.controlButton}
             onPress={handleInlineSharePress}
@@ -1956,14 +2659,14 @@ function VideoPlayerLoaded({
           </TouchableOpacity>
         </View>
 
-        <View style={styles.mainControls}>
+        <View style={styles.mainControls} pointerEvents="box-none">
           <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={togglePlayPause}>
             {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
           </TouchableOpacity>
         </View>
 
-        <View style={styles.bottomControls}>
-          <View style={styles.progressRow}>
+        <View style={styles.bottomControls} pointerEvents="box-none">
+          <View style={styles.progressRow} pointerEvents="box-none">
             <Text style={styles.timeText}>{formattedProgressLabel}</Text>
 
             <View style={styles.progressContainer}>
@@ -1990,8 +2693,8 @@ function VideoPlayerLoaded({
             </View>
           </View>
 
-          <View style={styles.actionsRow}>
-            <View style={styles.actionsLeft}>
+          <View style={styles.actionsRow} pointerEvents="box-none">
+            <View style={styles.actionsLeft} pointerEvents="box-none">
               <TouchableOpacity style={styles.controlButton} onPress={toggleMute}>
                 {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
               </TouchableOpacity>
@@ -2013,7 +2716,7 @@ function VideoPlayerLoaded({
               ) : null}
             </View>
 
-            <View style={styles.actionsRight}>
+            <View style={styles.actionsRight} pointerEvents="box-none">
               <TouchableOpacity
                 style={[
                   styles.controlButton,
@@ -2055,6 +2758,7 @@ function VideoPlayerLoaded({
         contentFit="contain"
         {...(Platform.OS === 'android' ? { surfaceType: 'textureView' as const } : {})}
       />
+      {renderSeekGestureLayer()}
       {renderLoadingOverlay()}
       {renderControlsOverlay()}
     </View>
@@ -2062,17 +2766,20 @@ function VideoPlayerLoaded({
 
   const renderMobileVideo = () => (
     <>
-      <TouchableOpacity
-        activeOpacity={1}
-        onPress={handleVideoPress}
+      <View
         style={[
           styles.videoContainer,
           { height: maxHeight },
           isNativeFullscreenVisible ? styles.hiddenInlineWhileFullscreen : null,
         ]}
+        accessibilityRole="adjustable"
+        accessibilityLabel="Video player"
+        accessibilityHint={seekHint}
+        accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+        onAccessibilityAction={handleAccessibilityAction}
       >
         {renderNativeVideoSurface()}
-      </TouchableOpacity>
+      </View>
 
       {nativeFullscreenConfig ? (
         <FullscreenVideoModal
@@ -2081,6 +2788,7 @@ function VideoPlayerLoaded({
           onDismiss={handleNativeFullscreenDismiss}
           onSharePress={onSharePress}
           onDownload={onDownload}
+          seekStepSeconds={seekStepSeconds}
           isDownloading={isDownloading}
           downloadProgress={downloadProgress}
         />
@@ -2097,6 +2805,7 @@ function VideoPlayerLoaded({
           onDismiss={handleWebFullscreenDismiss}
           onSharePress={onSharePress}
           onDownload={onDownload}
+          seekStepSeconds={seekStepSeconds}
           isDownloading={isDownloading}
           downloadProgress={downloadProgress}
         />
@@ -2105,7 +2814,15 @@ function VideoPlayerLoaded({
   );
 }
 
-function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isDownloading = false, downloadProgress }: FullscreenVideoModalProps) {
+function FullscreenVideoModal({
+  config,
+  onDismiss,
+  onSharePress,
+  onDownload,
+  seekStepSeconds,
+  isDownloading = false,
+  downloadProgress,
+}: FullscreenVideoModalProps) {
   const { theme } = useTheme();
   const { sourceUri, startTime, isMuted: initialMuted, playbackSpeed: initialSpeed, wasPlaying } = config;
 
@@ -2122,6 +2839,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
   const progressBarRef = useRef<View>(null);
   const progressBarWidthRef = useRef(1);
   const progressBarPageXRef = useRef<number | null>(null);
+  const playbackIdRef = useRef<string>(createPlaybackId());
   const initialSyncDoneRef = useRef(false);
   const playbackRateSyncedRef = useRef(false);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState ?? 'active');
@@ -2177,6 +2895,17 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
       p.playbackRate = initialSpeed;
     } catch {}
   });
+
+  const pauseSelf = useCallback(() => {
+    try {
+      player.pause();
+    } catch (error) {
+      logger.debug?.('FullscreenVideoModal: pause other video failed', error);
+    }
+    setIsPlayingSafe(false);
+  }, [player, setIsPlayingSafe]);
+
+  useEffect(() => registerPlaybackHandler(playbackIdRef.current, pauseSelf), [pauseSelf]);
 
   const { isPlaying: nativePlaying } = useEvent(player, 'playingChange', {
     isPlaying: player.playing,
@@ -2251,6 +2980,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
 
     if (snapshot.wasPlaying) {
       try {
+        pauseOtherVideos(playbackIdRef.current);
         player.play();
         setIsPlayingSafe(true);
       } catch (error) {
@@ -2339,6 +3069,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
 
         if (wasPlaying) {
           try {
+            pauseOtherVideos(playbackIdRef.current);
             player.play();
             setIsPlayingSafe(true);
           } catch (error) {
@@ -2406,6 +3137,12 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
   useEffect(() => {
     setIsPlayingSafe(!!nativePlaying);
   }, [nativePlaying, setIsPlayingSafe]);
+
+  useEffect(() => {
+    if (isPlaying) {
+      pauseOtherVideos(playbackIdRef.current);
+    }
+  }, [isPlaying]);
 
   useEffect(() => {
     if (typeof timeUpdate?.currentTime === 'number') {
@@ -2580,6 +3317,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
     } else {
       restartIfEnded();
       try {
+        pauseOtherVideos(playbackIdRef.current);
         player.play();
         setIsPlayingSafe(true);
       } catch (error) {
@@ -2595,6 +3333,70 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
     setShowControls(true);
   };
 
+  const handleSingleTap = useCallback(() => {
+    setShowControls((visible) => !visible);
+  }, []);
+
+  const seekBySeconds = useCallback(
+    (deltaSeconds: number) => {
+      const durationSource = player.duration || duration || 0;
+      if (!durationSource || !Number.isFinite(durationSource)) {
+        return false;
+      }
+
+      const baseTime = Number.isFinite(currentTime) ? currentTime : 0;
+      const nextTime = clamp(baseTime + deltaSeconds, 0, durationSource);
+      if (!Number.isFinite(nextTime)) {
+        return false;
+      }
+
+      try {
+        player.currentTime = nextTime;
+      } catch (error) {
+        logger.debug?.('FullscreenVideoModal: seek failed', error);
+      }
+      setCurrentTimeSafe(nextTime);
+      return true;
+    },
+    [currentTime, duration, player, setCurrentTimeSafe]
+  );
+
+  const seekHint = useMemo(
+    () => formatSeekHint(seekStepSeconds ?? SEEK_STEP_SECONDS),
+    [seekStepSeconds]
+  );
+
+  const shouldShowLoading = isLoading || !(effectiveDuration > 0);
+  const shouldShowControls = showControls && !shouldShowLoading;
+  const disableSpeedControl = shouldShowLoading;
+  const formattedProgressLabel = useMemo(() => {
+    return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
+  }, [currentTime, effectiveDuration]);
+
+  const seekGestureEnabled = !shouldShowLoading && !isDraggingProgress;
+  const { overlayState, overlayAnimatedStyle, handleSeekTap, handleAccessibilityAction } = useSeekGesture({
+    enabled: seekGestureEnabled,
+    stepSeconds: seekStepSeconds,
+    onSingleTap: handleSingleTap,
+    onSeekBySeconds: seekBySeconds,
+  });
+
+  const renderSeekGestureLayer = () => (
+    <View style={styles.seekGestureLayer} pointerEvents="box-none">
+      <Pressable
+        style={[styles.seekZone, styles.seekZoneLeft]}
+        onPress={() => handleSeekTap('backward')}
+        accessible={false}
+      />
+      <Pressable
+        style={[styles.seekZone, styles.seekZoneRight]}
+        onPress={() => handleSeekTap('forward')}
+        accessible={false}
+      />
+      <SeekOverlay state={overlayState} animatedStyle={overlayAnimatedStyle} variant="fullscreen" />
+    </View>
+  );
+
   const cyclePlaybackSpeed = useCallback(() => {
     setShowControls(true);
     const currentRate = playbackSpeed;
@@ -2606,10 +3408,6 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
     applyPlaybackRate(nextRate);
     setPlaybackSpeed(nextRate);
   }, [applyPlaybackRate, playbackSpeed]);
-
-  const handleVideoPress = () => {
-    setShowControls((visible) => !visible);
-  };
 
   const handleClose = useCallback(() => {
     try {
@@ -2647,13 +3445,6 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
     onDownload?.();
   }, [onDownload]);
 
-  const shouldShowLoading = isLoading || !(effectiveDuration > 0);
-  const shouldShowControls = showControls && !shouldShowLoading;
-  const disableSpeedControl = shouldShowLoading;
-  const formattedProgressLabel = useMemo(() => {
-    return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
-  }, [currentTime, effectiveDuration]);
-
   return (
     <Modal
       visible
@@ -2665,7 +3456,14 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
       hardwareAccelerated
     >
       <SafeAreaView style={styles.fullscreenModalRoot}>
-        <TouchableOpacity activeOpacity={1} style={styles.fullscreenTouchable} onPress={handleVideoPress}>
+        <View
+          style={styles.fullscreenTouchable}
+          accessibilityRole="adjustable"
+          accessibilityLabel="Video player"
+          accessibilityHint={seekHint}
+          accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+          onAccessibilityAction={handleAccessibilityAction}
+        >
           <View style={styles.fullscreenVideoWrapper}>
             <VideoView
               style={styles.fullscreenVideoSurface}
@@ -2676,6 +3474,8 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
               contentFit="contain"
               {...(Platform.OS === 'android' ? { surfaceType: 'textureView' as const } : {})}
             />
+
+            {renderSeekGestureLayer()}
 
             {shouldShowLoading ? (
               <View style={styles.fullscreenLoadingOverlay}>
@@ -2690,8 +3490,8 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
             ) : null}
 
             {shouldShowControls ? (
-              <View style={styles.fullscreenOverlay}>
-                <View style={styles.fullscreenTopRow}>
+              <View style={styles.fullscreenOverlay} pointerEvents="box-none">
+                <View style={styles.fullscreenTopRow} pointerEvents="box-none">
                   <TouchableOpacity
                     style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
                     onPress={handleClosePress}
@@ -2709,7 +3509,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                   </TouchableOpacity>
                 </View>
 
-                <View style={styles.fullscreenMainControls}>
+                <View style={styles.fullscreenMainControls} pointerEvents="box-none">
                   <TouchableOpacity
                     style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
                     onPress={togglePlayPause}
@@ -2718,8 +3518,8 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                   </TouchableOpacity>
                 </View>
 
-                <View style={styles.fullscreenBottomControls}>
-                  <View style={styles.fullscreenProgressRow}>
+                <View style={styles.fullscreenBottomControls} pointerEvents="box-none">
+                  <View style={styles.fullscreenProgressRow} pointerEvents="box-none">
                     <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
 
                     <View style={styles.fullscreenProgressContainer}>
@@ -2747,8 +3547,8 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                     </View>
                   </View>
 
-                  <View style={styles.fullscreenActionsRow}>
-                    <View style={styles.fullscreenActionsLeft}>
+                  <View style={styles.fullscreenActionsRow} pointerEvents="box-none">
+                    <View style={styles.fullscreenActionsLeft} pointerEvents="box-none">
                       <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
                         {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
                       </TouchableOpacity>
@@ -2770,7 +3570,7 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
                       ) : null}
                     </View>
 
-                    <View style={styles.fullscreenActionsRight}>
+                    <View style={styles.fullscreenActionsRight} pointerEvents="box-none">
                       <TouchableOpacity
                         style={[
                           styles.fullscreenControlButton,
@@ -2794,13 +3594,21 @@ function FullscreenVideoModal({ config, onDismiss, onSharePress, onDownload, isD
               </View>
             ) : null}
           </View>
-        </TouchableOpacity>
+        </View>
       </SafeAreaView>
     </Modal>
   );
 }
 
-function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDownloading = false, downloadProgress }: WebFullscreenModalProps) {
+function WebFullscreenModal({
+  config,
+  onDismiss,
+  onSharePress,
+  onDownload,
+  seekStepSeconds,
+  isDownloading = false,
+  downloadProgress,
+}: WebFullscreenModalProps) {
   const { theme } = useTheme();
   const { sourceUri, startTime, isMuted: initialMuted, playbackSpeed: initialSpeed, wasPlaying } = config;
 
@@ -2829,6 +3637,9 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
   const progressBarRef = useRef<View>(null);
   const progressBarWidthRef = useRef(1);
   const progressBarPageXRef = useRef<number | null>(null);
+  const webWrapperRef = useRef<any>(null);
+  const webKeyboardActiveRef = useRef(true);
+  const playbackIdRef = useRef<string>(createPlaybackId());
 
   const setCurrentTimeSafe = useCallback((next: number) => {
     if (!Number.isFinite(next)) {
@@ -2898,6 +3709,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
     applyPlaybackRate(playbackSpeed);
 
     if (wasPlaying) {
+      pauseOtherVideos(playbackIdRef.current);
       const playPromise = videoRef.current.play?.();
       if (playPromise?.catch) {
         playPromise.catch(() => undefined);
@@ -2925,6 +3737,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
       setIsPlaying(false);
       intendedPlayingRef.current = false;
     } else {
+      pauseOtherVideos(playbackIdRef.current);
       const playPromise = videoRef.current.play?.();
       if (playPromise?.catch) {
         playPromise.catch(() => undefined);
@@ -2958,6 +3771,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
             videoRef.current.currentTime = currentTime;
           }
         }
+        pauseOtherVideos(playbackIdRef.current);
         const playPromise = videoRef.current.play?.();
         if (playPromise?.catch) {
           playPromise.catch(() => undefined);
@@ -2993,6 +3807,42 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
     }
     setShowControls(true);
   };
+
+  const handleSingleTap = useCallback(() => {
+    setShowControls((visible) => !visible);
+  }, []);
+
+  const seekBySeconds = useCallback(
+    (deltaSeconds: number) => {
+      const durationSource = videoRef.current?.duration ?? duration ?? 0;
+      if (!durationSource || !Number.isFinite(durationSource)) {
+        return false;
+      }
+
+      const baseTime = Number.isFinite(currentTime) ? currentTime : 0;
+      const nextTime = clamp(baseTime + deltaSeconds, 0, durationSource);
+      if (!Number.isFinite(nextTime)) {
+        return false;
+      }
+
+      if (videoRef.current) {
+        try {
+          videoRef.current.currentTime = nextTime;
+        } catch (error) {
+          logger.debug?.('WebFullscreenModal: seek failed', error);
+        }
+      }
+
+      setCurrentTimeSafe(nextTime);
+      return true;
+    },
+    [currentTime, duration, setCurrentTimeSafe]
+  );
+
+  const seekHint = useMemo(
+    () => formatSeekHint(seekStepSeconds ?? SEEK_STEP_SECONDS),
+    [seekStepSeconds]
+  );
 
   const cyclePlaybackSpeed = useCallback(() => {
     setShowControls(true);
@@ -3119,21 +3969,241 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
     [applyScrubProgress, getProgressFromEvent]
   );
 
-  const handleClose = useCallback(() => {
+  const shouldShowLoading = !(duration > 0);
+  const shouldShowControls = showControls && !shouldShowLoading;
+  const formattedProgressLabel = useMemo(() => {
+    return `${formatTime(currentTime)} / ${formatTime(duration)}`;
+  }, [currentTime, duration]);
+
+  const seekGestureEnabled = !shouldShowLoading && !isDraggingProgress;
+  const { overlayState, overlayAnimatedStyle, handleSeekTap, handleKeyboardSeek, handleAccessibilityAction } =
+    useSeekGesture({
+      enabled: seekGestureEnabled,
+      stepSeconds: seekStepSeconds,
+      onSingleTap: handleSingleTap,
+      onSeekBySeconds: seekBySeconds,
+    });
+
+  const webFocusStyle = useMemo(
+    () =>
+      Platform.OS === 'web'
+        ? ({ outline: 'none', caretColor: 'transparent', WebkitTapHighlightColor: 'transparent' } as any)
+        : null,
+    []
+  );
+
+  const handleWebFocus = useCallback(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+    try {
+      document.documentElement?.setAttribute('data-tm-video-focus', 'true');
+      document.body?.setAttribute('data-tm-video-focus', 'true');
+    } catch {
+      // ignore
+    }
+    clearWebSelection();
+  }, []);
+
+  const handleWebBlur = useCallback(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+    try {
+      document.documentElement?.removeAttribute('data-tm-video-focus');
+      document.body?.removeAttribute('data-tm-video-focus');
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const pauseSelf = useCallback(() => {
     if (videoRef.current) {
       try {
         videoRef.current.pause();
+      } catch (error) {
+        logger.debug?.('WebFullscreenModal: pause other video failed', error);
+      }
+    }
+
+    intendedPlayingRef.current = false;
+    pauseRequestedRef.current = false;
+    setIsPlaying(false);
+  }, [setIsPlaying]);
+
+  useEffect(() => registerPlaybackHandler(playbackIdRef.current, pauseSelf), [pauseSelf]);
+
+  useEffect(() => {
+    if (isPlaying) {
+      pauseOtherVideos(playbackIdRef.current);
+    }
+  }, [isPlaying]);
+
+  const exitFullscreen = useCallback(() => {
+    const element = videoRef.current;
+    const latestTime =
+      element && Number.isFinite(element.currentTime)
+        ? element.currentTime
+        : Number.isFinite(currentTime)
+          ? currentTime
+          : 0;
+    const latestMuted = element ? element.muted : isMuted;
+    const latestSpeed =
+      element && Number.isFinite(element.playbackRate) ? element.playbackRate : playbackSpeed;
+    const latestWasPlaying = element ? !element.paused : isPlaying;
+
+    if (element) {
+      try {
+        element.pause();
       } catch (error) {
         logger.debug?.('WebFullscreenModal: pause on close failed', error);
       }
     }
     onDismiss({
-      currentTime,
-      isMuted,
-      playbackSpeed,
-      wasPlaying: isPlaying,
+      currentTime: latestTime,
+      isMuted: latestMuted,
+      playbackSpeed: latestSpeed,
+      wasPlaying: latestWasPlaying,
     });
   }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed]);
+
+  const handleKeyboardShortcut = useCallback(
+    (event: any) => {
+      if (Platform.OS !== 'web') {
+        return false;
+      }
+
+      if (event?.defaultPrevented) {
+        return false;
+      }
+
+      if (event?.metaKey || event?.ctrlKey || event?.altKey) {
+        return false;
+      }
+
+      if (isKeyboardEventFromEditable(event)) {
+        return false;
+      }
+
+      const key = event?.key;
+      const code = event?.code;
+      const lower = typeof key === 'string' ? key.toLowerCase() : '';
+
+      const markHandled = () => {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        clearWebSelection();
+        setShowControls(true);
+      };
+
+      if (key === 'ArrowLeft' || lower === 'j') {
+        markHandled();
+        handleKeyboardSeek('backward');
+        return true;
+      }
+
+      if (key === 'ArrowRight' || lower === 'l') {
+        markHandled();
+        handleKeyboardSeek('forward');
+        return true;
+      }
+
+      const isSpace = code === 'Space' || key === ' ' || key === 'Spacebar';
+      if (isSpace || lower === 'k') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        togglePlayPause();
+        return true;
+      }
+
+      if (lower === 'm') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        toggleMute();
+        return true;
+      }
+
+      if (key === 'Escape') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        exitFullscreen();
+        return true;
+      }
+
+      if (lower === 'f') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        markHandled();
+        exitFullscreen();
+        return true;
+      }
+
+      return false;
+    },
+    [exitFullscreen, handleKeyboardSeek, toggleMute, togglePlayPause]
+  );
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') {
+      return;
+    }
+
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
+      if (!webKeyboardActiveRef.current) {
+        return;
+      }
+      handleKeyboardShortcut(event);
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown, true);
+    handleWebFocus();
+
+    return () => {
+      webKeyboardActiveRef.current = false;
+      window.removeEventListener('keydown', handleGlobalKeyDown, true);
+      handleWebBlur();
+    };
+  }, [handleKeyboardShortcut, handleWebBlur, handleWebFocus]);
+
+  const handleKeyDown = useCallback(
+    (event: any) => {
+      if (handleKeyboardShortcut(event)) {
+        clearWebSelection();
+      }
+    },
+    [handleKeyboardShortcut]
+  );
+
+  const renderSeekGestureLayer = () => (
+    <View style={styles.seekGestureLayer} pointerEvents="box-none">
+      <Pressable
+        style={[styles.seekZone, styles.seekZoneLeft]}
+        onPress={() => handleSeekTap('backward')}
+        accessible={false}
+      />
+      <Pressable
+        style={[styles.seekZone, styles.seekZoneRight]}
+        onPress={() => handleSeekTap('forward')}
+        accessible={false}
+      />
+      <SeekOverlay state={overlayState} animatedStyle={overlayAnimatedStyle} variant="fullscreen" />
+    </View>
+  );
+
+  const handleClose = useCallback(() => {
+    exitFullscreen();
+  }, [exitFullscreen]);
 
   const handleShare = useCallback(() => {
     handleClose();
@@ -3141,10 +4211,6 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
       onSharePress();
     }, 0);
   }, [handleClose, onSharePress]);
-
-  const handleToggleControls = useCallback(() => {
-    setShowControls((visible) => !visible);
-  }, []);
 
   const handleVideoSeeked = useCallback(() => {
     if (!videoRef.current) {
@@ -3158,10 +4224,11 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
   }, [setCurrentTimeSafe]);
 
   const handleVideoPlay = useCallback(() => {
+    pauseOtherVideos(playbackIdRef.current);
     intendedPlayingRef.current = true;
     pauseRequestedRef.current = false;
     setIsPlaying(true);
-  }, []);
+  }, [setIsPlaying]);
 
   const handleVideoPause = useCallback(() => {
     setIsPlaying(false);
@@ -3186,12 +4253,6 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
     onDownload?.();
   }, [onDownload]);
 
-  const shouldShowLoading = !(duration > 0);
-  const shouldShowControls = showControls && !shouldShowLoading;
-  const formattedProgressLabel = useMemo(() => {
-    return `${formatTime(currentTime)} / ${formatTime(duration)}`;
-  }, [currentTime, duration]);
-
   return (
     <Modal
       visible
@@ -3201,12 +4262,31 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
       statusBarTranslucent
     >
       <SafeAreaView style={styles.webFullscreenRoot}>
-        <TouchableOpacity activeOpacity={1} style={styles.webFullscreenTouchable} onPress={handleToggleControls}>
+        <View
+          ref={webWrapperRef}
+          style={[styles.webFullscreenTouchable, webFocusStyle]}
+          accessibilityRole="adjustable"
+          accessibilityLabel="Video player"
+          accessibilityHint={seekHint}
+          accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+          onAccessibilityAction={handleAccessibilityAction}
+          {...(Platform.OS === 'web'
+            ? ({
+                onKeyDown: handleKeyDown,
+                onFocus: handleWebFocus,
+                onBlur: handleWebBlur,
+                onMouseDown: (event: any) => event.preventDefault?.(),
+                tabIndex: -1,
+                dataSet: { tmVideoPlayer: 'true' },
+              } as any)
+            : {})}
+        >
           <View style={styles.webFullscreenVideoWrapper}>
             <video
               ref={videoRef}
               src={sourceUri}
-              style={{ width: '100%', height: '100%', backgroundColor: '#000' }}
+              style={{ width: '100%', height: '100%', backgroundColor: '#000', outline: 'none' }}
+              onMouseDown={(event) => event.preventDefault?.()}
               onLoadedMetadata={handleLoadedMetadata}
               onTimeUpdate={handleTimeUpdate}
               onSeeked={handleVideoSeeked}
@@ -3215,7 +4295,10 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
               muted={isMuted}
               playsInline
               preload="auto"
+              tabIndex={-1}
             />
+
+            {renderSeekGestureLayer()}
 
             {shouldShowLoading ? (
               <View style={styles.fullscreenLoadingOverlay}>
@@ -3230,8 +4313,8 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
             ) : null}
 
             {shouldShowControls ? (
-              <View style={styles.fullscreenOverlay}>
-                <View style={styles.fullscreenTopRow}>
+              <View style={styles.fullscreenOverlay} pointerEvents="box-none">
+                <View style={styles.fullscreenTopRow} pointerEvents="box-none">
                   <TouchableOpacity
                     style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
                     onPress={handleClosePress}
@@ -3249,7 +4332,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                   </TouchableOpacity>
                 </View>
 
-                <View style={styles.fullscreenMainControls}>
+                <View style={styles.fullscreenMainControls} pointerEvents="box-none">
                   <TouchableOpacity
                     style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
                     onPress={togglePlayPause}
@@ -3258,8 +4341,8 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                   </TouchableOpacity>
                 </View>
 
-                <View style={styles.fullscreenBottomControls}>
-                  <View style={styles.fullscreenProgressRow}>
+                <View style={styles.fullscreenBottomControls} pointerEvents="box-none">
+                  <View style={styles.fullscreenProgressRow} pointerEvents="box-none">
                     <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
 
                     <View style={styles.fullscreenProgressContainer}>
@@ -3286,8 +4369,8 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                     </View>
                   </View>
 
-                  <View style={styles.fullscreenActionsRow}>
-                    <View style={styles.fullscreenActionsLeft}>
+                  <View style={styles.fullscreenActionsRow} pointerEvents="box-none">
+                    <View style={styles.fullscreenActionsLeft} pointerEvents="box-none">
                       <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
                         {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
                       </TouchableOpacity>
@@ -3309,7 +4392,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
                       ) : null}
                     </View>
 
-                    <View style={styles.fullscreenActionsRight}>
+                    <View style={styles.fullscreenActionsRight} pointerEvents="box-none">
                       <TouchableOpacity
                         style={[styles.fullscreenControlButton, styles.fullscreenSpeedButton]}
                         onPress={cyclePlaybackSpeed}
@@ -3328,7 +4411,7 @@ function WebFullscreenModal({ config, onDismiss, onSharePress, onDownload, isDow
               </View>
             ) : null}
           </View>
-        </TouchableOpacity>
+        </View>
       </SafeAreaView>
     </Modal>
   );
@@ -3349,6 +4432,10 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
     borderRadius: 8,
     overflow: 'hidden',
+    outlineStyle: 'solid',
+    outlineWidth: 0,
+    outlineColor: 'transparent',
+    userSelect: 'none',
   },
   webFullscreenRoot: {
     flex: 1,
@@ -3356,11 +4443,18 @@ const styles = StyleSheet.create({
   },
   webFullscreenTouchable: {
     flex: 1,
+    outlineStyle: 'solid',
+    outlineWidth: 0,
+    outlineColor: 'transparent',
   },
   webFullscreenVideoWrapper: {
     flex: 1,
     position: 'relative',
     backgroundColor: '#000',
+    outlineStyle: 'solid',
+    outlineWidth: 0,
+    outlineColor: 'transparent',
+    userSelect: 'none',
   },
   hiddenInlineWhileFullscreen: {
     opacity: 0,
@@ -3369,6 +4463,10 @@ const styles = StyleSheet.create({
   inlineVideoWrapper: {
     flex: 1,
     position: 'relative',
+    outlineStyle: 'solid',
+    outlineWidth: 0,
+    outlineColor: 'transparent',
+    userSelect: 'none',
   },
   inlineVideoSurface: {
     flex: 1,
@@ -3380,6 +4478,10 @@ const styles = StyleSheet.create({
   fullscreenVideoWrapper: {
     flex: 1,
     position: 'relative',
+    outlineStyle: 'solid',
+    outlineWidth: 0,
+    outlineColor: 'transparent',
+    userSelect: 'none',
   },
   fullscreenVideoSurface: {
     flex: 1,
@@ -3438,11 +4540,68 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.3)',
     justifyContent: 'space-between',
     padding: 16,
+    userSelect: 'none',
   },
   controlsOverlayMinimal: {
     justifyContent: 'center',
     alignItems: 'center',
     paddingHorizontal: 0,
+  },
+  seekGestureLayer: {
+    ...StyleSheet.absoluteFillObject,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  seekZone: {
+    flex: 1,
+    height: '100%',
+  },
+  seekZoneLeft: {
+    alignItems: 'flex-start',
+  },
+  seekZoneRight: {
+    alignItems: 'flex-end',
+  },
+  seekOverlay: {
+    position: 'absolute',
+    top: '32%',
+    width: 120,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    backgroundColor: 'rgba(8,12,24,0.72)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 4,
+    userSelect: 'none',
+  },
+  seekOverlayFullscreen: {
+    width: 140,
+    paddingVertical: 12,
+    borderRadius: 18,
+  },
+  seekOverlayLeft: {
+    left: 18,
+  },
+  seekOverlayRight: {
+    right: 18,
+  },
+  seekOverlayArrow: {
+    color: 'white',
+    fontSize: 20,
+    fontWeight: '700',
+    letterSpacing: 2,
+  },
+  seekOverlayText: {
+    marginTop: 4,
+    color: 'white',
+    fontSize: 13,
+    fontWeight: '600',
   },
   fullscreenTopRow: {
     flexDirection: 'row',
@@ -3567,6 +4726,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 32,
     paddingVertical: 36,
     gap: 16,
+    userSelect: 'none',
   },
   fullscreenLoadingOverlay: {
     position: 'absolute',

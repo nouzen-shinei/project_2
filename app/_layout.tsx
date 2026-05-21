@@ -46,6 +46,7 @@ import ModalAlertProvider from '../components/ModalAlertProvider';
 import * as Updates from 'expo-updates';
 import { installErrorFilter } from '../globalErrorFilter';
 import { TenantProvider, useTenant } from '../hooks/useTenantContext';
+import { VideoSeekProvider } from '../hooks/useVideoSeekConfig';
 import TenantAccessScreen from '../components/TenantAccessScreen';
 import { useTheme } from '../hooks/useTheme';
 import InviteOverlay from '../components/InviteOverlay';
@@ -528,30 +529,32 @@ export default function RootLayout() {
           <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
             <MaintenanceGate>
               <ThemeProvider>
-                <ModalAlertProvider>
-                  <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colorScheme === 'dark' ? '#0f172a' : '#fff' }}>
-                    <Image
-                      source={require('../assets/images/icon.png')}
-                      style={{ width: 140, height: 140, marginBottom: 28, borderRadius: 30 }}
-                      resizeMode="contain"
-                    />
-                    <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#aaa' : '#888'} />
-                    <Text
-                      style={{
-                        position: 'absolute',
-                        bottom: 24,
-                        textAlign: 'center',
-                        color: colorScheme === 'dark' ? '#9CA3AF' : '#6B7280',
-                        fontSize: 16,
-                      }}
-                    >
-                      © vipika.in
-                    </Text>
-                  </View>
-                  <ReloginRequiredModal />
-                  <StatusBar style="auto" />
-                  <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-                </ModalAlertProvider>
+                <VideoSeekProvider>
+                  <ModalAlertProvider>
+                    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colorScheme === 'dark' ? '#0f172a' : '#fff' }}>
+                      <Image
+                        source={require('../assets/images/icon.png')}
+                        style={{ width: 140, height: 140, marginBottom: 28, borderRadius: 30 }}
+                        resizeMode="contain"
+                      />
+                      <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#aaa' : '#888'} />
+                      <Text
+                        style={{
+                          position: 'absolute',
+                          bottom: 24,
+                          textAlign: 'center',
+                          color: colorScheme === 'dark' ? '#9CA3AF' : '#6B7280',
+                          fontSize: 16,
+                        }}
+                      >
+                        © vipika.in
+                      </Text>
+                    </View>
+                    <ReloginRequiredModal />
+                    <StatusBar style="auto" />
+                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                  </ModalAlertProvider>
+                </VideoSeekProvider>
               </ThemeProvider>
             </MaintenanceGate>
           </SafeAreaWebTopOverride>
@@ -568,20 +571,22 @@ export default function RootLayout() {
           <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
             <MaintenanceGate>
               <ThemeProvider>
-                <ModalAlertProvider>
-                  <Stack screenOptions={{ headerShown: false }}>
-                    <Stack.Screen name="l" options={{ headerShown: false }} />
-                    <Stack.Screen name="s/index" options={{ headerShown: false }} />
-                    <Stack.Screen name="s/[token]" options={{ headerShown: false }} />
-                    <Stack.Screen name="shared/index" options={{ headerShown: false }} />
-                    <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
-                    <Stack.Screen name="invite/[token]" options={{ headerShown: false }} />
-                    <Stack.Screen name="+not-found" options={{ headerShown: false }} />
-                  </Stack>
-                  <ReloginRequiredModal />
-                  <StatusBar style="auto" />
-                  <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-                </ModalAlertProvider>
+                <VideoSeekProvider>
+                  <ModalAlertProvider>
+                    <Stack screenOptions={{ headerShown: false }}>
+                      <Stack.Screen name="l" options={{ headerShown: false }} />
+                      <Stack.Screen name="s/index" options={{ headerShown: false }} />
+                      <Stack.Screen name="s/[token]" options={{ headerShown: false }} />
+                      <Stack.Screen name="shared/index" options={{ headerShown: false }} />
+                      <Stack.Screen name="shared/[token]" options={{ headerShown: false }} />
+                      <Stack.Screen name="invite/[token]" options={{ headerShown: false }} />
+                      <Stack.Screen name="+not-found" options={{ headerShown: false }} />
+                    </Stack>
+                    <ReloginRequiredModal />
+                    <StatusBar style="auto" />
+                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                  </ModalAlertProvider>
+                </VideoSeekProvider>
               </ThemeProvider>
             </MaintenanceGate>
           </SafeAreaWebTopOverride>
@@ -598,12 +603,14 @@ export default function RootLayout() {
           <SafeAreaWebTopOverride shouldOverride={webSafeAreaOverride}>
             <MaintenanceGate>
               <ThemeProvider>
-                <ModalAlertProvider>
-                  <LoginScreen />
-                  <ReloginRequiredModal />
-                  <StatusBar style="auto" />
-                  <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-                </ModalAlertProvider>
+                <VideoSeekProvider>
+                  <ModalAlertProvider>
+                    <LoginScreen />
+                    <ReloginRequiredModal />
+                    <StatusBar style="auto" />
+                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                  </ModalAlertProvider>
+                </VideoSeekProvider>
               </ThemeProvider>
             </MaintenanceGate>
           </SafeAreaWebTopOverride>
@@ -621,17 +628,19 @@ export default function RootLayout() {
             <AuthGate>
               <TenantProvider>
                 <ThemeProvider>
-                  <ModalAlertProvider>
-                    <TenantAwareShell
-                      colorScheme={colorScheme}
-                      isOffline={isOffline}
-                      roleChangeNotice={roleChangeNotice}
-                      router={router}
-                      onTenantBootstrapped={() => setTenantBootstrapped(true)}
-                    />
-                    <ReloginRequiredModal />
-                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
-                  </ModalAlertProvider>
+                  <VideoSeekProvider>
+                    <ModalAlertProvider>
+                      <TenantAwareShell
+                        colorScheme={colorScheme}
+                        isOffline={isOffline}
+                        roleChangeNotice={roleChangeNotice}
+                        router={router}
+                        onTenantBootstrapped={() => setTenantBootstrapped(true)}
+                      />
+                      <ReloginRequiredModal />
+                      <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                    </ModalAlertProvider>
+                  </VideoSeekProvider>
                 </ThemeProvider>
               </TenantProvider>
             </AuthGate>

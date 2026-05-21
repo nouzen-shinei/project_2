@@ -117,7 +117,7 @@ import {
 import VideoPlayer from '../../components/VideoPlayer';
 import { StickerGifPickerMobile } from '../../components/StickerGifPickerMobile';
 import ProgressiveImage from '../../components/ui/ProgressiveImage';
-import { ArrowLeft, Search, X, Paperclip, Smile, Play, Star, Clock, MessageCircle, Send, Heart, Eye, AlertCircle, Download, Share, Camera, Trash2, ChevronDown, RotateCcw, CheckCircle2, File as FileIcon, Image as ImageIcon, Edit3, Reply, Copy } from 'lucide-react-native';
+import { ArrowLeft, Search, X, Info, Paperclip, Smile, Play, Star, Clock, MessageCircle, Send, Heart, Eye, AlertCircle, Download, Share, Camera, Trash2, ChevronDown, RotateCcw, CheckCircle2, File as FileIcon, Image as ImageIcon, Edit3, Reply, Copy } from 'lucide-react-native';
 import { formatMessageTimestamp, getChatDateSeparator, formatOnlineStatus } from '../../lib/timeUtils';
 import { isImageFile, isVideoFile } from '../../lib/fileUtils';
 import { notificationService } from '../../services/notificationService';
@@ -206,7 +206,6 @@ import {
   type ChatConversationSearchScope,
   type ChatConversationSearchScopeShortcutAction,
   normalizeChatConversationSearchQuery,
-  normalizeChatConversationSearchScope,
   resolveChatConversationSearchMatchIds,
   resolveChatConversationSearchBestScopeSuggestion,
   resolveChatConversationSearchNoMatchesGuidance,
@@ -224,17 +223,6 @@ import {
   resolveChatConversationSearchScopeStep,
   shouldLoadOlderForConversationSearch,
 } from '@/lib/chatConversationSearch';
-import {
-  type ChatConversationSearchContextSnapshot,
-  type PersistedChatConversationSearchContextStore,
-  DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_AGE_MS,
-  DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_ENTRIES,
-  DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_QUERY_LENGTH,
-  normalizePersistedConversationSearchContextStore,
-  readPersistedConversationSearchContext,
-  upsertPersistedConversationSearchContext,
-} from '@/lib/chatConversationSearchContext';
-import { resolveChatConversationSearchContextKey } from '@/lib/chatConversationSearchContextKey';
 import {
   createChatConversationSearchUxRollupState,
   recordChatConversationSearchUxRollup,
@@ -449,21 +437,7 @@ const CONVERSATION_SEARCH_SCOPE_OPTIONS: readonly {
   { key: 'media', label: CONVERSATION_SEARCH_SCOPE_LABELS.media },
 ];
 
-const CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY =
-  'chat.conversation_search_context.v1';
-const CONVERSATION_SEARCH_CONTEXT_PERSIST_DEBOUNCE_MS = 220;
 const CONVERSATION_SEARCH_QUERY_DEBOUNCE_MS = 140;
-const CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS = {
-  maxAgeMs: DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_AGE_MS,
-  maxEntries: DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_ENTRIES,
-  maxQueryLength: DEFAULT_CHAT_CONVERSATION_SEARCH_CONTEXT_MAX_QUERY_LENGTH,
-};
-
-const DEFAULT_CONVERSATION_SEARCH_CONTEXT: ChatConversationSearchContextSnapshot = {
-  visible: false,
-  query: '',
-  scope: 'all',
-};
 
 const UNREAD_DIVIDER_AUTO_DISMISS_MS = 2200;
 const UNREAD_DIVIDER_ACTION_DISMISS_MS = 180;
@@ -803,20 +777,11 @@ export default function Chat() {
   const [conversationSearchShortcutPulseScope, setConversationSearchShortcutPulseScope] =
     useState<ChatConversationSearchScope | null>(null);
   const [isConversationSearchHistoryLoading, setIsConversationSearchHistoryLoading] = useState(false);
-  const [conversationSearchContextHydrationTick, setConversationSearchContextHydrationTick] =
-    useState(0);
+  const [showSearchShortcutTipsModal, setShowSearchShortcutTipsModal] = useState(false);
   const conversationSearchInputRef = useRef<TextInput | null>(null);
   const conversationSearchQueryRef = useRef('');
   const previousConversationSearchQueryRef = useRef('');
   const previousConversationSearchScopeRef = useRef<ChatConversationSearchScope>('all');
-  const conversationSearchContextByConversationKeyRef =
-    useRef<Map<string, ChatConversationSearchContextSnapshot>>(new Map());
-  const activeConversationSearchContextKeyRef = useRef<string | null>(null);
-  const conversationSearchContextStoreRef =
-    useRef<PersistedChatConversationSearchContextStore>({});
-  const conversationSearchContextHydratedRef = useRef(false);
-  const conversationSearchContextPersistTimerRef =
-    useRef<ReturnType<typeof setTimeout> | null>(null);
   const conversationSearchLoadTokenRef = useRef(0);
   const conversationSearchHistoryLoadAttemptsRef = useRef(0);
   const conversationSearchLoadDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -976,6 +941,7 @@ export default function Chat() {
   const [isLoadingChatInfo, setIsLoadingChatInfo] = useState(false);
   const [conversationSummaries, setConversationSummaries] = useState<Map<string, ConversationSummary>>(new Map());
   const isSmallScreen = screenData.width < 700;
+  const showKeyboardShortcuts = Platform.OS === 'web' && !isSmallScreen;
   const [pinnedChats, setPinnedChats] = useState<Record<string, number>>({});
   const [userListOptionsVisible, setUserListOptionsVisible] = useState(false);
   const [longPressedMember, setLongPressedMember] = useState<TeamMember | null>(null);
@@ -1284,12 +1250,6 @@ export default function Chat() {
       }),
     [selectedTeamMember?.id, selectedTeamMember?.email]
   );
-  const activeConversationSearchContextKey = useMemo(() => {
-    return resolveChatConversationSearchContextKey({
-      activeComposerDraftKey,
-      tenantId: activeTenant?.id ?? null,
-    });
-  }, [activeComposerDraftKey, activeTenant?.id]);
 
   const updateSpecialComposerState = useCallback((value: string) => {
     const nextSpecialComposerState = resolveChatSpecialComposerState(value);
@@ -3521,11 +3481,15 @@ export default function Chat() {
       previousConversationSearchQueryRef.current = '';
       previousConversationSearchScopeRef.current = 'all';
       setIsConversationSearchHistoryLoading(false);
+      setShowSearchShortcutTipsModal(false);
+      conversationSearchVisibleRef.current = true;
       setConversationSearchVisible(true);
       setConversationSearchQuery(seededQuery);
       setConversationSearchScope('all');
       setConversationSearchActiveIndex(0);
       setConversationSearchHighlightMessageId(null);
+      setConversationSearchKeyboardSuggestionScope(null);
+      setConversationSearchShortcutPulseScope(null);
     },
     []
   );
@@ -5095,195 +5059,55 @@ export default function Chat() {
   useEffect(() => {
     replyJumpConversationKeyRef.current = activeComposerDraftKey;
   }, [activeComposerDraftKey]);
-
-  const schedulePersistConversationSearchContextStore = useCallback(() => {
-    if (!conversationSearchContextHydratedRef.current) {
-      return;
-    }
-
-    scheduleTimeoutRef(conversationSearchContextPersistTimerRef, () => {
-      const serializedStore = JSON.stringify(conversationSearchContextStoreRef.current);
-      void AsyncStorage.setItem(
-        CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY,
-        serializedStore
-      ).catch((error) => {
-        logger.debug('Failed to persist conversation search context store', {
-          error,
-        });
-      });
-    }, CONVERSATION_SEARCH_CONTEXT_PERSIST_DEBOUNCE_MS);
-  }, []);
-
-  const persistConversationSearchContextForKey = useCallback(
-    (
-      conversationKey: string,
-      snapshot: ChatConversationSearchContextSnapshot
-    ) => {
-      const normalizedConversationKey = conversationKey.trim();
-      if (!normalizedConversationKey) {
-        return;
-      }
-
-      const normalizedSnapshot: ChatConversationSearchContextSnapshot = {
-        visible: snapshot.visible === true,
-        query: typeof snapshot.query === 'string' ? snapshot.query : '',
-        scope: normalizeChatConversationSearchScope(snapshot.scope),
-      };
-
-      conversationSearchContextByConversationKeyRef.current.set(
-        normalizedConversationKey,
-        normalizedSnapshot
-      );
-      conversationSearchContextStoreRef.current =
-        upsertPersistedConversationSearchContext(
-          conversationSearchContextStoreRef.current,
-          normalizedConversationKey,
-          normalizedSnapshot,
-          Date.now(),
-          CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS
-        );
-
-      schedulePersistConversationSearchContextStore();
+  const resetConversationSearchState = useCallback(
+    (nextVisible: boolean) => {
+      clearScheduledConversationSearchHistoryLoad();
+      clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
+      conversationSearchLoadTokenRef.current += 1;
+      conversationSearchHistoryLoadAttemptsRef.current = 0;
+      conversationSearchVisibleRef.current = nextVisible;
+      setConversationSearchVisible(nextVisible);
+      setConversationSearchQuery('');
+      setConversationSearchScope('all');
+      setConversationSearchActiveIndex(0);
+      setConversationSearchHighlightMessageId(null);
+      setConversationSearchKeyboardSuggestionScope(null);
+      setConversationSearchShortcutPulseScope(null);
+      setIsConversationSearchHistoryLoading(false);
+      setShowSearchShortcutTipsModal(false);
+      previousConversationSearchQueryRef.current = '';
+      previousConversationSearchScopeRef.current = 'all';
     },
-    [schedulePersistConversationSearchContextStore]
+    [clearScheduledConversationSearchHistoryLoad]
   );
 
-  useEffect(() => {
-    let isCancelled = false;
+  const openSearchShortcutTipsModal = useCallback(() => {
+    if (!showKeyboardShortcuts) {
+      return;
+    }
+    setShowSearchShortcutTipsModal(true);
+  }, [showKeyboardShortcuts]);
 
-    const hydrateConversationSearchContextStore = async () => {
-      try {
-        const serializedStore = await AsyncStorage.getItem(
-          CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY
-        );
-        const parsedStore = serializedStore ? JSON.parse(serializedStore) : {};
-        const normalizedStore = normalizePersistedConversationSearchContextStore(
-          parsedStore,
-          Date.now(),
-          CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS
-        );
-
-        if (isCancelled) {
-          return;
-        }
-
-        conversationSearchContextStoreRef.current = normalizedStore;
-        const hydratedMap = new Map<string, ChatConversationSearchContextSnapshot>();
-        for (const [conversationKey, entry] of Object.entries(normalizedStore)) {
-          hydratedMap.set(conversationKey, {
-            visible: entry.visible === true,
-            query: typeof entry.query === 'string' ? entry.query : '',
-            scope: normalizeChatConversationSearchScope(entry.scope),
-          });
-        }
-        conversationSearchContextByConversationKeyRef.current = hydratedMap;
-      } catch (error) {
-        logger.debug('Failed to hydrate conversation search context store', {
-          error,
-        });
-      } finally {
-        if (isCancelled) {
-          return;
-        }
-
-        conversationSearchContextHydratedRef.current = true;
-        setConversationSearchContextHydrationTick((currentTick) =>
-          currentTick + 1
-        );
-      }
-    };
-
-    void hydrateConversationSearchContextStore();
-
-    return () => {
-      isCancelled = true;
-    };
+  const closeSearchShortcutTipsModal = useCallback(() => {
+    setShowSearchShortcutTipsModal(false);
   }, []);
 
   useEffect(() => {
-    return () => {
-      if (!conversationSearchContextPersistTimerRef.current) {
-        return;
-      }
-
-      clearTimeoutRef(conversationSearchContextPersistTimerRef);
-
-      const serializedStore = JSON.stringify(conversationSearchContextStoreRef.current);
-      void AsyncStorage.setItem(
-        CONVERSATION_SEARCH_CONTEXT_STORAGE_KEY,
-        serializedStore
-      ).catch(() => undefined);
-    };
-  }, []);
+    if (!showKeyboardShortcuts && showSearchShortcutTipsModal) {
+      setShowSearchShortcutTipsModal(false);
+    }
+  }, [showKeyboardShortcuts, showSearchShortcutTipsModal]);
 
   useEffect(() => {
-    const previousConversationKey = activeConversationSearchContextKeyRef.current;
-    if (previousConversationKey) {
-      persistConversationSearchContextForKey(previousConversationKey, {
-        visible: conversationSearchVisibleRef.current,
-        query: conversationSearchQueryRef.current,
-        scope: conversationSearchScopeRef.current,
-      });
-    }
-
-    const nextConversationKey = activeConversationSearchContextKey || null;
-    activeConversationSearchContextKeyRef.current = nextConversationKey;
-
-    const inMemoryContext = nextConversationKey
-      ? conversationSearchContextByConversationKeyRef.current.get(nextConversationKey)
-      : null;
-    const persistedContext =
-      !inMemoryContext && nextConversationKey
-        ? readPersistedConversationSearchContext(
-            conversationSearchContextStoreRef.current,
-            nextConversationKey,
-            Date.now(),
-            CONVERSATION_SEARCH_CONTEXT_STORE_OPTIONS
-          )
-        : null;
-
-    const savedContext = inMemoryContext || persistedContext;
-    if (nextConversationKey && savedContext) {
-      conversationSearchContextByConversationKeyRef.current.set(
-        nextConversationKey,
-        savedContext
-      );
-    }
-
-    const restoredContext: ChatConversationSearchContextSnapshot = {
-      visible: savedContext?.visible === true,
-      query:
-        typeof savedContext?.query === 'string'
-          ? savedContext.query
-          : DEFAULT_CONVERSATION_SEARCH_CONTEXT.query,
-      scope: normalizeChatConversationSearchScope(
-        savedContext?.scope ?? DEFAULT_CONVERSATION_SEARCH_CONTEXT.scope
-      ),
-    };
-
     setShowReplyJumpToLatestSafely(false);
     setReplyJumpHighlightMessageId(null);
     clearReplyJumpHighlightTimer();
-    clearScheduledConversationSearchHistoryLoad();
-    clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
-    conversationSearchLoadTokenRef.current += 1;
-    conversationSearchHistoryLoadAttemptsRef.current = 0;
-    setIsConversationSearchHistoryLoading(false);
-    setConversationSearchVisible(restoredContext.visible);
-    setConversationSearchQuery(restoredContext.query);
-    setConversationSearchScope(restoredContext.scope);
-    setConversationSearchActiveIndex(0);
-    setConversationSearchHighlightMessageId(null);
-    setConversationSearchKeyboardSuggestionScope(null);
-    setConversationSearchShortcutPulseScope(null);
-    previousConversationSearchQueryRef.current = '';
-    previousConversationSearchScopeRef.current = restoredContext.scope;
+    resetConversationSearchState(false);
   }, [
-    activeConversationSearchContextKey,
-    conversationSearchContextHydrationTick,
+    activeComposerDraftKey,
+    activeTenant?.id,
     clearReplyJumpHighlightTimer,
-    clearScheduledConversationSearchHistoryLoad,
-    persistConversationSearchContextForKey,
+    resetConversationSearchState,
     setShowReplyJumpToLatestSafely,
   ]);
 
@@ -5357,19 +5181,8 @@ export default function Chat() {
   );
 
   const closeConversationSearch = useCallback(() => {
-    clearScheduledConversationSearchHistoryLoad();
-    clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
-    conversationSearchLoadTokenRef.current += 1;
-    conversationSearchHistoryLoadAttemptsRef.current = 0;
-    setConversationSearchVisible(false);
-    setConversationSearchActiveIndex(0);
-    setConversationSearchHighlightMessageId(null);
-    setConversationSearchKeyboardSuggestionScope(null);
-    setConversationSearchShortcutPulseScope(null);
-    setIsConversationSearchHistoryLoading(false);
-    previousConversationSearchQueryRef.current = normalizedConversationSearchQueryRef.current;
-    previousConversationSearchScopeRef.current = conversationSearchScopeRef.current;
-  }, [clearScheduledConversationSearchHistoryLoad]);
+    resetConversationSearchState(false);
+  }, [resetConversationSearchState]);
 
   const toggleConversationSearch = useCallback(() => {
     if (conversationSearchVisible) {
@@ -5377,8 +5190,8 @@ export default function Chat() {
       return;
     }
 
-    setConversationSearchVisible(true);
-  }, [closeConversationSearch, conversationSearchVisible]);
+    resetConversationSearchState(true);
+  }, [closeConversationSearch, conversationSearchVisible, resetConversationSearchState]);
 
   const clearConversationSearchShortcutPulseTimer = useCallback(() => {
     clearTimeoutRef(conversationSearchShortcutPulseTimerRef);
@@ -5634,7 +5447,7 @@ export default function Chat() {
       if (isFindShortcut) {
         event.preventDefault();
         if (!conversationSearchVisible) {
-          setConversationSearchVisible(true);
+          resetConversationSearchState(true);
           return;
         }
 
@@ -5689,6 +5502,7 @@ export default function Chat() {
     conversationSearchVisible,
     executeConversationSearchShortcutAction,
     messageInfoModalState.visible,
+    resetConversationSearchState,
     selectedTeamMember,
   ]);
 
@@ -5708,24 +5522,6 @@ export default function Chat() {
   useEffect(() => {
     isConversationSearchHistoryLoadingRef.current = isConversationSearchHistoryLoading;
   }, [isConversationSearchHistoryLoading]);
-
-  useEffect(() => {
-    const conversationKey = activeConversationSearchContextKeyRef.current;
-    if (!conversationKey) {
-      return;
-    }
-
-    persistConversationSearchContextForKey(conversationKey, {
-      visible: conversationSearchVisible,
-      query: conversationSearchQuery,
-      scope: conversationSearchScope,
-    });
-  }, [
-    conversationSearchQuery,
-    conversationSearchScope,
-    conversationSearchVisible,
-    persistConversationSearchContextForKey,
-  ]);
 
   useEffect(() => {
     if (!conversationSearchVisible) {
@@ -9866,10 +9662,11 @@ export default function Chat() {
   // Render pending rich media (stickers/GIFs) with a clock icon until sent
   const renderPendingMedia = (tempId: string, item: PendingMediaItem) => {
     if (!selectedTeamMember) return null;
+    const inferredServerMessageId = findLikelyServerMessageIdForPendingMedia(item);
     const pendingMediaVisibilityState = resolveChatPendingServerMatchVisibility({
       selectedRecipientId: selectedTeamMember.id,
       itemRecipientId: item.recipientId,
-      serverMessageId: item.serverMessageId,
+      serverMessageId: item.serverMessageId || inferredServerMessageId,
       deliveredMessageIds,
       normalizeMessageId,
     });
@@ -10189,7 +9986,7 @@ export default function Chat() {
                   >
                     {messageInfoCopiedRowKey === '__all__' ? 'Copied' : 'Copy all'}
                   </Text>
-                  {Platform.OS === 'web' ? (
+                  {showKeyboardShortcuts ? (
                     <View
                       style={[
                         styles.messageInfoShortcutBadge,
@@ -10214,7 +10011,7 @@ export default function Chat() {
                   >
                     <X size={18} color={theme.textSecondary} />
                   </TouchableOpacity>
-                  {Platform.OS === 'web' ? (
+                  {showKeyboardShortcuts ? (
                     <View
                       style={[
                         styles.messageInfoShortcutBadge,
@@ -10347,7 +10144,7 @@ export default function Chat() {
                       ? 'Hide all recipient details'
                       : 'Show all recipient details'}
                   </Text>
-                  {Platform.OS === 'web' ? (
+                  {showKeyboardShortcuts ? (
                     <View
                       style={[
                         styles.messageInfoShortcutBadge,
@@ -10366,7 +10163,7 @@ export default function Chat() {
               </View>
             ) : null}
 
-            {Platform.OS === 'web' ? (
+            {showKeyboardShortcuts ? (
               <View
                 style={[
                   styles.messageInfoShortcutHintRow,
@@ -10722,6 +10519,115 @@ export default function Chat() {
     pendingTextMessageCandidatesByKey,
   ]);
 
+  const normalizePendingMediaUrl = useCallback((value?: string | null) => {
+    return typeof value === 'string' ? value.trim() : '';
+  }, []);
+
+  const buildPendingMediaMatchKey = useCallback((
+    sender: string,
+    recipient: string,
+    kind: PendingMediaItem['kind'],
+    url: string
+  ) => `${sender}|${recipient}|${kind}|${url}`, []);
+
+  const pendingMediaMessageCandidatesByKey = useMemo(() => {
+    const candidatesByKey = new Map<string, { id: string; timestampMs: number }[]>();
+    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      return candidatesByKey;
+    }
+
+    for (const msg of displayedMessages) {
+      if (!msg || msg.deleted) {
+        continue;
+      }
+
+      const candidateId = normalizeMessageId(msg?.id);
+      if (!candidateId) {
+        continue;
+      }
+
+      const kind = msg.sticker ? 'sticker' : msg.gif ? 'gif' : '';
+      if (!kind) {
+        continue;
+      }
+
+      const mediaUrl = kind === 'sticker' ? msg.sticker?.url : msg.gif?.url;
+      const normalizedUrl = normalizePendingMediaUrl(mediaUrl);
+      if (!normalizedUrl) {
+        continue;
+      }
+
+      const candidateSender = normalizeParticipantEmail(msg?.sender);
+      const candidateRecipient = normalizeParticipantEmail(msg?.recipientId);
+      if (!candidateSender || !candidateRecipient) {
+        continue;
+      }
+
+      const matchKey = buildPendingMediaMatchKey(candidateSender, candidateRecipient, kind, normalizedUrl);
+      const entry = {
+        id: candidateId,
+        timestampMs: resolveTimestampMs(msg?.timestamp),
+      };
+
+      const bucket = candidatesByKey.get(matchKey);
+      if (bucket) {
+        bucket.push(entry);
+      } else {
+        candidatesByKey.set(matchKey, [entry]);
+      }
+    }
+
+    return candidatesByKey;
+  }, [
+    displayedMessages,
+    normalizeMessageId,
+    normalizeParticipantEmail,
+    normalizePendingMediaUrl,
+    buildPendingMediaMatchKey,
+  ]);
+
+  const findLikelyServerMessageIdForPendingMedia = useCallback((pendingItem?: PendingMediaItem): string => {
+    if (!pendingItem) {
+      return '';
+    }
+
+    const pendingStatus = pendingItem.status;
+    const normalizedPendingUrl = normalizePendingMediaUrl(pendingItem.previewUri);
+    const normalizedSender = normalizeParticipantEmail(
+      pendingItem.sender || effectiveUser?.email || user?.email || ''
+    );
+    const normalizedRecipient = normalizeParticipantEmail(pendingItem.recipientId);
+    const pendingTimestamp = resolveTimestampMs(pendingItem.timestamp);
+    if (!normalizedPendingUrl || !normalizedSender || !normalizedRecipient) {
+      return '';
+    }
+
+    const matchKey = buildPendingMediaMatchKey(
+      normalizedSender,
+      normalizedRecipient,
+      pendingItem.kind,
+      normalizedPendingUrl
+    );
+    const candidates = pendingMediaMessageCandidatesByKey.get(matchKey);
+
+    return resolveChatPendingServerMessageIdFromCandidates({
+      pendingStatus,
+      normalizedPendingText: normalizedPendingUrl,
+      normalizedSender,
+      normalizedRecipient,
+      pendingTimestampMs: pendingTimestamp,
+      candidates: candidates || [],
+      maxTimestampDeltaMs: 12000,
+    });
+  }, [
+    normalizePendingMediaUrl,
+    normalizeParticipantEmail,
+    effectiveUser?.email,
+    user?.email,
+    buildPendingMediaMatchKey,
+    pendingMediaMessageCandidatesByKey,
+  ]);
+
   useEffect(() => {
     if (pendingMessages.size === 0) {
       return;
@@ -10783,6 +10689,53 @@ export default function Chat() {
     normalizeMessageId,
     findLikelyServerMessageIdForPendingText,
   ]);
+
+  useEffect(() => {
+    if (pendingMedia.size === 0) {
+      return;
+    }
+
+    const updates: { tempId: string; serverMessageId: string }[] = [];
+    for (const [tempId, pendingItem] of pendingMedia.entries()) {
+      if (!pendingItem) {
+        continue;
+      }
+
+      if (pendingItem.status !== 'sending' && pendingItem.status !== 'sent') {
+        continue;
+      }
+
+      const existingServerMessageId = normalizeMessageId(pendingItem.serverMessageId);
+      if (existingServerMessageId) {
+        continue;
+      }
+
+      const guessedServerMessageId = findLikelyServerMessageIdForPendingMedia(pendingItem);
+      if (!guessedServerMessageId) {
+        continue;
+      }
+
+      updates.push({ tempId, serverMessageId: guessedServerMessageId });
+    }
+
+    if (updates.length === 0) {
+      return;
+    }
+
+    setPendingMedia((prev) => {
+      const next = new Map(prev);
+      updates.forEach(({ tempId, serverMessageId }) => {
+        const current = next.get(tempId);
+        if (current) {
+          next.set(tempId, {
+            ...current,
+            serverMessageId,
+          });
+        }
+      });
+      return next;
+    });
+  }, [pendingMedia, normalizeMessageId, findLikelyServerMessageIdForPendingMedia]);
 
   useEffect(() => {
     const activePendingIds = new Set<string>();
@@ -11205,6 +11158,10 @@ export default function Chat() {
     const activeIds = resolveChatPendingActiveIdSet(pendingMessages.keys());
     pruneMapByKeySet(retryPendingMessagePressHandlersRef.current, activeIds);
   }, [pendingMessages]);
+
+  const inlineConversationSearchHighlightQuery = conversationSearchVisible
+    ? normalizedConversationSearchQuery
+    : '';
 
   // Render pending messages with visual indicators
   const renderPendingMessage = (tempId: string, pendingMsg: PendingMessage) => {
@@ -12072,9 +12029,6 @@ export default function Chat() {
   };
 
   const hasConversationSearchMatches = conversationSearchMatchIds.length > 0;
-  const inlineConversationSearchHighlightQuery = conversationSearchVisible
-    ? normalizedConversationSearchQuery
-    : '';
 
   // Keep this as a plain object because this section is after conditional returns.
   const chatReactiveContextValue: ChatReactiveContextValue = {
@@ -12102,6 +12056,10 @@ export default function Chat() {
     isConversationSearchHistoryLoading &&
     normalizedConversationSearchQuery.length > 0 &&
     !hasConversationSearchMatches;
+  const showConversationSearchNavControls =
+    normalizedConversationSearchQuery.length > 0 || showConversationSearchLoading;
+  const showConversationSearchTipsButton =
+    showKeyboardShortcuts && !showConversationSearchNavControls;
   const conversationSearchScopeSuggestions = resolveChatConversationSearchScopeSuggestions(
     conversationSearchScopeMatchCounts,
     conversationSearchScope,
@@ -12124,6 +12082,9 @@ export default function Chat() {
     return `Most matches: ${scopeLabel} (${conversationSearchBestScopeSuggestion.count})`;
   })();
   const conversationSearchKeyboardSuggestionHintLabel = (() => {
+    if (!showKeyboardShortcuts) {
+      return '';
+    }
     if (conversationSearchKeyboardSuggestionScope == null) {
       return '';
     }
@@ -12303,51 +12264,70 @@ export default function Chat() {
             </View>
 
             <View style={styles.conversationSearchActions}>
-              {showConversationSearchLoading && (
-                <ActivityIndicator size="small" color={theme.primary} style={styles.conversationSearchLoadingIndicator} />
+              {showConversationSearchTipsButton ? (
+                <TouchableOpacity
+                  onPress={openSearchShortcutTipsModal}
+                  style={[
+                    styles.conversationSearchTipsButton,
+                    { backgroundColor: theme.background, borderColor: theme.border },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Show search shortcut tips"
+                >
+                  <Info size={14} color={theme.textSecondary} />
+                  <Text style={[styles.conversationSearchTipsButtonText, { color: theme.textSecondary }]}>
+                    Shortcuts
+                  </Text>
+                </TouchableOpacity>
+              ) : (
+                <>
+                  {showConversationSearchLoading && (
+                    <ActivityIndicator size="small" color={theme.primary} style={styles.conversationSearchLoadingIndicator} />
+                  )}
+                  <Text
+                    style={[
+                      styles.conversationSearchCounter,
+                      { color: hasConversationSearchMatches ? theme.text : theme.textSecondary },
+                    ]}
+                  >
+                    {conversationSearchCounterLabel}
+                  </Text>
+                  <TouchableOpacity
+                    onPress={handleConversationSearchPrevious}
+                    disabled={!hasConversationSearchMatches}
+                    style={[
+                      styles.conversationSearchNavButton,
+                      {
+                        backgroundColor: theme.background,
+                        borderColor: theme.border,
+                        opacity: hasConversationSearchMatches ? 1 : 0.5,
+                      },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Previous search result"
+                  >
+                    <View style={styles.rotate180}>
+                      <ChevronDown size={14} color={theme.text} />
+                    </View>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={handleConversationSearchNext}
+                    disabled={!hasConversationSearchMatches}
+                    style={[
+                      styles.conversationSearchNavButton,
+                      {
+                        backgroundColor: theme.background,
+                        borderColor: theme.border,
+                        opacity: hasConversationSearchMatches ? 1 : 0.5,
+                      },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Next search result"
+                  >
+                    <ChevronDown size={14} color={theme.text} />
+                  </TouchableOpacity>
+                </>
               )}
-              <Text
-                style={[
-                  styles.conversationSearchCounter,
-                  { color: hasConversationSearchMatches ? theme.text : theme.textSecondary },
-                ]}
-              >
-                {conversationSearchCounterLabel}
-              </Text>
-              <TouchableOpacity
-                onPress={handleConversationSearchPrevious}
-                disabled={!hasConversationSearchMatches}
-                style={[
-                  styles.conversationSearchNavButton,
-                  {
-                    backgroundColor: theme.background,
-                    borderColor: theme.border,
-                    opacity: hasConversationSearchMatches ? 1 : 0.5,
-                  },
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel="Previous search result"
-              >
-                <View style={styles.rotate180}>
-                  <ChevronDown size={14} color={theme.text} />
-                </View>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={handleConversationSearchNext}
-                disabled={!hasConversationSearchMatches}
-                style={[
-                  styles.conversationSearchNavButton,
-                  {
-                    backgroundColor: theme.background,
-                    borderColor: theme.border,
-                    opacity: hasConversationSearchMatches ? 1 : 0.5,
-                  },
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel="Next search result"
-              >
-                <ChevronDown size={14} color={theme.text} />
-              </TouchableOpacity>
             </View>
           </View>
 
@@ -12389,7 +12369,7 @@ export default function Chat() {
                   ]}
                   accessibilityRole="button"
                   accessibilityLabel={
-                    Platform.OS === 'web'
+                    showKeyboardShortcuts
                       ? normalizedConversationSearchQuery
                         ? `Filter search by ${scopeOption.label}, ${scopeMatchCount} matches, shortcut Alt+Shift+${scopeShortcutKey}`
                         : `Filter search by ${scopeOption.label}, shortcut Alt+Shift+${scopeShortcutKey}`
@@ -12409,7 +12389,7 @@ export default function Chat() {
                     >
                       {scopeChipLabel}
                     </Text>
-                    {Platform.OS === 'web' ? (
+                    {showKeyboardShortcuts ? (
                       <View
                         style={[
                           styles.conversationSearchScopeChipShortcutBadge,
@@ -12443,15 +12423,6 @@ export default function Chat() {
               );
             })}
           </View>
-          {Platform.OS === 'web' ? (
-            <Text
-              allowFontScaling={false}
-              style={[styles.conversationSearchScopeHint, { color: theme.textSecondary }]}
-            >
-              Tip: Alt+Shift+A/T/F/R/M picks scopes; Alt+Shift+Up/Down cycles scopes; Alt+Shift+Left/Right cycles suggestion chips; Alt+Shift+Enter applies highlighted suggestion (or best); Alt+Shift+1-3 picks suggestions; Alt+Shift+L loads older; Alt+Shift+X clears query; Alt+Shift+0 or Backspace resets
-            </Text>
-          ) : null}
-
           {normalizedConversationSearchQuery.length > 0 && (
             <View style={styles.conversationSearchSnippetRow}>
               {conversationSearchActiveSnippet ? (
@@ -12655,7 +12626,7 @@ export default function Chat() {
                         const isKeyboardSuggestionActive =
                           conversationSearchKeyboardSuggestionScope === suggestion.scope;
                         const suggestionShortcutOrdinal = suggestionIndex + 1;
-                        const suggestionChipLabel = Platform.OS === 'web'
+                        const suggestionChipLabel = showKeyboardShortcuts
                           ? `${suggestionShortcutOrdinal}. ${suggestionScopeLabel} (${suggestion.count})`
                           : `${suggestionScopeLabel} (${suggestion.count})`;
 
@@ -12682,7 +12653,7 @@ export default function Chat() {
                             ]}
                             accessibilityRole="button"
                             accessibilityLabel={
-                              Platform.OS === 'web'
+                              showKeyboardShortcuts
                                 ? `Try ${suggestionScopeLabel} filter, ${suggestion.count} matches, shortcut Alt+Shift+${suggestionShortcutOrdinal}`
                                 : `Try ${suggestionScopeLabel} filter, ${suggestion.count} matches`
                             }
@@ -12866,6 +12837,103 @@ export default function Chat() {
         teamMember={selectedTeamMember}
         theme={theme}
       />
+
+      {showKeyboardShortcuts ? (
+        <Modal
+          visible={showSearchShortcutTipsModal}
+          transparent
+          animationType="fade"
+          onRequestClose={closeSearchShortcutTipsModal}
+        >
+          <Pressable
+            style={styles.searchShortcutTipsOverlay}
+            onPress={closeSearchShortcutTipsModal}
+          >
+            <Pressable
+              onPress={() => undefined}
+              style={[
+                styles.searchShortcutTipsCard,
+                { backgroundColor: theme.surface, borderColor: theme.border },
+              ]}
+            >
+              <View style={styles.searchShortcutTipsHeader}>
+                <View>
+                  <Text style={[styles.searchShortcutTipsTitle, { color: theme.text }]}>Search shortcuts</Text>
+                  <Text style={[styles.searchShortcutTipsSubtitle, { color: theme.textSecondary }]}>Web only</Text>
+                </View>
+                <TouchableOpacity
+                  onPress={closeSearchShortcutTipsModal}
+                  style={[styles.searchShortcutTipsCloseButton, { backgroundColor: theme.background }]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close shortcut tips"
+                >
+                  <X size={18} color={theme.text} />
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.searchShortcutTipsSection}>
+                <Text style={[styles.searchShortcutTipsSectionTitle, { color: theme.text }]}>Find & Navigate</Text>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Cmd/Ctrl + F</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Open search</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Enter</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Next match</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Shift + Enter</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Previous match</Text>
+                </View>
+              </View>
+
+              <View style={styles.searchShortcutTipsSection}>
+                <Text style={[styles.searchShortcutTipsSectionTitle, { color: theme.text }]}>Scopes</Text>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + A/T/F/R/M</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Pick scope</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + Up/Down</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Cycle scopes</Text>
+                </View>
+              </View>
+
+              <View style={styles.searchShortcutTipsSection}>
+                <Text style={[styles.searchShortcutTipsSectionTitle, { color: theme.text }]}>Suggestions</Text>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + Left/Right</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Cycle suggestions</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + 1/2/3</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Pick suggestion</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + Enter</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Apply suggestion</Text>
+                </View>
+              </View>
+
+              <View style={styles.searchShortcutTipsSection}>
+                <Text style={[styles.searchShortcutTipsSectionTitle, { color: theme.text }]}>Other</Text>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + L</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Load older</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + X</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Clear query</Text>
+                </View>
+                <View style={styles.searchShortcutTipsRow}>
+                  <Text style={[styles.searchShortcutTipsKey, { color: theme.text }]}>Alt + Shift + 0 / Backspace</Text>
+                  <Text style={[styles.searchShortcutTipsValue, { color: theme.textSecondary }]}>Reset all</Text>
+                </View>
+              </View>
+            </Pressable>
+          </Pressable>
+        </Modal>
+      ) : null}
 
       {selectedTeamMember && !isChatBootstrapGateDone && (
         <View style={[styles.loadingOverlay, { backgroundColor: theme.background, pointerEvents: 'auto', zIndex: 40 }]}> 
@@ -13084,6 +13152,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginLeft: 10,
   },
+  conversationSearchTipsButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  conversationSearchTipsButtonText: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+    marginLeft: 6,
+  },
   conversationSearchLoadingIndicator: {
     marginRight: 6,
   },
@@ -13140,15 +13221,76 @@ const styles = StyleSheet.create({
     fontFamily: 'Inter-Bold',
     lineHeight: 12,
   },
-  conversationSearchScopeHint: {
-    marginTop: 2,
-    paddingHorizontal: 2,
-    fontSize: 10,
-    fontFamily: 'Inter-Regular',
-  },
   conversationSearchSnippetRow: {
     marginTop: 5,
     paddingHorizontal: 2,
+  },
+  searchShortcutTipsOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(8, 12, 22, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  searchShortcutTipsCard: {
+    width: '100%',
+    maxWidth: 520,
+    borderRadius: 18,
+    borderWidth: 1,
+    padding: 18,
+    ...(Platform.OS === 'web'
+      ? ({ boxShadow: '0 18px 30px rgba(10, 10, 15, 0.28)' } as any)
+      : {
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 10 },
+          shadowOpacity: 0.25,
+          shadowRadius: 18,
+          elevation: 12,
+        }),
+  },
+  searchShortcutTipsHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  searchShortcutTipsTitle: {
+    fontSize: 18,
+    fontFamily: 'Poppins-SemiBold',
+  },
+  searchShortcutTipsSubtitle: {
+    marginTop: 2,
+    fontSize: 11,
+    fontFamily: 'Inter-Regular',
+  },
+  searchShortcutTipsCloseButton: {
+    borderRadius: 16,
+    padding: 8,
+  },
+  searchShortcutTipsSection: {
+    marginTop: 10,
+  },
+  searchShortcutTipsSectionTitle: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+    marginBottom: 6,
+  },
+  searchShortcutTipsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
+  searchShortcutTipsKey: {
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+  },
+  searchShortcutTipsValue: {
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+    marginLeft: 12,
+    textAlign: 'right',
+    flex: 1,
   },
   conversationSearchSnippetPressArea: {
     paddingVertical: 1,

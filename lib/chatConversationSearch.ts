@@ -143,12 +143,17 @@ function resolveMessageSearchSources(
   }
 
   const raw = message as Record<string, unknown>;
+  const replyContext =
+    raw.replyTo && typeof raw.replyTo === 'object'
+      ? (raw.replyTo as Record<string, unknown>)
+      : null;
+  const hasReplyContext = Boolean(replyContext);
   const seen = new Set<string>();
   const candidates: ChatConversationSearchSourceCandidate[] = [];
 
   pushSearchSourceCandidate(seen, candidates, 'text', raw.text);
-  pushSearchSourceCandidate(seen, candidates, 'reply', (raw.replyTo as Record<string, unknown> | undefined)?.text);
-  pushSearchSourceCandidate(seen, candidates, 'reply', (raw.replyTo as Record<string, unknown> | undefined)?.senderName);
+  pushSearchSourceCandidate(seen, candidates, 'reply', replyContext?.text);
+  pushSearchSourceCandidate(seen, candidates, 'reply', replyContext?.senderName);
 
   if (Array.isArray(raw.attachments)) {
     for (const attachment of raw.attachments) {
@@ -159,7 +164,6 @@ function resolveMessageSearchSources(
       const rawAttachment = attachment as Record<string, unknown>;
       pushSearchSourceCandidate(seen, candidates, 'attachment', rawAttachment.fileName);
       pushSearchSourceCandidate(seen, candidates, 'attachment', rawAttachment.fileType);
-      pushSearchSourceCandidate(seen, candidates, 'attachment', rawAttachment.url);
     }
   }
 
@@ -177,7 +181,6 @@ function resolveMessageSearchSources(
 
   pushSearchSourceCandidate(seen, candidates, 'file', raw.fileName);
   pushSearchSourceCandidate(seen, candidates, 'file', raw.fileType);
-  pushSearchSourceCandidate(seen, candidates, 'file', raw.fileUrl);
   pushSearchSourceCandidate(seen, candidates, 'sender', raw.senderName);
   pushSearchSourceCandidate(seen, candidates, 'sender', raw.sender);
 
@@ -193,7 +196,7 @@ function resolveMessageSearchSources(
       case 'attachment':
         return candidate.type === 'attachment' || candidate.type === 'file';
       case 'reply':
-        return candidate.type === 'reply';
+        return hasReplyContext;
       case 'media':
         return (
           candidate.type === 'attachment' ||
@@ -472,6 +475,8 @@ export function resolveChatConversationSearchScopeMatchCounts(
       continue;
     }
 
+    const rawMessage = message as Record<string, unknown>;
+    const hasReplyContext = Boolean(rawMessage.replyTo && typeof rawMessage.replyTo === 'object');
     const matchedScopes: Record<ChatConversationSearchScope, boolean> = {
       all: false,
       text: false,
@@ -492,6 +497,9 @@ export function resolveChatConversationSearchScopeMatchCounts(
       switch (candidate.type) {
         case 'text':
           matchedScopes.text = true;
+          if (hasReplyContext) {
+            matchedScopes.reply = true;
+          }
           break;
         case 'reply':
           matchedScopes.reply = true;
@@ -500,10 +508,21 @@ export function resolveChatConversationSearchScopeMatchCounts(
         case 'file':
           matchedScopes.attachment = true;
           matchedScopes.media = true;
+          if (hasReplyContext) {
+            matchedScopes.reply = true;
+          }
           break;
         case 'sticker':
         case 'gif':
           matchedScopes.media = true;
+          if (hasReplyContext) {
+            matchedScopes.reply = true;
+          }
+          break;
+        case 'sender':
+          if (hasReplyContext) {
+            matchedScopes.reply = true;
+          }
           break;
         default:
           break;
