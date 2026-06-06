@@ -660,14 +660,14 @@ const SafeAreaWebTopOverride = ({
 }) => {
   const insets = useSafeAreaInsets();
 
-  if (!shouldOverride) {
-    return <>{children}</>;
-  }
-
   const adjustedInsets = useMemo(
     () => ({ ...insets, top: 0, bottom: 0, left: 0, right: 0 }),
     [insets]
   );
+
+  if (!shouldOverride) {
+    return <>{children}</>;
+  }
 
   return (
     <SafeAreaInsetsContext.Provider value={adjustedInsets}>

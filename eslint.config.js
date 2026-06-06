@@ -7,6 +7,13 @@ module.exports = defineConfig([
   {
     ignores: ["dist/*"],
   },
+  {
+    settings: {
+      'import/parsers': {
+        '@typescript-eslint/parser': ['.ts', '.tsx'],
+      },
+    },
+  },
   // Limit these relaxations to the UI code where they are currently very noisy.
   // Keeps lint output clean without weakening rules for scripts/backends.
   {

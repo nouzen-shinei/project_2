@@ -8,7 +8,6 @@ import {
   TouchableOpacity,
   Pressable,
   Platform,
-  ActivityIndicator,
   PanResponder,
   Image,
   GestureResponderEvent,
@@ -41,11 +40,20 @@ import {
   resolveProgressPercentText,
 } from '@/lib/uploadProgressDisplayEasing';
 import { useEvent } from 'expo';
-import { useVideoPlayer, VideoView, type VideoSource, type VideoPlayer as ExpoVideoPlayer } from 'expo-video';
+import {
+  useVideoPlayer,
+  VideoView,
+  type VideoSource,
+  type VideoPlayer as ExpoVideoPlayer,
+  type VideoPlayerStatus,
+} from 'expo-video';
+import Reanimated, { useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
 import { ShareModal } from './ShareModal';
 import { chatCacheService } from '../services/chatCacheService';
 import * as Haptics from 'expo-haptics';
 import { DEFAULT_SEEK_STEP_SECONDS, useVideoSeekConfig } from '../hooks/useVideoSeekConfig';
+import { useVideoPlaybackUxState } from '@/hooks/useVideoPlaybackUxState';
+import { VideoBufferingOverlay } from './VideoBufferingOverlay';
 
 const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 const MAX_THUMBNAIL_DIMENSION = 640;
@@ -86,6 +94,30 @@ const captureFrameFromElement = (element: any): string | null => {
     return canvas.toDataURL('image/jpeg', 0.8);
   } catch (error) {
     logger.debug?.('VideoPlayer: failed to capture frame from video element', error);
+    return null;
+  }
+};
+
+const resolveBufferedPercentFromElement = (element: HTMLVideoElement | null): number | null => {
+  if (!element) {
+    return null;
+  }
+  const duration = element.duration;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return null;
+  }
+  try {
+    const buffered = element.buffered;
+    if (!buffered || buffered.length === 0) {
+      return null;
+    }
+    const end = buffered.end(buffered.length - 1);
+    if (!Number.isFinite(end)) {
+      return null;
+    }
+    return clamp((end / duration) * 100, 0, 100);
+  } catch (error) {
+    logger.debug?.('VideoPlayer: failed to resolve buffered percent', error);
     return null;
   }
 };
@@ -666,6 +698,7 @@ interface VideoPlayerLoadedProps {
   onResolvedUriChange?: (uri: string | null) => void;
   onDurationChange?: (duration: number | null) => void;
   onPreviewAvailable?: (uri: string) => void;
+  posterUri?: string | null;
   controlVariant: 'full' | 'minimal';
   cacheKey: string;
   initialPlaybackPosition: number;
@@ -779,6 +812,7 @@ function VideoPlayer({
   useEffect(() => {
     if (hydratedKeyRef.current === cacheKey) {
       if (thumbnailUrl) {
+        setPreviewUri((prev) => (prev === thumbnailUrl ? prev : thumbnailUrl));
       }
       if ((forceImmediateLoad || autoPlay || !isWeb) && !shouldLoadVideo) {
         setShouldLoadVideo(true);
@@ -900,6 +934,10 @@ function VideoPlayer({
       return;
     }
 
+    if (shouldLoadVideo || autoPlay) {
+      return;
+    }
+
     const candidate = resolvedVideoUri || uri;
     if (!candidate || attemptedPreviewSources.current.has(candidate)) {
       return;
@@ -921,11 +959,11 @@ function VideoPlayer({
     return () => {
       cancelled = true;
     };
-  }, [previewUri, resolvedVideoUri, uri]);
+  }, [autoPlay, previewUri, resolvedVideoUri, shouldLoadVideo, uri]);
 
   const renderPlaceholder = () => {
-    const showPreviewImage = isWeb && !!previewUri;
-    const showPreviewBadge = isWeb && !showPreviewImage;
+    const showPreviewImage = !!previewUri;
+    const showPreviewBadge = !showPreviewImage;
 
     return (
       <TouchableOpacity
@@ -947,7 +985,7 @@ function VideoPlayer({
                   {showPreviewBadge ? (
                     <View style={styles.placeholderBadge}>
                       <Clapperboard size={16} color="white" />
-                      <Text style={styles.placeholderBadgeText}>No preview yet</Text>
+                      <Text style={styles.placeholderBadgeText}>Preview unavailable</Text>
                     </View>
                   ) : null}
                 </View>
@@ -969,7 +1007,7 @@ function VideoPlayer({
                 <Play size={36} color="white" />
               </TouchableOpacity>
 
-              <Text style={styles.placeholderHint}>Tap to load video</Text>
+              <Text style={styles.placeholderHint}>Tap to play</Text>
             </>
           ) : (
             <TouchableOpacity
@@ -998,6 +1036,7 @@ function VideoPlayer({
       onResolvedUriChange={setResolvedVideoUri}
       onDurationChange={setDisplayDuration}
       onPreviewAvailable={handlePreviewAvailable}
+      posterUri={previewUri}
       controlVariant={controlVariant}
       cacheKey={cacheKey}
       initialPlaybackPosition={cachedInitialPosition}
@@ -1067,6 +1106,7 @@ function VideoPlayerLoaded({
   onResolvedUriChange,
   onDurationChange,
   onPreviewAvailable,
+  posterUri,
   controlVariant,
   cacheKey,
   initialPlaybackPosition,
@@ -1087,6 +1127,12 @@ function VideoPlayerLoaded({
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [pendingPlayRequest, setPendingPlayRequest] = useState(autoPlay || initialWasPlaying);
+  const [webStatus, setWebStatus] = useState<VideoPlayerStatus>('idle');
+  const [webBufferedPercent, setWebBufferedPercent] = useState<number | null>(null);
+  const [webIsBuffering, setWebIsBuffering] = useState(false);
+  const [webIsStalled, setWebIsStalled] = useState(false);
+  const [webPlaybackError, setWebPlaybackError] = useState<string | null>(null);
+  const [webEnded, setWebEnded] = useState(false);
   const videoRef = useRef<any>(null);
   const videoViewRef = useRef<React.ElementRef<typeof VideoView> | null>(null);
   const playbackIdRef = useRef<string>(createPlaybackId());
@@ -1114,6 +1160,10 @@ function VideoPlayerLoaded({
   const pauseRequestedRef = useRef(false);
   const lastCacheSyncRef = useRef(0);
   const pendingCacheSyncRef = useRef<number | null>(null);
+  const lastResumeAttemptRef = useRef(0);
+  const readyOpacity = useSharedValue(0);
+  const controlsOpacity = useRef(new Animated.Value(showControlsProp ? 1 : 0)).current;
+  const controlsScale = useRef(new Animated.Value(1)).current;
   const normalizedProgress = useEasedDownloadProgressPercent(
     downloadProgress,
     isDownloading
@@ -1135,6 +1185,18 @@ function VideoPlayerLoaded({
 
   useEffect(() => {
     resolvedUriRef.current = resolvedUri;
+  }, [resolvedUri]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    setWebStatus('loading');
+    setWebPlaybackError(null);
+    setWebEnded(false);
+    setWebBufferedPercent(null);
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
   }, [resolvedUri]);
 
   useEffect(() => {
@@ -1326,7 +1388,12 @@ function VideoPlayerLoaded({
     currentLiveTimestamp: null,
     currentOffsetFromLive: null,
   });
-  const { status } = useEvent(player, 'statusChange', { status: player.status });
+  const statusEvent = useEvent(player, 'statusChange', {
+    status: player.status,
+    oldStatus: undefined,
+  });
+  const status = statusEvent?.status ?? player.status;
+  const statusError = statusEvent?.error ?? null;
   const playbackRateChange = useEvent(player, 'playbackRateChange', {
     playbackRate: player.playbackRate ?? 1,
   });
@@ -1542,14 +1609,21 @@ function VideoPlayerLoaded({
   useEffect(() => {
     let cancelled = false;
 
+    const applyResolvedUri = (nextUri: string, patch?: Partial<VideoSourceCacheEntry>) => {
+      if (!nextUri) {
+        return;
+      }
+      setResolvedUri((prev) => (prev === nextUri ? prev : nextUri));
+      onResolvedUriChange?.(nextUri);
+      if (cacheKeyRef.current) {
+        patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: nextUri, ...patch });
+      }
+    };
+
     if (initialResolvedUri) {
       setResolving(false);
       setIsLoadingSafe(false);
-      onResolvedUriChange?.(initialResolvedUri);
-      patchVideoCacheEntry(cacheKeyRef.current, {
-        resolvedUri: initialResolvedUri,
-        lastPosition: initialPositionRef.current,
-      });
+      applyResolvedUri(initialResolvedUri, { lastPosition: initialPositionRef.current });
       return () => {
         cancelled = true;
       };
@@ -1559,17 +1633,12 @@ function VideoPlayerLoaded({
     setCurrentTimeSafe(0);
     setDurationSafe(0);
     updateDuration(null);
-    setResolving(true);
-    onResolvedUriChange?.(null);
+    setResolving(false);
+    applyResolvedUri(uri);
 
     (async () => {
       try {
         if (uri.startsWith('data:')) {
-          if (!cancelled) {
-            setResolvedUri(uri);
-            onResolvedUriChange?.(uri);
-            patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: uri });
-          }
           return;
         }
 
@@ -1578,26 +1647,26 @@ function VideoPlayerLoaded({
         if (cancelled) {
           return;
         }
-        const finalUri = localUri || uri;
-        setResolvedUri(finalUri);
-        onResolvedUriChange?.(finalUri);
-        patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: finalUri });
-        if (/^https?:/i.test(uri) && finalUri === uri) {
+
+        if (localUri) {
+          const canSwapSource = currentTimeRef.current <= 0.1;
+          if (canSwapSource) {
+            applyResolvedUri(localUri);
+          } else if (cacheKeyRef.current) {
+            patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: localUri });
+          }
+        }
+
+        if (/^https?:/i.test(uri) && !localUri) {
           chatCacheService
             .getMediaForDownload(uri, fileName, hint, 'low')
             .catch((error) => logger.debug?.('VideoPlayer: background cache warm failed', error));
         }
       } catch (error) {
         logger.debug?.('VideoPlayer: failed to resolve cached media', error);
-        if (!cancelled) {
-          setResolvedUri(uri);
-          onResolvedUriChange?.(uri);
-          patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: uri });
-        }
       } finally {
         if (!cancelled) {
           setResolving(false);
-          setIsLoadingSafe(false);
         }
       }
     })();
@@ -1678,10 +1747,15 @@ function VideoPlayerLoaded({
       try {
         if (isPlaying) {
           player.pause();
+          intendedPlayingRef.current = false;
+          setPendingPlayRequest(false);
+          syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
         } else {
           pauseOtherVideos(playbackIdRef.current);
           restartIfEnded();
           player.play();
+          intendedPlayingRef.current = true;
+          syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: true });
         }
       } catch (error) {
         logger.debug?.('VideoPlayer: togglePlayPause error', error);
@@ -1690,6 +1764,73 @@ function VideoPlayerLoaded({
     setIsPlayingSafe(!isPlaying);
     setShowControlsVisible(true);
   };
+
+  const handleRetry = useCallback(() => {
+    if (!resolvedUri) {
+      return;
+    }
+    setIsLoadingSafe(true);
+    setWebPlaybackError(null);
+    setWebEnded(false);
+    setWebStatus('loading');
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    intendedPlayingRef.current = true;
+    pauseRequestedRef.current = false;
+    setPendingPlayRequest(true);
+
+    if (Platform.OS === 'web' && videoRef.current) {
+      try {
+        videoRef.current.load();
+        const playPromise = videoRef.current.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => undefined);
+        }
+      } catch (error) {
+        logger.debug?.('VideoPlayer: web retry failed', error);
+      }
+      return;
+    }
+
+    try {
+      const replace = (player as unknown as { replaceAsync?: (source: VideoSource) => Promise<void> }).replaceAsync;
+      if (typeof replace === 'function') {
+        void replace({ uri: resolvedUri });
+      } else {
+        player.replace({ uri: resolvedUri }, true);
+      }
+    } catch (error) {
+      logger.debug?.('VideoPlayer: native retry failed', error);
+    }
+  }, [player, resolvedUri, setIsLoadingSafe]);
+
+  const handleReplay = useCallback(() => {
+    setWebEnded(false);
+    restartIfEnded();
+    if (Platform.OS === 'web' && videoRef.current) {
+      try {
+        pauseOtherVideos(playbackIdRef.current);
+        const playPromise = videoRef.current.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => undefined);
+        }
+        setIsPlayingSafe(true);
+      } catch (error) {
+        logger.debug?.('VideoPlayer: web replay failed', error);
+      }
+    } else if (Platform.OS !== 'web') {
+      try {
+        pauseOtherVideos(playbackIdRef.current);
+        player.play();
+        setIsPlayingSafe(true);
+      } catch (error) {
+        logger.debug?.('VideoPlayer: native replay failed', error);
+      }
+    }
+    intendedPlayingRef.current = true;
+    pauseRequestedRef.current = false;
+    setShowControlsVisible(true);
+  }, [player, restartIfEnded, setIsPlayingSafe]);
 
   const toggleMute = () => {
     if (Platform.OS === 'web' && videoRef.current) {
@@ -1741,6 +1882,19 @@ function VideoPlayerLoaded({
     [duration, player, setCurrentTimeSafe, syncPlaybackCache]
   );
 
+  const updateWebBufferedPercent = useCallback(() => {
+    const nextBuffered = resolveBufferedPercentFromElement(videoRef.current as HTMLVideoElement | null);
+    if (nextBuffered == null) {
+      return;
+    }
+    setWebBufferedPercent((prev) => {
+      if (prev != null && Math.abs(prev - nextBuffered) < 0.6) {
+        return prev;
+      }
+      return nextBuffered;
+    });
+  }, []);
+
   const handleTimeUpdate = () => {
     if (Platform.OS === 'web' && videoRef.current) {
       const nextTime = videoRef.current.currentTime;
@@ -1748,6 +1902,7 @@ function VideoPlayerLoaded({
         currentTimeRef.current = nextTime;
       }
       setCurrentTimeSafe(nextTime);
+      updateWebBufferedPercent();
 
       if (Number.isFinite(nextTime)) {
         const key = cacheKeyRef.current;
@@ -1826,10 +1981,61 @@ function VideoPlayerLoaded({
         }
       }
       setIsLoadingSafe(false);
+      setWebStatus('readyToPlay');
+      setWebPlaybackError(null);
+      setWebEnded(false);
       seekToInitialPosition();
       tryFulfillPendingPlay();
     }
   };
+
+  const handleWebLoadStart = useCallback(() => {
+    setIsLoadingSafe(true);
+    setWebStatus('loading');
+    setWebPlaybackError(null);
+    setWebEnded(false);
+  }, [setIsLoadingSafe]);
+
+  const handleWebCanPlay = useCallback(() => {
+    setWebStatus('readyToPlay');
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    setIsLoadingSafe(false);
+    tryFulfillPendingPlay();
+  }, [setIsLoadingSafe, tryFulfillPendingPlay]);
+
+  const handleWebWaiting = useCallback(() => {
+    setWebIsBuffering(true);
+  }, []);
+
+  const handleWebStalled = useCallback(() => {
+    setWebIsStalled(true);
+    setWebIsBuffering(true);
+  }, []);
+
+  const handleWebPlaying = useCallback(() => {
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    setWebStatus('readyToPlay');
+    setIsLoadingSafe(false);
+  }, [setIsLoadingSafe]);
+
+  const handleWebError = useCallback(() => {
+    setWebPlaybackError('Playback failed');
+    setWebStatus('error');
+    setIsLoadingSafe(false);
+  }, [setIsLoadingSafe]);
+
+  const handleWebEnded = useCallback(() => {
+    setWebEnded(true);
+    intendedPlayingRef.current = false;
+    pauseRequestedRef.current = false;
+    setIsPlayingSafe(false);
+  }, [setIsPlayingSafe]);
+
+  const handleWebProgress = useCallback(() => {
+    updateWebBufferedPercent();
+  }, [updateWebBufferedPercent]);
 
   const handleInlineWebSeeked = useCallback(() => {
     if (!videoRef.current) {
@@ -1857,10 +2063,17 @@ function VideoPlayerLoaded({
     intendedPlayingRef.current = true;
     pauseRequestedRef.current = false;
     setIsPlayingSafe(true);
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    setWebEnded(false);
+    setWebStatus('readyToPlay');
+    setWebPlaybackError(null);
   }, [setIsPlayingSafe]);
 
   const handleInlineWebPause = useCallback(() => {
     setIsPlayingSafe(false);
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
     if (pauseRequestedRef.current) {
       intendedPlayingRef.current = false;
       pauseRequestedRef.current = false;
@@ -2356,14 +2569,38 @@ function VideoPlayerLoaded({
       ? duration || durationRef.current || 0
       : player.duration || duration || durationRef.current || 0;
 
+  // Centralize playback UX state so inline/fullscreen overlays stay in sync across platforms.
+  const playbackUxState = useVideoPlaybackUxState({
+    status: Platform.OS === 'web' ? webStatus : status,
+    isLoading: isLoading || resolving,
+    isPlaying,
+    intendedPlaying: intendedPlayingRef.current,
+    duration: effectiveDuration,
+    currentTime,
+    bufferedPosition:
+      Platform.OS === 'web' ? null : timeUpdate?.bufferedPosition ?? player.bufferedPosition ?? null,
+    bufferedPercentOverride: Platform.OS === 'web' ? webBufferedPercent : null,
+    isSeeking: isDraggingProgress,
+    hasResolvedUri: !!resolvedUri,
+    error: Platform.OS === 'web' ? webPlaybackError : statusError?.message ?? null,
+    ended: Platform.OS === 'web' ? webEnded : undefined,
+    externalBuffering: Platform.OS === 'web' ? webIsBuffering : undefined,
+    externalStalled: Platform.OS === 'web' ? webIsStalled : undefined,
+  });
+
   const progressPercentage =
     effectiveDuration > 0 && Number.isFinite(currentTime)
       ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100))
       : 0;
+  const bufferedPercentage = Math.min(
+    100,
+    Math.max(progressPercentage, playbackUxState.bufferedPercent ?? 0)
+  );
 
-  const shouldShowLoading = isLoading || resolving || !resolvedUri || !(effectiveDuration > 0);
-  const shouldShowControls = showControlsProp && showControlsVisible && !shouldShowLoading;
-  const disableSpeedControl = shouldShowLoading || !resolvedUri;
+  const shouldLockControls =
+    playbackUxState.isInitialLoading || playbackUxState.isError || playbackUxState.isEnded;
+  const shouldShowControls = showControlsProp && showControlsVisible && !shouldLockControls;
+  const disableSpeedControl = shouldLockControls || !resolvedUri;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
@@ -2372,7 +2609,8 @@ function VideoPlayerLoaded({
     [seekStepSeconds]
   );
 
-  const seekGestureEnabled = !shouldShowLoading && !isDraggingProgress;
+  const seekGestureEnabled =
+    !shouldLockControls && !playbackUxState.isBuffering && !playbackUxState.isStalled && !isDraggingProgress;
   const { overlayState, overlayAnimatedStyle, handleSeekTap, handleKeyboardSeek, handleAccessibilityAction } =
     useSeekGesture({
       enabled: seekGestureEnabled,
@@ -2380,6 +2618,69 @@ function VideoPlayerLoaded({
       onSingleTap: handleSingleTap,
       onSeekBySeconds: seekBySeconds,
     });
+
+  useEffect(() => {
+    readyOpacity.value = 0;
+  }, [readyOpacity, resolvedUri]);
+
+  useEffect(() => {
+    if (playbackUxState.isReady) {
+      readyOpacity.value = withTiming(1, { duration: 240 });
+    }
+  }, [playbackUxState.isReady, readyOpacity]);
+
+  const readyAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: readyOpacity.value,
+    transform: [{ scale: 0.985 + 0.015 * readyOpacity.value }],
+  }));
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(controlsOpacity, {
+        toValue: shouldShowControls ? 1 : 0,
+        duration: shouldShowControls ? 180 : 140,
+        useNativeDriver: true,
+      }),
+      Animated.spring(controlsScale, {
+        toValue: shouldShowControls ? 1 : 0.98,
+        speed: 18,
+        bounciness: 4,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [controlsOpacity, controlsScale, shouldShowControls]);
+
+  useEffect(() => {
+    if (!playbackUxState.isReady || playbackUxState.isBuffering || playbackUxState.isStalled) {
+      return;
+    }
+    if (!intendedPlayingRef.current || isPlaying) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastResumeAttemptRef.current < 900) {
+      return;
+    }
+    lastResumeAttemptRef.current = now;
+
+    if (Platform.OS === 'web' && videoRef.current) {
+      try {
+        const playPromise = videoRef.current.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => undefined);
+        }
+      } catch (error) {
+        logger.debug?.('VideoPlayer: resume after buffering failed', error);
+      }
+      return;
+    }
+
+    try {
+      player.play();
+    } catch (error) {
+      logger.debug?.('VideoPlayer: resume after buffering failed', error);
+    }
+  }, [isPlaying, playbackUxState.isBuffering, playbackUxState.isReady, playbackUxState.isStalled, player]);
 
   const handleKeyboardShortcut = useCallback(
     (event: any) => {
@@ -2592,62 +2893,98 @@ function VideoPlayerLoaded({
           } as any)
         : {})}
     >
-      <video
-        ref={videoRef}
-        src={resolvedUri}
-        style={{ width: '100%', height: '100%', backgroundColor: '#000', borderRadius: 8, outline: 'none' }}
-        onMouseDown={(event) => event.preventDefault?.()}
-        onTimeUpdate={handleTimeUpdate}
-        onSeeked={handleInlineWebSeeked}
-        onLoadedMetadata={handleLoadedMetadata}
-        onPlay={handleInlineWebPlay}
-        onPause={handleInlineWebPause}
-        muted={isMuted}
-        playsInline
-        preload="auto"
-        tabIndex={-1}
-      />
+      <Reanimated.View style={[styles.inlineVideoSurface, readyAnimatedStyle]}>
+        <video
+          ref={videoRef}
+          src={resolvedUri}
+          style={{ width: '100%', height: '100%', backgroundColor: '#000', outline: 'none' }}
+          onMouseDown={(event) => event.preventDefault?.()}
+          onLoadStart={handleWebLoadStart}
+          onCanPlay={handleWebCanPlay}
+          onCanPlayThrough={handleWebCanPlay}
+          onWaiting={handleWebWaiting}
+          onStalled={handleWebStalled}
+          onPlaying={handleWebPlaying}
+          onError={handleWebError}
+          onEnded={handleWebEnded}
+          onProgress={handleWebProgress}
+          onTimeUpdate={handleTimeUpdate}
+          onSeeked={handleInlineWebSeeked}
+          onLoadedMetadata={handleLoadedMetadata}
+          onPlay={handleInlineWebPlay}
+          onPause={handleInlineWebPause}
+          muted={isMuted}
+          playsInline
+          preload="auto"
+          tabIndex={-1}
+        />
+      </Reanimated.View>
       {renderSeekGestureLayer()}
-      {renderLoadingOverlay()}
+      {renderPlaybackOverlay()}
       {renderControlsOverlay()}
     </View>
   );
 
-  const renderLoadingOverlay = () => {
-    if (!shouldShowLoading) {
-      return null;
-    }
+  const renderPlaybackOverlay = () => {
+    const overlayPhase =
+      playbackUxState.phase === 'ready' || playbackUxState.phase === 'idle'
+        ? 'loading'
+        : playbackUxState.phase;
+    const showPoster =
+      !!posterUri && (playbackUxState.isInitialLoading || playbackUxState.isBuffering || playbackUxState.isStalled);
 
     return (
-      <View style={styles.loadingOverlay}>
-        <View style={styles.loadingBadge}>
-          <View style={styles.loadingBadgeRow}>
-            <ActivityIndicator size="small" color={theme.primary} />
-            <Text style={[styles.loadingBadgeText, { color: '#B4C0CF' }]}>Preparing video</Text>
-          </View>
-          <Text style={[styles.loadingBadgeSubtext, { color: theme.textSecondary }]}>Setting up playback...</Text>
-        </View>
-      </View>
+      <>
+        {showPoster ? (
+          <Image
+            source={{ uri: posterUri as string }}
+            style={styles.bufferingPoster}
+            resizeMode="cover"
+            blurRadius={Platform.OS === 'web' ? 0 : 8}
+          />
+        ) : null}
+        <VideoBufferingOverlay
+          visible={playbackUxState.showOverlay}
+          phase={overlayPhase}
+          title={playbackUxState.statusLabel}
+          subtitle={playbackUxState.statusDetail}
+          bufferedPercent={playbackUxState.bufferedPercent}
+          accentColor={theme.primary}
+          variant="inline"
+          showSpinner={playbackUxState.showSpinner}
+          showPercent={playbackUxState.showPercent}
+          onRetry={playbackUxState.isError ? handleRetry : undefined}
+          onReplay={playbackUxState.isEnded ? handleReplay : undefined}
+        />
+      </>
     );
   };
 
   const renderControlsOverlay = () => {
-    if (!shouldShowControls) {
+    if (!showControlsProp) {
       return null;
     }
+    const overlayPointerEvents = shouldShowControls ? 'box-none' : 'none';
+    const overlayAnimatedStyle = {
+      opacity: controlsOpacity,
+      transform: [{ scale: controlsScale }],
+    };
 
     if (isMinimalControls) {
       return (
-        <View style={[styles.controlsOverlay, styles.controlsOverlayMinimal]} pointerEvents="box-none">
+        <Animated.View
+          style={[styles.controlsOverlay, styles.controlsOverlayMinimal, overlayAnimatedStyle]}
+          pointerEvents={overlayPointerEvents}
+        >
           <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={togglePlayPause}>
             {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
           </TouchableOpacity>
-        </View>
+        </Animated.View>
       );
     }
 
     return (
-      <View style={styles.controlsOverlay} pointerEvents="box-none">
+      <Animated.View style={[styles.controlsOverlay, overlayAnimatedStyle]} pointerEvents={overlayPointerEvents}>
         <View style={styles.topControls} pointerEvents="box-none">
           <TouchableOpacity
             style={styles.controlButton}
@@ -2678,6 +3015,7 @@ function VideoPlayerLoaded({
                 {...progressPanResponder.panHandlers}
               >
                 <View style={styles.progressBar}>
+                  <View style={[styles.progressBuffered, { width: `${bufferedPercentage}%` }]} />
                   <View style={[styles.progressFill, { width: `${progressPercentage}%` }]} />
                   <View
                     style={[
@@ -2742,24 +3080,26 @@ function VideoPlayerLoaded({
             </View>
           </View>
         </View>
-      </View>
+      </Animated.View>
     );
   };
 
   const renderNativeVideoSurface = () => (
     <View style={styles.inlineVideoWrapper}>
-      <VideoView
-        ref={videoViewRef as any}
-        style={styles.inlineVideoSurface}
-        player={player as unknown as any}
-        nativeControls={false}
-        allowsPictureInPicture
-        allowsFullscreen
-        contentFit="contain"
-        {...(Platform.OS === 'android' ? { surfaceType: 'textureView' as const } : {})}
-      />
+      <Reanimated.View style={[styles.inlineVideoSurface, readyAnimatedStyle]}>
+        <VideoView
+          ref={videoViewRef as any}
+          style={StyleSheet.absoluteFillObject}
+          player={player as unknown as any}
+          nativeControls={false}
+          allowsPictureInPicture
+          allowsFullscreen
+          contentFit="contain"
+          {...(Platform.OS === 'android' ? { surfaceType: 'textureView' as const } : {})}
+        />
+      </Reanimated.View>
       {renderSeekGestureLayer()}
-      {renderLoadingOverlay()}
+      {renderPlaybackOverlay()}
       {renderControlsOverlay()}
     </View>
   );
@@ -2845,6 +3185,11 @@ function FullscreenVideoModal({
   const appStateRef = useRef<AppStateStatus>(AppState.currentState ?? 'active');
   const backgroundSnapshotRef = useRef<{ time: number; wasPlaying: boolean } | null>(null);
   const pendingRestoreRef = useRef(false);
+  const intendedPlayingRef = useRef(wasPlaying);
+  const readyOpacity = useSharedValue(0);
+  const controlsOpacity = useRef(new Animated.Value(1)).current;
+  const controlsScale = useRef(new Animated.Value(1)).current;
+  const lastResumeAttemptRef = useRef(0);
 
   const setIsPlayingSafe = useCallback((next: boolean) => {
     setIsPlaying((prev) => (prev === next ? prev : next));
@@ -2902,6 +3247,7 @@ function FullscreenVideoModal({
     } catch (error) {
       logger.debug?.('FullscreenVideoModal: pause other video failed', error);
     }
+    intendedPlayingRef.current = false;
     setIsPlayingSafe(false);
   }, [player, setIsPlayingSafe]);
 
@@ -2916,7 +3262,12 @@ function FullscreenVideoModal({
     currentLiveTimestamp: null,
     currentOffsetFromLive: null,
   });
-  const { status } = useEvent(player, 'statusChange', { status: player.status });
+  const statusEvent = useEvent(player, 'statusChange', {
+    status: player.status,
+    oldStatus: undefined,
+  });
+  const status = statusEvent?.status ?? player.status;
+  const statusError = statusEvent?.error ?? null;
   const playbackRateChange = useEvent(player, 'playbackRateChange', {
     playbackRate: player.playbackRate ?? initialSpeed ?? 1,
   });
@@ -2983,9 +3334,11 @@ function FullscreenVideoModal({
         pauseOtherVideos(playbackIdRef.current);
         player.play();
         setIsPlayingSafe(true);
+        intendedPlayingRef.current = true;
       } catch (error) {
         logger.debug?.('FullscreenVideoModal: resume after background failed', error);
         setIsPlayingSafe(false);
+        intendedPlayingRef.current = false;
       }
     }
 
@@ -3001,7 +3354,9 @@ function FullscreenVideoModal({
     setPlaybackSpeed(initialSpeed);
     setCurrentTimeSafe(startTime);
     setShowControls(true);
-  }, [initialMuted, initialSpeed, setCurrentTimeSafe, setIsPlayingSafe, sourceUri, startTime, wasPlaying]);
+    intendedPlayingRef.current = wasPlaying;
+    readyOpacity.value = 0;
+  }, [initialMuted, initialSpeed, readyOpacity, setCurrentTimeSafe, setIsPlayingSafe, sourceUri, startTime, wasPlaying]);
 
   useEffect(() => {
     applyPlaybackRate(playbackSpeed);
@@ -3162,6 +3517,18 @@ function FullscreenVideoModal({
   }, [player]);
 
   const effectiveDuration = player.duration || duration || 0;
+  const playbackUxState = useVideoPlaybackUxState({
+    status,
+    isLoading,
+    isPlaying,
+    intendedPlaying: intendedPlayingRef.current,
+    duration: effectiveDuration,
+    currentTime,
+    bufferedPosition: timeUpdate?.bufferedPosition ?? player.bufferedPosition ?? null,
+    isSeeking: isDraggingProgress,
+    hasResolvedUri: true,
+    error: statusError?.message ?? null,
+  });
   const progressPercentage =
     effectiveDuration > 0 && Number.isFinite(currentTime)
       ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100))
@@ -3314,15 +3681,18 @@ function FullscreenVideoModal({
         logger.debug?.('FullscreenVideoModal: pause error', error);
       }
       setIsPlayingSafe(false);
+      intendedPlayingRef.current = false;
     } else {
       restartIfEnded();
       try {
         pauseOtherVideos(playbackIdRef.current);
         player.play();
         setIsPlayingSafe(true);
+        intendedPlayingRef.current = true;
       } catch (error) {
         logger.debug?.('FullscreenVideoModal: play error', error);
         setIsPlayingSafe(false);
+        intendedPlayingRef.current = false;
       }
     }
     setShowControls(true);
@@ -3366,20 +3736,68 @@ function FullscreenVideoModal({
     [seekStepSeconds]
   );
 
-  const shouldShowLoading = isLoading || !(effectiveDuration > 0);
-  const shouldShowControls = showControls && !shouldShowLoading;
-  const disableSpeedControl = shouldShowLoading;
+  const shouldLockControls =
+    playbackUxState.isInitialLoading || playbackUxState.isError || playbackUxState.isEnded;
+  const shouldShowControls = showControls && !shouldLockControls;
+  const disableSpeedControl = shouldLockControls;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
 
-  const seekGestureEnabled = !shouldShowLoading && !isDraggingProgress;
+  const seekGestureEnabled =
+    !shouldLockControls && !playbackUxState.isBuffering && !playbackUxState.isStalled && !isDraggingProgress;
   const { overlayState, overlayAnimatedStyle, handleSeekTap, handleAccessibilityAction } = useSeekGesture({
     enabled: seekGestureEnabled,
     stepSeconds: seekStepSeconds,
     onSingleTap: handleSingleTap,
     onSeekBySeconds: seekBySeconds,
   });
+
+  useEffect(() => {
+    if (playbackUxState.isReady) {
+      readyOpacity.value = withTiming(1, { duration: 240 });
+    }
+  }, [playbackUxState.isReady, readyOpacity]);
+
+  const readyAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: readyOpacity.value,
+    transform: [{ scale: 0.985 + 0.015 * readyOpacity.value }],
+  }));
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(controlsOpacity, {
+        toValue: shouldShowControls ? 1 : 0,
+        duration: shouldShowControls ? 180 : 140,
+        useNativeDriver: true,
+      }),
+      Animated.spring(controlsScale, {
+        toValue: shouldShowControls ? 1 : 0.98,
+        speed: 18,
+        bounciness: 4,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [controlsOpacity, controlsScale, shouldShowControls]);
+
+  useEffect(() => {
+    if (!playbackUxState.isReady || playbackUxState.isBuffering || playbackUxState.isStalled) {
+      return;
+    }
+    if (!intendedPlayingRef.current || isPlaying) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastResumeAttemptRef.current < 900) {
+      return;
+    }
+    lastResumeAttemptRef.current = now;
+    try {
+      player.play();
+    } catch (error) {
+      logger.debug?.('FullscreenVideoModal: resume after buffering failed', error);
+    }
+  }, [isPlaying, playbackUxState.isBuffering, playbackUxState.isReady, playbackUxState.isStalled, player]);
 
   const renderSeekGestureLayer = () => (
     <View style={styles.seekGestureLayer} pointerEvents="box-none">
@@ -3445,6 +3863,58 @@ function FullscreenVideoModal({
     onDownload?.();
   }, [onDownload]);
 
+  const handleRetry = useCallback(() => {
+    intendedPlayingRef.current = true;
+    try {
+      setIsLoadingSafe(true);
+      const replace = (player as unknown as { replaceAsync?: (source: VideoSource) => Promise<void> }).replaceAsync;
+      if (typeof replace === 'function') {
+        void replace({ uri: sourceUri });
+      } else {
+        player.replace({ uri: sourceUri }, true);
+      }
+      player.play();
+      setIsPlayingSafe(true);
+    } catch (error) {
+      logger.debug?.('FullscreenVideoModal: retry failed', error);
+    }
+  }, [player, setIsLoadingSafe, setIsPlayingSafe, sourceUri]);
+
+  const handleReplay = useCallback(() => {
+    restartIfEnded();
+    try {
+      pauseOtherVideos(playbackIdRef.current);
+      player.play();
+      setIsPlayingSafe(true);
+      intendedPlayingRef.current = true;
+    } catch (error) {
+      logger.debug?.('FullscreenVideoModal: replay failed', error);
+    }
+  }, [player, restartIfEnded, setIsPlayingSafe]);
+
+  const renderPlaybackOverlay = () => {
+    const overlayPhase =
+      playbackUxState.phase === 'ready' || playbackUxState.phase === 'idle'
+        ? 'loading'
+        : playbackUxState.phase;
+
+    return (
+      <VideoBufferingOverlay
+        visible={playbackUxState.showOverlay}
+        phase={overlayPhase}
+        title={playbackUxState.statusLabel}
+        subtitle={playbackUxState.statusDetail}
+        bufferedPercent={playbackUxState.bufferedPercent}
+        accentColor={theme.primary}
+        variant="fullscreen"
+        showSpinner={playbackUxState.showSpinner}
+        showPercent={playbackUxState.showPercent}
+        onRetry={playbackUxState.isError ? handleRetry : undefined}
+        onReplay={playbackUxState.isEnded ? handleReplay : undefined}
+      />
+    );
+  };
+
   return (
     <Modal
       visible
@@ -3465,134 +3935,132 @@ function FullscreenVideoModal({
           onAccessibilityAction={handleAccessibilityAction}
         >
           <View style={styles.fullscreenVideoWrapper}>
-            <VideoView
-              style={styles.fullscreenVideoSurface}
-              player={player as unknown as any}
-              nativeControls={false}
-              allowsPictureInPicture
-              allowsFullscreen
-              contentFit="contain"
-              {...(Platform.OS === 'android' ? { surfaceType: 'textureView' as const } : {})}
-            />
+            <Reanimated.View style={[styles.fullscreenVideoSurface, readyAnimatedStyle]}>
+              <VideoView
+                style={StyleSheet.absoluteFillObject}
+                player={player as unknown as any}
+                nativeControls={false}
+                allowsPictureInPicture
+                allowsFullscreen
+                contentFit="contain"
+                {...(Platform.OS === 'android' ? { surfaceType: 'textureView' as const } : {})}
+              />
+            </Reanimated.View>
 
             {renderSeekGestureLayer()}
 
-            {shouldShowLoading ? (
-              <View style={styles.fullscreenLoadingOverlay}>
-                <View style={styles.fullscreenLoadingBadge}>
-                  <View style={styles.fullscreenLoadingBadgeRow}>
-                    <ActivityIndicator size="small" color={theme.primary} />
-                    <Text style={styles.fullscreenLoadingBadgeText}>Preparing video</Text>
-                  </View>
-                  <Text style={styles.fullscreenLoadingBadgeSubtext}>Setting up playback...</Text>
-                </View>
+            {renderPlaybackOverlay()}
+
+            <Animated.View
+              style={[
+                styles.fullscreenOverlay,
+                { opacity: controlsOpacity, transform: [{ scale: controlsScale }] },
+              ]}
+              pointerEvents={shouldShowControls ? 'box-none' : 'none'}
+            >
+              <View style={styles.fullscreenTopRow} pointerEvents="box-none">
+                <TouchableOpacity
+                  style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
+                  onPress={handleClosePress}
+                >
+                  <X size={20} color="white" />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.fullscreenControlButton}
+                  onPress={handleSharePress}
+                  accessibilityRole="button"
+                  accessibilityLabel={shareButtonA11yLabel}
+                >
+                  <Share2 size={20} color="white" />
+                </TouchableOpacity>
               </View>
-            ) : null}
 
-            {shouldShowControls ? (
-              <View style={styles.fullscreenOverlay} pointerEvents="box-none">
-                <View style={styles.fullscreenTopRow} pointerEvents="box-none">
-                  <TouchableOpacity
-                    style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
-                    onPress={handleClosePress}
-                  >
-                    <X size={20} color="white" />
-                  </TouchableOpacity>
+              <View style={styles.fullscreenMainControls} pointerEvents="box-none">
+                <TouchableOpacity
+                  style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
+                  onPress={togglePlayPause}
+                >
+                  {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
+                </TouchableOpacity>
+              </View>
 
-                  <TouchableOpacity
-                    style={styles.fullscreenControlButton}
-                    onPress={handleSharePress}
-                    accessibilityRole="button"
-                    accessibilityLabel={shareButtonA11yLabel}
-                  >
-                    <Share2 size={20} color="white" />
-                  </TouchableOpacity>
-                </View>
+              <View style={styles.fullscreenBottomControls} pointerEvents="box-none">
+                <View style={styles.fullscreenProgressRow} pointerEvents="box-none">
+                  <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
 
-                <View style={styles.fullscreenMainControls} pointerEvents="box-none">
-                  <TouchableOpacity
-                    style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
-                    onPress={togglePlayPause}
-                  >
-                    {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
-                  </TouchableOpacity>
-                </View>
-
-                <View style={styles.fullscreenBottomControls} pointerEvents="box-none">
-                  <View style={styles.fullscreenProgressRow} pointerEvents="box-none">
-                    <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
-
-                    <View style={styles.fullscreenProgressContainer}>
-                      <View
-                        ref={progressBarRef}
-                        collapsable={false}
-                        style={styles.fullscreenProgressBarTouchable}
-                        onLayout={handleProgressBarLayout}
-                        {...progressPanResponder.panHandlers}
-                      >
-                        <View style={styles.fullscreenProgressBar}>
-                          <View style={[styles.fullscreenProgressBuffered, { width: `${bufferedPercentage}%` }]} />
-                          <View style={[styles.fullscreenProgressFill, { width: `${progressPercentage}%` }]} />
-                          <View
-                            style={[
-                              styles.fullscreenProgressThumb,
-                              {
-                                left: `${progressPercentage}%`,
-                                transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
-                              },
-                            ]}
-                          />
-                        </View>
+                  <View style={styles.fullscreenProgressContainer}>
+                    <View
+                      ref={progressBarRef}
+                      collapsable={false}
+                      style={styles.fullscreenProgressBarTouchable}
+                      onLayout={handleProgressBarLayout}
+                      {...progressPanResponder.panHandlers}
+                    >
+                      <View style={styles.fullscreenProgressBar}>
+                        <View style={[styles.fullscreenProgressBuffered, { width: `${bufferedPercentage}%` }]} />
+                        <View style={[styles.fullscreenProgressFill, { width: `${progressPercentage}%` }]} />
+                        <View
+                          style={[
+                            styles.fullscreenProgressThumb,
+                            {
+                              left: `${progressPercentage}%`,
+                              transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
+                            },
+                          ]}
+                        />
                       </View>
                     </View>
                   </View>
+                </View>
 
-                  <View style={styles.fullscreenActionsRow} pointerEvents="box-none">
-                    <View style={styles.fullscreenActionsLeft} pointerEvents="box-none">
-                      <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
-                        {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
-                      </TouchableOpacity>
+                <View style={styles.fullscreenActionsRow} pointerEvents="box-none">
+                  <View style={styles.fullscreenActionsLeft} pointerEvents="box-none">
+                    <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
+                      {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
+                    </TouchableOpacity>
 
-                      {onDownload ? (
-                        <TouchableOpacity
-                          style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
-                            onPress={handleDownloadPress}
-                          disabled={isDownloading}
-                          accessibilityRole="button"
-                          accessibilityLabel={downloadButtonA11yLabel}
-                        >
-                          {isDownloading ? (
-                            <Text style={styles.fullscreenDownloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
-                          ) : (
-                            <Download size={20} color="white" />
-                          )}
-                        </TouchableOpacity>
-                      ) : null}
-                    </View>
-
-                    <View style={styles.fullscreenActionsRight} pointerEvents="box-none">
+                    {onDownload ? (
                       <TouchableOpacity
-                        style={[
-                          styles.fullscreenControlButton,
-                          styles.fullscreenSpeedButton,
-                          disableSpeedControl ? styles.fullscreenSpeedButtonDisabled : null,
-                        ]}
-                        onPress={cyclePlaybackSpeed}
-                        disabled={disableSpeedControl}
+                        style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
+                          onPress={handleDownloadPress}
+                        disabled={isDownloading}
                         accessibilityRole="button"
-                        accessibilityLabel="Toggle playback speed"
+                        accessibilityLabel={downloadButtonA11yLabel}
                       >
-                        <Text style={styles.fullscreenSpeedLabel}>{playbackSpeedLabel}</Text>
+                        {isDownloading ? (
+                          <Text style={styles.fullscreenDownloadProgressText}>
+                            {resolveProgressPercentText(normalizedProgress)}
+                          </Text>
+                        ) : (
+                          <Download size={20} color="white" />
+                        )}
                       </TouchableOpacity>
+                    ) : null}
+                  </View>
 
-                      <TouchableOpacity style={styles.fullscreenControlButton} onPress={handleClose}>
-                        <Minimize size={20} color="white" />
-                      </TouchableOpacity>
-                    </View>
+                  <View style={styles.fullscreenActionsRight} pointerEvents="box-none">
+                    <TouchableOpacity
+                      style={[
+                        styles.fullscreenControlButton,
+                        styles.fullscreenSpeedButton,
+                        disableSpeedControl ? styles.fullscreenSpeedButtonDisabled : null,
+                      ]}
+                      onPress={cyclePlaybackSpeed}
+                      disabled={disableSpeedControl}
+                      accessibilityRole="button"
+                      accessibilityLabel="Toggle playback speed"
+                    >
+                      <Text style={styles.fullscreenSpeedLabel}>{playbackSpeedLabel}</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={styles.fullscreenControlButton} onPress={handleClose}>
+                      <Minimize size={20} color="white" />
+                    </TouchableOpacity>
                   </View>
                 </View>
               </View>
-            ) : null}
+            </Animated.View>
           </View>
         </View>
       </SafeAreaView>
@@ -3617,8 +4085,15 @@ function WebFullscreenModal({
   const [playbackSpeed, setPlaybackSpeed] = useState(initialSpeed);
   const [currentTime, setCurrentTime] = useState(startTime);
   const [duration, setDuration] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
   const [showControls, setShowControls] = useState(true);
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
+  const [webStatus, setWebStatus] = useState<VideoPlayerStatus>('idle');
+  const [webBufferedPercent, setWebBufferedPercent] = useState<number | null>(null);
+  const [webIsBuffering, setWebIsBuffering] = useState(false);
+  const [webIsStalled, setWebIsStalled] = useState(false);
+  const [webPlaybackError, setWebPlaybackError] = useState<string | null>(null);
+  const [webEnded, setWebEnded] = useState(false);
   const normalizedProgress = useEasedDownloadProgressPercent(
     downloadProgress,
     isDownloading
@@ -3640,6 +4115,10 @@ function WebFullscreenModal({
   const webWrapperRef = useRef<any>(null);
   const webKeyboardActiveRef = useRef(true);
   const playbackIdRef = useRef<string>(createPlaybackId());
+  const readyOpacity = useSharedValue(0);
+  const controlsOpacity = useRef(new Animated.Value(1)).current;
+  const controlsScale = useRef(new Animated.Value(1)).current;
+  const lastResumeAttemptRef = useRef(0);
 
   const setCurrentTimeSafe = useCallback((next: number) => {
     if (!Number.isFinite(next)) {
@@ -3666,7 +4145,16 @@ function WebFullscreenModal({
     setIsMuted(initialMuted);
     setPlaybackSpeed(initialSpeed);
     setCurrentTimeSafe(startTime);
-  }, [initialMuted, initialSpeed, setCurrentTimeSafe, startTime, wasPlaying]);
+    setIsLoading(true);
+    setWebStatus('loading');
+    setWebPlaybackError(null);
+    setWebEnded(false);
+    setWebBufferedPercent(null);
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    readyOpacity.value = 0;
+    intendedPlayingRef.current = wasPlaying;
+  }, [initialMuted, initialSpeed, readyOpacity, setCurrentTimeSafe, startTime, wasPlaying]);
 
   useEffect(() => {
     applyPlaybackRate(playbackSpeed);
@@ -3692,6 +4180,19 @@ function WebFullscreenModal({
     };
   }, [showControls, isPlaying, isDraggingProgress]);
 
+  const updateWebBufferedPercent = useCallback(() => {
+    const nextBuffered = resolveBufferedPercentFromElement(videoRef.current);
+    if (nextBuffered == null) {
+      return;
+    }
+    setWebBufferedPercent((prev) => {
+      if (prev != null && Math.abs(prev - nextBuffered) < 0.6) {
+        return prev;
+      }
+      return nextBuffered;
+    });
+  }, []);
+
   const handleLoadedMetadata = () => {
     if (!videoRef.current) {
       return;
@@ -3700,6 +4201,10 @@ function WebFullscreenModal({
     if (mediaDuration > 0) {
       setDuration(mediaDuration);
     }
+    setIsLoading(false);
+    setWebStatus('readyToPlay');
+    setWebPlaybackError(null);
+    setWebEnded(false);
     try {
       videoRef.current.currentTime = startTime || 0;
     } catch (error) {
@@ -3719,10 +4224,57 @@ function WebFullscreenModal({
     }
   };
 
+  const handleWebLoadStart = useCallback(() => {
+    setIsLoading(true);
+    setWebStatus('loading');
+    setWebPlaybackError(null);
+    setWebEnded(false);
+  }, []);
+
+  const handleWebCanPlay = useCallback(() => {
+    setIsLoading(false);
+    setWebStatus('readyToPlay');
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+  }, []);
+
+  const handleWebWaiting = useCallback(() => {
+    setWebIsBuffering(true);
+  }, []);
+
+  const handleWebStalled = useCallback(() => {
+    setWebIsStalled(true);
+    setWebIsBuffering(true);
+  }, []);
+
+  const handleWebPlaying = useCallback(() => {
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    setWebStatus('readyToPlay');
+  }, []);
+
+  const handleWebError = useCallback(() => {
+    setWebPlaybackError('Playback failed');
+    setWebStatus('error');
+    setIsLoading(false);
+  }, []);
+
+  const handleWebEnded = useCallback(() => {
+    setWebEnded(true);
+    intendedPlayingRef.current = false;
+    pauseRequestedRef.current = false;
+    setIsPlaying(false);
+  }, []);
+
+  const handleWebProgress = useCallback(() => {
+    updateWebBufferedPercent();
+  }, [updateWebBufferedPercent]);
+
   const handleTimeUpdate = () => {
     if (videoRef.current) {
       const nextTime = videoRef.current.currentTime;
       setCurrentTimeSafe(nextTime);
+      updateWebBufferedPercent();
       // Keep modal time in sync with the element on every update.
     }
   };
@@ -3969,13 +4521,32 @@ function WebFullscreenModal({
     [applyScrubProgress, getProgressFromEvent]
   );
 
-  const shouldShowLoading = !(duration > 0);
-  const shouldShowControls = showControls && !shouldShowLoading;
+  const playbackUxState = useVideoPlaybackUxState({
+    status: webStatus,
+    isLoading,
+    isPlaying,
+    intendedPlaying: intendedPlayingRef.current,
+    duration,
+    currentTime,
+    bufferedPercentOverride: webBufferedPercent,
+    isSeeking: isDraggingProgress,
+    hasResolvedUri: true,
+    error: webPlaybackError,
+    ended: webEnded,
+    externalBuffering: webIsBuffering,
+    externalStalled: webIsStalled,
+  });
+
+  const bufferedPercent = playbackUxState.bufferedPercent ?? 0;
+  const shouldLockControls =
+    playbackUxState.isInitialLoading || playbackUxState.isError || playbackUxState.isEnded;
+  const shouldShowControls = showControls && !shouldLockControls;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(duration)}`;
   }, [currentTime, duration]);
 
-  const seekGestureEnabled = !shouldShowLoading && !isDraggingProgress;
+  const seekGestureEnabled =
+    !shouldLockControls && !playbackUxState.isBuffering && !playbackUxState.isStalled && !isDraggingProgress;
   const { overlayState, overlayAnimatedStyle, handleSeekTap, handleKeyboardSeek, handleAccessibilityAction } =
     useSeekGesture({
       enabled: seekGestureEnabled,
@@ -3983,6 +4554,58 @@ function WebFullscreenModal({
       onSingleTap: handleSingleTap,
       onSeekBySeconds: seekBySeconds,
     });
+
+  useEffect(() => {
+    if (playbackUxState.isReady) {
+      readyOpacity.value = withTiming(1, { duration: 240 });
+    }
+  }, [playbackUxState.isReady, readyOpacity]);
+
+  const readyAnimatedStyle = useAnimatedStyle(() => ({
+    opacity: readyOpacity.value,
+    transform: [{ scale: 0.985 + 0.015 * readyOpacity.value }],
+  }));
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(controlsOpacity, {
+        toValue: shouldShowControls ? 1 : 0,
+        duration: shouldShowControls ? 180 : 140,
+        useNativeDriver: true,
+      }),
+      Animated.spring(controlsScale, {
+        toValue: shouldShowControls ? 1 : 0.98,
+        speed: 18,
+        bounciness: 4,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [controlsOpacity, controlsScale, shouldShowControls]);
+
+  useEffect(() => {
+    if (!playbackUxState.isReady || playbackUxState.isBuffering || playbackUxState.isStalled) {
+      return;
+    }
+    if (!intendedPlayingRef.current || isPlaying) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastResumeAttemptRef.current < 900) {
+      return;
+    }
+    lastResumeAttemptRef.current = now;
+    if (!videoRef.current) {
+      return;
+    }
+    try {
+      const playPromise = videoRef.current.play?.();
+      if (playPromise?.catch) {
+        playPromise.catch(() => undefined);
+      }
+    } catch (error) {
+      logger.debug?.('WebFullscreenModal: resume after buffering failed', error);
+    }
+  }, [isPlaying, playbackUxState.isBuffering, playbackUxState.isReady, playbackUxState.isStalled]);
 
   const webFocusStyle = useMemo(
     () =>
@@ -4228,10 +4851,17 @@ function WebFullscreenModal({
     intendedPlayingRef.current = true;
     pauseRequestedRef.current = false;
     setIsPlaying(true);
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
+    setWebEnded(false);
+    setWebStatus('readyToPlay');
+    setWebPlaybackError(null);
   }, [setIsPlaying]);
 
   const handleVideoPause = useCallback(() => {
     setIsPlaying(false);
+    setWebIsBuffering(false);
+    setWebIsStalled(false);
     if (pauseRequestedRef.current) {
       intendedPlayingRef.current = false;
       pauseRequestedRef.current = false;
@@ -4252,6 +4882,68 @@ function WebFullscreenModal({
     event?.stopPropagation?.();
     onDownload?.();
   }, [onDownload]);
+
+  const handleRetry = useCallback(() => {
+    intendedPlayingRef.current = true;
+    setIsLoading(true);
+    setWebPlaybackError(null);
+    setWebEnded(false);
+    if (!videoRef.current) {
+      return;
+    }
+    try {
+      videoRef.current.load();
+      const playPromise = videoRef.current.play?.();
+      if (playPromise?.catch) {
+        playPromise.catch(() => undefined);
+      }
+      setIsPlaying(true);
+    } catch (error) {
+      logger.debug?.('WebFullscreenModal: retry failed', error);
+    }
+  }, []);
+
+  const handleReplay = useCallback(() => {
+    if (!videoRef.current) {
+      return;
+    }
+    try {
+      videoRef.current.currentTime = 0;
+    } catch (error) {
+      logger.debug?.('WebFullscreenModal: reset time failed', error);
+    }
+    pauseOtherVideos(playbackIdRef.current);
+    const playPromise = videoRef.current.play?.();
+    if (playPromise?.catch) {
+      playPromise.catch(() => undefined);
+    }
+    setIsPlaying(true);
+    intendedPlayingRef.current = true;
+    setWebEnded(false);
+  }, []);
+
+  const renderPlaybackOverlay = () => {
+    const overlayPhase =
+      playbackUxState.phase === 'ready' || playbackUxState.phase === 'idle'
+        ? 'loading'
+        : playbackUxState.phase;
+
+    return (
+      <VideoBufferingOverlay
+        visible={playbackUxState.showOverlay}
+        phase={overlayPhase}
+        title={playbackUxState.statusLabel}
+        subtitle={playbackUxState.statusDetail}
+        bufferedPercent={playbackUxState.bufferedPercent}
+        accentColor={theme.primary}
+        variant="fullscreen"
+        showSpinner={playbackUxState.showSpinner}
+        showPercent={playbackUxState.showPercent}
+        onRetry={playbackUxState.isError ? handleRetry : undefined}
+        onReplay={playbackUxState.isEnded ? handleReplay : undefined}
+      />
+    );
+  };
 
   return (
     <Modal
@@ -4282,134 +4974,140 @@ function WebFullscreenModal({
             : {})}
         >
           <View style={styles.webFullscreenVideoWrapper}>
-            <video
-              ref={videoRef}
-              src={sourceUri}
-              style={{ width: '100%', height: '100%', backgroundColor: '#000', outline: 'none' }}
-              onMouseDown={(event) => event.preventDefault?.()}
-              onLoadedMetadata={handleLoadedMetadata}
-              onTimeUpdate={handleTimeUpdate}
-              onSeeked={handleVideoSeeked}
-              onPlay={handleVideoPlay}
-              onPause={handleVideoPause}
-              muted={isMuted}
-              playsInline
-              preload="auto"
-              tabIndex={-1}
-            />
+            <Reanimated.View style={[styles.fullscreenVideoSurface, readyAnimatedStyle]}>
+              <video
+                ref={videoRef}
+                src={sourceUri}
+                style={{ width: '100%', height: '100%', backgroundColor: '#000', outline: 'none' }}
+                onMouseDown={(event) => event.preventDefault?.()}
+                onLoadStart={handleWebLoadStart}
+                onCanPlay={handleWebCanPlay}
+                onCanPlayThrough={handleWebCanPlay}
+                onWaiting={handleWebWaiting}
+                onStalled={handleWebStalled}
+                onPlaying={handleWebPlaying}
+                onError={handleWebError}
+                onEnded={handleWebEnded}
+                onProgress={handleWebProgress}
+                onLoadedMetadata={handleLoadedMetadata}
+                onTimeUpdate={handleTimeUpdate}
+                onSeeked={handleVideoSeeked}
+                onPlay={handleVideoPlay}
+                onPause={handleVideoPause}
+                muted={isMuted}
+                playsInline
+                preload="auto"
+                tabIndex={-1}
+              />
+            </Reanimated.View>
 
             {renderSeekGestureLayer()}
 
-            {shouldShowLoading ? (
-              <View style={styles.fullscreenLoadingOverlay}>
-                <View style={styles.fullscreenLoadingBadge}>
-                  <View style={styles.fullscreenLoadingBadgeRow}>
-                    <ActivityIndicator size="small" color={theme.primary} />
-                    <Text style={styles.fullscreenLoadingBadgeText}>Preparing video</Text>
-                  </View>
-                  <Text style={styles.fullscreenLoadingBadgeSubtext}>Setting up playback...</Text>
-                </View>
+            {renderPlaybackOverlay()}
+
+            <Animated.View
+              style={[
+                styles.fullscreenOverlay,
+                { opacity: controlsOpacity, transform: [{ scale: controlsScale }] },
+              ]}
+              pointerEvents={shouldShowControls ? 'box-none' : 'none'}
+            >
+              <View style={styles.fullscreenTopRow} pointerEvents="box-none">
+                <TouchableOpacity
+                  style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
+                  onPress={handleClosePress}
+                >
+                  <X size={20} color="white" />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.fullscreenControlButton}
+                  onPress={handleSharePress}
+                  accessibilityRole="button"
+                  accessibilityLabel={shareButtonA11yLabel}
+                >
+                  <Share2 size={20} color="white" />
+                </TouchableOpacity>
               </View>
-            ) : null}
 
-            {shouldShowControls ? (
-              <View style={styles.fullscreenOverlay} pointerEvents="box-none">
-                <View style={styles.fullscreenTopRow} pointerEvents="box-none">
-                  <TouchableOpacity
-                    style={[styles.fullscreenControlButton, styles.fullscreenCloseButton]}
-                    onPress={handleClosePress}
-                  >
-                    <X size={20} color="white" />
-                  </TouchableOpacity>
+              <View style={styles.fullscreenMainControls} pointerEvents="box-none">
+                <TouchableOpacity
+                  style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
+                  onPress={togglePlayPause}
+                >
+                  {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
+                </TouchableOpacity>
+              </View>
 
-                  <TouchableOpacity
-                    style={styles.fullscreenControlButton}
-                    onPress={handleSharePress}
-                    accessibilityRole="button"
-                    accessibilityLabel={shareButtonA11yLabel}
-                  >
-                    <Share2 size={20} color="white" />
-                  </TouchableOpacity>
-                </View>
+              <View style={styles.fullscreenBottomControls} pointerEvents="box-none">
+                <View style={styles.fullscreenProgressRow} pointerEvents="box-none">
+                  <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
 
-                <View style={styles.fullscreenMainControls} pointerEvents="box-none">
-                  <TouchableOpacity
-                    style={[styles.fullscreenControlButton, styles.fullscreenPlayButton]}
-                    onPress={togglePlayPause}
-                  >
-                    {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
-                  </TouchableOpacity>
-                </View>
-
-                <View style={styles.fullscreenBottomControls} pointerEvents="box-none">
-                  <View style={styles.fullscreenProgressRow} pointerEvents="box-none">
-                    <Text style={styles.fullscreenTimeText}>{formattedProgressLabel}</Text>
-
-                    <View style={styles.fullscreenProgressContainer}>
-                      <View
-                        ref={progressBarRef}
-                        collapsable={false}
-                        style={styles.fullscreenProgressBarTouchable}
-                        onLayout={handleProgressBarLayout}
-                        {...progressPanResponder.panHandlers}
-                      >
-                        <View style={styles.fullscreenProgressBar}>
-                          <View style={[styles.fullscreenProgressFill, { width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }]} />
-                          <View
-                            style={[
-                              styles.fullscreenProgressThumb,
-                              {
-                                left: `${duration > 0 ? (currentTime / duration) * 100 : 0}%`,
-                                transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
-                              },
-                            ]}
-                          />
-                        </View>
+                  <View style={styles.fullscreenProgressContainer}>
+                    <View
+                      ref={progressBarRef}
+                      collapsable={false}
+                      style={styles.fullscreenProgressBarTouchable}
+                      onLayout={handleProgressBarLayout}
+                      {...progressPanResponder.panHandlers}
+                    >
+                      <View style={styles.fullscreenProgressBar}>
+                        <View style={[styles.fullscreenProgressBuffered, { width: `${bufferedPercent}%` }]} />
+                        <View style={[styles.fullscreenProgressFill, { width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }]} />
+                        <View
+                          style={[
+                            styles.fullscreenProgressThumb,
+                            {
+                              left: `${duration > 0 ? (currentTime / duration) * 100 : 0}%`,
+                              transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
+                            },
+                          ]}
+                        />
                       </View>
                     </View>
                   </View>
+                </View>
 
-                  <View style={styles.fullscreenActionsRow} pointerEvents="box-none">
-                    <View style={styles.fullscreenActionsLeft} pointerEvents="box-none">
-                      <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
-                        {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
-                      </TouchableOpacity>
+                <View style={styles.fullscreenActionsRow} pointerEvents="box-none">
+                  <View style={styles.fullscreenActionsLeft} pointerEvents="box-none">
+                    <TouchableOpacity style={styles.fullscreenControlButton} onPress={toggleMute}>
+                      {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
+                    </TouchableOpacity>
 
-                      {onDownload ? (
-                        <TouchableOpacity
-                          style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
-                            onPress={handleDownloadPress}
-                          disabled={isDownloading}
-                          accessibilityRole="button"
-                          accessibilityLabel={downloadButtonA11yLabel}
-                        >
-                          {isDownloading ? (
-                            <Text style={styles.fullscreenDownloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
-                          ) : (
-                            <Download size={20} color="white" />
-                          )}
-                        </TouchableOpacity>
-                      ) : null}
-                    </View>
-
-                    <View style={styles.fullscreenActionsRight} pointerEvents="box-none">
+                    {onDownload ? (
                       <TouchableOpacity
-                        style={[styles.fullscreenControlButton, styles.fullscreenSpeedButton]}
-                        onPress={cyclePlaybackSpeed}
+                        style={[styles.fullscreenControlButton, isDownloading ? styles.controlButtonDisabled : null]}
+                          onPress={handleDownloadPress}
+                        disabled={isDownloading}
                         accessibilityRole="button"
-                        accessibilityLabel="Toggle playback speed"
+                        accessibilityLabel={downloadButtonA11yLabel}
                       >
-                        <Text style={styles.fullscreenSpeedLabel}>{`${Math.round(playbackSpeed * 100) / 100}x`}</Text>
+                        {isDownloading ? (
+                          <Text style={styles.fullscreenDownloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
+                        ) : (
+                          <Download size={20} color="white" />
+                        )}
                       </TouchableOpacity>
+                    ) : null}
+                  </View>
 
-                      <TouchableOpacity style={styles.fullscreenControlButton} onPress={handleClose}>
-                        <Minimize size={20} color="white" />
-                      </TouchableOpacity>
-                    </View>
+                  <View style={styles.fullscreenActionsRight} pointerEvents="box-none">
+                    <TouchableOpacity
+                      style={[styles.fullscreenControlButton, styles.fullscreenSpeedButton]}
+                      onPress={cyclePlaybackSpeed}
+                      accessibilityRole="button"
+                      accessibilityLabel="Toggle playback speed"
+                    >
+                      <Text style={styles.fullscreenSpeedLabel}>{`${Math.round(playbackSpeed * 100) / 100}x`}</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={styles.fullscreenControlButton} onPress={handleClose}>
+                      <Minimize size={20} color="white" />
+                    </TouchableOpacity>
                   </View>
                 </View>
               </View>
-            ) : null}
+            </Animated.View>
           </View>
         </View>
       </SafeAreaView>
@@ -4475,6 +5173,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
     borderRadius: 8,
   },
+  bufferingPoster: {
+    ...StyleSheet.absoluteFillObject,
+    borderRadius: 8,
+    opacity: 0.92,
+  },
   fullscreenVideoWrapper: {
     flex: 1,
     position: 'relative',
@@ -4488,48 +5191,6 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
     backgroundColor: '#000',
-  },
-  loadingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  loadingText: {
-    marginTop: 8,
-    fontSize: 14,
-  },
-  loadingBadge: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderRadius: 14,
-    backgroundColor: 'rgba(15,20,32,0.75)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.15)',
-    minWidth: 170,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.25,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 4,
-  },
-  loadingBadgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  loadingBadgeText: {
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  loadingBadgeSubtext: {
-    marginTop: 4,
-    fontSize: 12,
   },
   controlsOverlay: {
     position: 'absolute',
@@ -4697,6 +5358,13 @@ const styles = StyleSheet.create({
     borderRadius: 2,
     position: 'relative',
   },
+  progressBuffered: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    height: '100%',
+    backgroundColor: 'rgba(255,255,255,0.5)',
+  },
   progressFill: {
     height: '100%',
     backgroundColor: 'white',
@@ -4727,53 +5395,6 @@ const styles = StyleSheet.create({
     paddingVertical: 36,
     gap: 16,
     userSelect: 'none',
-  },
-  fullscreenLoadingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(6,10,24,0.82)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 24,
-    gap: 12,
-  },
-  fullscreenLoadingText: {
-    marginTop: 8,
-    fontSize: 14,
-    color: 'rgba(255,255,255,0.92)',
-  },
-  fullscreenLoadingBadge: {
-    paddingHorizontal: 18,
-    paddingVertical: 14,
-    borderRadius: 16,
-    backgroundColor: 'rgba(15,20,32,0.82)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.2)',
-    alignItems: 'center',
-    minWidth: 190,
-    shadowColor: '#000',
-    shadowOpacity: 0.3,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 5,
-  },
-  fullscreenLoadingBadgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  fullscreenLoadingBadgeText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: 'rgba(255,255,255,0.96)',
-  },
-  fullscreenLoadingBadgeSubtext: {
-    marginTop: 4,
-    fontSize: 12,
-    color: 'rgba(255,255,255,0.78)',
   },
   fullscreenMainControls: {
     flex: 1,
