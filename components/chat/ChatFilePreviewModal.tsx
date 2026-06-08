@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Modal, View, Text, TouchableOpacity, ScrollView, SafeAreaView, TextInput, Image, StyleSheet, Platform } from 'react-native';
 import { X, Trash2, Send, File as FileIcon } from 'lucide-react-native';
 import VideoPlayer from '../VideoPlayer';
@@ -12,6 +12,15 @@ const formatFileSize = (bytes: number): string => {
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+};
+
+const formatDuration = (seconds: number): string => {
+  if (!seconds || seconds <= 0) return '';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
 };
 
 interface ChatFilePreviewModalProps {
@@ -41,6 +50,32 @@ interface ChatFilePreviewModalProps {
     error: string;
     [key: string]: any;
   };
+}
+
+// ---------------------------------------------------------------------------
+// ImagePreview — renders image URIs including blob: object URLs.
+// blob: images work once img-src in the CSP includes 'blob:'.
+// Uses RN Image on native; on web RN Web translates Image → <img> natively.
+// ---------------------------------------------------------------------------
+function ImagePreview({ uri, theme }: { uri: string; theme: any }) {
+  const [errored, setErrored] = useState(false);
+
+  if (!uri || errored) {
+    return (
+      <View style={[styles.fileIconContainer, { marginRight: 12 }]}>
+        <FileIcon size={32} color={theme.primary} />
+      </View>
+    );
+  }
+
+  return (
+    <Image
+      source={{ uri }}
+      style={styles.previewImage}
+      resizeMode="cover"
+      onError={() => setErrored(true)}
+    />
+  );
 }
 
 export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
@@ -147,16 +182,23 @@ export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
                 ? 'Unknown file'
                 : safePreviewNameCandidate;
               const fileSizeValue = file.fileSize || file.size;
+              const durationValue: number | null | undefined = file.duration;
               const isImage = isImageFile(mimeType, safePreviewName);
               const isVideo = isVideoFile(mimeType, safePreviewName);
               const previewImageUri = String(file.previewUri || file.uri || '');
               const thumbnailUri = file.thumbnail || file.preview || file.poster || null;
 
+              // Build the metadata string: size · duration
+              const metaParts: string[] = [];
+              if (fileSizeValue) metaParts.push(formatFileSize(fileSizeValue));
+              if (isVideo && durationValue && durationValue > 0) metaParts.push(formatDuration(durationValue));
+              const metaString = metaParts.join('  ·  ');
+
               return (
                 <View key={index} style={[styles.filePreviewItem, { backgroundColor: theme.background }]}>
                   <View style={[styles.filePreviewInfo, isVideo ? styles.filePreviewInfoVideo : null]}>
                     {isImage && previewImageUri ? (
-                      <Image source={{ uri: previewImageUri }} style={styles.previewImage} />
+                      <ImagePreview uri={previewImageUri} theme={theme} />
                     ) : isVideo ? (
                       <View style={styles.videoPreviewContainer}>
                         <VideoPlayer
@@ -177,9 +219,9 @@ export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
                       <Text style={[styles.previewFileName, { color: theme.text }]} numberOfLines={2}>
                         {safePreviewName}
                       </Text>
-                      {fileSizeValue ? (
+                      {metaString ? (
                         <Text style={[styles.previewFileSize, { color: theme.textSecondary }]}>
-                          {formatFileSize(fileSizeValue)}
+                          {metaString}
                         </Text>
                       ) : null}
                     </View>

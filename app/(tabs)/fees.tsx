@@ -21,7 +21,7 @@ import { ScrollView as GHScrollView } from 'react-native-gesture-handler';
 import { useIsFocused } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Picker } from '@react-native-picker/picker';
-import { Calendar, DollarSign, CircleAlert as AlertCircle, CircleCheck as CheckCircle, Clock, Send, Filter, Download, Eye, EyeOff, Users, X, Trash2, Upload, FileText, Plus, ChevronDown, Info, Mail, MessageSquare, Phone, Bell, Check, Search } from 'lucide-react-native';
+import { Calendar, DollarSign, CircleAlert as AlertCircle, CircleCheck as CheckCircle, Clock, Send, Filter, Download, Eye, EyeOff, Users, X, Trash2, Upload, FileText, Plus, ChevronDown, Info, Mail, MessageSquare, Phone, Bell, Check, Search, Camera } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as Linking from 'expo-linking';
@@ -29,6 +29,7 @@ import * as IntentLauncher from 'expo-intent-launcher';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as XLSX from 'xlsx';
+import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
 import { ref, getDownloadURL, deleteObject } from 'firebase/storage';
 import { reconcileTenantStorageUsageViaBackend, uploadBlobViaBackend } from '../../services/backendStorageUploadService';
 import { maybeShowStorageLimitReachedAlert } from '../../services/storageLimitAlert';
@@ -4210,6 +4211,16 @@ export default function Fees() {
       window.removeEventListener('drop', handleWindowDrop);
     };
   }, [addFilesToReceiptSelection, showReceiptUpload]);
+
+  const handleTakeReceiptPhoto = useCallback(async () => {
+    try {
+      const result = await MediaPickerUtil.captureImage();
+      if (result.canceled || !result.assets?.length) return;
+      addFilesToReceiptSelection(result.assets);
+    } catch (err) {
+      logger.warn('Fees: receipt photo capture failed', err);
+    }
+  }, [addFilesToReceiptSelection]);
 
   const selectFiles = async (source: 'gallery' | 'documents') => {
     try {
@@ -9908,6 +9919,19 @@ export default function Fees() {
               {selectedFiles.length === 0 ? (
                 // Show file selection option when no files are selected
                 <View style={styles.uploadOptions}>
+                  <TouchableOpacity
+                    style={[styles.uploadOption, { backgroundColor: theme.surface, borderColor: theme.border }]}
+                    onPress={handleTakeReceiptPhoto}
+                    disabled={uploadingReceipt}
+                    accessibilityLabel="Take photo of receipt"
+                    accessibilityRole="button"
+                  >
+                    <Camera size={32} color={theme.primary} />
+                    <Text style={[styles.uploadOptionTitle, { color: theme.text }]}>Take Photo</Text>
+                    <Text style={[styles.uploadOptionSubtitle, { color: theme.textSecondary }]}>
+                      Capture a receipt with your camera
+                    </Text>
+                  </TouchableOpacity>
                   <TouchableOpacity
                     style={[styles.uploadOption, { backgroundColor: theme.surface, borderColor: theme.border }]}
                     onPress={() => handleUploadReceipt('unified')}

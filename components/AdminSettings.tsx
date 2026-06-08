@@ -40,6 +40,7 @@ import {
   TENANT_LOGO_MAX_BYTES,
   TenantLogoAsset,
 } from '@/services/tenantBrandingService';
+import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
 import { reconcileTenantStorageUsageViaBackend } from '@/services/backendStorageUploadService';
 
 const DEFAULT_JOIN_REQUEST_PAGE = 5;
@@ -210,22 +211,65 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
     if (pickingLogo) {
       return;
     }
+
+    // Show source picker: "Take Photo" or "Choose from Gallery"
+    const getSource = (): Promise<'camera' | 'gallery' | 'cancel'> =>
+      new Promise((resolve) => {
+        if (Platform.OS === 'web') {
+          // On web, Alert.alert is available but shows a browser dialog.
+          // Use it for simplicity — matches the native pattern.
+          Alert.alert(
+            'Pick Logo',
+            'Choose how you want to add your logo',
+            [
+              { text: 'Take Photo', onPress: () => resolve('camera') },
+              { text: 'Choose from Gallery', onPress: () => resolve('gallery') },
+              { text: 'Cancel', style: 'cancel', onPress: () => resolve('cancel') },
+            ],
+            { cancelable: true, onDismiss: () => resolve('cancel') }
+          );
+        } else {
+          Alert.alert(
+            'Pick Logo',
+            'Choose how you want to add your logo',
+            [
+              { text: 'Take Photo', onPress: () => resolve('camera') },
+              { text: 'Choose from Gallery', onPress: () => resolve('gallery') },
+              { text: 'Cancel', style: 'cancel', onPress: () => resolve('cancel') },
+            ],
+            { cancelable: true }
+          );
+        }
+      });
+
+    const source = await getSource();
+    if (source === 'cancel') return;
+
     setPickingLogo(true);
     try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert('Permission needed', 'Allow photo access to pick a logo.');
-        return;
+      let result: { canceled: boolean; assets?: Array<{ uri: string; mimeType?: string; fileName?: string | null }> };
+
+      if (source === 'camera') {
+        result = await MediaPickerUtil.captureImage();
+      } else {
+        // Existing gallery path — preserve behaviour exactly
+        const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!permission.granted) {
+          Alert.alert('Permission needed', 'Allow photo access to pick a logo.');
+          return;
+        }
+        result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ImagePicker.MediaTypeOptions.Images,
+          allowsEditing: true,
+          aspect: [1, 1],
+          quality: 0.9,
+        });
       }
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        allowsEditing: true,
-        aspect: [1, 1],
-        quality: 0.9,
-      });
+
       if (result.canceled || !result.assets?.length) {
         return;
       }
+
       const asset = result.assets[0];
       if (!asset.uri) {
         Toast.show({
@@ -237,6 +281,7 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
         });
         return;
       }
+
       setPendingLogoAsset({
         uri: asset.uri,
         mimeType: asset.mimeType,
@@ -245,13 +290,24 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
       setLogoPreviewUrl(asset.uri);
     } catch (pickerError) {
       logger.warn('AdminSettings: logo picker failed', pickerError);
-      Toast.show({
-        type: 'error',
-        text1: 'Unable to pick logo',
-        text2: 'Something went wrong while picking that image.',
-        position: 'top',
-        topOffset: 60,
-      });
+      const errorMessage = pickerError instanceof Error ? pickerError.message : '';
+      if (errorMessage.toLowerCase().includes('permission') || errorMessage.toLowerCase().includes('denied')) {
+        Toast.show({
+          type: 'error',
+          text1: 'Camera access denied',
+          text2: 'Please update your device settings to allow camera access.',
+          position: 'top',
+          topOffset: 60,
+        });
+      } else {
+        Toast.show({
+          type: 'error',
+          text1: 'Unable to pick logo',
+          text2: 'Something went wrong while picking that image.',
+          position: 'top',
+          topOffset: 60,
+        });
+      }
     } finally {
       setPickingLogo(false);
     }

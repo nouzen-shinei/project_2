@@ -52,12 +52,13 @@ export function injectCSP(opts: InjectOptions = {}) {
     // frame-ancestors intentionally omitted (ignored in meta)
     `form-action 'self'`,
     // Fonts & images allow data: URIs for embedded assets
-    `img-src 'self' data: https:`,
+    `img-src 'self' data: blob: https:`,
     `font-src 'self' data: https:`,
   `media-src 'self' data: blob: https:`,
     `style-src ${styleSrc}`,
     `style-src-attr 'unsafe-inline'`,
     `script-src ${scriptSrc}`,
+    `worker-src 'self' blob:`,
   // Allow websocket (dev) & https API calls, and data/blob URIs for local file reads on web
   `connect-src 'self' https: wss: data: blob: ${connectExtra}`.trim(),
   // Allow frames if needed (some Firebase transports create hidden iframes)

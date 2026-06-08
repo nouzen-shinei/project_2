@@ -27,6 +27,8 @@ import {
 } from 'lucide-react-native';
 
 import * as ImagePicker from 'expo-image-picker';
+import Toast from 'react-native-toast-message';
+import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
 import { useTenant } from '@/hooks/useTenantContext';
 import { useTheme } from '@/hooks/useTheme';
 import { useAuth } from '@/hooks/useAuthUnified';
@@ -600,11 +602,16 @@ const TenantMembershipManager = () => {
     }));
   };
 
-  const handlePickCreateLogo = async () => {
-    if (pickingCreateLogo) {
-      return;
-    }
-    setPickingCreateLogo(true);
+  const applyCreateLogoAsset = (asset: { uri: string; mimeType?: string | null; fileName?: string | null }) => {
+    setCreateLogoAsset({
+      uri: asset.uri,
+      mimeType: asset.mimeType ?? undefined,
+      fileName: asset.fileName ?? undefined,
+    });
+    setCreateLogoPreviewUrl(asset.uri);
+  };
+
+  const pickCreateLogoFromGallery = async () => {
     try {
       const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!permission.granted) {
@@ -625,17 +632,74 @@ const TenantMembershipManager = () => {
         Alert.alert('Invalid image', 'Unable to use that image. Please pick another logo.');
         return;
       }
-      setCreateLogoAsset({
-        uri: asset.uri,
-        mimeType: asset.mimeType,
-        fileName: asset.fileName || undefined,
-      });
-      setCreateLogoPreviewUrl(asset.uri);
+      applyCreateLogoAsset(asset);
     } catch (pickerError) {
-      logger.warn('TenantMembershipManager: logo picker failed', pickerError);
+      logger.warn('TenantMembershipManager: gallery logo picker failed', pickerError);
       Alert.alert('Unable to pick logo', 'Something went wrong while choosing that image.');
-    } finally {
-      setPickingCreateLogo(false);
+    }
+  };
+
+  const pickCreateLogoFromCamera = async () => {
+    try {
+      const result = await MediaPickerUtil.captureImage();
+      if (result.canceled || !result.assets?.length) {
+        return;
+      }
+      const asset = result.assets[0];
+      if (!asset.uri) {
+        return;
+      }
+      applyCreateLogoAsset(asset);
+    } catch (cameraError) {
+      logger.warn('TenantMembershipManager: camera logo capture failed', cameraError);
+      const message = cameraError instanceof Error ? cameraError.message : '';
+      if (message.toLowerCase().includes('permission') || message.toLowerCase().includes('denied')) {
+        Toast.show({
+          type: 'error',
+          text1: 'Camera access is denied.',
+          position: 'top',
+          topOffset: 60,
+        });
+      } else {
+        Alert.alert('Unable to capture photo', 'Something went wrong with the camera. Please try again.');
+      }
+    }
+  };
+
+  const handlePickCreateLogo = () => {
+    if (pickingCreateLogo) {
+      return;
+    }
+    if (Platform.OS !== 'web') {
+      Alert.alert('Pick logo', 'Choose a source', [
+        {
+          text: 'Take Photo',
+          onPress: async () => {
+            setPickingCreateLogo(true);
+            try {
+              await pickCreateLogoFromCamera();
+            } finally {
+              setPickingCreateLogo(false);
+            }
+          },
+        },
+        {
+          text: 'Choose from Gallery',
+          onPress: async () => {
+            setPickingCreateLogo(true);
+            try {
+              await pickCreateLogoFromGallery();
+            } finally {
+              setPickingCreateLogo(false);
+            }
+          },
+        },
+        { text: 'Cancel', style: 'cancel' },
+      ]);
+    } else {
+      // On web, fall through to gallery picker directly; camera is handled inline by MediaPickerUtil
+      setPickingCreateLogo(true);
+      pickCreateLogoFromGallery().finally(() => setPickingCreateLogo(false));
     }
   };
 

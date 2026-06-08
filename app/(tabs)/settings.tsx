@@ -264,6 +264,14 @@ export default function Settings() {
     return ROLE_BADGE_MAP[derivedRole] ?? null;
   }, [derivedRole]);
 
+  const isCameraAvailable = useMemo(() => {
+    if (Platform.OS !== 'web') return true;
+    return (
+      typeof navigator !== 'undefined' &&
+      typeof (navigator as any).mediaDevices?.getUserMedia === 'function'
+    );
+  }, []);
+
   const canShowTeamMembersList = isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins;
 
   const [componentLoading, setComponentLoading] = useState(true);
@@ -928,6 +936,24 @@ export default function Settings() {
     };
   }, [showEmailModal, activeTenant?.id, tenantUnavailable, canShowTeamMembersList]);
 
+  const handleProfilePictureChange = useCallback(async () => {
+    if (uploadingProfilePicture) return;
+    setShowImagePickerModal(true);
+  }, [uploadingProfilePicture]);
+
+  const handleTakePhoto = useCallback(async () => {
+    setShowImagePickerModal(false);
+    try {
+      const result = await MediaPickerUtil.captureProfileImage();
+      if (result.canceled || !result.assets?.length) return;
+      const asset = result.assets[0];
+      setPendingProfilePictureUri(asset.uri);
+      setCurrentProfilePictureURL(asset.uri);
+    } catch (err) {
+      logger.warn('Settings: profile photo capture failed', err);
+    }
+  }, []);
+
   // Safe early return after all hooks and effects are registered
   if (showOfflineLoadingSettings) {
     return (
@@ -1233,12 +1259,6 @@ export default function Settings() {
   setSelectedImageFileName(null);
   setSelectedImageFileSize(null);
     setEditingProfile(true);
-  };
-
-  const handleProfilePictureChange = async () => {
-    if (uploadingProfilePicture) return;
-    
-    setShowImagePickerModal(true);
   };
 
   const selectFromCamera = async () => {
@@ -4163,13 +4183,19 @@ Additional Notes:
               <Text style={[styles.modalSubtitle, { color: theme.textSecondary }]}>Choose a photo for your profile</Text>
 
               <View style={styles.modalButtons}>
-                <TouchableOpacity 
-                  style={[styles.modalButton, { backgroundColor: theme.primary + '10', borderColor: theme.primary }]}
-                  onPress={selectFromCamera}
-                >
-                  <Camera size={24} color={theme.primary} />
-                  <Text style={[styles.modalButtonText, { color: theme.primary }]}>Camera</Text>
-                </TouchableOpacity>
+                {isCameraAvailable ? (
+                  <TouchableOpacity
+                    style={[styles.modalButton, { backgroundColor: theme.primary + '10', borderColor: theme.primary }]}
+                    onPress={handleTakePhoto}
+                    accessibilityLabel="Take photo"
+                    accessibilityRole="button"
+                  >
+                    <Camera size={24} color={theme.primary} />
+                    <Text style={[styles.modalButtonText, { color: theme.primary }]}>Take Photo</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <Text style={[styles.modalButtonText, { color: theme.textSecondary }]}>Camera is unavailable on this device or browser.</Text>
+                )}
 
                 <TouchableOpacity 
                   style={[styles.modalButton, { backgroundColor: theme.primary + '10', borderColor: theme.primary }]}

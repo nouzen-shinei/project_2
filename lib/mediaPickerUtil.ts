@@ -9,6 +9,130 @@ import * as DocumentPicker from 'expo-document-picker';
 
 const isWeb = Platform.OS === 'web';
 
+/**
+ * Infers MIME type from a URI file extension.
+ * Strips query strings before extracting the extension.
+ * Falls back to 'application/octet-stream' for unknown extensions.
+ */
+export function inferFileType(uri: string): string {
+  const ext = (uri.split('?')[0].split('.').pop() ?? '').toLowerCase();
+  const map: Record<string, string> = {
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    heic: 'image/heic',
+    heif: 'image/heic',
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    mp4: 'video/mp4',
+    m4v: 'video/mp4',
+    mov: 'video/quicktime',
+    webm: 'video/webm',
+    avi: 'video/x-msvideo',
+    pdf: 'application/pdf',
+  };
+  return map[ext] ?? 'application/octet-stream';
+}
+
+// -------------------------------------------------------------------------
+// Internal type definitions for the web camera mount helper
+// -------------------------------------------------------------------------
+interface MountCameraOptions {
+  mode: 'photo' | 'video' | 'photo-video';
+  webVideoMaxDurationSeconds?: number;
+  aspectRatio?: number;
+}
+
+interface NormalizedPickerResult {
+  canceled: boolean;
+  assets: Array<{
+    uri: string;
+    type: 'image' | 'video';
+    fileName: string;
+    fileSize: number | null;
+    duration: number | null;
+    aspectRatio?: number;
+    mimeType?: string;
+  }>;
+}
+
+/**
+ * Imperatively mounts the CameraCapture component into a detached DOM node,
+ * awaits a capture result or cancellation, and normalises the result into
+ * the same { canceled, assets } shape as expo-image-picker.
+ *
+ * The DOM container is appended to document.body before the await and removed
+ * unconditionally (success or cancel) in the cleanup callback.
+ *
+ * Only called on the web platform — never imported on native.
+ */
+async function mountCameraCaptureOnWeb(opts: MountCameraOptions): Promise<NormalizedPickerResult> {
+  // Dynamic imports keep this helper tree-shakeable and avoid static
+  // references to react-dom/client on native bundles.
+  const { createRoot } = await import('react-dom/client');
+  const React = await import('react');
+  // Import .web directly — dynamic import() does NOT apply Metro platform suffixes,
+  // so importing '@/components/CameraCapture' would resolve index.tsx → .native export.
+  const { CameraCapture } = await import('@/components/CameraCapture/CameraCapture.web');
+
+  return new Promise<NormalizedPickerResult>((resolve) => {
+    const container = document.createElement('div');
+    // z-index 2147483647 is the maximum — ensures we sit above React Native Modal backdrops
+    container.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:all;';
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    const cleanup = () => {
+      try {
+        root.unmount();
+      } catch {
+        // ignore unmount errors
+      }
+      try {
+        if (container.parentNode) {
+          document.body.removeChild(container);
+        }
+      } catch {
+        // ignore removal errors
+      }
+    };
+
+    const handleCapture = (result: import('@/types/camera').CaptureResult) => {
+      cleanup();
+      const fileType = result.fileType ?? inferFileType(result.uri);
+      const mimePrefix = fileType.split('/')[0] as 'image' | 'video';
+      const timestamp = Date.now();
+      const defaultExt = mimePrefix === 'video' ? 'mp4' : 'jpg';
+      resolve({
+        canceled: false,
+        assets: [{
+          uri: result.uri,
+          type: mimePrefix,
+          fileName: result.fileName ?? `${mimePrefix}_${timestamp}.${defaultExt}`,
+          fileSize: result.fileSize ?? null,
+          duration: result.duration ?? null,
+          mimeType: fileType,
+          ...(opts.aspectRatio != null && { aspectRatio: opts.aspectRatio }),
+        }],
+      });
+    };
+
+    const handleCancel = () => {
+      cleanup();
+      resolve({ canceled: true, assets: [] });
+    };
+
+    root.render(
+      React.default.createElement(CameraCapture, {
+        mode: opts.mode,
+        onCapture: handleCapture,
+        onCancel: handleCancel,
+        webVideoMaxDurationSeconds: opts.webVideoMaxDurationSeconds,
+      })
+    );
+  });
+}
+
 export const MediaPickerUtil = {
   async selectImageNoEdit() {
     try {
@@ -100,9 +224,8 @@ export const MediaPickerUtil = {
 
   async captureImage() {
     try {
-      // On web, camera capture is more complex, so we'll show an alert
       if (isWeb) {
-        throw new Error('Camera capture is not available on web. Please use image selection instead.');
+        return mountCameraCaptureOnWeb({ mode: 'photo' });
       }
 
       // Use statically imported ImagePicker
@@ -142,7 +265,7 @@ export const MediaPickerUtil = {
   async captureImageNoEdit() {
     try {
       if (isWeb) {
-        throw new Error('Camera capture is not available on web. Please use image selection instead.');
+        return mountCameraCaptureOnWeb({ mode: 'photo-video' });
       }
 
       // Check and request camera permissions
@@ -253,7 +376,7 @@ export const MediaPickerUtil = {
     try {
       // On web, camera capture is not available
       if (isWeb) {
-        throw new Error('Video capture is not available on web. Please use video selection instead.');
+        return mountCameraCaptureOnWeb({ mode: 'photo-video', webVideoMaxDurationSeconds: 60 });
       }
 
       // Use statically imported ImagePicker
@@ -477,7 +600,7 @@ export const MediaPickerUtil = {
     try {
       // On web, camera capture is not available, so redirect to select
       if (isWeb) {
-        throw new Error('Camera capture is not available on web. Please use image selection instead.');
+        return mountCameraCaptureOnWeb({ mode: 'photo', aspectRatio: 1 });
       }
 
       // Use statically imported ImagePicker

@@ -7961,19 +7961,6 @@ export default function Chat() {
         }
       }
     } catch (error: any) {
-      if (
-        typeof error?.message === 'string' &&
-        error.message.includes('Camera capture is not available on web')
-      ) {
-        Toast.show({
-          type: 'error',
-          text1: 'Camera Not Available',
-          text2: 'Camera capture is not available on web. Please use image selection instead.',
-          position: 'top',
-        });
-        return;
-      }
-
       if (error.message?.includes('Permission')) {
         Toast.show({
           type: 'error',
