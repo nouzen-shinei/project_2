@@ -83,6 +83,12 @@ export interface HydratedAttachment extends FileAttachment {
 	previewUri?: string;
 	/** H.264 transcoded URL — used preferentially over resolvedUrl for video on web. */
 	transcodedUrl?: string;
+	/**
+	 * Set to `true` by the backend transcoder after it deleted the original H.265 file
+	 * and overwrote the attachment's primary `url` field with the H.264 copy.
+	 * When `true`, `url` already points at a playable H.264 file and the original is gone.
+	 */
+	originalReplaced?: boolean;
 }
 
 export interface HydratedChatMessage extends ChatMessage {
@@ -1307,7 +1313,7 @@ class ChatCacheService {
 			// manages its own codec-aware loading via <video> elements. Caching them via
 			// webMediaCache wastes bandwidth and causes 403 errors for deleted originals
 			// (H.265 files removed from Firebase Storage after transcoding).
-			if (isVideoFile(undefined, fileName || remoteUrl)) {
+			if (isVideoFile('', fileName || remoteUrl)) {
 				return remoteUrl;
 			}
 			try {
@@ -1763,7 +1769,7 @@ class ChatCacheService {
 
 		if (Platform.OS === 'web') {
 			// Never download video files on web — same reason as getMediaForDownload.
-			if (isVideoFile(undefined, fileName || remoteUrl)) {
+			if (isVideoFile('', fileName || remoteUrl)) {
 				return remoteUrl;
 			}
 			try {

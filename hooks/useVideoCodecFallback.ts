@@ -6,6 +6,7 @@ import { Platform } from 'react-native';
 
 import { firestore } from '@/config/firebase';
 import { canPlayCodec } from '@/utils/codecDetector';
+import { isVideoTranscodeEnabled } from '@/lib/videoTranscodeConfig';
 import { logger } from '@/lib/logger';
 import { runtimeEndpoints } from '@/services/runtimeEndpoints';
 import { internalTokenManager } from '@/services/internalTokenManager';
@@ -123,6 +124,11 @@ export function useVideoCodecFallback(options: UseVideoCodecFallbackOptions): {
   // Stable ref used to cancel the Firestore listener and timeout from within effects.
   const pollingCleanupRef = useRef<(() => void) | null>(null);
   const timeoutHandleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Set to true when the backend tells us VIDEO_TRANSCODE_ENABLED=false.
+  // Prevents re-requesting a transcode after the first disabled response
+  // and routes the subsequent codec error to the permanent-error path.
+  const transcodeKnownDisabledRef = useRef(false);
 
   // ── Helper: swap to transcodedUri immediately ────────────────────────────
 
@@ -243,6 +249,23 @@ export function useVideoCodecFallback(options: UseVideoCodecFallbackOptions): {
 
         const data: { status: string; transcodedUrl?: string } = await response.json();
 
+        // Backend transcoding is disabled (VIDEO_TRANSCODE_ENABLED=false).
+        // Don't error immediately — the browser may be able to decode the original
+        // directly (e.g. Chrome on macOS 13+ plays H.265 via VideoToolbox even
+        // though canPlayType incorrectly reports "" for hvc1).
+        // Mark the disabled state and load the original URI. If the browser truly
+        // cannot decode it, useWebVideoPlayer fires onUnsupportedCodec →
+        // handleCodecError → onCodecError hits the transcodeKnownDisabledRef guard
+        // and shows the permanent error then.
+        if (data.status === 'disabled') {
+          transcodeKnownDisabledRef.current = true;
+          onSpinnerChangeRef.current(false);
+          setPhase('idle');
+          setActiveUri(uri);
+          onSourceResolvedRef.current(uri, seekTo);
+          return;
+        }
+
         // Short-circuit: server says job is already done.
         if (data.status === 'done' && typeof data.transcodedUrl === 'string') {
           onSpinnerChangeRef.current(false);
@@ -331,12 +354,19 @@ export function useVideoCodecFallback(options: UseVideoCodecFallbackOptions): {
       if (effectiveTranscodedUri) {
         // Requirement 1.1: swap immediately to the pre-resolved H.264 URI.
         performSwap(effectiveTranscodedUri, currentTimeAtError);
+      } else if (!isVideoTranscodeEnabled() || transcodeKnownDisabledRef.current) {
+        // Transcoding is disabled (client-side flag) OR the backend already told us
+        // it's disabled. The browser truly cannot decode this format.
+        cancelPolling();
+        setPhase('error');
+        onSpinnerChangeRef.current(false);
+        onPermanentErrorRef.current("This video format can't be played in this browser.");
       } else {
         // Requirement 1.3: request on-demand transcoding, then poll.
         void requestTranscode(currentTimeAtError);
       }
     },
-    [transcodedUri, performSwap, requestTranscode],
+    [transcodedUri, performSwap, requestTranscode, cancelPolling],
   );
 
   /**

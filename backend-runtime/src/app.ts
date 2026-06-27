@@ -5,7 +5,7 @@ import crypto from 'crypto';
 import fetch from 'node-fetch';
 import { createGzip } from 'node:zlib';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { scheduleVideoTranscode, transcodeDocId } from './videoTranscoder';
+import { scheduleVideoTranscode, transcodeDocId, isVideoTranscodeEnabled } from './videoTranscoder';
 import { enqueueReminder, enqueueCustomMessage, enqueuePaymentConfirmation, getJobStatus, listJobStatus, getInMemoryQueueSnapshot, shutdownQueue } from './queueProvider';
 import { sendSMS as backendSendSMS, sendVoiceCall as backendSendVoiceCall } from './twilio';
 import { metricsText, inc, metricNames, getFailureRate, getWindowCount } from './metrics';
@@ -12151,6 +12151,12 @@ export function createApp(options: CreateAppOptions = {}){
       }
 
       const { originalUrl, tenantId } = parsed.data;
+
+      // Requirement 8: when transcoding is disabled, never schedule a job.
+      // Report 'disabled' so the client surfaces the unsupported-video error.
+      if (!isVideoTranscodeEnabled()) {
+        return res.status(200).json({ status: 'disabled' });
+      }
 
       // Derive the deterministic document ID the same way the transcoder does:
       // sha256(storagePath) — where storagePath is extracted from the download URL.

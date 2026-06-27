@@ -41,6 +41,7 @@ import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgres
 import { useWebVideoPlayer } from '@/hooks/useWebVideoPlayer';
 import { useVideoCodecFallback } from '@/hooks/useVideoCodecFallback';
 import { canPlayCodec } from '@/utils/codecDetector';
+import { isVideoTranscodeEnabled } from '@/lib/videoTranscodeConfig';
 import { useTenant } from '@/hooks/useTenantContext';
 import {
   resolveDownloadProgressLabel,
@@ -1566,7 +1567,6 @@ function VideoPlayerLoaded({
   // useWebVideoPlayer sees the correct URL immediately — no double-load on mount.
   const [webResolvedUri, setWebResolvedUri] = useState<string>(() => {
     if (Platform.OS !== 'web') return '';
-    const h265ok = canPlayCodec('h265');
     const trimmedTranscoded =
       typeof transcodedUri === 'string' && transcodedUri.trim().length > 0
         ? transcodedUri.trim()
@@ -1576,6 +1576,13 @@ function VideoPlayerLoaded({
     // after transcoding — loading it on any browser causes 403 console errors.
     if (trimmedTranscoded) {
       return trimmedTranscoded;
+    }
+    // When transcoding is disabled the original is never deleted — load immediately
+    // for ALL browsers. canPlayType reports '' for H.265 on Chrome/macOS even when
+    // VideoToolbox decoding is available, so h265ok is unreliable as a gate here.
+    // Browsers that truly can't decode the format will fire onUnsupportedCodec.
+    if (!isVideoTranscodeEnabled()) {
+      return uri;
     }
     // No transcodedUri yet on ANY browser: start empty so the <video> element
     // makes no network requests while we wait for transcodedUri to arrive from
@@ -1653,12 +1660,15 @@ function VideoPlayerLoaded({
       setWebResolvedUri(effectiveTranscodedUri);
       return;
     }
-    // No transcodedUri yet — wait briefly then trigger the codec fallback pipeline
-    // instead of loading the original URI directly. The fallback calls the backend
-    // which checks Firestore for an existing transcoded URL or determines the
-    // video needs no transcoding (H.264 original). This avoids making a HEAD
-    // request to a potentially-deleted H.265 original entirely.
-    //
+    // When transcoding is disabled the original is never deleted — load immediately
+    // for ALL browsers regardless of H.265 detection. canPlayType is unreliable:
+    // Chrome on macOS 13+ decodes H.265 via VideoToolbox but reports "" for hvc1.
+    // Browsers that truly can't decode the format fire onUnsupportedCodec → error.
+    if (!isVideoTranscodeEnabled()) {
+      setWebResolvedUri((prev) => (prev ? prev : uri));
+      return;
+    }
+    // No transcodedUri yet — wait briefly then trigger the codec fallback pipeline.
     // Timeout rationale:
     //   • 200 ms on H.265-capable browsers: allows the RTDB live subscription
     //     (~100 ms) to deliver transcodedUrl before the fallback fires.
@@ -3746,7 +3756,12 @@ function VideoPlayerLoaded({
   );
 
   const renderSeekGestureLayer = (variant: 'inline' | 'fullscreen' = 'inline') => (
-    <View style={styles.seekGestureLayer} pointerEvents="box-none">
+    <View
+      style={styles.seekGestureLayer}
+      // When a permanent codec error is shown, disable the seek gesture layer entirely
+      // so touches fall through to the Download link in the error overlay beneath it.
+      pointerEvents={codecFallbackError ? 'none' : 'box-none'}
+    >
       <Pressable
         style={[styles.seekZone, styles.seekZoneLeft]}
         onPress={() => handleSeekTap('backward')}
@@ -3920,12 +3935,15 @@ function VideoPlayerLoaded({
             </Text>
             {onDownload ? (
               <TouchableOpacity
-                onPress={onDownload}
+                onPress={isDownloading ? undefined : onDownload}
+                disabled={isDownloading}
                 style={{ marginTop: 12 }}
                 accessibilityRole="button"
-                accessibilityLabel="Download video"
+                accessibilityLabel={downloadButtonA11yLabel}
               >
-                <Text style={{ color: theme.primary ?? '#4A90E2', fontSize: 13 }}>Download</Text>
+                <Text style={{ color: theme.primary ?? '#4A90E2', fontSize: 13 }}>
+                  {isDownloading ? resolveProgressPercentText(normalizedProgress) : 'Download'}
+                </Text>
               </TouchableOpacity>
             ) : null}
           </View>
@@ -3993,16 +4011,23 @@ function VideoPlayerLoaded({
             // Never show while the video is actually playing.
             suppressOverlay
               ? false
-              // Suppress the generic error state when the codec-fallback system owns the error UI.
-              // This prevents "Playback failed" flashing behind the "Converting…" spinner or
-              // the fallback's own "Video playback failed. Try downloading." overlay.
-              : Platform.OS === 'web' && playbackUxState.isError && (
-                  codecFallbackActive ||
-                  codecFallbackError != null ||
+              // Suppress whenever the codec-fallback system is rendering its own overlay:
+              //   • spinner — "Converting for your browser…" / "Loading compatible format…"
+              //   • timeout — "Video is still processing. Try again in a moment."
+              //   • permanent error — "Video playback failed." / "format not supported"
+              //   • requesting/polling — brief transition before the spinner appears
+              //   • error phase — disabled-transcode permanent error or swap-target failure
+              // The check is NOT limited to playbackUxState.isError — the codec fallback
+              // overlays also appear during initial loading (isLoading=true, isError=false),
+              // and the buffering overlay must not cover them in that window.
+              : Platform.OS === 'web' && (
+                  codecFallbackSpinnerVisible ||
                   codecFallbackTimeout ||
-                  // Also suppress while a swap is resolving (brief window before 'done')
+                  codecFallbackError != null ||
                   codecFallbackPhase === 'requesting' ||
-                  codecFallbackPhase === 'polling'
+                  codecFallbackPhase === 'polling' ||
+                  codecFallbackPhase === 'error' ||
+                  (playbackUxState.isError && codecFallbackActive)
                 )
               ? false
               : playbackUxState.showOverlay

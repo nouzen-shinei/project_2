@@ -8773,7 +8773,25 @@ export default function Chat() {
               return [];
             }
             return msg.attachments
-              .map((att: any) => att?.url)
+              .map((att: any) => {
+                if (!att || typeof att.url !== 'string' || att.url.length === 0) {
+                  return undefined;
+                }
+                // For video attachments that have a transcoded H.264 copy (or whose
+                // url was already replaced by the backend), the original H.265 file
+                // has been deleted from Firebase Storage. Validating att.url would
+                // issue a HEAD request that returns 403. Skip these — the video
+                // plays via its transcoded copy and the VideoPlayer surfaces its own
+                // errors. Videos without a transcoded copy are still validated.
+                if (isVideoFile(att.fileType, att.fileName)) {
+                  const hasTranscoded =
+                    typeof att.transcodedUrl === 'string' && att.transcodedUrl.trim().length > 0;
+                  if (hasTranscoded || att.originalReplaced === true) {
+                    return undefined;
+                  }
+                }
+                return att.url as string;
+              })
               .filter(
                 (url: any): url is string =>
                   typeof url === 'string' &&

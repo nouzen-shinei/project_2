@@ -479,7 +479,27 @@ function releaseTranscodeSlot(): void {
 
 // ─── Main export ─────────────────────────────────────────────────────────────
 
+/**
+ * Whether server-side video transcoding is enabled. Controlled by the
+ * VIDEO_TRANSCODE_ENABLED env flag. Defaults to enabled (backward compatible);
+ * only an explicit disable value turns it off. When disabled, scheduleVideoTranscode
+ * is a no-op and /video/request-transcode reports { status: 'disabled' }.
+ */
+export function isVideoTranscodeEnabled(): boolean {
+  const raw = (process.env.VIDEO_TRANSCODE_ENABLED ?? '').trim().toLowerCase();
+  if (!raw) {
+    return true; // default: enabled
+  }
+  return !['false', '0', 'no', 'off', 'disabled'].includes(raw);
+}
+
 export function scheduleVideoTranscode(job: TranscodeJob): void {
+  if (!isVideoTranscodeEnabled()) {
+    console.log(
+      `[videoTranscoder] transcoding disabled via VIDEO_TRANSCODE_ENABLED — skipping ${job.originalPath}`
+    );
+    return;
+  }
   setImmediate(async () => {
     try {
       await acquireTranscodeSlot();
@@ -668,9 +688,10 @@ async function runTranscodeJob(job: TranscodeJob): Promise<void> {
         const rtdb = admin.database();
         // rAttIdx >= 0: attachment in the attachments[] array
         // rAttIdx === -1: single-file message — write to the message root
-        const attachPath = rAttIdx >= 0
-          ? `tenantChat/${rTenantId}/conversationMessages/${rConvKey}/${rMsgId}/attachments/${rAttIdx}/transcodedUrl`
-          : `tenantChat/${rTenantId}/conversationMessages/${rConvKey}/${rMsgId}/transcodedUrl`;
+        const basePath = rAttIdx >= 0
+          ? `tenantChat/${rTenantId}/conversationMessages/${rConvKey}/${rMsgId}/attachments/${rAttIdx}`
+          : `tenantChat/${rTenantId}/conversationMessages/${rConvKey}/${rMsgId}`;
+        const attachPath = `${basePath}/transcodedUrl`;
 
         // Attempt the write with one retry on transient failure.
         const writeWithRetry = async () => {
@@ -684,6 +705,33 @@ async function runTranscodeJob(job: TranscodeJob): Promise<void> {
 
         await writeWithRetry();
         console.log(`[videoTranscoder] wrote transcodedUrl to RTDB ${rMsgId}[${rAttIdx >= 0 ? rAttIdx : 'root'}]`);
+
+        // If the original was successfully deleted, overwrite the primary `url` field so
+        // that every client reading attachment.url receives the H.264 copy rather than the
+        // deleted original. rtdbInfo was read after the status:'done' write so it already
+        // contains originalDeleted (set by deleteOriginalWithRetry at step 11).
+        // Skip the overwrite when originalDeleteError is set — the original still exists.
+        const originalSuccessfullyDeleted =
+          rtdbInfo.originalDeleted === true && !rtdbInfo.originalDeleteError;
+
+        if (originalSuccessfullyDeleted) {
+          // Write url overwrite with one retry. Non-fatal on failure — the existing
+          // transcodedUrl field and frontend guards provide defense-in-depth.
+          const overwriteUrlWithRetry = async () => {
+            try {
+              await rtdb.ref(`${basePath}/url`).set(transcodedUrl);
+              await rtdb.ref(`${basePath}/originalReplaced`).set(true);
+            } catch (firstErr) {
+              await sleep(3_000);
+              await rtdb.ref(`${basePath}/url`).set(transcodedUrl);
+              await rtdb.ref(`${basePath}/originalReplaced`).set(true); // throws on second failure
+            }
+          };
+          await overwriteUrlWithRetry();
+          console.log(
+            `[videoTranscoder] overwrote canonical url in RTDB ${rMsgId}[${rAttIdx >= 0 ? rAttIdx : 'root'}]`
+          );
+        }
       }
     } catch (rtdbErr) {
       // Non-fatal — clients fall back to the Firestore videoTranscodes lookup.

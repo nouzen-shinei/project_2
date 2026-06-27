@@ -9,6 +9,7 @@ import { View, Text, Image, TouchableOpacity, ActivityIndicator, Platform } from
 import { Star, Heart, Smile, Trash2, AlertCircle, Eye, Edit3, RotateCcw } from 'lucide-react-native';
 import { useChatStable, useChatReactive } from './ChatContext';
 import type { HydratedAttachment, ChatReplyContext } from './ChatContext';
+import { resolveVideoSource } from '../../lib/videoSource';
 import AnimatedMessageWrapper from './AnimatedMessageWrapper';
 import MessageReplySnippet from './MessageReplySnippet';
 import MessageReactionPills from './MessageReactionPills';
@@ -765,19 +766,26 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
                               </Text>
                             </View>
                           </View>
-                        ) : isVideoFile(attachment.fileType, attachment.fileName) ? (
-                          <FileViewer
-                            fileUrl={attachment.transcodedUrl || attachment.resolvedUrl || attachment.url}
-                            fileName={attachment.fileName || 'Video File'}
-                            fileType={attachment.fileType || ''}
-                            fileSize={attachment.fileSize}
-                            onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'Video File')}
-                            downloadKey={getDownloadKey(attachment.url)}
-                            remoteFileUrl={attachment.transcodedUrl || attachment.url}
-                            transcodedUri={attachment.transcodedUrl}
-                            // Use FileViewer's built-in ShareModal
-                          />
-                        ) : isImageFile(attachment.fileType, attachment.fileName) ? (
+                        ) : isVideoFile(attachment.fileType, attachment.fileName) ? (() => {
+                          // Requirement 7.2: always use the safe source (transcodedUrl when present).
+                          // The original attachment.url is kept ONLY as a stable identity key
+                          // (downloadKey) — it is never used as a playback or network source.
+                          const { source: videoSource } = resolveVideoSource(attachment);
+                          return (
+                            <FileViewer
+                              fileUrl={videoSource}
+                              fileName={attachment.fileName || 'Video File'}
+                              fileType={attachment.fileType || ''}
+                              fileSize={attachment.fileSize}
+                              onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'Video File')}
+                              downloadKey={getDownloadKey(attachment.url)}
+                              remoteFileUrl={videoSource}
+                              transcodedUri={attachment.transcodedUrl}
+                              // Use FileViewer's built-in ShareModal
+                            />
+                          );
+                        })()
+                        : isImageFile(attachment.fileType, attachment.fileName) ? (
                           <TouchableOpacity onPress={getAttachmentImageViewPressHandler(attachment)}>
                             <ProgressiveImage
                               uri={attachment.resolvedUrl || attachment.url}
