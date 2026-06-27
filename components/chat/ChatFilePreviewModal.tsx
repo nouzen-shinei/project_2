@@ -1,10 +1,13 @@
-import React, { useState } from 'react';
-import { Modal, View, Text, TouchableOpacity, ScrollView, SafeAreaView, TextInput, Image, StyleSheet, Platform } from 'react-native';
-import { X, Trash2, Send, File as FileIcon } from 'lucide-react-native';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { Modal, View, Text, TouchableOpacity, ScrollView, SafeAreaView, TextInput, Image, StyleSheet, Platform, ActivityIndicator } from 'react-native';
+import { X, Trash2, Send, File as FileIcon, Music, Play, Pause } from 'lucide-react-native';
 import VideoPlayer from '../VideoPlayer';
-import { isImageFile, isVideoFile } from '../../lib/fileUtils';
+import { isImageFile, isVideoFile, isAudioFile } from '../../lib/fileUtils';
+import { useVideoPlayer, VideoView } from 'expo-video';
+import { useEvent } from 'expo';
 
 const CHAT_MESSAGE_MAX_CHARS = 500;
+const MAX_CHAT_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 
 const formatFileSize = (bytes: number): string => {
   if (bytes === 0) return '0 B';
@@ -31,7 +34,7 @@ interface ChatFilePreviewModalProps {
   groupedSkippedPreviewFiles: {
     folder: string[];
     duplicate: string[];
-    tooLarge: string[];
+    tooLarge: { name: string; fileSize: number }[];
     other: string[];
   };
   message: string;
@@ -78,6 +81,144 @@ function ImagePreview({ uri, theme }: { uri: string; theme: any }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// PreviewAudioPlayer — compact audio player that matches the video thumbnail
+// footprint (~140 px tall). Uses expo-video under the hood, same as AudioPlayer.
+// ---------------------------------------------------------------------------
+const PreviewAudioPlayer = React.memo(function PreviewAudioPlayer({
+  uri,
+}: {
+  uri: string;
+}) {
+  const [hasEnded, setHasEnded] = useState(false);
+
+  const player = useVideoPlayer(uri || null, (p) => {
+    p.loop = false;
+    p.muted = false;
+    p.timeUpdateEventInterval = 0.25;
+  });
+
+  const { isPlaying } = useEvent(player, 'playingChange', { isPlaying: player.playing });
+  const timeUpdate = useEvent(player, 'timeUpdate', {
+    currentTime: player.currentTime ?? 0,
+    bufferedPosition: player.bufferedPosition ?? 0,
+    currentLiveTimestamp: null,
+    currentOffsetFromLive: null,
+  });
+  const { status } = useEvent(player, 'statusChange', { status: player.status });
+
+  const position = useMemo(() => {
+    const t = timeUpdate.currentTime ?? 0;
+    return Number.isFinite(t) && t >= 0 ? t : 0;
+  }, [timeUpdate]);
+
+  const duration = useMemo(() => {
+    const d = player.duration;
+    return Number.isFinite(d) && d > 0 ? d : 0;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [player, status, timeUpdate]);
+
+  const progress = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
+  const isLoading = status === 'loading';
+
+  // Pause + release when unmounted
+  useEffect(() => {
+    return () => {
+      try { player.pause(); } catch { /* ignore */ }
+    };
+  }, [player]);
+
+  // Detect end-of-track
+  useEffect(() => {
+    if (!isPlaying && duration > 0 && position >= Math.max(0, duration - 0.1)) {
+      setHasEnded(true);
+    }
+  }, [isPlaying, position, duration]);
+
+  const toggle = useCallback(() => {
+    if (isPlaying) { player.pause(); return; }
+    if (hasEnded) { player.currentTime = 0; setHasEnded(false); }
+    player.play();
+  }, [isPlaying, hasEnded, player]);
+
+  const fmt = (s: number) => {
+    if (!Number.isFinite(s) || s < 0) return '0:00';
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <View style={previewAudioStyles.container}>
+      {/* expo-video requires a VideoView even for audio — keep it zero-size */}
+      <VideoView
+        player={player as any}
+        nativeControls={false}
+        allowsFullscreen={false}
+        allowsPictureInPicture={false}
+        style={previewAudioStyles.hiddenVideo}
+      />
+
+      {/* Decorative background icon */}
+      <Music size={80} color="rgba(139,92,246,0.18)" style={previewAudioStyles.bgIcon} />
+
+      {/* Centred play / pause button — mirrors the video thumbnail overlay */}
+      <TouchableOpacity
+        onPress={toggle}
+        style={previewAudioStyles.playBtn}
+        disabled={isLoading}
+        activeOpacity={0.8}
+      >
+        {isLoading ? (
+          <ActivityIndicator size="small" color="white" />
+        ) : isPlaying ? (
+          <Pause size={22} color="white" />
+        ) : (
+          <Play size={26} color="white" />
+        )}
+      </TouchableOpacity>
+
+      {/* Thin progress bar + time labels pinned to the bottom */}
+      <View style={previewAudioStyles.bottom}>
+        <View style={previewAudioStyles.progressTrack}>
+          <View style={[previewAudioStyles.progressFill, { width: `${progress}%` as any }]} />
+        </View>
+        <View style={previewAudioStyles.timeRow}>
+          <Text style={previewAudioStyles.timeText}>{fmt(position)}</Text>
+          <Text style={previewAudioStyles.timeText}>{duration > 0 ? fmt(duration) : '--:--'}</Text>
+        </View>
+      </View>
+    </View>
+  );
+});
+
+// Extracts the playback duration of a local media URI on web via a hidden
+// HTMLMediaElement. Resolves to 0 on error or if not on web.
+function getMediaDurationWeb(uri: string): Promise<number> {
+  return new Promise((resolve) => {
+    if (Platform.OS !== 'web' || !uri) {
+      resolve(0);
+      return;
+    }
+    const el = document.createElement('video');
+    el.preload = 'metadata';
+    const timeout = setTimeout(() => {
+      el.src = '';
+      resolve(0);
+    }, 6000);
+    el.onloadedmetadata = () => {
+      clearTimeout(timeout);
+      resolve(isFinite(el.duration) && el.duration > 0 ? el.duration : 0);
+      el.src = '';
+    };
+    el.onerror = () => {
+      clearTimeout(timeout);
+      resolve(0);
+    };
+    el.src = uri;
+  });
+}
+
 export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
   visible,
   onClose,
@@ -92,6 +233,36 @@ export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
   onRemoveFile,
   theme,
 }) => {
+  // Durations extracted from media files (not provided by the file picker)
+  const [mediaDurations, setMediaDurations] = useState<Record<number, number>>({});
+
+  useEffect(() => {
+    if (!visible) return;
+    // Reset whenever the file list changes
+    setMediaDurations({});
+
+    let cancelled = false;
+    const extract = async () => {
+      const result: Record<number, number> = {};
+      for (let i = 0; i < selectedFiles.length; i++) {
+        if (cancelled) break;
+        const file = selectedFiles[i];
+        const mimeType = String(file.mimeType || file.type || file.fileType || '').toLowerCase();
+        const name = String(file.fileName || file.name || '');
+        // Use file-provided duration first; otherwise probe via HTML5 media element
+        if (file.duration && file.duration > 0) {
+          result[i] = file.duration;
+        } else if (isVideoFile(mimeType, name) || isAudioFile(mimeType, name)) {
+          const uri = String(file.uri || file.previewUri || '');
+          const dur = await getMediaDurationWeb(uri);
+          if (dur > 0) result[i] = dur;
+        }
+      }
+      if (!cancelled) setMediaDurations(result);
+    };
+    extract();
+    return () => { cancelled = true; };
+  }, [visible, selectedFiles]);
   return (
     <Modal
       visible={visible}
@@ -146,12 +317,26 @@ export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
                 {groupedSkippedPreviewFiles.tooLarge.length > 0 && (
                   <>
                     <Text style={styles.skippedPreviewGroupTitle}>
-                      Too Large ({groupedSkippedPreviewFiles.tooLarge.length})
+                      Too Large — max {formatFileSize(MAX_CHAT_FILE_SIZE)} ({groupedSkippedPreviewFiles.tooLarge.length})
                     </Text>
                     {groupedSkippedPreviewFiles.tooLarge.map((entry, idx) => (
-                      <Text key={`too_large_${entry}_${idx}`} style={styles.skippedPreviewGroupItem} numberOfLines={1}>
-                        • {entry}
-                      </Text>
+                      <View key={`too_large_${idx}`} style={styles.skippedTooLargeItem}>
+                        <Text style={styles.skippedPreviewGroupItem} numberOfLines={1}>
+                          • {entry.name}
+                        </Text>
+                        {entry.fileSize > 0 && (
+                          <View style={styles.skippedTooLargeSizeRow}>
+                            <Text style={styles.skippedTooLargeSizeLabel}>Size: </Text>
+                            <Text style={styles.skippedTooLargeSizeValue}>
+                              {formatFileSize(entry.fileSize)}
+                            </Text>
+                            <Text style={styles.skippedTooLargeSizeLabel}>  ·  Limit: </Text>
+                            <Text style={styles.skippedTooLargeSizeLimit}>
+                              {formatFileSize(MAX_CHAT_FILE_SIZE)}
+                            </Text>
+                          </View>
+                        )}
+                      </View>
                     ))}
                   </>
                 )}
@@ -182,21 +367,22 @@ export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
                 ? 'Unknown file'
                 : safePreviewNameCandidate;
               const fileSizeValue = file.fileSize || file.size;
-              const durationValue: number | null | undefined = file.duration;
+              const durationValue: number | null | undefined = mediaDurations[index] ?? file.duration;
               const isImage = isImageFile(mimeType, safePreviewName);
               const isVideo = isVideoFile(mimeType, safePreviewName);
+              const isAudio = isAudioFile(mimeType, safePreviewName);
               const previewImageUri = String(file.previewUri || file.uri || '');
               const thumbnailUri = file.thumbnail || file.preview || file.poster || null;
 
               // Build the metadata string: size · duration
               const metaParts: string[] = [];
               if (fileSizeValue) metaParts.push(formatFileSize(fileSizeValue));
-              if (isVideo && durationValue && durationValue > 0) metaParts.push(formatDuration(durationValue));
+              if ((isVideo || isAudio) && durationValue && durationValue > 0) metaParts.push(formatDuration(durationValue));
               const metaString = metaParts.join('  ·  ');
 
               return (
                 <View key={index} style={[styles.filePreviewItem, { backgroundColor: theme.background }]}>
-                  <View style={[styles.filePreviewInfo, isVideo ? styles.filePreviewInfoVideo : null]}>
+                  <View style={[styles.filePreviewInfo, (isVideo || isAudio) ? styles.filePreviewInfoVideo : null]}>
                     {isImage && previewImageUri ? (
                       <ImagePreview uri={previewImageUri} theme={theme} />
                     ) : isVideo ? (
@@ -210,11 +396,18 @@ export const ChatFilePreviewModal: React.FC<ChatFilePreviewModalProps> = ({
                           controlVariant="minimal"
                         />
                       </View>
+                    ) : isAudio ? (
+                      <View style={styles.audioPreviewContainer}>
+                        <PreviewAudioPlayer
+                          uri={file.uri}
+                        />
+                      </View>
                     ) : (
                       <View style={styles.fileIconContainer}>
                         <FileIcon size={32} color={theme.primary} />
                       </View>
                     )}
+                    {/* Show filename + size below every file type, same pattern as video */}
                     <View style={styles.filePreviewDetails}>
                       <Text style={[styles.previewFileName, { color: theme.text }]} numberOfLines={2}>
                         {safePreviewName}
@@ -354,6 +547,12 @@ const styles = StyleSheet.create({
     width: '100%',
     marginBottom: 8,
   },
+  audioPreviewContainer: {
+    maxWidth: 360,
+    width: '100%',
+    marginBottom: 4,
+    alignSelf: 'flex-start',
+  },
   videoPreviewPlayer: {
     width: '100%',
     borderRadius: 8,
@@ -460,5 +659,89 @@ const styles = StyleSheet.create({
   skippedPreviewGroupItem: {
     color: '#B45309',
     fontSize: 12,
+  },
+  skippedTooLargeItem: {
+    marginBottom: 6,
+  },
+  skippedTooLargeSizeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 10,
+    marginTop: 2,
+  },
+  skippedTooLargeSizeLabel: {
+    color: '#B45309',
+    fontSize: 11,
+    fontFamily: 'Inter-Regular',
+  },
+  skippedTooLargeSizeValue: {
+    color: '#DC2626',
+    fontSize: 11,
+    fontFamily: 'Inter-SemiBold',
+  },
+  skippedTooLargeSizeLimit: {
+    color: '#92400E',
+    fontSize: 11,
+    fontFamily: 'Inter-Regular',
+  },
+});
+
+const previewAudioStyles = StyleSheet.create({
+  container: {
+    width: '100%',
+    height: 140,
+    borderRadius: 8,
+    backgroundColor: 'rgba(139,92,246,0.12)',
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hiddenVideo: {
+    width: 0,
+    height: 0,
+    position: 'absolute',
+  },
+  bgIcon: {
+    position: 'absolute',
+    opacity: 1,
+  },
+  playBtn: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.35)',
+  },
+  bottom: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    paddingHorizontal: 10,
+    paddingBottom: 6,
+  },
+  progressTrack: {
+    height: 3,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 2,
+    overflow: 'hidden',
+    marginBottom: 4,
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: '#8B5CF6',
+    borderRadius: 2,
+  },
+  timeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  timeText: {
+    fontSize: 10,
+    color: 'rgba(255,255,255,0.7)',
+    fontFamily: 'Inter-Regular',
   },
 });

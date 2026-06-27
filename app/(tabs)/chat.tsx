@@ -7651,7 +7651,11 @@ export default function Chat() {
         .map((file) => file?.fileName || file?.name || 'Unknown file')
         .join(', ');
       skippedEntries.push(
-        ...oversizedFiles.map((file) => `[Too large] ${file?.fileName || file?.name || 'Unknown file'}`)
+        ...oversizedFiles.map((file) => {
+          const name = file?.fileName || file?.name || 'Unknown file';
+          const size = file?.fileSize || file?.size || 0;
+          return `[Too large] ${name}||${size}`;
+        })
       );
       Toast.show({
         type: 'error',
@@ -7692,7 +7696,12 @@ export default function Chat() {
   }, [MAX_SKIPPED_PREVIEW_ITEMS, getPreviewFileIdentity]);
 
   const groupedSkippedPreviewFiles = useMemo(() => {
-    const groups: Record<'folder' | 'duplicate' | 'tooLarge' | 'other', string[]> = {
+    const groups: {
+      folder: string[];
+      duplicate: string[];
+      tooLarge: { name: string; fileSize: number }[];
+      other: string[];
+    } = {
       folder: [],
       duplicate: [],
       tooLarge: [],
@@ -7713,7 +7722,15 @@ export default function Chat() {
       } else if (label === 'duplicate') {
         groups.duplicate.push(value);
       } else if (label === 'too large') {
-        groups.tooLarge.push(value);
+        const pipeIdx = value.lastIndexOf('||');
+        if (pipeIdx !== -1) {
+          groups.tooLarge.push({
+            name: value.slice(0, pipeIdx),
+            fileSize: parseInt(value.slice(pipeIdx + 2), 10) || 0,
+          });
+        } else {
+          groups.tooLarge.push({ name: value, fileSize: 0 });
+        }
       } else {
         groups.other.push(entry);
       }

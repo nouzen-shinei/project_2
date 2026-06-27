@@ -126,6 +126,12 @@ export interface CameraCaptureProps {
    *   `CameraView.recordAsync({ maxDuration: 300 })`).
    */
   webVideoMaxDurationSeconds?: number;
+
+  /**
+   * Which tab to show as active when the camera first opens in `photo-video`
+   * mode. Defaults to `'photo'`. Ignored when `mode` is `'photo'` or `'video'`.
+   */
+  initialCaptureMode?: 'photo' | 'video';
 }
 
 // ---------------------------------------------------------------------------

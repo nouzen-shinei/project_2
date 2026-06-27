@@ -1026,7 +1026,7 @@ export default function Dashboard() {
     styles.header,
     { backgroundColor: theme.surface, paddingTop: Math.max(0, sharedTopPadding - effectiveHeaderComp) }
   ]}>
-        <View>
+        <View style={{ flex: 1, marginRight: 8 }}>
           <Text allowFontScaling={false} style={[styles.greeting, { color: theme.text }]}>{getGreeting()}</Text>
           <Text allowFontScaling={false} style={[styles.subtitle, { color: theme.textSecondary }]}>{"Here's your tuition overview"}</Text>
         </View>

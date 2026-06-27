@@ -41,6 +41,7 @@ interface MountCameraOptions {
   mode: 'photo' | 'video' | 'photo-video';
   webVideoMaxDurationSeconds?: number;
   aspectRatio?: number;
+  initialCaptureMode?: 'photo' | 'video';
 }
 
 interface NormalizedPickerResult {
@@ -128,6 +129,7 @@ async function mountCameraCaptureOnWeb(opts: MountCameraOptions): Promise<Normal
         onCapture: handleCapture,
         onCancel: handleCancel,
         webVideoMaxDurationSeconds: opts.webVideoMaxDurationSeconds,
+        initialCaptureMode: opts.initialCaptureMode,
       })
     );
   });
@@ -388,7 +390,7 @@ export const MediaPickerUtil = {
     try {
       // On web, camera capture is not available
       if (isWeb) {
-        return mountCameraCaptureOnWeb({ mode: 'photo-video', webVideoMaxDurationSeconds: 60 });
+        return mountCameraCaptureOnWeb({ mode: 'photo-video', webVideoMaxDurationSeconds: 60, initialCaptureMode: 'video' });
       }
 
       // Use statically imported ImagePicker

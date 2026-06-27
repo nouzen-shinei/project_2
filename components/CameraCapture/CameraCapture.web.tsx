@@ -129,7 +129,7 @@ const FolderIcon = () => (
 
 // ── Main component ─────────────────────────────────────────────────────────
 function CameraCapture({
-  mode, onCapture, onCancel, webVideoMaxDurationSeconds,
+  mode, onCapture, onCancel, webVideoMaxDurationSeconds, initialCaptureMode,
 }: CameraCaptureProps) {
 
   const effectiveMaxDuration = useMemo(() => {
@@ -140,7 +140,7 @@ function CameraCapture({
   }, [webVideoMaxDurationSeconds]);
 
   const [captureMode, setCaptureMode] = useState<'photo' | 'video'>(
-    mode === 'video' ? 'video' : 'photo',
+    mode === 'video' ? 'video' : (initialCaptureMode ?? 'photo'),
   );
   const [flashOverlay, setFlashOverlay] = useState(false);
   const [errorMsg,     setErrorMsg]     = useState<string | null>(null);
@@ -342,6 +342,7 @@ function CameraCapture({
         style={{
           position: 'absolute', inset: 0, width: '100%', height: '100%',
           objectFit: 'cover', pointerEvents: 'none', zIndex: 1,
+          transform: 'scaleX(-1)',
         }}
       />
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, Pressable } from 'react-native';
+import { View, Text, Pressable, Platform } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Sparkles, PartyPopper } from 'lucide-react-native';
 import { useBirthdays } from './BirthdayProvider';
@@ -29,7 +29,8 @@ export default function BirthdayBanner() {
       start={{ x: 0, y: 0 }}
       end={{ x: 1, y: 0 }}
   // extra space above (paddingTop) while keeping children anchored to bottom (justifyContent: 'flex-end')
-  style={{ paddingTop: 36, paddingBottom: 12, paddingHorizontal: 16, minHeight: 88, borderBottomWidth: 1, borderColor: 'rgba(0,0,0,0.08)', zIndex: 1000, position: 'relative', marginTop: -appliedComp, justifyContent: 'flex-end' }}
+  // On web, no status bar/notch compensation is needed, so paddingTop is reduced
+  style={{ paddingTop: Platform.OS === 'web' ? 12 : 36, paddingBottom: 12, paddingHorizontal: 16, minHeight: Platform.OS === 'web' ? 0 : 88, borderBottomWidth: 1, borderColor: 'rgba(0,0,0,0.08)', zIndex: 1000, position: 'relative', marginTop: -appliedComp, justifyContent: 'flex-end' }}
       onLayout={(e) => {
         const h = e.nativeEvent.layout.height;
         if (!measured.current && h > 0) {
