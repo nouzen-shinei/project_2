@@ -1,6 +1,67 @@
 import * as admin from 'firebase-admin';
+import * as crypto from 'crypto';
 import { ensureFirebase } from './firebaseAdmin';
 import { getConversationKey, normalizeEmail, sanitizeKey } from './chatRealtime';
+
+// ─── Helpers for videoTranscodes RTDB write-back ─────────────────────────────
+
+/** Parse the storage object path out of a Firebase Storage download URL. */
+function extractStoragePathFromDownloadUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(/^\/v0\/b\/[^/]+\/o\/(.+)$/);
+    return match ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Derive the videoTranscodes Firestore document id for a storage path (mirrors videoTranscoder.ts). */
+function transcodeDocIdFromPath(storagePath: string): string {
+  return crypto.createHash('sha256').update(storagePath).digest('hex').slice(0, 40);
+}
+
+/**
+ * Fire-and-forget: record the RTDB message location in each video attachment's
+ * videoTranscodes Firestore document so the transcoder can write transcodedUrl
+ * back to the message when transcoding completes.
+ */
+function recordRtdbPathInTranscodeDocs(
+  tenantId: string,
+  conversationKey: string,
+  messageId: string,
+  attachments: Array<{ url: string; fileType?: string; fileName?: string }> | undefined,
+  singleFileUrl?: string,
+  singleFileType?: string
+): void {
+  try {
+    const fsdb = admin.firestore();
+    const rtdbPath = { rtdbTenantId: tenantId, rtdbConversationKey: conversationKey, rtdbMessageId: messageId };
+
+    const processUrl = (url: string, attachmentIndex: number) => {
+      const storagePath = extractStoragePathFromDownloadUrl(url);
+      if (!storagePath) return;
+      const docId = transcodeDocIdFromPath(storagePath);
+      fsdb.collection('videoTranscodes').doc(docId)
+        .set({ ...rtdbPath, rtdbAttachmentIndex: attachmentIndex }, { merge: true })
+        .catch((err: unknown) =>
+          console.warn('[chatMessageWriter] failed to record RTDB path in videoTranscodes', err)
+        );
+    };
+
+    if (singleFileUrl && /\bvideo\b/i.test(singleFileType ?? '')) {
+      processUrl(singleFileUrl, -1);
+    }
+
+    (attachments ?? []).forEach((att, i) => {
+      if (/\bvideo\b/i.test(att.fileType ?? '') || /\bvideo\b/i.test(att.fileName ?? '')) {
+        processUrl(att.url, i);
+      }
+    });
+  } catch (err) {
+    console.warn('[chatMessageWriter] recordRtdbPathInTranscodeDocs error', err);
+  }
+}
 
 const DEFAULT_EDIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_DELETE_WINDOW_MS = 0; // unlimited by default
@@ -1536,6 +1597,17 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
   await writeMessageIndexRecord(db, tenantId, messageRecord);
   await registerConversationForUsers(db, tenantId, sender, recipient, messageId, timestamp);
   await applySummaryUpdatesForMessage(db, messageId, messageRecord);
+
+  // Record the RTDB message location in videoTranscodes docs so the transcoder
+  // can write transcodedUrl back to this message when done (best-effort).
+  recordRtdbPathInTranscodeDocs(
+    tenantId,
+    conversationKey,
+    messageId,
+    attachments,
+    input.fileUrl,
+    input.fileType,
+  );
 
   return messageRecord;
 }

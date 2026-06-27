@@ -139,6 +139,13 @@ service cloud.firestore {
       allow read, write: if isSignedIn();
     }
 
+    // Video transcode results: written by the backend, readable by authenticated users.
+    // Clients use these to get the H.264 URL for videos that were originally HEVC.
+    match /videoTranscodes/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false; // backend only via Admin SDK
+    }
+
     // Maintenance mode: allow anyone to read the single maintenance doc so the app can
     // show a blocking screen even before login.
     match /appConfig/maintenance {

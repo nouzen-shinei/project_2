@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import fetch from 'node-fetch';
 import { createGzip } from 'node:zlib';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { scheduleVideoTranscode, transcodeDocId } from './videoTranscoder';
 import { enqueueReminder, enqueueCustomMessage, enqueuePaymentConfirmation, getJobStatus, listJobStatus, getInMemoryQueueSnapshot, shutdownQueue } from './queueProvider';
 import { sendSMS as backendSendSMS, sendVoiceCall as backendSendVoiceCall } from './twilio';
 import { metricsText, inc, metricNames, getFailureRate, getWindowCount } from './metrics';
@@ -1296,12 +1297,17 @@ function inferExtensionFromContentType(contentType?: string | null, fallback = '
   return fallback;
 }
 
-async function sumStoragePrefixBytes(bucket: ReturnType<admin.storage.Storage['bucket']>, prefix: string): Promise<number> {
+async function sumStoragePrefixBytes(
+  bucket: ReturnType<admin.storage.Storage['bucket']>,
+  prefix: string,
+  excludePaths: Set<string> = new Set()
+): Promise<number> {
   let total = 0;
   let nextPageToken: string | undefined;
   do {
     const [files, , response] = await bucket.getFiles({ prefix, pageToken: nextPageToken });
     files.forEach((file) => {
+      if (excludePaths.has(file.name)) return;
       const sizeRaw = (file.metadata as any)?.size;
       const size = typeof sizeRaw === 'string' ? Number(sizeRaw) : typeof sizeRaw === 'number' ? sizeRaw : 0;
       if (Number.isFinite(size) && size > 0) {
@@ -1313,7 +1319,11 @@ async function sumStoragePrefixBytes(bucket: ReturnType<admin.storage.Storage['b
   return total;
 }
 
-async function estimateTenantStorageBytes(bucket: ReturnType<admin.storage.Storage['bucket']>, tenantId: string): Promise<number> {
+async function estimateTenantStorageBytes(
+  bucket: ReturnType<admin.storage.Storage['bucket']>,
+  tenantId: string,
+  db?: admin.firestore.Firestore
+): Promise<number> {
   const normalizedTenantId = tenantId.trim();
   const prefixes = [
     `tenant-branding/${normalizedTenantId}/`,
@@ -1323,7 +1333,41 @@ async function estimateTenantStorageBytes(bucket: ReturnType<admin.storage.Stora
     `student_profiles/${normalizedTenantId}/`,
     `profile-pictures/${normalizedTenantId}/`,
   ];
-  const results = await Promise.all(prefixes.map((prefix) => sumStoragePrefixBytes(bucket, prefix).catch(() => 0)));
+
+  // Query videoTranscodes for originalDeleted files to exclude from byte total.
+  // Per requirements 3.8 and 3.9: if query fails or times out, log a warning and
+  // proceed with the full sum (temporarily inflated until next reconciliation).
+  let excludePaths = new Set<string>();
+  if (db) {
+    try {
+      const EXCLUDE_QUERY_TIMEOUT_MS = 5000;
+      const deletedQueryPromise = db
+        .collection('videoTranscodes')
+        .where('tenantId', '==', normalizedTenantId)
+        .where('originalDeleted', '==', true)
+        .get();
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('videoTranscodes exclusion query timed out')), EXCLUDE_QUERY_TIMEOUT_MS)
+      );
+      const deletedSnap = await Promise.race([deletedQueryPromise, timeoutPromise]);
+      deletedSnap.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
+        const originalPath: unknown = doc.data().originalPath;
+        if (typeof originalPath === 'string' && originalPath.length > 0) {
+          excludePaths.add(originalPath);
+        }
+      });
+    } catch (err) {
+      console.warn(
+        '[estimateTenantStorageBytes] Failed to query originalDeleted videoTranscodes; proceeding with full sum (may be temporarily inflated).',
+        err instanceof Error ? err.message : err
+      );
+      excludePaths = new Set<string>(); // reset to empty — full sum
+    }
+  }
+
+  const results = await Promise.all(
+    prefixes.map((prefix) => sumStoragePrefixBytes(bucket, prefix, excludePaths).catch(() => 0))
+  );
   return results.reduce((acc, value) => acc + value, 0);
 }
 
@@ -1341,7 +1385,7 @@ async function loadOrInitTenantStorageUsage(
     }
   }
 
-  const estimated = await estimateTenantStorageBytes(bucket, tenantId);
+  const estimated = await estimateTenantStorageBytes(bucket, tenantId, db);
   await usageRef.set(
     {
       tenantId,
@@ -5522,6 +5566,34 @@ export interface CreateAppOptions {
   };
 }
 
+/**
+ * Parses a Firebase Storage download URL and returns the decoded object path.
+ *
+ * Firebase Storage download URLs have the form:
+ *   https://firebasestorage.googleapis.com/v0/b/{bucket}/o/{encodedPath}?alt=media&token=...
+ *
+ * This is the inverse of `buildDownloadUrl` in videoTranscoder.ts.
+ * Returns the decoded storage path (the `o/` parameter) or throws if the URL
+ * is not a recognised Firebase Storage download URL.
+ */
+export function storagePathFromUrl(url: string): string {
+  // Accept only well-formed http/https URLs.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`storagePathFromUrl: invalid URL: ${url}`);
+  }
+
+  // Match Firebase Storage hostname and path pattern /v0/b/{bucket}/o/{encodedPath}
+  const match = parsed.pathname.match(/^\/v0\/b\/[^/]+\/o\/(.+)$/);
+  if (!match) {
+    throw new Error(`storagePathFromUrl: not a Firebase Storage download URL: ${url}`);
+  }
+
+  return decodeURIComponent(match[1]);
+}
+
 export function createApp(options: CreateAppOptions = {}){
   const app = express();
   const isTestProcess = process.env.TEST_MODE === '1' || process.argv.includes('--test');
@@ -6531,6 +6603,13 @@ export function createApp(options: CreateAppOptions = {}){
       return next();
     }
     return res.status(403).json({ error: 'not_authorized' });
+  }
+
+  function requireAuthContext(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (!req.authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    return next();
   }
 
   async function resolveGlobalAdminLookup(input: { uid?: string; email?: string }): Promise<{
@@ -11599,7 +11678,7 @@ export function createApp(options: CreateAppOptions = {}){
           ? planLimits.storageBytes
           : 0;
 
-      const bytes = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+      const bytes = await estimateTenantStorageBytes(bucket, normalizedTenantId, db);
       await db
         .collection('tenantStorageUsage')
         .doc(normalizedTenantId)
@@ -11666,7 +11745,7 @@ export function createApp(options: CreateAppOptions = {}){
     const db = getFirestoreImpl();
 
     const reconcileUsageBytes = async (): Promise<number> => {
-      const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+      const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId, db);
       await db.collection('tenantStorageUsage').doc(normalizedTenantId).set(
         {
           tenantId: normalizedTenantId,
@@ -11789,7 +11868,7 @@ export function createApp(options: CreateAppOptions = {}){
         : 0;
 
     const reconcileUsageBytes = async (): Promise<number> => {
-      const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId);
+      const reconciled = await estimateTenantStorageBytes(bucket, normalizedTenantId, db);
       await db.collection('tenantStorageUsage').doc(normalizedTenantId).set(
         {
           tenantId: normalizedTenantId,
@@ -12021,6 +12100,26 @@ export function createApp(options: CreateAppOptions = {}){
       }
 
       inc(metricNames.storageUploadAccepted, uploadMetricLabels);
+
+      // Fire async video transcode for chat video uploads.
+      // The original URL is returned immediately; the transcoded H.264 URL is
+      // written to Firestore (videoTranscodes collection) when ready.
+      // This fixes HEVC/H.265 videos from iPhone/VN-editor that won't play
+      // in Android mobile browsers (Chrome/Edge lack an HEVC decoder).
+      const isVideoUpload =
+        uploadPurpose === 'chat' &&
+        (contentType.startsWith('video/') ||
+          /\.(mp4|mov|m4v|avi|mkv|webm|hevc|heic)$/i.test(filename || ''));
+      if (isVideoUpload) {
+        scheduleVideoTranscode({
+          originalPath: objectPath,
+          bucketName: bucket.name,
+          originalUrl: url,
+          contentType,
+          tenantId: normalizedTenantId,
+        });
+      }
+
       return res.json({ url, path: objectPath, bytes, contentType, ...(shareToken ? { shareToken } : {}) });
     } catch (error) {
       await releaseTenantStorageBytes(db, normalizedTenantId, bytes).catch(() => undefined);
@@ -12030,6 +12129,106 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(500).json({ error: 'upload_failed' });
     }
   });
+
+  // ─── POST /video/request-transcode ───────────────────────────────────────────
+  // On-demand transcoding endpoint. Idempotent: returns existing job status if a
+  // videoTranscodes document already exists for the given URL, or schedules a new
+  // job if none exists (or the previous one errored out).
+  // Requirements: 1.3, 1.4
+  const requestTranscodeSchema = z.object({
+    originalUrl: z.string().url(),
+    tenantId: z.string().min(1),
+  });
+
+  app.post(
+    '/video/request-transcode',
+    requireAuthContext,
+    rateLimitMiddleware({ windowMs: 60_000, max: 10 }),
+    async (req, res) => {
+      const parsed = requestTranscodeSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+      }
+
+      const { originalUrl, tenantId } = parsed.data;
+
+      // Derive the deterministic document ID the same way the transcoder does:
+      // sha256(storagePath) — where storagePath is extracted from the download URL.
+      let storagePath: string;
+      try {
+        storagePath = storagePathFromUrl(originalUrl);
+      } catch {
+        return res.status(400).json({ error: 'invalid_storage_url' });
+      }
+
+      const docId = transcodeDocId(storagePath);
+
+      let db: admin.firestore.Firestore;
+      try {
+        ensureFirebase();
+        db = admin.firestore();
+      } catch (err) {
+        console.error('[request_transcode] firestore init failed', err);
+        return res.status(500).json({ error: 'internal_error' });
+      }
+
+      try {
+        const docRef = db.collection('videoTranscodes').doc(docId);
+        const snap = await docRef.get();
+
+        if (snap.exists) {
+          const data = snap.data() as Record<string, any>;
+          const status: string = typeof data?.status === 'string' ? data.status : '';
+          const existingTranscodedUrl: string | undefined =
+            typeof data?.transcodedUrl === 'string' && data.transcodedUrl.length > 0
+              ? data.transcodedUrl
+              : undefined;
+
+          // If a transcoded URL is present, return it immediately regardless of status.
+          // This handles the case where status was set to 'error' by a LATER attempt
+          // to re-download the original file that was already deleted after a successful
+          // first transcode (originalDeleted: true but a retry call saw status: 'error').
+          if (existingTranscodedUrl) {
+            // Repair the status field if it's wrong so future queries find it correctly.
+            if (status !== 'done') {
+              docRef.set(
+                {
+                  status: 'done',
+                  error: admin.firestore.FieldValue.delete(),
+                  failedAt: admin.firestore.FieldValue.delete(),
+                },
+                { merge: true }
+              ).catch((err: unknown) =>
+                console.warn('[request_transcode] failed to repair status field', err)
+              );
+            }
+            return res.status(200).json({ status: 'done', transcodedUrl: existingTranscodedUrl });
+          }
+
+          if (status === 'processing') {
+            return res.status(202).json({ status: 'processing' });
+          }
+
+          // status === 'error' with no transcodedUrl → schedule a new transcode job
+        }
+
+        // Document absent or status is 'error' — schedule a new transcode job.
+        // The job itself will write the initial Firestore document with status: 'processing'.
+        scheduleVideoTranscode({
+          originalPath: storagePath,
+          bucketName: admin.storage().bucket().name,
+          originalUrl,
+          contentType: 'video/mp4',
+          tenantId,
+        });
+
+        return res.status(202).json({ status: 'processing' });
+      } catch (err) {
+        console.error('[request_transcode] firestore read failed', err);
+        return res.status(500).json({ error: 'internal_error' });
+      }
+    }
+  );
 
   app.post('/students/create', requireStaffTenantAccess, async (req, res) => {
     const tenantAccess = req.tenantAccess;

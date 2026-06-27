@@ -9079,8 +9079,11 @@ export default function Chat() {
     const cacheKey = `${baseKey}::download::${downloadName}`;
     return resolveMapCacheEntry(attachmentDownloadPressHandlersRef.current, cacheKey, () => {
       return () => {
+        // Prefer the transcoded H.264 URL for download; the original H.265 may have
+        // been deleted from Storage after transcoding (originalDeleted: true).
+        const downloadUrl = (attachment as any).transcodedUrl || attachment.url;
         void handleDownloadFileRef.current(
-          attachment.url,
+          downloadUrl,
           downloadName,
           attachment.resolvedUrl
         );

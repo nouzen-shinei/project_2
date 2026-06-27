@@ -767,13 +767,14 @@ const ChatMessageItem = React.memo(function ChatMessageItem({
                           </View>
                         ) : isVideoFile(attachment.fileType, attachment.fileName) ? (
                           <FileViewer
-                            fileUrl={attachment.resolvedUrl || attachment.url}
+                            fileUrl={attachment.transcodedUrl || attachment.resolvedUrl || attachment.url}
                             fileName={attachment.fileName || 'Video File'}
                             fileType={attachment.fileType || ''}
                             fileSize={attachment.fileSize}
                             onDownload={getAttachmentDownloadPressHandler(attachment, attachment.fileName || 'Video File')}
                             downloadKey={getDownloadKey(attachment.url)}
-                            remoteFileUrl={attachment.url}
+                            remoteFileUrl={attachment.transcodedUrl || attachment.url}
+                            transcodedUri={attachment.transcodedUrl}
                             // Use FileViewer's built-in ShareModal
                           />
                         ) : isImageFile(attachment.fileType, attachment.fileName) ? (

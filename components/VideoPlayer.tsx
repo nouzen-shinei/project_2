@@ -18,6 +18,9 @@ import {
   StatusBar,
   AppState,
   AppStateStatus,
+  StyleProp,
+  ViewStyle,
+  ActivityIndicator,
 } from 'react-native';
 import {
   Play,
@@ -35,6 +38,10 @@ import {
 import { useTheme } from '../hooks/useTheme';
 import { useDownloadState } from '@/hooks/useDownloadState';
 import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
+import { useWebVideoPlayer } from '@/hooks/useWebVideoPlayer';
+import { useVideoCodecFallback } from '@/hooks/useVideoCodecFallback';
+import { canPlayCodec } from '@/utils/codecDetector';
+import { useTenant } from '@/hooks/useTenantContext';
 import {
   resolveDownloadProgressLabel,
   resolveProgressPercentText,
@@ -47,6 +54,7 @@ import {
   type VideoPlayer as ExpoVideoPlayer,
   type VideoPlayerStatus,
 } from 'expo-video';
+import { useNativeVideoPlayer } from '../hooks/useNativeVideoPlayer';
 import Reanimated, { useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
 import { ShareModal } from './ShareModal';
 import { chatCacheService } from '../services/chatCacheService';
@@ -54,6 +62,9 @@ import * as Haptics from 'expo-haptics';
 import { DEFAULT_SEEK_STEP_SECONDS, useVideoSeekConfig } from '../hooks/useVideoSeekConfig';
 import { useVideoPlaybackUxState } from '@/hooks/useVideoPlaybackUxState';
 import { VideoBufferingOverlay } from './VideoBufferingOverlay';
+import { useWebVideoState } from '@/hooks/useWebVideoSetup';
+import { useVideoProgressBar } from '@/hooks/useVideoProgressBar';
+import { useMediaSession } from '@/hooks/useMediaSession';
 
 const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 const MAX_THUMBNAIL_DIMENSION = 640;
@@ -420,17 +431,18 @@ const useSeekGesture = ({
       overlayOpacity.setValue(0);
       overlayScale.setValue(0.92);
 
+      const nativeDriver = Platform.OS !== 'web';
       overlayAnimationRef.current = Animated.parallel([
         Animated.timing(overlayOpacity, {
           toValue: 1,
           duration: 120,
-          useNativeDriver: true,
+          useNativeDriver: nativeDriver,
         }),
         Animated.spring(overlayScale, {
           toValue: 1,
           speed: 18,
           bounciness: 6,
-          useNativeDriver: true,
+          useNativeDriver: nativeDriver,
         }),
       ]);
 
@@ -440,7 +452,7 @@ const useSeekGesture = ({
           Animated.timing(overlayOpacity, {
             toValue: 0,
             duration: 180,
-            useNativeDriver: true,
+            useNativeDriver: nativeDriver,
           }).start(() => {
             setOverlayState((prev) => ({ ...prev, visible: false }));
           });
@@ -623,21 +635,38 @@ function SeekOverlay({ state, animatedStyle, variant = 'inline' }: SeekOverlayPr
 }
 
 interface VideoPlayerProps {
+  /** The primary video URL to play. Required. On web, used as the playback source unless `transcodedUri` is provided. */
   uri: string;
+  /** The display name of the file, used for download and share labels. Defaults to `"video.mp4"`. */
   fileName?: string;
+  /** Callback invoked when the user presses the download button. */
   onDownload?: () => void;
-  style?: any;
+  /** Additional styles applied to the outermost container view. */
+  style?: StyleProp<ViewStyle>;
+  /** When `true`, playback begins immediately on mount without requiring a user tap. */
   autoPlay?: boolean;
+  /** When `true`, the control bar is visible on mount. Defaults to `true`. */
   showControlsProp?: boolean;
+  /** Maximum height in logical pixels that the video container may occupy. Defaults to `300`. */
   maxHeight?: number;
+  /** Number of seconds to seek on a double-tap or keyboard shortcut. Falls back to the global seek config when omitted. */
   seekStepSeconds?: number;
+  /** Callback invoked when the user opens the share sheet for this video. */
   onShare?: () => void;
+  /** The canonical URL surfaced in the share sheet. Falls back to `uri` when omitted. */
   shareUrl?: string;
+  /** Pre-computed thumbnail image URL shown as a poster before playback starts. */
   thumbnailUrl?: string;
+  /** Selects between the full-featured control bar (`"full"`) and the compact variant (`"minimal"`). Defaults to `"full"`. */
   controlVariant?: 'full' | 'minimal';
+  /** When `true`, the download button is replaced by a progress indicator. */
   isDownloading?: boolean;
+  /** Download progress value in the range `[0, 1]` used by the progress indicator. */
   downloadProgress?: number;
+  /** Stable key used to look up download state from the global download registry. Falls back to `shareUrl` then `uri`. */
   downloadKey?: string;
+  /** The H.264 URL produced by the server transcoder. When non-empty, used as the primary playback source on web instead of `uri`. */
+  transcodedUri?: string;
 }
 
 type VideoSourceCacheEntry = {
@@ -705,6 +734,8 @@ interface VideoPlayerLoadedProps {
   initialResolvedUri?: string | null;
   isDownloading?: boolean;
   downloadProgress?: number;
+  /** The H.264 URL produced by the server transcoder. Accepted but ignored on native; native always uses `uri`. */
+  transcodedUri?: string;
 }
 
 type FullscreenSnapshot = {
@@ -716,10 +747,14 @@ type FullscreenSnapshot = {
 
 type NativeFullscreenConfig = FullscreenSnapshot & {
   sourceUri: string;
+  /** Poster image URI shown immediately while the fullscreen player loads. */
+  posterUri?: string;
 };
 
 type WebFullscreenConfig = FullscreenSnapshot & {
   sourceUri: string;
+  /** Poster image URI shown immediately while the fullscreen player loads. */
+  posterUri?: string;
 };
 
 type FullscreenReturnState = {
@@ -737,6 +772,13 @@ interface FullscreenVideoModalProps {
   seekStepSeconds?: number;
   isDownloading?: boolean;
   downloadProgress?: number;
+  /**
+   * When provided, this player is used directly in the fullscreen VideoView instead
+   * of creating a new player from `config.sourceUri`. The player is already loaded and
+   * possibly playing — no rebuffering, no reload, instant transition.
+   * expo-video supports multiple VideoViews sharing one player instance.
+   */
+  sharedPlayer?: ExpoVideoPlayer;
 }
 
 interface WebFullscreenModalProps {
@@ -747,6 +789,95 @@ interface WebFullscreenModalProps {
   seekStepSeconds?: number;
   isDownloading?: boolean;
   downloadProgress?: number;
+}
+
+function usePrefetchShadowVideo(uri: string, enabled: boolean): void {
+  const shadowRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+
+    if (!enabled) {
+      // Clean up shadow element if it exists
+      const shadow = shadowRef.current;
+      if (shadow) {
+        try {
+          shadow.src = '';
+          shadow.load();
+          shadow.remove();
+        } catch {
+          // ignore
+        }
+        shadowRef.current = null;
+      }
+      return;
+    }
+
+    // Skip for data: and blob: URIs
+    if (!uri || uri.startsWith('data:') || uri.startsWith('blob:')) {
+      return;
+    }
+
+    // Avoid creating duplicate shadow elements for the same URI
+    const existingShadow = shadowRef.current;
+    if (existingShadow && existingShadow.dataset?.prefetchUri === uri) {
+      return;
+    }
+
+    // Clean up any previous shadow element
+    if (existingShadow) {
+      try {
+        existingShadow.src = '';
+        existingShadow.load();
+        existingShadow.remove();
+      } catch {
+        // ignore
+      }
+      shadowRef.current = null;
+    }
+
+    try {
+      const shadow = document.createElement('video');
+      shadow.muted = true;
+      shadow.preload = 'metadata';
+      shadow.playsInline = true;
+      shadow.style.display = 'none';
+      shadow.style.position = 'absolute';
+      shadow.style.width = '0';
+      shadow.style.height = '0';
+      shadow.style.pointerEvents = 'none';
+      // Store URI for deduplication
+      shadow.dataset.prefetchUri = uri;
+      shadow.src = uri;
+      document.body.appendChild(shadow);
+      shadowRef.current = shadow;
+    } catch {
+      // ignore - prefetch is best-effort
+    }
+
+    return () => {
+      // Cleanup handled by the next enabled=false run or unmount
+    };
+  }, [enabled, uri]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      const shadow = shadowRef.current;
+      if (shadow) {
+        try {
+          shadow.src = '';
+          shadow.load();
+          shadow.remove();
+        } catch {
+          // ignore
+        }
+        shadowRef.current = null;
+      }
+    };
+  }, []);
 }
 
 function VideoPlayer({
@@ -765,6 +896,7 @@ function VideoPlayer({
   isDownloading,
   downloadProgress,
   downloadKey,
+  transcodedUri,
 }: VideoPlayerProps) {
   const { theme } = useTheme();
   const { seekStepSeconds: globalSeekStepSeconds } = useVideoSeekConfig();
@@ -925,6 +1057,52 @@ function VideoPlayer({
     [styles, maxHeight]
   );
 
+  // On H.265-unsupported browsers: only shadow-prefetch when the transcoded URL is
+  // already resolved. When transcodedUri is absent, the original H.265 may have been
+  // deleted from Firebase Storage after transcoding — prefetching it causes a 403.
+  // Pass null to disable the shadow element until the H.264 URL arrives via chatCacheService.
+  const h265UnsupportedForPrefetch = Platform.OS === 'web' && !canPlayCodec('h265');
+  const trimmedTranscodedForPrefetch =
+    typeof transcodedUri === 'string' && transcodedUri.trim().length > 0
+      ? transcodedUri.trim()
+      : null;
+  // Shadow-prefetch ONLY when the transcoded URL is already resolved.
+  // Without it we cannot distinguish a deleted original (transcoded → original removed,
+  // returns 403) from a live original (never transcoded, returns 200). Skipping the
+  // shadow element for untranscoded videos costs a minor UX optimisation (no metadata
+  // preload while the placeholder is visible) but eliminates all 403 console errors
+  // from the shadow element on both H.265-capable and H.265-incapable browsers.
+  const effectivePrefetchUri: string | null = trimmedTranscodedForPrefetch;
+
+  usePrefetchShadowVideo(
+    effectivePrefetchUri ?? '',
+    Platform.OS === 'web' &&
+      !shouldLoadVideo &&
+      effectivePrefetchUri !== null &&
+      !effectivePrefetchUri.startsWith('data:') &&
+      !effectivePrefetchUri.startsWith('blob:')
+  );
+
+  // When transcodedUri first becomes available (chatCacheService resolved it),
+  // clear the original URI from the attempted-preview set so the thumbnail effect
+  // can retry with the H.264 URL. Without this, the original attempt's cache entry
+  // would block the retry.
+  const prevTranscodedUriRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const trimmed =
+      typeof transcodedUri === 'string' && transcodedUri.trim().length > 0
+        ? transcodedUri.trim()
+        : undefined;
+    if (trimmed && !prevTranscodedUriRef.current) {
+      // transcodedUri just arrived — clear the original URI so thumbnail retries
+      attemptedPreviewSources.current.delete(uri);
+      attemptedPreviewSources.current.delete(resolvedVideoUri ?? '');
+      // Also clear the current previewUri if it was generated from a failed attempt
+      // (a null-result thumbnail is not stored, so this is mainly a safety measure)
+    }
+    prevTranscodedUriRef.current = trimmed;
+  }, [transcodedUri, uri, resolvedVideoUri]);
+
   useEffect(() => {
     if (Platform.OS !== 'web') {
       return;
@@ -938,7 +1116,31 @@ function VideoPlayer({
       return;
     }
 
-    const candidate = resolvedVideoUri || uri;
+    // For transcoded videos, prefer the H.264 URL for thumbnail generation.
+    // Android Chrome can't load H.265 for canvas capture, and the original file
+    // is deleted from Firebase Storage after transcoding (returns 403).
+    const effectiveTranscodedUriForThumb =
+      typeof transcodedUri === 'string' && transcodedUri.trim().length > 0
+        ? transcodedUri.trim()
+        : null;
+
+    // Skip thumbnail generation until the transcoded H.264 URL is available on
+    // ALL browsers — not just H.265-unsupported ones.
+    //
+    // On H.265-unsupported browsers: can't decode H.265 for canvas capture.
+    // On H.265-capable browsers (e.g. desktop Chrome on macOS 13+): the original
+    // may have been deleted from Firebase Storage after transcoding, so loading
+    // it causes a 403 HEAD request.
+    //
+    // Videos that have a server thumbnail (thumbnailUrl prop) bypass this path
+    // entirely — previewUri is already set and the guard above returns early.
+    // Non-transcoded H.264 videos (no transcodedUri ever) will get their thumbnail
+    // via the live frame capture (currentTime >= 0.5 s useEffect) after first play.
+    if (!effectiveTranscodedUriForThumb) {
+      return;
+    }
+
+    const candidate = effectiveTranscodedUriForThumb;
     if (!candidate || attemptedPreviewSources.current.has(candidate)) {
       return;
     }
@@ -959,7 +1161,9 @@ function VideoPlayer({
     return () => {
       cancelled = true;
     };
-  }, [autoPlay, previewUri, resolvedVideoUri, shouldLoadVideo, uri]);
+    // transcodedUri added: when chatCacheService resolves the H.264 URL, this effect
+    // re-runs and generates the thumbnail from the H.264 source (which is always accessible).
+  }, [autoPlay, previewUri, resolvedVideoUri, shouldLoadVideo, transcodedUri, uri]);
 
   const renderPlaceholder = () => {
     const showPreviewImage = !!previewUri;
@@ -1044,6 +1248,7 @@ function VideoPlayer({
       initialWasPlaying={cachedWasPlaying}
       isDownloading={effectiveIsDownloading}
       downloadProgress={effectiveProgress}
+      transcodedUri={transcodedUri}
     />
   ) : (
     renderPlaceholder()
@@ -1087,10 +1292,225 @@ const areVideoPlayerPropsEqual = (prev: VideoPlayerProps, next: VideoPlayerProps
   if ((prev.isDownloading ?? false) !== (next.isDownloading ?? false)) return false;
   if ((prev.downloadProgress ?? 0) !== (next.downloadProgress ?? 0)) return false;
   if ((prev.downloadKey ?? '') !== (next.downloadKey ?? '')) return false;
+  // transcodedUri changes when chatCacheService resolves the H.264 URL asynchronously.
+  // Without this check, VideoPlayer never re-renders when the URL arrives, preventing
+  // thumbnail updates and leaving VideoPlayerLoaded loading the deleted original.
+  if ((prev.transcodedUri ?? '') !== (next.transcodedUri ?? '')) return false;
   return true;
 };
 
 export default React.memo(VideoPlayer, areVideoPlayerPropsEqual);
+
+// ─── FullControls Props ──────────────────────────────────────────────────────
+
+interface FullControlsProps {
+  isPlaying: boolean;
+  isMuted: boolean;
+  isDownloading: boolean;
+  isDraggingProgress: boolean;
+  isWebFullscreenActive: boolean;
+  disableSpeedControl: boolean;
+  formattedProgressLabel: string;
+  progressPercentage: number;
+  bufferedPercentage: number;
+  playbackSpeedLabel: string;
+  normalizedProgress: number;
+  downloadButtonA11yLabel: string;
+  shareButtonA11yLabel: string;
+  overlayAnimatedStyle: { opacity: Animated.Value; transform: { scale: Animated.Value }[] };
+  overlayPointerEvents: 'box-none' | 'none';
+  /** Optional style override for the controls overlay — used for web fullscreen. */
+  overlayStyle?: object;
+  progressBarRef: React.RefObject<View | null>;
+  progressPanResponder: ReturnType<typeof PanResponder.create>;
+  handleProgressBarLayout: (event: LayoutChangeEvent) => void;
+  onTogglePlayPause: () => void;
+  onToggleMute: () => void;
+  onDownload?: () => void;
+  onSharePress: (event?: GestureResponderEvent) => void;
+  onFullscreenPress: () => void;
+  onCyclePlaybackSpeed: () => void;
+  /** When provided, renders an X close button in the top-left (web fullscreen mode). */
+  onCloseFullscreen?: () => void;
+}
+
+/**
+ * Full control bar: play/pause, scrubber, time, speed, mute, fullscreen, download, share.
+ * Contains no conditional branch that selects between control variants.
+ */
+function FullControls({
+  isPlaying,
+  isMuted,
+  isDownloading,
+  isDraggingProgress,
+  isWebFullscreenActive,
+  disableSpeedControl,
+  formattedProgressLabel,
+  progressPercentage,
+  bufferedPercentage,
+  playbackSpeedLabel,
+  normalizedProgress,
+  downloadButtonA11yLabel,
+  shareButtonA11yLabel,
+  overlayAnimatedStyle,
+  overlayPointerEvents,
+  overlayStyle,
+  progressBarRef,
+  progressPanResponder,
+  handleProgressBarLayout,
+  onTogglePlayPause,
+  onToggleMute,
+  onDownload,
+  onSharePress,
+  onFullscreenPress,
+  onCyclePlaybackSpeed,
+  onCloseFullscreen,
+}: FullControlsProps) {
+  return (
+    <Animated.View style={[styles.controlsOverlay, overlayStyle, overlayAnimatedStyle]} pointerEvents={overlayPointerEvents}>
+      <View
+        style={[styles.topControls, onCloseFullscreen ? { justifyContent: 'space-between' } : null]}
+        pointerEvents="box-none"
+      >
+        {onCloseFullscreen ? (
+          <TouchableOpacity
+            style={styles.controlButton}
+            onPress={onCloseFullscreen}
+            accessibilityRole="button"
+            accessibilityLabel="Exit fullscreen"
+          >
+            <X size={20} color="white" />
+          </TouchableOpacity>
+        ) : null}
+        <TouchableOpacity
+          style={styles.controlButton}
+          onPress={onSharePress}
+          accessibilityRole="button"
+          accessibilityLabel={shareButtonA11yLabel}
+        >
+          <Share2 size={20} color="white" />
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.mainControls} pointerEvents="box-none">
+        <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={onTogglePlayPause}>
+          {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.bottomControls} pointerEvents="box-none">
+        <View style={styles.progressRow} pointerEvents="box-none">
+          <Text style={styles.timeText}>{formattedProgressLabel}</Text>
+
+          <View style={styles.progressContainer}>
+            <View
+              ref={progressBarRef}
+              collapsable={false}
+              style={styles.progressBarTouchable}
+              onLayout={handleProgressBarLayout}
+              {...progressPanResponder.panHandlers}
+            >
+              <View style={styles.progressBar}>
+                <View style={[styles.progressBuffered, { width: `${bufferedPercentage}%` }]} />
+                <View style={[styles.progressFill, { width: `${progressPercentage}%` }]} />
+                <View
+                  style={[
+                    styles.progressThumb,
+                    {
+                      left: `${progressPercentage}%`,
+                      transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
+                    },
+                  ]}
+                />
+              </View>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.actionsRow} pointerEvents="box-none">
+          <View style={styles.actionsLeft} pointerEvents="box-none">
+            <TouchableOpacity style={styles.controlButton} onPress={onToggleMute}>
+              {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
+            </TouchableOpacity>
+
+            {onDownload ? (
+              <TouchableOpacity
+                style={[styles.controlButton, isDownloading ? styles.controlButtonDisabled : null]}
+                onPress={onDownload}
+                disabled={isDownloading}
+                accessibilityRole="button"
+                accessibilityLabel={downloadButtonA11yLabel}
+              >
+                {isDownloading ? (
+                  <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
+                ) : (
+                  <Download size={20} color="white" />
+                )}
+              </TouchableOpacity>
+            ) : null}
+          </View>
+
+          <View style={styles.actionsRight} pointerEvents="box-none">
+            <TouchableOpacity
+              style={[
+                styles.controlButton,
+                styles.speedButton,
+                disableSpeedControl ? styles.controlButtonDisabled : null,
+              ]}
+              onPress={onCyclePlaybackSpeed}
+              disabled={disableSpeedControl}
+              accessibilityRole="button"
+              accessibilityLabel="Toggle playback speed"
+            >
+              <Gauge size={20} color="white" />
+              <Text style={styles.speedLabel}>{playbackSpeedLabel}</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.controlButton} onPress={onFullscreenPress}>
+              {Platform.OS === 'web' ? (
+                isWebFullscreenActive ? <Minimize size={20} color="white" /> : <Maximize size={20} color="white" />
+              ) : (
+                <Maximize size={20} color="white" />
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Animated.View>
+  );
+}
+
+// ─── MinimalControls Props ───────────────────────────────────────────────────
+
+interface MinimalControlsProps {
+  isPlaying: boolean;
+  overlayAnimatedStyle: { opacity: Animated.Value; transform: { scale: Animated.Value }[] };
+  overlayPointerEvents: 'box-none' | 'none';
+  onTogglePlayPause: () => void;
+}
+
+/**
+ * Compact control bar: play/pause button only.
+ * Contains no conditional branch that selects between control variants.
+ * Has no shared internal code with FullControls.
+ */
+function MinimalControls({
+  isPlaying,
+  overlayAnimatedStyle,
+  overlayPointerEvents,
+  onTogglePlayPause,
+}: MinimalControlsProps) {
+  return (
+    <Animated.View
+      style={[styles.controlsOverlay, styles.controlsOverlayMinimal, overlayAnimatedStyle]}
+      pointerEvents={overlayPointerEvents}
+    >
+      <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={onTogglePlayPause}>
+        {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
+      </TouchableOpacity>
+    </Animated.View>
+  );
+}
 
 function VideoPlayerLoaded({
   uri,
@@ -1113,33 +1533,272 @@ function VideoPlayerLoaded({
   initialResolvedUri,
   isDownloading = false,
   downloadProgress,
+  transcodedUri,
 }: VideoPlayerLoadedProps) {
   const { theme } = useTheme();
+
+  // ── Tenant context (needed for on-demand transcode requests) ─────────────
+  const { activeTenant } = useTenant();
+  const activeTenantId = activeTenant?.id ?? '';
+
+  // ── Effective transcodedUri — trim + empty-string guard ──────────────────
+  // Requirements 2.7: whitespace-only or empty values are treated as absent.
+  const effectiveTranscodedUri =
+    typeof transcodedUri === 'string' && transcodedUri.trim().length > 0
+      ? transcodedUri.trim()
+      : undefined;
+
+  // ── Web codec fallback state machine ─────────────────────────────────────
+  // Tracks whether the "Video is processing" spinner is visible.
+  const [codecFallbackSpinnerVisible, setCodecFallbackSpinnerVisible] = useState(false);
+  // Permanent error message set by the fallback (swap-target failure, no transcode job).
+  const [codecFallbackError, setCodecFallbackError] = useState<string | null>(null);
+  // Timeout error triggers a dismissible "Try again" message + retry button.
+  const [codecFallbackTimeout, setCodecFallbackTimeout] = useState(false);
+  // Whether h265 is supported by the current browser — determined once synchronously.
+  const canPlayH265Ref = useRef<boolean | null>(null);
+  if (Platform.OS === 'web' && canPlayH265Ref.current === null) {
+    canPlayH265Ref.current = canPlayCodec('h265');
+  }
+
+  // The resolved web URI to pass to useWebVideoPlayer.
+  // Initialised synchronously (lazy useState) so the first useLayoutEffect inside
+  // useWebVideoPlayer sees the correct URL immediately — no double-load on mount.
+  const [webResolvedUri, setWebResolvedUri] = useState<string>(() => {
+    if (Platform.OS !== 'web') return '';
+    const h265ok = canPlayCodec('h265');
+    const trimmedTranscoded =
+      typeof transcodedUri === 'string' && transcodedUri.trim().length > 0
+        ? transcodedUri.trim()
+        : undefined;
+    // Always use the transcoded H.264 copy when available, regardless of H.265
+    // support. The original H.265 may have been deleted from Firebase Storage
+    // after transcoding — loading it on any browser causes 403 console errors.
+    if (trimmedTranscoded) {
+      return trimmedTranscoded;
+    }
+    // No transcodedUri yet on ANY browser: start empty so the <video> element
+    // makes no network requests while we wait for transcodedUri to arrive from
+    // RTDB (typically within 100–200 ms on a live subscription). The useEffect
+    // below sets the correct URI once it resolves or a short timeout elapses.
+    return '';
+  });
+
+  // Track the currently-active web source in a ref so handleFullscreenPress can
+  // pass the correct URL (which may differ from resolvedUriRef after a codec swap).
+  const webResolvedUriRef = useRef<string>(webResolvedUri);
+  // Stable ref to handleCodecError so the fallback timeout can call it without
+  // capturing a stale closure — handleCodecError identity changes between renders.
+  // Initialized to a no-op because handleCodecError is defined later in this
+  // component (from useVideoCodecFallback). The sync effect below updates the ref
+  // after every render, so it is always current before the 200 ms timer fires.
+  const handleCodecErrorRef = useRef<(currentTime: number) => void>(() => {});
+  // Ref to tryFulfillPendingPlay — needed by onReady callback which is evaluated
+  // before tryFulfillPendingPlay is declared in the render function body.
+  const tryFulfillPendingPlayRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    webResolvedUriRef.current = webResolvedUri;
+  }, [webResolvedUri]);
+
+  // Ref to hold the seek-to position that should be applied when the new source loads.
+  const webPlayerSeekRef = useRef<number>(0);
+  // State version of the seek position so it can update the useWebVideoPlayer initialPosition.
+  const [webInitialPosition, setWebInitialPosition] = useState<number>(
+    Number.isFinite(initialPlaybackPosition) && initialPlaybackPosition > 0 ? initialPlaybackPosition : 0
+  );
+
+  // ── useVideoCodecFallback: orchestrates detect → request → poll → swap ───
+  const {
+    phase: codecFallbackPhase,
+    onCodecError: handleCodecError,
+    onSwapTargetError: handleSwapTargetError,
+    retry: retryCodecFallback,
+    activeUri: codecActiveUri,
+  } = useVideoCodecFallback({
+    uri,
+    transcodedUri: effectiveTranscodedUri,
+    tenantId: activeTenantId,
+    onSourceResolved: (resolvedUrl, seekTo) => {
+      setWebResolvedUri(resolvedUrl);
+      // Seek to the position recorded at the codec error moment (Requirement 1.6).
+      webPlayerSeekRef.current = seekTo;
+      setWebInitialPosition(seekTo);
+      // Clear any previous error so the controls overlay unlocks when the
+      // new compatible source starts playing.
+      setWebPlaybackError(null);
+      setWebStatus('loading');
+      setIsLoadingSafe(true);
+    },
+    onSpinnerChange: setCodecFallbackSpinnerVisible,
+    onPermanentError: setCodecFallbackError,
+    onTimeoutError: () => setCodecFallbackTimeout(true),
+  });
+
+  // Keep handleCodecErrorRef current so the fallback timer can call it safely.
+  useEffect(() => {
+    handleCodecErrorRef.current = handleCodecError;
+  }, [handleCodecError]);
+
+  // Initialise webResolvedUri once we know the codec capability and have the URI.
+  // This runs once on mount (and when uri/effectiveTranscodedUri change).
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    const h265ok = canPlayH265Ref.current ?? canPlayCodec('h265');
+    if (effectiveTranscodedUri) {
+      // Always prefer the transcoded H.264 copy when available — on ALL browsers.
+      // The original H.265 may have been deleted after transcoding, so loading it
+      // even on H.265-capable browsers (e.g. desktop Chrome macOS 13+) risks 403.
+      setWebResolvedUri(effectiveTranscodedUri);
+      return;
+    }
+    // No transcodedUri yet — wait briefly then trigger the codec fallback pipeline
+    // instead of loading the original URI directly. The fallback calls the backend
+    // which checks Firestore for an existing transcoded URL or determines the
+    // video needs no transcoding (H.264 original). This avoids making a HEAD
+    // request to a potentially-deleted H.265 original entirely.
+    //
+    // Timeout rationale:
+    //   • 200 ms on H.265-capable browsers: allows the RTDB live subscription
+    //     (~100 ms) to deliver transcodedUrl before the fallback fires.
+    //   • 1000 ms on H.265-unsupported browsers: more time for hydrateMessages
+    //     (Firestore) to return the transcodedUrl on older messages.
+    const fallbackDelayMs = h265ok ? 200 : 1000;
+    const timer = setTimeout(() => {
+      // If webResolvedUri was set by another path (transcodedUri arrived), skip.
+      if (webResolvedUriRef.current) {
+        return;
+      }
+      // Trigger the codec fallback which queries the backend for the correct URL.
+      // For transcoded videos: backend returns the H.264 copy (no HEAD to original).
+      // For H.264 videos:      backend returns the original URL (safe, not deleted).
+      // onSourceResolved in useVideoCodecFallback will call setWebResolvedUri.
+      handleCodecErrorRef.current?.(0);
+    }, fallbackDelayMs);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uri, effectiveTranscodedUri]);
+
+  // Keep webResolvedUri in sync when the fallback hook resolves a new source
+  // (reactive swap path). We also need to update the web player's position seek.
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    if (codecActiveUri && codecActiveUri !== webResolvedUri) {
+      setWebResolvedUri(codecActiveUri);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codecActiveUri]);
+
+  // ── useWebVideoPlayer: manages the <video> element ref ───────────────────
+  // Only call on web; on native we use useNativeVideoPlayer.
+  // The hook is always called (Rules of Hooks), but is a no-op on native because
+  // resolvedUri is '' on native and the hook guards Platform.OS internally.
+  const {
+    state: webPlayerState,
+    videoRef: webVideoRef,
+    play: webPlay,
+    pause: webPause,
+    seek: webSeek,
+    setMuted: webSetMuted,
+    setPlaybackSpeed: webSetPlaybackSpeed,
+  } = useWebVideoPlayer({
+    resolvedUri: Platform.OS === 'web' ? webResolvedUri : '',
+    autoPlay: autoPlay || initialWasPlaying,
+    initialPosition: webInitialPosition,
+    isMuted: false, // will be synced below
+    playbackSpeed: 1, // will be synced below
+    onUnsupportedCodec: (currentTime) => {
+      if (Platform.OS === 'web') {
+        // Immediately reset the video element to stop audio-only playback.
+        // H.265 on Android Chrome: the browser can decode audio but not video,
+        // so the element plays audio-only while the "Converting..." spinner shows.
+        // Setting webResolvedUri to '' triggers the useWebVideoPlayer empty-guard
+        // which calls el.pause() + removeAttribute('src') + load() — silencing it.
+        setWebResolvedUri('');
+        handleCodecError(currentTime);
+      }
+    },
+    onError: (error) => {
+      if (Platform.OS === 'web') {
+        // `done` means we successfully swapped to the transcoded H.264 source.
+        const isPlayingTranscodedSource =
+          codecFallbackPhase === 'done' &&
+          typeof effectiveTranscodedUri === 'string' &&
+          effectiveTranscodedUri.length > 0;
+
+        if (isPlayingTranscodedSource && error !== 'unsupported-codec') {
+          // The H.264 transcoded source itself failed — show permanent error.
+          handleSwapTargetError();
+        } else if (!isPlayingTranscodedSource && codecFallbackPhase === 'idle') {
+          // Any error on the original source (codec, network, 403 after transcoding).
+          // Reset element immediately to stop audio-only H.265 playback, then
+          // trigger the fallback: instant swap if transcodedUri is already known,
+          // otherwise POST /video/request-transcode to get/start the transcoded copy.
+          setWebResolvedUri('');
+          handleCodecError(webPlayerState.currentTime ?? 0);
+        }
+      }
+    },
+    onEnded: () => {
+      if (Platform.OS === 'web') {
+        setWebEnded(true);
+      }
+    },
+    onReady: () => {
+      if (Platform.OS === 'web') {
+        setIsLoadingSafe(false);
+        setWebStatus('readyToPlay');
+        // Fulfill any pending play request the user made while the buffer was
+        // reloading (e.g. after tab background cleared the browser's video buffer).
+        tryFulfillPendingPlayRef.current();
+      }
+    },
+  });
   const [isPlaying, setIsPlaying] = useState(autoPlay || initialWasPlaying);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [showControlsVisible, setShowControlsVisible] = useState(showControlsProp);
-  const [webFullscreenConfig, setWebFullscreenConfig] = useState<WebFullscreenConfig | null>(null);
+  // CSS-based fullscreen: a boolean is all that's needed.
+  // The same <video> element expands via position:fixed — no new element, no rebuffering.
+  const [isWebFullscreenExpanded, setIsWebFullscreenExpanded] = useState(false);
   const [nativeFullscreenConfig, setNativeFullscreenConfig] = useState<NativeFullscreenConfig | null>(null);
   const [resolving, setResolving] = useState(false);
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
-  const [pendingPlayRequest, setPendingPlayRequest] = useState(autoPlay || initialWasPlaying);
-  const [webStatus, setWebStatus] = useState<VideoPlayerStatus>('idle');
-  const [webBufferedPercent, setWebBufferedPercent] = useState<number | null>(null);
-  const [webIsBuffering, setWebIsBuffering] = useState(false);
-  const [webIsStalled, setWebIsStalled] = useState(false);
-  const [webPlaybackError, setWebPlaybackError] = useState<string | null>(null);
-  const [webEnded, setWebEnded] = useState(false);
-  const videoRef = useRef<any>(null);
+  const [pendingPlayRequest, setPendingPlayRequest] = useState(autoPlay || initialWasPlaying || playRequestId > 0);
+  // Ref mirrors pendingPlayRequest so callbacks with stale closures (e.g. canplay
+  // event firing before React batches the state update) can still read the latest value.
+  const pendingPlayRequestRef = useRef(autoPlay || initialWasPlaying || playRequestId > 0);
+  const {
+    webStatus, setWebStatus,
+    webBufferedPercent, setWebBufferedPercent,
+    webIsBuffering, setWebIsBuffering,
+    webIsStalled, setWebIsStalled,
+    webPlaybackError, setWebPlaybackError,
+    webEnded, setWebEnded,
+    handleWebLoadStart: _hookWebLoadStart,
+    handleWebCanPlay: _hookWebCanPlay,
+    handleWebWaiting: _hookWebWaiting,
+    handleWebStalled: _hookWebStalled,
+    handleWebPlaying: _hookWebPlaying,
+    handleWebError: _hookWebError,
+    handleWebEnded: _hookWebEnded,
+    resetWebState,
+  } = useWebVideoState();
   const videoViewRef = useRef<React.ElementRef<typeof VideoView> | null>(null);
   const playbackIdRef = useRef<string>(createPlaybackId());
   const controlsTimeoutRef = useRef<number | null>(null);
-  const progressBarRef = useRef<View>(null);
-  const progressBarWidthRef = useRef(1);
-  const progressBarPageXRef = useRef<number | null>(null);
+  // On native, we need a ref for the VideoView (native fallback). On web, we use
+  // webVideoRef from useWebVideoPlayer for stable HTMLVideoElement identity.
+  const nativeVideoRef = useRef<any>(null);
+  // videoRef is the active ref: webVideoRef on web, nativeVideoRef on native.
+  // Both are always created (Rules of Hooks); we just pick which one to use.
+  const videoRef: React.MutableRefObject<any> = Platform.OS === 'web' ? webVideoRef : nativeVideoRef;
   const [resolvedUri, setResolvedUri] = useState<string>(initialResolvedUri || uri);
   const lastPlayRequestIdRef = useRef(playRequestId);
   const durationRef = useRef<number | null>(null);
@@ -1158,6 +1817,11 @@ function VideoPlayerLoaded({
   const pendingRestoreRef = useRef(false);
   const intendedPlayingRef = useRef(autoPlay || initialWasPlaying);
   const pauseRequestedRef = useRef(false);
+  // Tracks ended state in a ref so the resumeIfNeeded closure (defined inside a
+  // useEffect with potentially stale state captures) can check it reliably.
+  // el.ended can reset to false when the browser drops the video buffer after
+  // a tab is backgrounded, making the ref necessary as a second guard.
+  const webEndedRef = useRef(false);
   const lastCacheSyncRef = useRef(0);
   const pendingCacheSyncRef = useRef<number | null>(null);
   const lastResumeAttemptRef = useRef(0);
@@ -1191,13 +1855,83 @@ function VideoPlayerLoaded({
     if (Platform.OS !== 'web') {
       return;
     }
-    setWebStatus('loading');
-    setWebPlaybackError(null);
-    setWebEnded(false);
-    setWebBufferedPercent(null);
-    setWebIsBuffering(false);
-    setWebIsStalled(false);
-  }, [resolvedUri]);
+    resetWebState();
+  }, [resetWebState, resolvedUri]);
+
+  // ── Sync useWebVideoPlayer state into local state variables ───────────────
+  // This keeps the rest of the component logic (controls, cache, etc.) working
+  // with no changes, as they read from the local state variables.
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    const s = webPlayerState;
+    setCurrentTimeSafe(s.currentTime);
+    if (Number.isFinite(s.currentTime)) {
+      currentTimeRef.current = s.currentTime;
+    }
+    setIsPlayingSafe(s.isPlaying);
+    setWebBufferedPercent(s.bufferedPercent ?? null);
+    setWebIsBuffering(s.isBuffering);
+    setWebIsStalled(s.isStalled);
+    if (s.ended) {
+      setWebEnded(true);
+      webEndedRef.current = true;
+      // Prevent tab-switch auto-replay. When the browser clears the video buffer
+      // after the tab is hidden, el.ended resets to false. Resetting intendedPlayingRef
+      // here is the reliable guard — resumeIfNeeded bails on !intendedPlayingRef.current.
+      intendedPlayingRef.current = false;
+      pauseRequestedRef.current = false;
+      pendingPlayRequestRef.current = false;
+      setPendingPlayRequest(false);
+    }
+    if (s.error && s.error !== 'unsupported-codec') {
+      setWebPlaybackError(s.error);
+      setWebStatus('error');
+    } else if (s.error === 'unsupported-codec') {
+      setWebPlaybackError('unsupported-codec');
+      setWebStatus('error');
+    }
+    if (s.duration > 0) {
+      setDurationSafe(s.duration);
+      updateDuration(s.duration);
+    }
+    if (!s.isBuffering && !s.isStalled && (s.isPlaying || s.currentTime > 0)) {
+      setIsLoadingSafe(false);
+      // Always update to readyToPlay when the video is actually playing — this
+      // clears the 'error' status set by the original source failure so that
+      // the controls overlay unlocks after a successful source swap.
+      setWebStatus('readyToPlay');
+      // Also clear the playback error so shouldLockControls becomes false.
+      setWebPlaybackError((prev) => (prev ? null : prev));
+    }
+  // Only depend on the stable webPlayerState reference to avoid running on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webPlayerState]);
+
+  // Keep webEndedRef in sync with webEnded state so replay/retry actions
+  // (which call setWebEnded(false)) correctly re-enable resumeIfNeeded.
+  useEffect(() => {
+    webEndedRef.current = webEnded;
+  }, [webEnded]);
+
+  // ── Sync isMuted → useWebVideoPlayer ─────────────────────────────────────
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    webSetMuted(isMuted);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMuted]);
+
+  // ── Sync playbackSpeed → useWebVideoPlayer ────────────────────────────────
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    webSetPlaybackSpeed(playbackSpeed);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playbackSpeed]);
 
   useEffect(() => {
     playbackRateSyncedRef.current = false;
@@ -1215,6 +1949,7 @@ function VideoPlayerLoaded({
       return;
     }
     intendedPlayingRef.current = true;
+    pendingPlayRequestRef.current = true;
     setPendingPlayRequest(true);
   }, [initialWasPlaying]);
 
@@ -1269,7 +2004,7 @@ function VideoPlayerLoaded({
     });
   }, []);
   const isNativeFullscreenVisible = !!nativeFullscreenConfig;
-  const isWebFullscreenActive = !!webFullscreenConfig;
+  const isWebFullscreenActive = isWebFullscreenExpanded;
   const isFullscreen = Platform.OS === 'web' ? isWebFullscreenActive : isNativeFullscreenVisible;
 
   const playbackSpeedLabel = useMemo(() => {
@@ -1295,15 +2030,26 @@ function VideoPlayerLoaded({
     [onDurationChange]
   );
 
-  const nativeSource: VideoSource = useMemo(() => ({ uri: resolvedUri }), [resolvedUri]);
-  const player = useVideoPlayer(nativeSource, (p: ExpoVideoPlayer) => {
-    p.loop = false;
-    p.muted = isMuted;
-    p.timeUpdateEventInterval = 0.25;
-    p.preservesPitch = true;
-    try {
-      p.playbackRate = playbackSpeed;
-    } catch {}
+  // ── Native player (iOS / Android) ────────────────────────────────────────
+  // useNativeVideoPlayer encapsulates expo-video player creation, event
+  // subscriptions, and cleanup (Requirements 4.1). On native, we always play
+  // `resolvedUri` regardless of any `transcodedUri` prop — the codec fallback
+  // path is web-only (Requirement 4.8).
+  const {
+    state: nativePlayerState,
+    player,
+  } = useNativeVideoPlayer({
+    // On web, VideoPlayer uses useWebVideoPlayer instead of expo-video.
+    // Pass '' so useNativeVideoPlayer receives a null source and expo-video
+    // does not probe the video URI — which would cause HEAD 403 errors for
+    // deleted H.265 originals (removed from Firebase Storage after transcoding).
+    uri: Platform.OS !== 'web' ? resolvedUri : '',
+    autoPlay: autoPlay || initialWasPlaying,
+    initialPosition: Number.isFinite(initialPlaybackPosition) && initialPlaybackPosition > 0
+      ? initialPlaybackPosition
+      : undefined,
+    playbackSpeed,
+    isMuted,
   });
 
   const pauseSelf = useCallback(() => {
@@ -1323,10 +2069,15 @@ function VideoPlayerLoaded({
 
     intendedPlayingRef.current = false;
     pauseRequestedRef.current = false;
+    pendingPlayRequestRef.current = false;
     setPendingPlayRequest(false);
     setIsPlayingSafe(false);
     syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
-  }, [player, setIsPlayingSafe, setPendingPlayRequest, syncPlaybackCache]);
+    // Show controls so the user sees the paused state and can resume playback.
+    // Without this, controls stay hidden when another video takes over — the
+    // user would see a paused video with no visible way to resume it.
+    setShowControlsVisible(true);
+  }, [player, setIsPlayingSafe, setPendingPlayRequest, setShowControlsVisible, syncPlaybackCache]);
 
   useEffect(() => registerPlaybackHandler(playbackIdRef.current, pauseSelf), [pauseSelf]);
 
@@ -1379,24 +2130,20 @@ function VideoPlayerLoaded({
     hasAppliedInitialPositionRef.current = true;
   }, [player, setCurrentTimeSafe]);
 
-  const { isPlaying: nativePlaying } = useEvent(player, 'playingChange', {
-    isPlaying: player.playing,
-  });
-  const timeUpdate = useEvent(player, 'timeUpdate', {
-    currentTime: player.currentTime,
-    bufferedPosition: player.bufferedPosition ?? 0,
-    currentLiveTimestamp: null,
-    currentOffsetFromLive: null,
-  });
-  const statusEvent = useEvent(player, 'statusChange', {
-    status: player.status,
-    oldStatus: undefined,
-  });
-  const status = statusEvent?.status ?? player.status;
-  const statusError = statusEvent?.error ?? null;
-  const playbackRateChange = useEvent(player, 'playbackRateChange', {
-    playbackRate: player.playbackRate ?? 1,
-  });
+  // Map useNativeVideoPlayer hook outputs to the local variable names used
+  // throughout the rest of this component.
+  const nativePlaying = nativePlayerState.isPlaying;
+  const timeUpdate = {
+    currentTime: nativePlayerState.currentTime,
+    bufferedPosition: nativePlayerState.bufferedPosition,
+  };
+  const status = nativePlayerState.status;
+  const statusError: { message?: string } | null = nativePlayerState.error
+    ? { message: nativePlayerState.error }
+    : null;
+  // playbackRateChange: synthesise a compatible shape so downstream effects
+  // that read playbackRateChange.playbackRate continue to work unchanged.
+  const playbackRateChange = { playbackRate: player.playbackRate ?? 1 };
 
   const applyPlaybackRate = useCallback(
     (rate: number) => {
@@ -1473,135 +2220,13 @@ function VideoPlayerLoaded({
     playbackRateSyncedRef.current = true;
   }, [applyPlaybackRate, playbackSpeed]);
 
-  const handleProgressBarLayout = useCallback(
-    (event: LayoutChangeEvent) => {
-      const { width } = event.nativeEvent.layout;
-      if (Number.isFinite(width) && width > 0) {
-        progressBarWidthRef.current = width;
-      }
-
-      if (progressBarRef.current && typeof progressBarRef.current.measure === 'function') {
-        progressBarRef.current.measure((_x, _y, measuredWidth, _height, pageX) => {
-          if (Number.isFinite(measuredWidth) && measuredWidth > 0) {
-            progressBarWidthRef.current = measuredWidth;
-          }
-          if (typeof pageX === 'number' && Number.isFinite(pageX)) {
-            progressBarPageXRef.current = pageX;
-          }
-        });
-      }
-    },
-    []
-  );
-
-  const resolveLocationX = useCallback((evt: GestureResponderEvent) => {
-    const { locationX, pageX } = evt.nativeEvent;
-    if (typeof locationX === 'number' && Number.isFinite(locationX)) {
-      return locationX;
-    }
-    if (
-      typeof pageX === 'number' &&
-      Number.isFinite(pageX) &&
-      progressBarPageXRef.current != null &&
-      Number.isFinite(progressBarPageXRef.current)
-    ) {
-      return pageX - (progressBarPageXRef.current as number);
-    }
-    return null;
-  }, []);
-
-  const calculateScrubProgress = useCallback((locationX: number | null) => {
-    if (locationX == null) {
-      return null;
-    }
-    const width = progressBarWidthRef.current;
-    if (!Number.isFinite(width) || width <= 0) {
-      return null;
-    }
-    const ratio = clamp(locationX / width, 0, 1);
-    return ratio * 100;
-  }, []);
-
-  const applyScrubProgress = useCallback(
-    (progressValue: number | null, commit: boolean) => {
-      if (progressValue == null) {
-        return;
-      }
-
-      const normalized = clamp(progressValue / 100, 0, 1);
-      const durationSource =
-        Platform.OS === 'web'
-          ? durationRef.current ?? duration ?? 0
-          : player.duration || durationRef.current || duration || 0;
-      const baseDuration = Number.isFinite(durationSource) && durationSource > 0 ? durationSource : 0;
-      const newTime = baseDuration * normalized;
-
-      if (Number.isFinite(newTime)) {
-        setCurrentTimeSafe(newTime);
-      }
-
-      if (!commit) {
-        return;
-      }
-
-      if (Platform.OS === 'web' && videoRef.current) {
-        videoRef.current.currentTime = newTime;
-      } else if (Platform.OS !== 'web') {
-        try {
-          player.currentTime = newTime;
-        } catch (error) {
-          logger.debug?.('VideoPlayer: native seek failed', error);
-        }
-      }
-
-      if (commit) {
-        currentTimeRef.current = newTime;
-        syncPlaybackCache(true, { time: newTime, wasPlaying: intendedPlayingRef.current });
-      }
-    },
-    [duration, player, setCurrentTimeSafe, syncPlaybackCache]
-  );
-
-  const getProgressFromEvent = useCallback(
-    (evt: GestureResponderEvent) => {
-      const location = resolveLocationX(evt);
-      return calculateScrubProgress(location);
-    },
-    [calculateScrubProgress, resolveLocationX]
-  );
-
-  const progressPanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: (evt) => {
-          setIsDraggingProgress(true);
-          setShowControlsVisible(true);
-          applyScrubProgress(getProgressFromEvent(evt), false);
-        },
-        onPanResponderMove: (evt) => {
-          setShowControlsVisible(true);
-          applyScrubProgress(getProgressFromEvent(evt), false);
-        },
-        onPanResponderRelease: (evt) => {
-          setIsDraggingProgress(false);
-          setShowControlsVisible(true);
-          applyScrubProgress(getProgressFromEvent(evt), true);
-        },
-        onPanResponderTerminate: (evt) => {
-          setIsDraggingProgress(false);
-          setShowControlsVisible(true);
-          applyScrubProgress(getProgressFromEvent(evt), true);
-        },
-        onPanResponderTerminationRequest: () => false,
-      }),
-    [applyScrubProgress, getProgressFromEvent]
-  );
+  // Progress bar gesture handling is extracted to the useVideoProgressBar hook.
+  // The hook call is placed after effectiveDuration is defined (below).
 
   useEffect(() => {
     if (playRequestId !== lastPlayRequestIdRef.current) {
       lastPlayRequestIdRef.current = playRequestId;
+      pendingPlayRequestRef.current = true;
       setPendingPlayRequest(true);
     }
   }, [playRequestId]);
@@ -1619,6 +2244,25 @@ function VideoPlayerLoaded({
         patchVideoCacheEntry(cacheKeyRef.current, { resolvedUri: nextUri, ...patch });
       }
     };
+
+    // ── WEB: use the codec-aware resolved URI ─────────────────────────────────
+    // On web, the effective source is managed by the codec fallback state machine
+    // (useVideoCodecFallback + useWebVideoPlayer). We still call applyResolvedUri
+    // to keep the cache and parent callbacks in sync, but the actual <video> src
+    // is controlled by webResolvedUri / webVideoRef (not this local resolvedUri).
+    if (Platform.OS === 'web') {
+      setResolving(false);
+      setIsLoadingSafe(true);
+      // Use the effective transcoded URI if h265 is not supported (proactive path),
+      // otherwise use the original URI as the cache / parent resolver source.
+      const webCacheUri = (canPlayH265Ref.current === false && effectiveTranscodedUri)
+        ? effectiveTranscodedUri
+        : uri;
+      applyResolvedUri(webCacheUri);
+      return () => {
+        cancelled = true;
+      };
+    }
 
     if (initialResolvedUri) {
       setResolving(false);
@@ -1674,23 +2318,34 @@ function VideoPlayerLoaded({
     return () => {
       cancelled = true;
     };
-  }, [cacheKey, fileName, initialResolvedUri, onResolvedUriChange, setCurrentTimeSafe, setDurationSafe, setIsLoadingSafe, updateDuration, uri]);
+  }, [cacheKey, effectiveTranscodedUri, fileName, initialResolvedUri, onResolvedUriChange, setCurrentTimeSafe, setDurationSafe, setIsLoadingSafe, updateDuration, uri]);
 
   useEffect(() => {
+    // Keep controls visible when video ends so user can see play button to restart.
+    // Use a ref guard to prevent this from causing a re-render loop.
+    if (webEnded && showControlsProp) {
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = null;
+      }
+      setShowControlsVisible((prev) => (prev === true ? prev : true));
+      return () => {};  // explicit cleanup to satisfy React
+    }
     if (showControlsProp && isPlaying && !isDraggingProgress) {
       if (controlsTimeoutRef.current) {
         clearTimeout(controlsTimeoutRef.current);
       }
       controlsTimeoutRef.current = setTimeout(() => {
         setShowControlsVisible(false);
-      }, 3000) as unknown as number;
+      }, 2000) as unknown as number;
     }
     return () => {
       if (controlsTimeoutRef.current) {
         clearTimeout(controlsTimeoutRef.current);
       }
     };
-  }, [showControlsProp, isPlaying, isDraggingProgress]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showControlsProp, isPlaying, isDraggingProgress, webEnded]);
 
   const restartIfEnded = useCallback(() => {
     const epsilon = 0.35;
@@ -1732,7 +2387,28 @@ function VideoPlayerLoaded({
         syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
       } else {
         pauseOtherVideos(playbackIdRef.current);
-        restartIfEnded();
+        // If the video ended, seek back to start before resuming.
+        // Clear webEnded so the UX state leaves the 'ended' phase.
+        if (webEnded) {
+          setWebEnded(false);
+          try { videoRef.current.currentTime = 0; } catch {}
+          currentTimeRef.current = 0;
+        } else {
+          restartIfEnded();
+        }
+        // If the element has no data (e.g. tab was backgrounded for a long time
+        // and the browser discarded the buffer), reload before playing.
+        // Do NOT set isPlaying=true here — the play hasn't started yet.
+        // onReady → tryFulfillPendingPlayRef.current() will initiate play once
+        // the element has buffered enough metadata.
+        if (videoRef.current.readyState === 0 && videoRef.current.src && !videoRef.current.error) {
+          pendingPlayRequestRef.current = true;
+          setPendingPlayRequest(true);
+          intendedPlayingRef.current = true;
+          setIsLoadingSafe(true);
+          videoRef.current.load();
+          return;
+        }
         const playPromise = videoRef.current.play();
         if (playPromise?.catch) {
           playPromise.catch((error: unknown) => {
@@ -1920,7 +2596,9 @@ function VideoPlayerLoaded({
   };
 
   const tryFulfillPendingPlay = useCallback(() => {
-    if (!pendingPlayRequest) {
+    // Use ref to avoid stale closure — canplay/canplaythrough events fire
+    // before React batches setPendingPlayRequest(true) into the closure.
+    if (!pendingPlayRequestRef.current) {
       return;
     }
 
@@ -1938,16 +2616,19 @@ function VideoPlayerLoaded({
               setIsPlayingSafe(true);
               intendedPlayingRef.current = true;
               pauseRequestedRef.current = false;
+              pendingPlayRequestRef.current = false;
               setPendingPlayRequest(false);
             })
             .catch((error: unknown) => {
               logger.debug?.('VideoPlayer: autoplay rejected', error);
+              pendingPlayRequestRef.current = false;
               setPendingPlayRequest(false);
             });
         } else {
           setIsPlayingSafe(true);
           intendedPlayingRef.current = true;
           pauseRequestedRef.current = false;
+          pendingPlayRequestRef.current = false;
           setPendingPlayRequest(false);
         }
       } catch (error) {
@@ -1959,11 +2640,19 @@ function VideoPlayerLoaded({
     try {
       pauseOtherVideos(playbackIdRef.current);
       player.play();
+      pendingPlayRequestRef.current = false;
       setPendingPlayRequest(false);
     } catch (error) {
       logger.debug?.('VideoPlayer: native autoplay failed', error);
     }
-  }, [pendingPlayRequest, player, setIsPlayingSafe]);
+  // Remove pendingPlayRequest from deps — we read via ref to avoid stale closures
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [player, setIsPlayingSafe]);
+
+  // Keep the ref in sync so onReady (defined before tryFulfillPendingPlay) can call it.
+  useEffect(() => {
+    tryFulfillPendingPlayRef.current = tryFulfillPendingPlay;
+  }, [tryFulfillPendingPlay]);
 
   const handleLoadedMetadata = () => {
     if (Platform.OS === 'web' && videoRef.current) {
@@ -1980,6 +2669,25 @@ function VideoPlayerLoaded({
           onPreviewAvailable(frame);
         }
       }
+
+      // Detect unsupported video codec (e.g. H.265/HEVC from iPhone recordings):
+      // the container parses and audio/duration are available, but the video track
+      // has zero dimensions because the browser can't decode it. Mobile Chrome/Edge
+      // on Android lack an HEVC decoder, so the video renders black / fails while
+      // audio plays. Surface a clear error instead of a confusing black screen.
+      const vw = videoRef.current.videoWidth;
+      const vh = videoRef.current.videoHeight;
+      if ((!vw || !vh) && mediaDuration > 0) {
+        logger.warn?.('VideoPlayer: video track has zero dimensions — likely unsupported codec (HEVC)', {
+          videoWidth: vw,
+          videoHeight: vh,
+        });
+        setWebPlaybackError('unsupported-codec');
+        setWebStatus('error');
+        setIsLoadingSafe(false);
+        return;
+      }
+
       setIsLoadingSafe(false);
       setWebStatus('readyToPlay');
       setWebPlaybackError(null);
@@ -1991,51 +2699,76 @@ function VideoPlayerLoaded({
 
   const handleWebLoadStart = useCallback(() => {
     setIsLoadingSafe(true);
-    setWebStatus('loading');
-    setWebPlaybackError(null);
-    setWebEnded(false);
-  }, [setIsLoadingSafe]);
+    _hookWebLoadStart();
+  }, [setIsLoadingSafe, _hookWebLoadStart]);
 
   const handleWebCanPlay = useCallback(() => {
-    setWebStatus('readyToPlay');
-    setWebIsBuffering(false);
-    setWebIsStalled(false);
+    _hookWebCanPlay();
     setIsLoadingSafe(false);
     tryFulfillPendingPlay();
-  }, [setIsLoadingSafe, tryFulfillPendingPlay]);
+  }, [_hookWebCanPlay, setIsLoadingSafe, tryFulfillPendingPlay]);
 
   const handleWebWaiting = useCallback(() => {
-    setWebIsBuffering(true);
-  }, []);
+    _hookWebWaiting();
+  }, [_hookWebWaiting]);
 
   const handleWebStalled = useCallback(() => {
-    setWebIsStalled(true);
-    setWebIsBuffering(true);
-  }, []);
+    _hookWebStalled();
+  }, [_hookWebStalled]);
 
   const handleWebPlaying = useCallback(() => {
-    setWebIsBuffering(false);
-    setWebIsStalled(false);
-    setWebStatus('readyToPlay');
+    _hookWebPlaying();
     setIsLoadingSafe(false);
-  }, [setIsLoadingSafe]);
+  }, [_hookWebPlaying, setIsLoadingSafe]);
 
   const handleWebError = useCallback(() => {
-    setWebPlaybackError('Playback failed');
-    setWebStatus('error');
+    _hookWebError(videoRef.current as HTMLVideoElement | null);
     setIsLoadingSafe(false);
-  }, [setIsLoadingSafe]);
+  }, [_hookWebError, setIsLoadingSafe]);
 
   const handleWebEnded = useCallback(() => {
-    setWebEnded(true);
+    // Explicitly pause — some browsers loop briefly after 'ended' before stopping.
+    if (videoRef.current && !videoRef.current.paused) {
+      try { videoRef.current.pause(); } catch { /* ignore */ }
+    }
+    _hookWebEnded();
     intendedPlayingRef.current = false;
     pauseRequestedRef.current = false;
     setIsPlayingSafe(false);
-  }, [setIsPlayingSafe]);
+  }, [_hookWebEnded, setIsPlayingSafe]);
 
   const handleWebProgress = useCallback(() => {
     updateWebBufferedPercent();
   }, [updateWebBufferedPercent]);
+
+  // Live frame capture: once the inline video has played past 0.5s on web,
+  // capture a frame directly from the playing element. This is more reliable
+  // than the hidden-video thumbnail approach because the element is already
+  // decoded in the current browser (no CORS / codec uncertainty).
+  const liveFrameCapturedRef = useRef(false);
+  useEffect(() => {
+    if (Platform.OS !== 'web') {
+      return;
+    }
+    // Only capture once, and only if we don't already have a data: URI thumbnail.
+    if (liveFrameCapturedRef.current) {
+      return;
+    }
+    if (currentTime < 0.5) {
+      return;
+    }
+    const el = webVideoRef.current as HTMLVideoElement | null;
+    if (!el) {
+      return;
+    }
+    const frame = captureFrameFromElement(el);
+    if (frame) {
+      liveFrameCapturedRef.current = true;
+      // Update the outer component's preview and persist it to the video cache.
+      onPreviewAvailable?.(frame);
+      patchVideoCacheEntry(cacheKey, { previewUri: frame });
+    }
+  }, [cacheKey, currentTime, onPreviewAvailable]);
 
   const handleInlineWebSeeked = useCallback(() => {
     if (!videoRef.current) {
@@ -2065,7 +2798,9 @@ function VideoPlayerLoaded({
     setIsPlayingSafe(true);
     setWebIsBuffering(false);
     setWebIsStalled(false);
-    setWebEnded(false);
+    // NOTE: Do NOT reset webEnded here. The ended state is only cleared explicitly
+    // by the user pressing Replay. Resetting it here caused a playback loop because
+    // the browser fires the play event right after ended in some scenarios.
     setWebStatus('readyToPlay');
     setWebPlaybackError(null);
   }, [setIsPlayingSafe]);
@@ -2109,15 +2844,37 @@ function VideoPlayerLoaded({
       if (document.visibilityState && document.visibilityState !== 'visible') {
         return;
       }
+      // Never auto-resume after the video has ended — user must press Replay.
+      // Check both the DOM property and the React ref: el.ended can reset to false
+      // when the browser discards the video buffer on tab hide/show.
+      if (videoRef.current.ended || webEndedRef.current) {
+        return;
+      }
 
       try {
+        const el = videoRef.current;
         const resumeTime = currentTimeRef.current;
+
         if (Number.isFinite(resumeTime) && resumeTime > 0) {
-          if (Math.abs(videoRef.current.currentTime - resumeTime) > 0.5) {
-            videoRef.current.currentTime = resumeTime;
+          if (Math.abs(el.currentTime - resumeTime) > 0.5) {
+            el.currentTime = resumeTime;
           }
         }
-        const playPromise = videoRef.current.play?.();
+
+        // If the element is in a stale state after backgrounding (HAVE_NOTHING or
+        // HAVE_METADATA with no data), force a reload so the browser re-fetches
+        // the range it needs. The 'canplay' event will trigger the pending play.
+        if (el.readyState < 3 && el.src && !el.error) {
+          // Use pendingPlayRequestRef so onReady → tryFulfillPendingPlay handles
+          // the play() call after the element has reloaded its metadata.
+          // This avoids the fragile 400ms race between setTimeout and loadedmetadata.
+          pendingPlayRequestRef.current = true;
+          setPendingPlayRequest(true);
+          el.load();
+          return;
+        }
+
+        const playPromise = el.play?.();
         if (playPromise?.catch) {
           playPromise.catch(() => undefined);
         }
@@ -2128,7 +2885,11 @@ function VideoPlayerLoaded({
 
     const handleFullscreenChange = () => {
       syncFromElement();
-      resumeIfNeeded();
+      // Do NOT call resumeIfNeeded() on fullscreenchange.
+      // Entering/exiting native fullscreen via requestFullscreen() does not
+      // change video playback state — the video keeps playing or stays paused.
+      // Calling resumeIfNeeded() here caused the video to auto-play whenever
+      // the user toggled between inline and fullscreen mode.
     };
     const handleVisibilityChange = () => {
       syncFromElement();
@@ -2146,14 +2907,29 @@ function VideoPlayerLoaded({
     };
   }, [syncPlaybackCache]);
 
+  // ─── Media Session API callbacks and hook call are placed after effectiveDuration below ───
+
   const handleInlineSharePress = useCallback((event?: GestureResponderEvent) => {
     event?.stopPropagation?.();
+    // Exit native fullscreen first — the ShareModal renders outside the
+    // fullscreen element and would be hidden behind it otherwise.
+    if (Platform.OS === 'web' && isWebFullscreenExpanded && typeof document !== 'undefined') {
+      try {
+        const doc = document as any;
+        const exitFn = doc.exitFullscreen || doc.webkitExitFullscreen || doc.mozCancelFullScreen;
+        if (exitFn) {
+          const p = exitFn.call(document);
+          if (p?.catch) p.catch(() => undefined);
+        }
+      } catch { /* ignore */ }
+      setIsWebFullscreenExpanded(false);
+    }
     onSharePress(event);
-  }, [onSharePress]);
+  }, [onSharePress, isWebFullscreenExpanded]);
 
   const handleWebFullscreenDismiss = useCallback(
     (state: FullscreenReturnState) => {
-      setWebFullscreenConfig(null);
+      setIsWebFullscreenExpanded(false);
       setIsMuted(state.isMuted);
       setPlaybackSpeed(state.playbackSpeed);
       setCurrentTimeSafe(state.currentTime);
@@ -2226,85 +3002,58 @@ function VideoPlayerLoaded({
   }, [fileName, onResolvedUriChange, setResolvedUri, uri]);
 
   const handleFullscreenPress = () => {
-    if (Platform.OS === 'web' && videoRef.current && typeof document !== 'undefined') {
-      try {
-        if (webFullscreenConfig) {
-          return;
-        }
-
-        const wasPlaying = isPlaying;
+    if (Platform.OS === 'web') {
+      if (isWebFullscreenExpanded) {
+        // Exit native fullscreen
         try {
-          pauseRequestedRef.current = true;
-          videoRef.current.pause?.();
-        } catch (error) {
-          logger.debug?.('VideoPlayer: failed to pause before web fullscreen', error);
+          const doc = document as any;
+          const exitFn = doc.exitFullscreen || doc.webkitExitFullscreen || doc.mozCancelFullScreen;
+          if (exitFn) {
+            const p = exitFn.call(document);
+            if (p?.catch) p.catch(() => undefined);
+          }
+        } catch { /* ignore */ }
+        setIsWebFullscreenExpanded(false);
+      } else {
+        // Enter native browser fullscreen — bypasses all ancestor CSS transforms.
+        // The same <video> element keeps playing; the browser promotes the container
+        // to a fullscreen layer. No reload, no rebuffering.
+        const container = webWrapperRef.current as HTMLElement | null;
+        if (container) {
+          try {
+            const requestFn =
+              (container as any).requestFullscreen ||
+              (container as any).webkitRequestFullscreen ||
+              (container as any).mozRequestFullScreen;
+            if (requestFn) {
+              const p = requestFn.call(container);
+              if (p?.catch) p.catch(() => undefined);
+            }
+          } catch { /* ignore — fallback handled by state */ }
         }
-        setIsPlayingSafe(false);
-        intendedPlayingRef.current = false;
-
-        setWebFullscreenConfig({
-          sourceUri: resolvedUriRef.current || uri,
-          startTime: Number.isFinite(currentTimeRef.current) ? currentTimeRef.current : 0,
-          isMuted,
-          playbackSpeed,
-          wasPlaying,
-        });
-      } catch (error) {
-        logger.warn('VideoPlayer: fullscreen toggle error', error);
+        setIsWebFullscreenExpanded(true);
       }
-    } else if (Platform.OS !== 'web') {
+      setShowControlsVisible(true);
+      return;
+    } else {
       setShowControlsVisible(true);
       if (isNativeFullscreenVisible) {
         return;
       }
 
-      const wasPlayingBeforeFullscreen = isPlaying;
-      pauseForFullscreenRef.current = true;
-
-      try {
-        player.pause();
-      } catch (error) {
-        logger.debug?.('VideoPlayer: failed to pause before fullscreen', error);
-      }
-
-      void (async () => {
-        try {
-          const sourceForFullscreen = await ensureFullscreenSource();
-          if (!sourceForFullscreen) {
-            if (wasPlayingBeforeFullscreen) {
-              try {
-                player.play();
-                setIsPlayingSafe(true);
-              } catch (resumeError) {
-                logger.debug?.('VideoPlayer: failed to resume after fullscreen abort', resumeError);
-                setIsPlayingSafe(false);
-              }
-            }
-            return;
-          }
-
-          setNativeFullscreenConfig({
-            sourceUri: sourceForFullscreen,
-            startTime: Number.isFinite(currentTime) ? currentTime : 0,
-            isMuted,
-            playbackSpeed,
-            wasPlaying: wasPlayingBeforeFullscreen,
-          });
-        } catch (error) {
-          logger.debug?.('VideoPlayer: failed to prepare fullscreen source', { uri, error });
-          if (wasPlayingBeforeFullscreen) {
-            try {
-              player.play();
-              setIsPlayingSafe(true);
-            } catch (resumeError) {
-              logger.debug?.('VideoPlayer: failed to resume after fullscreen error', resumeError);
-              setIsPlayingSafe(false);
-            }
-          }
-        } finally {
-          pauseForFullscreenRef.current = false;
-        }
-      })();
+      // Shared player approach: the inline player keeps playing as the modal opens.
+      // expo-video allows the fullscreen VideoView to share the same player instance,
+      // so there is no reload or rebuffering — transition is instant.
+      setNativeFullscreenConfig({
+        // sourceUri is still passed so the modal can fall back to own player if needed,
+        // but it won't be loaded since sharedPlayer is provided.
+        sourceUri: resolvedUri || uri,
+        startTime: Number.isFinite(currentTime) ? currentTime : 0,
+        isMuted,
+        playbackSpeed,
+        wasPlaying: isPlaying,
+        posterUri: posterUri ?? undefined,
+      });
     }
   };
 
@@ -2314,44 +3063,23 @@ function VideoPlayerLoaded({
       setNativeFullscreenConfig(null);
 
       if (!result) {
-        try {
-          player.pause();
-        } catch (error) {
-          logger.debug?.('VideoPlayer: failed to pause after fullscreen dismiss', error);
-        }
-        setIsPlayingSafe(false);
+        // Dismissed without state — read actual player state to sync UI
+        setIsPlayingSafe(player.playing ?? false);
         return;
       }
 
       setIsMuted(result.isMuted);
-  playbackRateSyncedRef.current = false;
+      playbackRateSyncedRef.current = false;
       setPlaybackSpeed(result.playbackSpeed);
 
       const targetTime = Number.isFinite(result.currentTime) ? result.currentTime : 0;
       setCurrentTimeSafe(targetTime);
-      try {
-        player.currentTime = targetTime;
-      } catch (error) {
-        logger.debug?.('VideoPlayer: failed to sync time after fullscreen', error);
-      }
 
-      if (result.wasPlaying) {
-        try {
-          pauseOtherVideos(playbackIdRef.current);
-          player.play();
-          setIsPlayingSafe(true);
-        } catch (error) {
-          logger.debug?.('VideoPlayer: failed to resume after fullscreen', error);
-          setIsPlayingSafe(false);
-        }
-      } else {
-        try {
-          player.pause();
-        } catch (error) {
-          logger.debug?.('VideoPlayer: pause after fullscreen failed', error);
-        }
-        setIsPlayingSafe(false);
-      }
+      // Shared player: the player is already in the correct state after the modal
+      // dismissed. We only sync the UI state variables — no need to seek or replay.
+      // The player was controlled by FullscreenVideoModal and is already playing/paused
+      // at the right position.
+      setIsPlayingSafe(result.wasPlaying);
     },
     [player, setCurrentTimeSafe, setIsPlayingSafe, setNativeFullscreenConfig]
   );
@@ -2564,10 +3292,137 @@ function VideoPlayerLoaded({
     };
   }, [isNativeFullscreenVisible]);
 
+  // Lock page scroll when web fullscreen is active so the underlying chat list
+  // doesn't scroll behind the fullscreen video.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+    if (isWebFullscreenExpanded) {
+      const prevOverflow = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      return () => {
+        document.body.style.overflow = prevOverflow;
+      };
+    }
+  }, [isWebFullscreenExpanded]);
+
+  // Sync isWebFullscreenExpanded with the browser's native fullscreen state.
+  // When the user presses Escape (which the browser handles automatically), or
+  // when fullscreen is exited by any other means, update React state accordingly.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') {
+      return;
+    }
+    const onFsChange = () => {
+      const doc = document as any;
+      const fsElement =
+        doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement;
+      if (!fsElement) {
+        // Browser exited fullscreen (e.g. user pressed Escape)
+        setIsWebFullscreenExpanded(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange as EventListener);
+    document.addEventListener('mozfullscreenchange', onFsChange as EventListener);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange as EventListener);
+      document.removeEventListener('mozfullscreenchange', onFsChange as EventListener);
+    };
+  }, []); // Stable — setIsWebFullscreenExpanded is stable from useState
+
   const effectiveDuration =
     Platform.OS === 'web'
       ? duration || durationRef.current || 0
       : player.duration || duration || durationRef.current || 0;
+
+  // ─── Progress bar gesture handling (useVideoProgressBar hook) ─────────────
+  const {
+    progressBarRef,
+    handleLayout: handleProgressBarLayout,
+    panResponder: progressPanResponder,
+  } = useVideoProgressBar({
+    duration: effectiveDuration,
+    onScrubChange: (time) => {
+      setShowControlsVisible(true);
+      setCurrentTimeSafe(time);
+    },
+    onScrubCommit: (time) => {
+      currentTimeRef.current = time;
+      setCurrentTimeSafe(time);
+      setShowControlsVisible(true);
+      if (Platform.OS === 'web' && videoRef.current) {
+        videoRef.current.currentTime = time;
+      } else if (Platform.OS !== 'web') {
+        try { player.currentTime = time; } catch {}
+      }
+      syncPlaybackCache(true, { time, wasPlaying: intendedPlayingRef.current });
+    },
+    onDragStart: () => setIsDraggingProgress(true),
+    onDragEnd: () => setIsDraggingProgress(false),
+  });
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ─── Media Session API — notification panel play/pause/seek support ───────
+  const msOnPlay = useCallback(() => {
+    if (!videoRef.current) return;
+    pauseOtherVideos(playbackIdRef.current);
+    videoRef.current.play().catch(() => undefined);
+    intendedPlayingRef.current = true;
+    setIsPlayingSafe(true);
+  }, [pauseOtherVideos, setIsPlayingSafe]);
+
+  const msOnPause = useCallback(() => {
+    if (!videoRef.current) return;
+    pauseRequestedRef.current = true;
+    videoRef.current.pause();
+    intendedPlayingRef.current = false;
+    setIsPlayingSafe(false);
+    syncPlaybackCache(true, { time: currentTimeRef.current, wasPlaying: false });
+  }, [setIsPlayingSafe, syncPlaybackCache]);
+
+  const msOnStop = useCallback(() => {
+    if (!videoRef.current) return;
+    pauseRequestedRef.current = true;
+    videoRef.current.pause();
+    videoRef.current.currentTime = 0;
+    intendedPlayingRef.current = false;
+    setIsPlayingSafe(false);
+    syncPlaybackCache(true, { time: 0, wasPlaying: false });
+  }, [setIsPlayingSafe, syncPlaybackCache]);
+
+  const msOnSeekBackward = useCallback((offset: number) => {
+    if (!videoRef.current) return;
+    videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - offset);
+  }, []);
+
+  const msOnSeekForward = useCallback((offset: number) => {
+    if (!videoRef.current) return;
+    const dur = videoRef.current.duration || 0;
+    videoRef.current.currentTime = Math.min(dur, videoRef.current.currentTime + offset);
+  }, []);
+
+  const msOnSeekTo = useCallback((time: number) => {
+    if (!videoRef.current) return;
+    videoRef.current.currentTime = time;
+  }, []);
+
+  useMediaSession({
+    isPlaying,
+    title: fileName ? fileName.replace(/\.[^.]+$/, '') : null,
+    duration: effectiveDuration,
+    currentTime,
+    playbackRate: playbackSpeed,
+    onPlay: msOnPlay,
+    onPause: msOnPause,
+    onStop: msOnStop,
+    onSeekBackward: msOnSeekBackward,
+    onSeekForward: msOnSeekForward,
+    onSeekTo: msOnSeekTo,
+  });
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Centralize playback UX state so inline/fullscreen overlays stay in sync across platforms.
   const playbackUxState = useVideoPlaybackUxState({
@@ -2586,6 +3441,16 @@ function VideoPlayerLoaded({
     ended: Platform.OS === 'web' ? webEnded : undefined,
     externalBuffering: Platform.OS === 'web' ? webIsBuffering : undefined,
     externalStalled: Platform.OS === 'web' ? webIsStalled : undefined,
+    // 350ms enter delay on web: long enough to swallow brief 'waiting' events
+    // during normal playback, short enough to feel responsive on slow connections.
+    bufferingDelayMs: Platform.OS === 'web' ? 350 : 150,
+    bufferingExitDelayMs: 150,
+    // Stall threshold: show the overlay after 4 s of stalled playback on web
+    // (down from 8 s). Matches production-grade players (YouTube ~3-5 s).
+    stallThresholdMs: Platform.OS === 'web' ? 4000 : 2000,
+    // Buffer gap tolerance: show buffering once playhead is within 0.3 s of
+    // the buffer edge (was 0.5 s — tighter to catch real stalls sooner).
+    bufferGapSeconds: Platform.OS === 'web' ? 0.3 : 0.3,
   });
 
   const progressPercentage =
@@ -2597,10 +3462,12 @@ function VideoPlayerLoaded({
     Math.max(progressPercentage, playbackUxState.bufferedPercent ?? 0)
   );
 
-  const shouldLockControls =
-    playbackUxState.isInitialLoading || playbackUxState.isError || playbackUxState.isEnded;
+  // Only lock controls during initial loading — not during errors.
+  // The error overlay (VideoBufferingOverlay / codec fallback overlays) handles the
+  // error UX; keeping controls visible lets the user close fullscreen or retry.
+  const shouldLockControls = playbackUxState.isInitialLoading;
   const shouldShowControls = showControlsProp && showControlsVisible && !shouldLockControls;
-  const disableSpeedControl = shouldLockControls || !resolvedUri;
+  const disableSpeedControl = (playbackUxState.isInitialLoading || playbackUxState.isError) || !resolvedUri;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
@@ -2625,7 +3492,7 @@ function VideoPlayerLoaded({
 
   useEffect(() => {
     if (playbackUxState.isReady) {
-      readyOpacity.value = withTiming(1, { duration: 240 });
+      readyOpacity.value = withTiming(1, { duration: 160 });
     }
   }, [playbackUxState.isReady, readyOpacity]);
 
@@ -2634,24 +3501,34 @@ function VideoPlayerLoaded({
     transform: [{ scale: 0.985 + 0.015 * readyOpacity.value }],
   }));
 
+  // The ready fade-in is now handled by a CSS transition on a <div> cover overlay (web only).
+  // The cover starts opaque and transitions to transparent when playbackUxState.isReady becomes true.
+  // This avoids any Reanimated compositing layer on the video surface, fixing Chrome Android black screen.
+
   useEffect(() => {
+    // useNativeDriver is not supported on web — use JS-based animation there
+    const nativeDriver = Platform.OS !== 'web';
     Animated.parallel([
       Animated.timing(controlsOpacity, {
         toValue: shouldShowControls ? 1 : 0,
         duration: shouldShowControls ? 180 : 140,
-        useNativeDriver: true,
+        useNativeDriver: nativeDriver,
       }),
       Animated.spring(controlsScale, {
         toValue: shouldShowControls ? 1 : 0.98,
         speed: 18,
         bounciness: 4,
-        useNativeDriver: true,
+        useNativeDriver: nativeDriver,
       }),
     ]).start();
   }, [controlsOpacity, controlsScale, shouldShowControls]);
 
   useEffect(() => {
     if (!playbackUxState.isReady || playbackUxState.isBuffering || playbackUxState.isStalled) {
+      return;
+    }
+    // Never auto-resume if the video has ended — user must press Replay explicitly.
+    if (playbackUxState.isEnded) {
       return;
     }
     if (!intendedPlayingRef.current || isPlaying) {
@@ -2685,10 +3562,6 @@ function VideoPlayerLoaded({
   const handleKeyboardShortcut = useCallback(
     (event: any) => {
       if (Platform.OS !== 'web') {
-        return false;
-      }
-
-      if (webFullscreenConfig) {
         return false;
       }
 
@@ -2758,9 +3631,30 @@ function VideoPlayerLoaded({
         return true;
       }
 
+      if (key === 'Escape') {
+        if (event?.repeat) {
+          markHandled();
+          return true;
+        }
+        if (isWebFullscreenExpanded) {
+          markHandled();
+          // Call browser exit fullscreen (also triggers fullscreenchange → state sync)
+          try {
+            const doc = document as any;
+            const exitFn = doc.exitFullscreen || doc.webkitExitFullscreen || doc.mozCancelFullScreen;
+            if (exitFn) {
+              const p = exitFn.call(document);
+              if (p?.catch) p.catch(() => undefined);
+            }
+          } catch { /* ignore */ }
+          setIsWebFullscreenExpanded(false);
+        }
+        return true;
+      }
+
       return false;
     },
-    [handleFullscreenPress, handleKeyboardSeek, toggleMute, togglePlayPause, webFullscreenConfig]
+    [handleFullscreenPress, handleKeyboardSeek, toggleMute, togglePlayPause]
   );
 
   const webFocusStyle = useMemo(
@@ -2805,9 +3699,6 @@ function VideoPlayerLoaded({
     }
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (webFullscreenConfig) {
-        return;
-      }
       const target = event.target as Node | null;
       const container = webWrapperRef.current as Node | null;
       const isInside = !!(container && target && (container as any).contains?.(target));
@@ -2825,7 +3716,7 @@ function VideoPlayerLoaded({
     return () => {
       document.removeEventListener('pointerdown', handlePointerDown, true);
     };
-  }, [handleWebBlur, handleWebFocus, webFullscreenConfig]);
+  }, [handleWebBlur, handleWebFocus]);
 
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof window === 'undefined') {
@@ -2833,9 +3724,6 @@ function VideoPlayerLoaded({
     }
 
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
-      if (webFullscreenConfig) {
-        return;
-      }
       if (!webKeyboardActiveRef.current) {
         return;
       }
@@ -2846,7 +3734,7 @@ function VideoPlayerLoaded({
     return () => {
       window.removeEventListener('keydown', handleGlobalKeyDown, true);
     };
-  }, [handleKeyboardShortcut, webFullscreenConfig]);
+  }, [handleKeyboardShortcut]);
 
   const handleKeyDown = useCallback(
     (event: any) => {
@@ -2873,57 +3761,182 @@ function VideoPlayerLoaded({
     </View>
   );
 
-  const renderWebVideo = () => (
-    <View
-      ref={webWrapperRef}
-      style={[styles.videoContainer, webFocusStyle, { height: maxHeight }]}
-      accessibilityRole="adjustable"
-      accessibilityLabel="Video player"
-      accessibilityHint={seekHint}
-      accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
-      onAccessibilityAction={handleAccessibilityAction}
-      {...(Platform.OS === 'web'
-        ? ({
-            onKeyDown: handleKeyDown,
-            onFocus: handleWebFocus,
-            onBlur: handleWebBlur,
-            onMouseDown: (event: any) => event.preventDefault?.(),
-            tabIndex: -1,
-            dataSet: { tmVideoPlayer: 'true' },
-          } as any)
-        : {})}
-    >
-      <Reanimated.View style={[styles.inlineVideoSurface, readyAnimatedStyle]}>
-        <video
-          ref={videoRef}
-          src={resolvedUri}
-          style={{ width: '100%', height: '100%', backgroundColor: '#000', outline: 'none' }}
-          onMouseDown={(event) => event.preventDefault?.()}
-          onLoadStart={handleWebLoadStart}
-          onCanPlay={handleWebCanPlay}
-          onCanPlayThrough={handleWebCanPlay}
-          onWaiting={handleWebWaiting}
-          onStalled={handleWebStalled}
-          onPlaying={handleWebPlaying}
-          onError={handleWebError}
-          onEnded={handleWebEnded}
-          onProgress={handleWebProgress}
-          onTimeUpdate={handleTimeUpdate}
-          onSeeked={handleInlineWebSeeked}
-          onLoadedMetadata={handleLoadedMetadata}
-          onPlay={handleInlineWebPlay}
-          onPause={handleInlineWebPause}
-          muted={isMuted}
-          playsInline
-          preload="auto"
-          tabIndex={-1}
-        />
-      </Reanimated.View>
-      {renderSeekGestureLayer()}
-      {renderPlaybackOverlay()}
-      {renderControlsOverlay()}
-    </View>
-  );
+  const renderWebVideo = () => {
+    // ── Error state: h265 unsupported + no transcodedUri (Requirement 5.5) ──
+    // The fallback hook transitions to 'error' phase on mount when codec is
+    // unsupported and no transcoded copy is available. Render the error message
+    // and do NOT create any <video> element.
+    const isProactiveCodecError =
+      codecFallbackPhase === 'error' &&
+      !effectiveTranscodedUri &&
+      webResolvedUri === '' &&
+      !codecFallbackError; // permanent error set later for swap-target failures
+
+    if (isProactiveCodecError) {
+      return (
+        <View
+          style={[styles.videoContainer, { height: maxHeight }]}
+          accessibilityRole="none"
+          accessibilityLabel="Video unavailable"
+        >
+          <View style={styles.inlineVideoSurface}>
+            <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+              <Text style={{ color: theme.textSecondary, textAlign: 'center', fontSize: 14 }}>
+                Video format not supported
+              </Text>
+              <Text style={{ color: theme.textSecondary, textAlign: 'center', fontSize: 12, marginTop: 8 }}>
+                {"This video's format can't play in this browser. Try opening it in another browser or download it."}
+              </Text>
+            </View>
+          </View>
+        </View>
+      );
+    }
+
+    return (
+      <View
+        ref={webWrapperRef}
+        style={
+          isWebFullscreenExpanded
+            ? [styles.webFullscreenVideoWrapper, webFocusStyle]
+            : [styles.videoContainer, { height: maxHeight }, webFocusStyle]
+        }
+        accessibilityRole="adjustable"
+        accessibilityLabel="Video player"
+        accessibilityHint={seekHint}
+        accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]}
+        onAccessibilityAction={handleAccessibilityAction}
+        {...(Platform.OS === 'web'
+          ? ({
+              onKeyDown: handleKeyDown,
+              onFocus: handleWebFocus,
+              onBlur: handleWebBlur,
+              onMouseDown: (event: any) => event.preventDefault?.(),
+              tabIndex: -1,
+              dataSet: { tmVideoPlayer: 'true' },
+            } as any)
+          : {})}
+      >
+        <View style={isWebFullscreenExpanded ? styles.fullscreenVideoSurface : styles.inlineVideoSurface}>
+          {/* The <video> element is created and managed by useWebVideoPlayer via webVideoRef.
+              We render an empty container element and attach the ref so React sees the node.
+              useWebVideoPlayer sets el.src internally — we NEVER set src here directly.
+              This ensures the original `uri` is never assigned when h265 is unsupported. */}
+          <video
+            ref={webVideoRef as React.RefObject<HTMLVideoElement>}
+            style={{
+              width: '100%',
+              height: '100%',
+              outline: 'none',
+              objectFit: 'contain',
+              // NOTE: do NOT set backgroundColor on the <video> element itself.
+              // Mobile Chrome paints the background color OVER decoded video frames
+              // (compositor z-order bug) causing a black surface while audio plays.
+              // The black background lives on the wrapping container instead.
+            } as any}
+            onMouseDown={(event) => event.preventDefault?.()}
+            muted={isMuted}
+            playsInline
+            preload="auto"
+            crossOrigin="anonymous"
+            {...(posterUri ? { poster: posterUri } : {})}
+            disableRemotePlayback
+            tabIndex={-1}
+          />
+        </View>
+
+        {/* Codec fallback: spinner overlay (requesting / polling phase) */}
+        {codecFallbackSpinnerVisible ? (
+          <View
+            style={{
+              ...StyleSheet.absoluteFillObject,
+              backgroundColor: 'rgba(0,0,0,0.72)',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 10,
+            }}
+            pointerEvents="box-none"
+          >
+            <ActivityIndicator size="small" color="white" />
+            <Text style={{ color: 'white', textAlign: 'center', fontSize: 14, fontWeight: '500' }}>
+              {codecFallbackPhase === 'polling'
+                ? 'Converting for your browser…'
+                : 'Loading compatible format…'}
+            </Text>
+            {codecFallbackPhase === 'polling' ? (
+              <Text style={{ color: 'rgba(255,255,255,0.55)', textAlign: 'center', fontSize: 12 }}>
+                First-time conversion may take a moment
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
+
+        {/* Codec fallback: timeout — show message + retry button */}
+        {codecFallbackTimeout && !codecFallbackSpinnerVisible ? (
+          <View
+            style={{
+              ...StyleSheet.absoluteFillObject,
+              backgroundColor: 'rgba(0,0,0,0.72)',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 24,
+            }}
+          >
+            <Text style={{ color: 'white', textAlign: 'center', fontSize: 14, marginBottom: 16 }}>
+              Video is still processing. Try again in a moment.
+            </Text>
+            <TouchableOpacity
+              onPress={() => {
+                setCodecFallbackTimeout(false);
+                retryCodecFallback();
+              }}
+              style={{
+                backgroundColor: theme.primary ?? '#4A90E2',
+                paddingHorizontal: 20,
+                paddingVertical: 10,
+                borderRadius: 6,
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Retry video processing"
+            >
+              <Text style={{ color: 'white', fontSize: 14, fontWeight: '600' }}>Retry</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
+        {/* Codec fallback: permanent error (swap-target also failed) */}
+        {codecFallbackError && !codecFallbackSpinnerVisible && !codecFallbackTimeout ? (
+          <View
+            style={{
+              ...StyleSheet.absoluteFillObject,
+              backgroundColor: 'rgba(0,0,0,0.72)',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 24,
+            }}
+          >
+            <Text style={{ color: 'white', textAlign: 'center', fontSize: 14 }}>
+              {codecFallbackError}
+            </Text>
+            {onDownload ? (
+              <TouchableOpacity
+                onPress={onDownload}
+                style={{ marginTop: 12 }}
+                accessibilityRole="button"
+                accessibilityLabel="Download video"
+              >
+                <Text style={{ color: theme.primary ?? '#4A90E2', fontSize: 13 }}>Download</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ) : null}
+
+        {renderSeekGestureLayer(isWebFullscreenExpanded ? 'fullscreen' : 'inline')}
+        {renderPlaybackOverlay()}
+        {renderControlsOverlay()}
+      </View>
+    );
+  };
 
   const renderPlaybackOverlay = () => {
     const overlayPhase =
@@ -2933,9 +3946,41 @@ function VideoPlayerLoaded({
     const showPoster =
       !!posterUri && (playbackUxState.isInitialLoading || playbackUxState.isBuffering || playbackUxState.isStalled);
 
+    // On web: suppress the loading/buffering overlay once the video has actually started.
+    // The UX state machine can lag behind the real video state, keeping the overlay visible
+    // even while video is playing. Trust the actual playback state instead.
+    const videoActuallyPlaying = Platform.OS === 'web' && (isPlaying || currentTime > 0);
+    // Suppress overlays when video is visibly playing. Mobile Chrome fires the
+    // 'waiting' event frequently during normal playback of large files, causing
+    // false-positive buffering overlays on top of running video.
+    const suppressOverlay = videoActuallyPlaying && (
+      playbackUxState.phase === 'loading' ||
+      playbackUxState.isInitialLoading ||
+      (playbackUxState.isBuffering && isPlaying)
+    );
+
+    // Custom messaging for unsupported video codec (e.g. HEVC on Android browsers).
+    // When useVideoCodecFallback is active (swapping/polling/requesting), suppress this
+    // overlay — the fallback hook handles the UX (spinner, error message, retry button).
+    const codecFallbackActive = Platform.OS === 'web' && (
+      codecFallbackPhase === 'swapping' ||
+      codecFallbackPhase === 'requesting' ||
+      codecFallbackPhase === 'polling' ||
+      codecFallbackPhase === 'done' ||
+      codecFallbackSpinnerVisible
+    );
+    const isUnsupportedCodec =
+      Platform.OS === 'web' &&
+      webPlaybackError === 'unsupported-codec' &&
+      !codecFallbackActive;
+    const overlayTitle = isUnsupportedCodec ? 'Video format not supported' : playbackUxState.statusLabel;
+    const overlaySubtitle = isUnsupportedCodec
+      ? "This video's format can't play in this browser. Try opening it in another browser or download it."
+      : playbackUxState.statusDetail;
+
     return (
       <>
-        {showPoster ? (
+        {showPoster && !videoActuallyPlaying ? (
           <Image
             source={{ uri: posterUri as string }}
             style={styles.bufferingPoster}
@@ -2944,17 +3989,34 @@ function VideoPlayerLoaded({
           />
         ) : null}
         <VideoBufferingOverlay
-          visible={playbackUxState.showOverlay}
+          visible={
+            // Never show while the video is actually playing.
+            suppressOverlay
+              ? false
+              // Suppress the generic error state when the codec-fallback system owns the error UI.
+              // This prevents "Playback failed" flashing behind the "Converting…" spinner or
+              // the fallback's own "Video playback failed. Try downloading." overlay.
+              : Platform.OS === 'web' && playbackUxState.isError && (
+                  codecFallbackActive ||
+                  codecFallbackError != null ||
+                  codecFallbackTimeout ||
+                  // Also suppress while a swap is resolving (brief window before 'done')
+                  codecFallbackPhase === 'requesting' ||
+                  codecFallbackPhase === 'polling'
+                )
+              ? false
+              : playbackUxState.showOverlay
+          }
           phase={overlayPhase}
-          title={playbackUxState.statusLabel}
-          subtitle={playbackUxState.statusDetail}
+          title={overlayTitle}
+          subtitle={overlaySubtitle}
           bufferedPercent={playbackUxState.bufferedPercent}
           accentColor={theme.primary}
           variant="inline"
-          showSpinner={playbackUxState.showSpinner}
-          showPercent={playbackUxState.showPercent}
-          onRetry={playbackUxState.isError ? handleRetry : undefined}
-          onReplay={playbackUxState.isEnded ? handleReplay : undefined}
+          showSpinner={isUnsupportedCodec ? false : playbackUxState.showSpinner}
+          showPercent={isUnsupportedCodec ? false : playbackUxState.showPercent}
+          onRetry={playbackUxState.isError && !isUnsupportedCodec ? handleRetry : undefined}
+          onReplay={undefined}
         />
       </>
     );
@@ -2972,115 +4034,44 @@ function VideoPlayerLoaded({
 
     if (isMinimalControls) {
       return (
-        <Animated.View
-          style={[styles.controlsOverlay, styles.controlsOverlayMinimal, overlayAnimatedStyle]}
-          pointerEvents={overlayPointerEvents}
-        >
-          <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={togglePlayPause}>
-            {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
-          </TouchableOpacity>
-        </Animated.View>
+        <MinimalControls
+          isPlaying={isPlaying}
+          overlayAnimatedStyle={overlayAnimatedStyle}
+          overlayPointerEvents={overlayPointerEvents}
+          onTogglePlayPause={togglePlayPause}
+        />
       );
     }
 
     return (
-      <Animated.View style={[styles.controlsOverlay, overlayAnimatedStyle]} pointerEvents={overlayPointerEvents}>
-        <View style={styles.topControls} pointerEvents="box-none">
-          <TouchableOpacity
-            style={styles.controlButton}
-            onPress={handleInlineSharePress}
-            accessibilityRole="button"
-            accessibilityLabel={shareButtonA11yLabel}
-          >
-            <Share2 size={20} color="white" />
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.mainControls} pointerEvents="box-none">
-          <TouchableOpacity style={[styles.controlButton, styles.playButton]} onPress={togglePlayPause}>
-            {isPlaying ? <Pause size={32} color="white" /> : <Play size={32} color="white" />}
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.bottomControls} pointerEvents="box-none">
-          <View style={styles.progressRow} pointerEvents="box-none">
-            <Text style={styles.timeText}>{formattedProgressLabel}</Text>
-
-            <View style={styles.progressContainer}>
-              <View
-                ref={progressBarRef}
-                collapsable={false}
-                style={styles.progressBarTouchable}
-                onLayout={handleProgressBarLayout}
-                {...progressPanResponder.panHandlers}
-              >
-                <View style={styles.progressBar}>
-                  <View style={[styles.progressBuffered, { width: `${bufferedPercentage}%` }]} />
-                  <View style={[styles.progressFill, { width: `${progressPercentage}%` }]} />
-                  <View
-                    style={[
-                      styles.progressThumb,
-                      {
-                        left: `${progressPercentage}%`,
-                        transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
-                      },
-                    ]}
-                  />
-                </View>
-              </View>
-            </View>
-          </View>
-
-          <View style={styles.actionsRow} pointerEvents="box-none">
-            <View style={styles.actionsLeft} pointerEvents="box-none">
-              <TouchableOpacity style={styles.controlButton} onPress={toggleMute}>
-                {isMuted ? <VolumeX size={20} color="white" /> : <Volume2 size={20} color="white" />}
-              </TouchableOpacity>
-
-              {onDownload ? (
-                <TouchableOpacity
-                  style={[styles.controlButton, isDownloading ? styles.controlButtonDisabled : null]}
-                  onPress={onDownload}
-                  disabled={isDownloading}
-                  accessibilityRole="button"
-                  accessibilityLabel={downloadButtonA11yLabel}
-                >
-                  {isDownloading ? (
-                    <Text style={styles.downloadProgressText}>{resolveProgressPercentText(normalizedProgress)}</Text>
-                  ) : (
-                    <Download size={20} color="white" />
-                  )}
-                </TouchableOpacity>
-              ) : null}
-            </View>
-
-            <View style={styles.actionsRight} pointerEvents="box-none">
-              <TouchableOpacity
-                style={[
-                  styles.controlButton,
-                  styles.speedButton,
-                  disableSpeedControl ? styles.controlButtonDisabled : null,
-                ]}
-                onPress={cyclePlaybackSpeed}
-                disabled={disableSpeedControl}
-                accessibilityRole="button"
-                accessibilityLabel="Toggle playback speed"
-              >
-                <Gauge size={20} color="white" />
-                <Text style={styles.speedLabel}>{playbackSpeedLabel}</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity style={styles.controlButton} onPress={handleFullscreenPress}>
-                {Platform.OS === 'web' ? (
-                  isWebFullscreenActive ? <Minimize size={20} color="white" /> : <Maximize size={20} color="white" />
-                ) : (
-                  <Maximize size={20} color="white" />
-                )}
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Animated.View>
+      <FullControls
+        isPlaying={isPlaying}
+        isMuted={isMuted}
+        isDownloading={isDownloading}
+        isDraggingProgress={isDraggingProgress}
+        isWebFullscreenActive={isWebFullscreenActive}
+        disableSpeedControl={disableSpeedControl}
+        formattedProgressLabel={formattedProgressLabel}
+        progressPercentage={progressPercentage}
+        bufferedPercentage={bufferedPercentage}
+        playbackSpeedLabel={playbackSpeedLabel}
+        normalizedProgress={normalizedProgress}
+        downloadButtonA11yLabel={downloadButtonA11yLabel}
+        shareButtonA11yLabel={shareButtonA11yLabel}
+        overlayAnimatedStyle={overlayAnimatedStyle}
+        overlayPointerEvents={overlayPointerEvents}
+        progressBarRef={progressBarRef}
+        progressPanResponder={progressPanResponder}
+        handleProgressBarLayout={handleProgressBarLayout}
+        onTogglePlayPause={togglePlayPause}
+        onToggleMute={toggleMute}
+        onDownload={onDownload}
+        onSharePress={handleInlineSharePress}
+        onFullscreenPress={handleFullscreenPress}
+        onCyclePlaybackSpeed={cyclePlaybackSpeed}
+        overlayStyle={isWebFullscreenExpanded ? styles.fullscreenOverlay : undefined}
+        onCloseFullscreen={isWebFullscreenExpanded ? () => handleFullscreenPress() : undefined}
+      />
     );
   };
 
@@ -3131,6 +4122,7 @@ function VideoPlayerLoaded({
           seekStepSeconds={seekStepSeconds}
           isDownloading={isDownloading}
           downloadProgress={downloadProgress}
+          sharedPlayer={player}
         />
       ) : null}
     </>
@@ -3139,17 +4131,8 @@ function VideoPlayerLoaded({
   return (
     <>
       {Platform.OS === 'web' ? renderWebVideo() : renderMobileVideo()}
-      {Platform.OS === 'web' && webFullscreenConfig ? (
-        <WebFullscreenModal
-          config={webFullscreenConfig}
-          onDismiss={handleWebFullscreenDismiss}
-          onSharePress={onSharePress}
-          onDownload={onDownload}
-          seekStepSeconds={seekStepSeconds}
-          isDownloading={isDownloading}
-          downloadProgress={downloadProgress}
-        />
-      ) : null}
+      {/* WebFullscreenModal is no longer rendered — CSS-based fullscreen uses the same
+          inline <video> element with position:fixed, eliminating rebuffering entirely. */}
     </>
   );
 }
@@ -3162,6 +4145,7 @@ function FullscreenVideoModal({
   seekStepSeconds,
   isDownloading = false,
   downloadProgress,
+  sharedPlayer,
 }: FullscreenVideoModalProps) {
   const { theme } = useTheme();
   const { sourceUri, startTime, isMuted: initialMuted, playbackSpeed: initialSpeed, wasPlaying } = config;
@@ -3180,7 +4164,9 @@ function FullscreenVideoModal({
   const progressBarWidthRef = useRef(1);
   const progressBarPageXRef = useRef<number | null>(null);
   const playbackIdRef = useRef<string>(createPlaybackId());
-  const initialSyncDoneRef = useRef(false);
+  // When using a shared player, the player is already at the correct position and
+  // play state — skip the initial sync that would redundantly seek and play.
+  const initialSyncDoneRef = useRef(!!sharedPlayer);
   const playbackRateSyncedRef = useRef(false);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState ?? 'active');
   const backgroundSnapshotRef = useRef<{ time: number; wasPlaying: boolean } | null>(null);
@@ -3231,15 +4217,26 @@ function FullscreenVideoModal({
   );
   const shareButtonA11yLabel = 'Share video';
 
-  const player = useVideoPlayer({ uri: sourceUri }, (p: ExpoVideoPlayer) => {
+  // Create an own player as a fallback when no sharedPlayer is provided.
+  // When sharedPlayer IS provided, we pass null as the source to create a dormant
+  // (never-loaded) player — this satisfies the Rules of Hooks requirement (hooks
+  // cannot be conditional) while consuming negligible resources.
+  const ownPlayer = useVideoPlayer(sharedPlayer ? (null as unknown as { uri: string }) : { uri: sourceUri }, (p: ExpoVideoPlayer) => {
+    if (sharedPlayer) {
+      return; // Shared player already configured by the inline VideoPlayerLoaded
+    }
     p.loop = false;
     p.muted = initialMuted;
-    p.timeUpdateEventInterval = 0.25;
+    // More frequent time updates for a smoother progress bar (YouTube-level ~100ms)
+    p.timeUpdateEventInterval = 0.1;
     p.preservesPitch = true;
     try {
       p.playbackRate = initialSpeed;
     } catch {}
   });
+
+  // Use the shared player if provided; fall back to the own player.
+  const player: ExpoVideoPlayer = (sharedPlayer ?? ownPlayer) as ExpoVideoPlayer;
 
   const pauseSelf = useCallback(() => {
     try {
@@ -3509,12 +4506,16 @@ function FullscreenVideoModal({
     if (controlsTimeoutRef.current) {
       clearTimeout(controlsTimeoutRef.current);
     }
-    try {
-      player.pause();
-    } catch (error) {
-      logger.debug?.('FullscreenVideoModal: cleanup pause failed', error);
+    if (!sharedPlayer) {
+      // Only pause when using the own player — the shared player stays under control
+      // of VideoPlayerLoaded and should not be paused by this modal's cleanup.
+      try {
+        player.pause();
+      } catch (error) {
+        logger.debug?.('FullscreenVideoModal: cleanup pause failed', error);
+      }
     }
-  }, [player]);
+  }, [player, sharedPlayer]);
 
   const effectiveDuration = player.duration || duration || 0;
   const playbackUxState = useVideoPlaybackUxState({
@@ -3528,6 +4529,11 @@ function FullscreenVideoModal({
     isSeeking: isDraggingProgress,
     hasResolvedUri: true,
     error: statusError?.message ?? null,
+    // Match the inline player's production-grade buffering thresholds
+    bufferingDelayMs: 350,
+    bufferingExitDelayMs: 150,
+    stallThresholdMs: 4000,
+    bufferGapSeconds: 0.4,
   });
   const progressPercentage =
     effectiveDuration > 0 && Number.isFinite(currentTime)
@@ -3736,10 +4742,10 @@ function FullscreenVideoModal({
     [seekStepSeconds]
   );
 
-  const shouldLockControls =
-    playbackUxState.isInitialLoading || playbackUxState.isError || playbackUxState.isEnded;
+  // Don't hide controls on error — user needs close button and retry is in the overlay.
+  const shouldLockControls = playbackUxState.isInitialLoading;
   const shouldShowControls = showControls && !shouldLockControls;
-  const disableSpeedControl = shouldLockControls;
+  const disableSpeedControl = playbackUxState.isInitialLoading || playbackUxState.isError;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
@@ -3765,17 +4771,18 @@ function FullscreenVideoModal({
   }));
 
   useEffect(() => {
+    const nativeDriver = Platform.OS !== 'web';
     Animated.parallel([
       Animated.timing(controlsOpacity, {
         toValue: shouldShowControls ? 1 : 0,
         duration: shouldShowControls ? 180 : 140,
-        useNativeDriver: true,
+        useNativeDriver: nativeDriver,
       }),
       Animated.spring(controlsScale, {
         toValue: shouldShowControls ? 1 : 0.98,
         speed: 18,
         bounciness: 4,
-        useNativeDriver: true,
+        useNativeDriver: nativeDriver,
       }),
     ]).start();
   }, [controlsOpacity, controlsScale, shouldShowControls]);
@@ -3828,10 +4835,13 @@ function FullscreenVideoModal({
   }, [applyPlaybackRate, playbackSpeed]);
 
   const handleClose = useCallback(() => {
-    try {
-      player.pause();
-    } catch (error) {
-      logger.debug?.('FullscreenVideoModal: pause on close failed', error);
+    if (!sharedPlayer) {
+      // Only pause own player — shared player state is managed by VideoPlayerLoaded.
+      try {
+        player.pause();
+      } catch (error) {
+        logger.debug?.('FullscreenVideoModal: pause on close failed', error);
+      }
     }
     onDismiss({
       currentTime,
@@ -3839,7 +4849,7 @@ function FullscreenVideoModal({
       playbackSpeed,
       wasPlaying: isPlaying,
     });
-  }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed, player]);
+  }, [currentTime, isMuted, isPlaying, onDismiss, playbackSpeed, player, sharedPlayer]);
 
   const handleShare = useCallback(() => {
     handleClose();
@@ -3935,6 +4945,15 @@ function FullscreenVideoModal({
           onAccessibilityAction={handleAccessibilityAction}
         >
           <View style={styles.fullscreenVideoWrapper}>
+            {/* Poster image shown immediately while the fullscreen video loads — eliminates
+                the blank black flash between pressing fullscreen and the first decoded frame. */}
+            {config.posterUri && !playbackUxState.isReady ? (
+              <Image
+                source={{ uri: config.posterUri }}
+                style={[StyleSheet.absoluteFillObject, { zIndex: 1 }]}
+                resizeMode="cover"
+              />
+            ) : null}
             <Reanimated.View style={[styles.fullscreenVideoSurface, readyAnimatedStyle]}>
               <VideoView
                 style={StyleSheet.absoluteFillObject}
@@ -4535,11 +5554,16 @@ function WebFullscreenModal({
     ended: webEnded,
     externalBuffering: webIsBuffering,
     externalStalled: webIsStalled,
+    // Match the inline player's web-specific thresholds
+    bufferingDelayMs: 600,
+    bufferingExitDelayMs: 200,
+    stallThresholdMs: 8000,
+    bufferGapSeconds: 0.5,
   });
 
   const bufferedPercent = playbackUxState.bufferedPercent ?? 0;
-  const shouldLockControls =
-    playbackUxState.isInitialLoading || playbackUxState.isError || playbackUxState.isEnded;
+  // Don't hide controls on error — user needs close button and retry is in the overlay.
+  const shouldLockControls = playbackUxState.isInitialLoading;
   const shouldShowControls = showControls && !shouldLockControls;
   const formattedProgressLabel = useMemo(() => {
     return `${formatTime(currentTime)} / ${formatTime(duration)}`;
@@ -4561,23 +5585,23 @@ function WebFullscreenModal({
     }
   }, [playbackUxState.isReady, readyOpacity]);
 
-  const readyAnimatedStyle = useAnimatedStyle(() => ({
-    opacity: readyOpacity.value,
-    transform: [{ scale: 0.985 + 0.015 * readyOpacity.value }],
-  }));
+  // The ready fade-in in WebFullscreenModal is handled by a CSS transition on a <div> cover overlay.
+  // playbackUxState.isReady drives opacity: 0/1. No Reanimated opacity on the video surface.
+  // This fixes Chrome Android black screen (no compositing context interference).
 
   useEffect(() => {
+    const nativeDriver = Platform.OS !== 'web';
     Animated.parallel([
       Animated.timing(controlsOpacity, {
         toValue: shouldShowControls ? 1 : 0,
         duration: shouldShowControls ? 180 : 140,
-        useNativeDriver: true,
+        useNativeDriver: nativeDriver,
       }),
       Animated.spring(controlsScale, {
         toValue: shouldShowControls ? 1 : 0.98,
         speed: 18,
         bounciness: 4,
-        useNativeDriver: true,
+        useNativeDriver: nativeDriver,
       }),
     ]).start();
   }, [controlsOpacity, controlsScale, shouldShowControls]);
@@ -4928,9 +5952,19 @@ function WebFullscreenModal({
         ? 'loading'
         : playbackUxState.phase;
 
+    // Suppress the loading/buffering overlay when the video is visibly playing.
+    // The browser 'waiting' event fires constantly during normal playback of large files
+    // on mobile Chrome — don't show the spinner over a running video.
+    const videoActuallyPlaying = isPlaying || currentTime > 0;
+    const suppressOverlay = videoActuallyPlaying && (
+      playbackUxState.phase === 'loading' ||
+      playbackUxState.isInitialLoading ||
+      (playbackUxState.isBuffering && isPlaying)
+    );
+
     return (
       <VideoBufferingOverlay
-        visible={playbackUxState.showOverlay}
+        visible={suppressOverlay ? false : playbackUxState.showOverlay}
         phase={overlayPhase}
         title={playbackUxState.statusLabel}
         subtitle={playbackUxState.statusDetail}
@@ -4974,11 +6008,27 @@ function WebFullscreenModal({
             : {})}
         >
           <View style={styles.webFullscreenVideoWrapper}>
-            <Reanimated.View style={[styles.fullscreenVideoSurface, readyAnimatedStyle]}>
+            {/* Poster shown immediately while the web fullscreen video reloads — eliminates
+                the black flash. Fades out once the video is playing. */}
+            {config.posterUri && !playbackUxState.isReady ? (
+              <Image
+                source={{ uri: config.posterUri }}
+                style={[StyleSheet.absoluteFillObject, { zIndex: 1, opacity: 0.92 }] as any}
+                resizeMode="cover"
+              />
+            ) : null}
+            {/* Video element is NOT inside an opacity-animated view — prevents mobile browser black screen. */}
+            <View style={styles.fullscreenVideoSurface}>
               <video
                 ref={videoRef}
                 src={sourceUri}
-                style={{ width: '100%', height: '100%', backgroundColor: '#000', outline: 'none' }}
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  outline: 'none',
+                  objectFit: 'contain',
+                  // Do NOT set backgroundColor on <video> — mobile Chrome paints it over frames.
+                } as any}
                 onMouseDown={(event) => event.preventDefault?.()}
                 onLoadStart={handleWebLoadStart}
                 onCanPlay={handleWebCanPlay}
@@ -4997,9 +6047,13 @@ function WebFullscreenModal({
                 muted={isMuted}
                 playsInline
                 preload="auto"
+                disableRemotePlayback
+                {...(config.posterUri ? { poster: config.posterUri } : {})}
                 tabIndex={-1}
               />
-            </Reanimated.View>
+              {/* No black cover div — it created a sibling GPU compositing layer that
+                  stole the video's hardware surface on mobile Chrome, causing black screen. */}
+            </View>
 
             {renderSeekGestureLayer()}
 
@@ -5172,6 +6226,7 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: '#000',
     borderRadius: 8,
+    position: 'relative',
   },
   bufferingPoster: {
     ...StyleSheet.absoluteFillObject,

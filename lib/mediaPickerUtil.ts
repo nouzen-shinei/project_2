@@ -358,7 +358,19 @@ export const MediaPickerUtil = {
         allowsEditing: !allowsMultipleSelection,
         allowsMultipleSelection,
         quality: 0.8,
-        videoMaxDuration: 300, // 5 minutes max
+        videoMaxDuration: 300,
+        // videoExportPreset forces H.264 on iOS. Requires allowsEditing (single-select only).
+        // Prevents HEVC uploads that won't play in Android/web browsers.
+        ...(allowsMultipleSelection
+          ? {
+              preferredAssetRepresentationMode:
+                ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
+            }
+          : {
+              videoExportPreset: ImagePicker.VideoExportPreset.H264_1920x1080,
+              preferredAssetRepresentationMode:
+                ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
+            }),
       });
       
       return result;
@@ -405,6 +417,9 @@ export const MediaPickerUtil = {
         allowsEditing: true,
         quality: 0.8,
         videoMaxDuration: 300, // 5 minutes max
+        // Force H.264 recording so the video plays in every browser/platform.
+        // iOS encodes directly to H.264 via its hardware encoder (no server cost).
+        videoExportPreset: ImagePicker.VideoExportPreset.H264_1920x1080,
       });
       
       return result;

@@ -207,7 +207,9 @@ function CameraCapture({ mode, onCapture, onCancel }: CameraCaptureProps) {
     timer.start();
 
     try {
-      const result = await cameraRef.current.recordAsync({ maxDuration: 300 });
+      // Force H.264 ('avc1') on iOS so recordings play in every browser/platform.
+      // Ignored on Android (which records H.264 by default). Prevents HEVC output.
+      const result = await cameraRef.current.recordAsync({ maxDuration: 300, codec: 'avc1' });
 
       timer.stop();
       setIsRecording(false);

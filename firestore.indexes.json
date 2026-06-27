@@ -1,6 +1,22 @@
 {
   "indexes": [
     {
+      "collectionGroup": "videoTranscodes",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "originalUrl", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "videoTranscodes",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "tenantId", "order": "ASCENDING" },
+        { "fieldPath": "originalDeleted", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "attendance",
       "queryScope": "COLLECTION",
       "fields": [

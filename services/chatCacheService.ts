@@ -10,7 +10,7 @@ import { logger } from '@/lib/logger';
 import { clampRange, deriveRangeFromMessages, partitionMessagesByLimit, rangesOverlap, safeTimestamp, type PinRange } from '@/lib/chatHistoryPolicy';
 import type { ChatMessage, FileAttachment } from './chatService';
 import { webMediaCache } from './webMediaCache';
-import { isAudioFile, isImageFile } from '@/lib/fileUtils';
+import { isAudioFile, isImageFile, isVideoFile } from '@/lib/fileUtils';
 import { getChatPaginationProfile } from '@/lib/chatPaginationConfig';
 import { tenantService } from '@/services/tenantService';
 
@@ -81,6 +81,8 @@ interface DownloadTask {
 export interface HydratedAttachment extends FileAttachment {
 	resolvedUrl?: string;
 	previewUri?: string;
+	/** H.264 transcoded URL — used preferentially over resolvedUrl for video on web. */
+	transcodedUrl?: string;
 }
 
 export interface HydratedChatMessage extends ChatMessage {
@@ -1164,11 +1166,25 @@ class ChatCacheService {
 						continue;
 					}
 					const hydratedCandidate = (attachment as HydratedAttachment);
-					const primaryAttachmentUrl = attachment.url || hydratedCandidate.resolvedUrl;
-					this.enqueuePrefetchTarget(primaryAttachmentUrl, attachment.fileName, attachment.fileSize, targets);
-					const previewCandidate = hydratedCandidate.previewUri || attachment.thumbnailUrl;
-					if (previewCandidate) {
-						this.enqueuePrefetchTarget(previewCandidate, attachment.fileName, Math.min(attachment.fileSize ?? 0, 300000), targets, 'high');
+					if (isVideoFile(attachment.fileType, attachment.fileName)) {
+						// For video files: never enqueue the video URL itself.
+						// Reasons:
+						//   1. Videos can be 10–200 MB — eagerly downloading them wastes bandwidth.
+						//   2. The original H.265 is deleted after transcoding → any token variant
+						//      of that URL returns 403, polluting the console with errors.
+						//   3. The VideoPlayer handles its own codec-aware source loading.
+						// Only prefetch the thumbnail (small JPEG) when available.
+						const videoPreviewCandidate = hydratedCandidate.previewUri || attachment.thumbnailUrl;
+						if (videoPreviewCandidate) {
+							this.enqueuePrefetchTarget(videoPreviewCandidate, attachment.fileName, Math.min(attachment.fileSize ?? 0, 300000), targets, 'high');
+						}
+					} else {
+						const primaryAttachmentUrl = attachment.url || hydratedCandidate.resolvedUrl;
+						this.enqueuePrefetchTarget(primaryAttachmentUrl, attachment.fileName, attachment.fileSize, targets);
+						const previewCandidate = hydratedCandidate.previewUri || attachment.thumbnailUrl;
+						if (previewCandidate) {
+							this.enqueuePrefetchTarget(previewCandidate, attachment.fileName, Math.min(attachment.fileSize ?? 0, 300000), targets, 'high');
+						}
 					}
 				}
 			}
@@ -1287,6 +1303,13 @@ class ChatCacheService {
 			return remoteUrl;
 		}
 		if (Platform.OS === 'web') {
+			// Never download video files on web — they are 10–200 MB and the VideoPlayer
+			// manages its own codec-aware loading via <video> elements. Caching them via
+			// webMediaCache wastes bandwidth and causes 403 errors for deleted originals
+			// (H.265 files removed from Firebase Storage after transcoding).
+			if (isVideoFile(undefined, fileName || remoteUrl)) {
+				return remoteUrl;
+			}
 			try {
 				if (options?.lazy) {
 					const cached = await webMediaCache.getCached(remoteUrl, MEDIA_TTL_MS);
@@ -1602,16 +1625,49 @@ class ChatCacheService {
 		const concurrency = Math.max(1, Math.min(3, profile.downloads + 1));
 		const result = await this.mapWithConcurrency(attachments, concurrency, async (attachment) => {
 			const previewUri = await this.ensureAttachmentPreview(attachment, { signal });
+
+			// For video attachments, resolve the server-transcoded H.264 URL from
+			// Firestore. The server transcodes HEVC → H.264 asynchronously after upload;
+			// the transcoded URL plays in every browser including Android Chrome/Edge.
+			let transcodedUrl: string | undefined = attachment.transcodedUrl;
+			if (!transcodedUrl && isVideoFile(attachment.fileType, attachment.fileName)) {
+				// Check if the RTDB message already has transcodedUrl (written back
+				// by the transcoder after completing). This is the fastest path and
+				// avoids a Firestore round-trip.
+				const rtdbTranscoded = (attachment as any).transcodedUrl as string | undefined;
+				if (typeof rtdbTranscoded === 'string' && rtdbTranscoded.trim().length > 0) {
+					transcodedUrl = rtdbTranscoded.trim();
+				} else {
+					try {
+						transcodedUrl = await this.resolveTranscodedUrl(attachment.url);
+					} catch {
+						// Non-fatal: fall back to original URL
+					}
+				}
+			}
+
 			if (previewUri) {
 				return {
 					...attachment,
 					thumbnailUrl: previewUri,
 					previewUri,
 					resolvedUrl: previewUri,
+					...(transcodedUrl ? { transcodedUrl } : {}),
 				} as HydratedAttachment;
 			}
 
-			const fallbackPreview = attachment.thumbnailUrl || attachment.url;
+			// For video files: never use the full video URL as a preview fallback.
+		// Attempting to download/cache the video URL here causes 403 errors for
+		// transcoded videos (original H.265 is deleted from Firebase Storage after
+		// transcoding). The VideoPlayer generates a frame capture when the video plays.
+		if (isVideoFile(attachment.fileType, attachment.fileName) && !attachment.thumbnailUrl) {
+			return {
+				...attachment,
+				...(transcodedUrl ? { transcodedUrl } : {}),
+			} as HydratedAttachment;
+		}
+
+		const fallbackPreview = attachment.thumbnailUrl || attachment.url;
 			const hydratedPreview = await this.prepareMediaUri(
 				fallbackPreview,
 				attachment.fileName,
@@ -1630,10 +1686,60 @@ class ChatCacheService {
 				thumbnailUrl: resolvedPreview,
 				previewUri: resolvedPreview,
 				resolvedUrl: resolvedPreview,
+				...(transcodedUrl ? { transcodedUrl } : {}),
 			} as HydratedAttachment;
 		}, signal);
 
 		return result;
+	}
+
+	/**
+	 * Looks up the server-side transcoded H.264 URL for a video from Firestore.
+	 * The backend writes to videoTranscodes/{sha256(path)} after transcoding,
+	 * with originalUrl as a field for client-side lookup.
+	 * Returns undefined if not transcoded yet or if lookup fails.
+	 * Only runs on web — native players support HEVC natively.
+	 */
+	private async resolveTranscodedUrl(originalUrl: string): Promise<string | undefined> {
+		if (Platform.OS !== 'web') {
+			return undefined;
+		}
+		if (!originalUrl || (!originalUrl.startsWith('http://') && !originalUrl.startsWith('https://'))) {
+			return undefined;
+		}
+		try {
+			const { getFirestore, collection, query, where, limit, getDocs } = await import('firebase/firestore');
+			const { getApp } = await import('firebase/app');
+			const db = getFirestore(getApp());
+			// Query by originalUrl only — no status filter.
+			// The status field can be 'error' (stale from a retry of the already-deleted
+			// original) while transcodedUrl is valid. We check transcodedUrl presence in
+			// code instead of relying on the status field being correct.
+			const q = query(
+				collection(db, 'videoTranscodes'),
+				where('originalUrl', '==', originalUrl),
+				limit(1)
+			);
+			// Best-effort AbortController for cancelling the pending Firestore promise on timeout.
+			const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+			const timeoutPromise = new Promise<never>((_, reject) =>
+				setTimeout(() => {
+					controller?.abort();
+					reject(new Error('timeout'));
+				}, 5000)
+			);
+			const snap = await Promise.race([getDocs(q), timeoutPromise]);
+			if (snap.empty) return undefined;
+			const data = snap.docs[0].data();
+			// Return transcodedUrl only if it is a non-empty string.
+			// Ignore documents that only have status fields but no transcodedUrl yet.
+			const transcodedUrl = data.transcodedUrl;
+			return typeof transcodedUrl === 'string' && transcodedUrl.trim().length > 0
+				? transcodedUrl.trim()
+				: undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private async prepareMediaUri(
@@ -1656,6 +1762,10 @@ class ChatCacheService {
 		const lazy = options?.lazy ?? false;
 
 		if (Platform.OS === 'web') {
+			// Never download video files on web — same reason as getMediaForDownload.
+			if (isVideoFile(undefined, fileName || remoteUrl)) {
+				return remoteUrl;
+			}
 			try {
 				const cached = await webMediaCache.getCached(remoteUrl, MEDIA_TTL_MS);
 				if (cached) {

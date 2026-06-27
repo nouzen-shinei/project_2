@@ -214,8 +214,10 @@ export const useVideoPlaybackUxState = ({
         };
       case 'stalled':
         return {
-          statusLabel: 'Reconnecting...',
-          statusDetail: 'Trying to restore playback...',
+          // "Reconnecting" implies a network drop which is rarely what's happening.
+          // On web this state fires during normal heavy buffering; use neutral copy.
+          statusLabel: 'Buffering…',
+          statusDetail: 'Loading video data…',
         };
       case 'ended':
         return {
@@ -224,8 +226,8 @@ export const useVideoPlaybackUxState = ({
         };
       case 'error':
         return {
-          statusLabel: 'Playback failed',
-          statusDetail: 'Check your connection and try again.',
+          statusLabel: 'Video unavailable',
+          statusDetail: 'This video could not be loaded. Tap retry to try again.',
         };
       default:
         return { statusLabel: null, statusDetail: null };
@@ -243,7 +245,7 @@ export const useVideoPlaybackUxState = ({
     bufferedPercent: bufferedPercent ?? null,
     statusLabel,
     statusDetail,
-    showOverlay: phase !== 'ready' && phase !== 'idle',
+    showOverlay: phase !== 'ready' && phase !== 'idle' && phase !== 'ended',
     showSpinner: phase === 'loading' || phase === 'buffering' || phase === 'stalled',
     showPercent: phase === 'loading' || phase === 'buffering' || phase === 'stalled',
   };

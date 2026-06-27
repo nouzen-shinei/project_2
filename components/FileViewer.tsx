@@ -80,6 +80,8 @@ interface FileViewerProps {
   thumbnailUrl?: string;
   isPreviewAsset?: boolean;
   fileSize?: number;
+  /** H.264 transcoded URL — passed to VideoPlayer so it can avoid loading H.265 on unsupported browsers. */
+  transcodedUri?: string;
   onDownload?: () => void;
   onShare?: () => void;
   remoteFileUrl?: string;
@@ -98,6 +100,7 @@ export function FileViewer({
   fileSize,
   onDownload,
   onShare,
+  transcodedUri,
   remoteFileUrl,
   previewHeight,
   isDownloading,
@@ -169,6 +172,7 @@ export function FileViewer({
         isDownloading={isDownloading}
         downloadProgress={downloadProgress}
         downloadKey={resolvedDownloadKey}
+        transcodedUri={transcodedUri}
       />
     );
   }

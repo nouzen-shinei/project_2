@@ -36,6 +36,8 @@ export interface FileAttachment {
   fileType: string;
   fileSize: number;
   thumbnailUrl?: string;
+  /** H.264 transcoded URL produced by the server-side transcoder (may be undefined while transcoding). */
+  transcodedUrl?: string;
 }
 
 export interface ChatReplyContext {
