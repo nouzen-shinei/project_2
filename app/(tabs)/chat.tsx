@@ -115,7 +115,7 @@ import {
   OptionModal,
   ConfirmationModal,
 } from '../../components';
-import VideoPlayer from '../../components/VideoPlayer';
+import VideoPlayer, { pauseAllChatVideos } from '../../components/VideoPlayer';
 import { StickerGifPickerMobile } from '../../components/StickerGifPickerMobile';
 import ProgressiveImage from '../../components/ui/ProgressiveImage';
 import { ArrowLeft, Search, X, Info, Paperclip, Smile, Play, Star, Clock, MessageCircle, Send, Heart, Eye, AlertCircle, Download, Share, Camera, Trash2, ChevronDown, RotateCcw, CheckCircle2, File as FileIcon, Image as ImageIcon, Edit3, Reply, Copy } from 'lucide-react-native';
@@ -924,12 +924,25 @@ export default function Chat() {
 
   // Presence / relative-time re-render tick. Only runs while the Messages tab is
   // focused AND the app is foregrounded, so it never ticks (or backlogs timer
-  // callbacks) while backgrounded or while another tab is active.
+  // callbacks) while backgrounded or while another tab is active. It is further
+  // gated to the conversation-list view: the tick only refreshes the relative
+  // "last message" timestamps in the list, so there is no need to re-render the
+  // entire screen every 10s while the user is reading an open conversation.
   useForegroundInterval(
     () => setPresenceRenderTick((prev) => prev + 1),
     10000,
-    { enabled: isFocused }
+    { enabled: isFocused && !selectedTeamMember }
   );
+
+  // Stop video playback as soon as the Messages tab loses focus or the app is
+  // backgrounded. Freezing/detaching a screen does not stop an already-playing
+  // video, so without this a played video keeps decoding and buffering in the
+  // background, holding CPU and memory on web and native alike.
+  useEffect(() => {
+    if (!isFocused || !isAppActive) {
+      pauseAllChatVideos();
+    }
+  }, [isFocused, isAppActive]);
   const [screenData, setScreenData] = useState(Dimensions.get('window'));
   const [isUserActiveInChat, setIsUserActiveInChat] = useState(false);
   const [lastUserActivityAt, setLastUserActivityAt] = useState<number>(Date.now());
@@ -1196,6 +1209,7 @@ export default function Chat() {
     loadingMore = false,
     loadMore,
     warmNextPage,
+    trimToRecentWindow,
     sendMessage,
     sendMessageWithFile,
     sendMessageWithFiles,
@@ -1482,6 +1496,43 @@ export default function Chat() {
     messagePositionsRef.current = resolveChatPrunedMessagePositions(positions, validIds);
   }, [displayedMessages, normalizeMessageId]);
 
+  // Bound the per-message auxiliary maps to the live window. These refs are
+  // otherwise only cleared when the conversation changes, so over a long-lived
+  // conversation (with in-memory window trimming) they would accumulate entries
+  // for messages that are no longer rendered. Pruning is gated with hysteresis
+  // so it stays off the hot path and only runs once after the window shrinks.
+  useEffect(() => {
+    if (!Array.isArray(displayedMessages)) {
+      return;
+    }
+
+    const displayedCount = displayedMessages.length;
+    const animatedSize = globalAnimatedMessages.current.size;
+    const reactionsSize = messageReactionsRef.current.size;
+    const optimisticSize = reactionOptimisticUntilRef.current.size;
+
+    if (Math.max(animatedSize, reactionsSize, optimisticSize) <= displayedCount + 96) {
+      return;
+    }
+
+    const validIds = resolveChatDisplayedMessageIdSet(displayedMessages, (message: any) => {
+      return normalizeMessageId(message?.id);
+    });
+
+    // Reaction state for a message the user just acted on is always for a
+    // visible (retained) message, so it is never pruned here.
+    pruneMapByKeySet(messageReactionsRef.current, validIds);
+    pruneMapByKeySet(reactionOptimisticUntilRef.current, validIds);
+
+    if (animatedSize > displayedCount + 96) {
+      for (const id of Array.from(globalAnimatedMessages.current)) {
+        if (!validIds.has(id)) {
+          globalAnimatedMessages.current.delete(id);
+        }
+      }
+    }
+  }, [displayedMessages, normalizeMessageId]);
+
   const getMessageItemType = resolveChatMessageListItemType;
 
   const getMessageKey = useCallback(
@@ -1625,12 +1676,21 @@ export default function Chat() {
   
   // Media prefetch cache
   const prefetchedUrisRef = useRef<Set<string>>(new Set());
+  // Bound the dedupe set so it can't grow unbounded as more media scrolls into
+  // view over a long-lived chat session.
+  const MAX_PREFETCHED_URIS = 300;
   const prefetchUri = useCallback(async (uri?: string) => {
     if (!uri) return;
     if (prefetchedUrisRef.current.has(uri)) return;
     try {
       await Image.prefetch(uri);
       prefetchedUrisRef.current.add(uri);
+      if (prefetchedUrisRef.current.size > MAX_PREFETCHED_URIS) {
+        const oldestUri = prefetchedUrisRef.current.values().next().value;
+        if (oldestUri !== undefined) {
+          prefetchedUrisRef.current.delete(oldestUri);
+        }
+      }
     } catch {}
   }, []);
   const [filePreviewVisible, setFilePreviewVisible] = useState(false);
@@ -3854,11 +3914,19 @@ export default function Chat() {
   }, [displayedMessages, normalizeMessageId]);
 
   const listDrawDistance = useMemo(() => {
+    if (!isFocused) {
+      // When the conversation is not the active tab, shrink the render window
+      // so FlashList releases far offscreen rows (and the images/video elements
+      // they contain). This frees retained memory on every platform — including
+      // web, where freezing the screen keeps the DOM intact and would otherwise
+      // hold every rendered media row until the user returns.
+      return Platform.OS === 'web' ? 240 : 320;
+    }
     return resolveChatListDrawDistance(
       estimatedListSize.height,
       Platform.OS === 'web'
     );
-  }, [estimatedListSize.height]);
+  }, [estimatedListSize.height, isFocused]);
 
   useEffect(() => {
     if (!isFocused) {
@@ -6277,6 +6345,40 @@ export default function Chat() {
       scheduleScrollToBottom();
     }
   }, [isTyping, selectedTeamMember?.id]);
+
+  // Release older messages from memory once the in-memory backlog grows large
+  // AND the user is parked at the bottom of the conversation. Trimming only
+  // when at the bottom guarantees we never remove history the user is actively
+  // scrolling through; the trimmed pages stay in the persistent cache and
+  // reload automatically (via loadMore) when the user scrolls back up. This
+  // keeps the live dataset bounded so a long-lived, busy conversation cannot
+  // grow the JS heap and per-update work without limit.
+  useEffect(() => {
+    if (!selectedTeamMember || typeof trimToRecentWindow !== 'function') {
+      return;
+    }
+    if (loading || loadingMore || !isInitialAnchorSettled) {
+      return;
+    }
+    if (!isAtBottomRef.current) {
+      return;
+    }
+
+    const handle = setTimeout(() => {
+      if (isAtBottomRef.current && !loadingMore) {
+        trimToRecentWindow();
+      }
+    }, 1500);
+
+    return () => clearTimeout(handle);
+  }, [
+    messages.length,
+    loading,
+    loadingMore,
+    isInitialAnchorSettled,
+    selectedTeamMember?.id,
+    trimToRecentWindow,
+  ]);
 
   // Cleanup scroll timeout on unmount
   useEffect(() => {

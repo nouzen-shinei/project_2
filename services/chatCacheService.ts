@@ -1295,6 +1295,76 @@ class ChatCacheService {
 		}
 	}
 
+	/**
+	 * Free the in-memory media (web blob object URLs) referenced by the given
+	 * messages once they leave the live window — e.g. when the in-memory message
+	 * window is trimmed or the conversation is switched. The persistent disk
+	 * cache is kept intact, so reloading those messages re-hydrates the media
+	 * from cache without a network round trip. Web-only: on native, media lives
+	 * as files on disk managed by the media-cache eviction, not in JS heap.
+	 */
+	releaseInMemoryMedia(
+		removed: ReadonlyArray<Partial<ChatMessage> | null | undefined>,
+		retained?: ReadonlyArray<Partial<ChatMessage> | null | undefined>
+	): void {
+		if (Platform.OS !== 'web') {
+			return;
+		}
+		if (!Array.isArray(removed) || removed.length === 0) {
+			return;
+		}
+
+		const removedUrls = this.collectRemoteMediaUrls(removed);
+		if (!removedUrls.length) {
+			return;
+		}
+
+		// Never release a URL still referenced by a message that stays in memory
+		// (e.g. the same image forwarded twice), or its live row would break.
+		const retainedUrls = retained && retained.length
+			? new Set(this.collectRemoteMediaUrls(retained))
+			: null;
+
+		const toRelease = retainedUrls
+			? removedUrls.filter((url) => !retainedUrls.has(url))
+			: removedUrls;
+
+		if (toRelease.length) {
+			webMediaCache.release(toRelease);
+		}
+	}
+
+	private collectRemoteMediaUrls(
+		messages: ReadonlyArray<Partial<ChatMessage> | null | undefined>
+	): string[] {
+		const urls = new Set<string>();
+		const add = (value: unknown) => {
+			if (typeof value === 'string' && /^https?:\/\//i.test(value)) {
+				urls.add(value);
+			}
+		};
+
+		for (const message of messages) {
+			if (!message) {
+				continue;
+			}
+			const attachments = (message as any).attachments;
+			if (Array.isArray(attachments)) {
+				for (const attachment of attachments) {
+					add(attachment?.url);
+					add(attachment?.thumbnailUrl);
+				}
+			}
+			add((message as any).thumbnailUrl);
+			add((message as any).gif?.url);
+			add((message as any).gif?.thumbnailUrl);
+			add((message as any).sticker?.url);
+			add((message as any).sticker?.thumbnailUrl);
+		}
+
+		return Array.from(urls);
+	}
+
 	async getMediaForDownload(
 		remoteUrl: string,
 		fileName?: string,

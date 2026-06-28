@@ -160,6 +160,37 @@ class WebMediaCache {
     return Date.now() - entry.cachedAt > ttlMs;
   }
 
+  /**
+   * Release the in-memory blob object URLs for the given remote URLs without
+   * removing them from the persistent CacheStorage/index. Used when the messages
+   * that reference this media leave the in-memory window (trimmed or the
+   * conversation was switched): the object URLs can no longer be rendered, so
+   * holding their blobs in memory only wastes heap. A later reload re-hydrates
+   * the media and re-creates an object URL from the still-warm disk cache, so
+   * this is cheap to reverse and never triggers a network fetch.
+   */
+  release(remoteUrls: string | string[]): void {
+    if (!this.allowObjectUrls) {
+      return;
+    }
+    const urls = Array.isArray(remoteUrls) ? remoteUrls : [remoteUrls];
+    for (const remoteUrl of urls) {
+      if (!remoteUrl || typeof remoteUrl !== 'string') {
+        continue;
+      }
+      const entry = this.memory.get(remoteUrl);
+      if (!entry) {
+        continue;
+      }
+      try {
+        URL.revokeObjectURL(entry.objectUrl);
+      } catch {
+        // Revoking is best-effort; ignore failures.
+      }
+      this.memory.delete(remoteUrl);
+    }
+  }
+
   async getCached(remoteUrl: string, ttlMs: number): Promise<string | null> {
     if (!this.supported || !remoteUrl || remoteUrl.startsWith('data:') || remoteUrl.startsWith('blob:')) {
       return null;

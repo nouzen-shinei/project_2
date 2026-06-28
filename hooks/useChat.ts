@@ -33,6 +33,15 @@ const CHAT_BOOTSTRAP_PAGES = paginationProfile.bootstrapPages;
 const INITIAL_BOOTSTRAP_WINDOW = paginationProfile.bootstrapWindowSize;
 const REALTIME_RECONCILE_PAGE_SIZE = paginationProfile.realtimeReconcileSize;
 
+// Cap how many messages are retained in memory for the live view. Older
+// messages remain persisted in the chat cache and are transparently reloaded
+// by loadMore() when the user scrolls back up, so trimming only releases JS
+// heap and keeps the list virtualizing a bounded dataset. The trim threshold
+// sits well above the retain target so the window has hysteresis and does not
+// thrash (trim -> immediate reload -> trim) while new messages stream in.
+const MESSAGE_WINDOW_RETAIN_TARGET = Math.max(INITIAL_BOOTSTRAP_WINDOW * 3, 120);
+const MESSAGE_WINDOW_TRIM_THRESHOLD = MESSAGE_WINDOW_RETAIN_TARGET + INITIAL_BOOTSTRAP_WINDOW * 2;
+
 const takeLastN = <T>(items: T[], count: number): T[] => {
   if (!Array.isArray(items) || items.length === 0) return [];
   if (!count || items.length <= count) {
@@ -95,6 +104,9 @@ const buildMessageMetaSignature = (
 export function useChat(recipientId?: string, options?: { live?: boolean }) {
   const liveEnabled = options?.live ?? true;
   const [messages, setMessages] = useState<HydratedMessageState[]>([]);
+  // Mirror of `messages` for synchronous reads (e.g. window trimming) without
+  // adding `messages` to callback dependency lists.
+  const messagesRef = useRef<HydratedMessageState[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadVersion, setReloadVersion] = useState(0);
@@ -117,6 +129,11 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
   // Tracks the last-known mutable metadata signature per message id so reconcile
   // can skip messages that have not changed since we last saw them.
   const messageMetaSignatureRef = useRef<Map<string, string>>(new Map());
+  // Tracks the source message object identity per id. Messages are treated
+  // immutably (a changed message is a new object), so identity equality lets us
+  // skip recomputing the signature for unchanged messages and keep the sync
+  // O(changed) instead of O(total) on every update.
+  const messageMetaSourceRef = useRef<Map<string, unknown>>(new Map());
   const hydrationAbortRef = useRef<Set<AbortController>>(new Set());
   const hasHydratedInitialWindowRef = useRef(false);
   const activeRecipientRef = useRef<string | null>(recipientId ?? null);
@@ -197,14 +214,42 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     hasMoreRef.current = hasMore;
   }, [hasMore]);
 
+  // Keep the synchronous mirror of messages up to date.
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
   // Keep the metadata signature map in sync with the rendered messages. This
   // runs after paint and lets reconcile cheaply detect unchanged messages.
+  // The sync is incremental: signatures are only (re)computed for messages
+  // whose underlying object identity changed since the last pass, and stale
+  // entries are pruned. For large conversations this keeps the per-update cost
+  // proportional to the number of changed messages rather than the total.
   useEffect(() => {
-    const map = messageMetaSignatureRef.current;
-    map.clear();
+    const signatureMap = messageMetaSignatureRef.current;
+    const sourceMap = messageMetaSourceRef.current;
+    const seen = new Set<string>();
+
     for (const msg of messages) {
-      if (msg.id) {
-        map.set(msg.id, buildMessageMetaSignature(msg));
+      if (!msg.id) {
+        continue;
+      }
+      seen.add(msg.id);
+      // Skip the expensive signature recompute when the object is unchanged.
+      if (sourceMap.get(msg.id) === msg && signatureMap.has(msg.id)) {
+        continue;
+      }
+      sourceMap.set(msg.id, msg);
+      signatureMap.set(msg.id, buildMessageMetaSignature(msg));
+    }
+
+    // Drop entries for messages that are no longer present.
+    if (signatureMap.size !== seen.size) {
+      for (const id of signatureMap.keys()) {
+        if (!seen.has(id)) {
+          signatureMap.delete(id);
+          sourceMap.delete(id);
+        }
       }
     }
   }, [messages]);
@@ -563,8 +608,64 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     prefetchNextPage(cursor, hasMoreRef.current);
   }, [user?.email, recipientId, prefetchNextPage]);
 
+  // Drop the oldest in-memory messages once the live window grows past the trim
+  // threshold. The removed messages stay in the persistent chat cache, so
+  // scrolling back up reloads them through loadMore()/getCachedPageBefore().
+  // Callers must only invoke this when the viewport is parked at the bottom so
+  // history the user is actively reading is never removed.
+  const trimToRecentWindow = useCallback((): boolean => {
+    const current = messagesRef.current;
+    if (!Array.isArray(current) || current.length <= MESSAGE_WINDOW_TRIM_THRESHOLD) {
+      return false;
+    }
+
+    let removed: HydratedMessageState[] = [];
+    let retained: HydratedMessageState[] = [];
+
+    applyMessagesUpdate((prev) => {
+      if (prev.length <= MESSAGE_WINDOW_RETAIN_TARGET) {
+        return prev;
+      }
+
+      const cut = prev.length - MESSAGE_WINDOW_RETAIN_TARGET;
+      removed = prev.slice(0, cut);
+      const kept = prev.slice(cut);
+      retained = kept;
+      const newOldest = kept[0];
+      // Re-point pagination at the new in-memory boundary so the trimmed pages
+      // reload from cache when the user scrolls back up.
+      oldestCursorRef.current = toExclusiveCursor(newOldest?.timestamp ?? null);
+      hasMoreRef.current = true;
+      // A page prefetched relative to the previous (older) cursor is no longer
+      // adjacent to the trimmed window; loadMore() also re-validates the cursor.
+      prefetchedPageRef.current = null;
+      prefetchPromiseRef.current = null;
+      messagesRef.current = kept;
+      return kept;
+    }, { immediate: true });
+
+    if (removed.length) {
+      // Free the web blob object URLs held by the trimmed messages. They can no
+      // longer render, and a later scroll-up reload re-hydrates them from the
+      // persistent cache.
+      chatCacheService.releaseInMemoryMedia(removed, retained);
+      setHasMore(true);
+      return true;
+    }
+
+    return false;
+  }, [applyMessagesUpdate, toExclusiveCursor]);
+
   // Reset when chat partner changes
   useEffect(() => {
+    // Free the previous conversation's in-memory media before discarding its
+    // messages so blob object URLs do not accumulate across conversation
+    // switches (web). The disk cache is preserved for fast re-entry.
+    const previousMessages = messagesRef.current;
+    if (Array.isArray(previousMessages) && previousMessages.length) {
+      chatCacheService.releaseInMemoryMedia(previousMessages);
+    }
+    messagesRef.current = [];
     applyMessagesUpdate([], { immediate: true });
     setHasMore(true);
     setLoading(true);
@@ -1849,6 +1950,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     loadingMore,
     loadMore,
     warmNextPage,
+    trimToRecentWindow,
     sendMessage,
     sendMessageWithFile,
     sendSpecialMessage,

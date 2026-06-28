@@ -8454,8 +8454,8 @@ function withEnv(overrides, callback) {
 
   assert.strictEqual(
     resolveChatListDrawDistance(700, true),
-    1260,
-    'List-virtualization helper should use larger web draw-distance multiplier'
+    910,
+    'List-virtualization helper should use a bounded web draw-distance (lowered to cap retained DOM/media) that still exceeds the native window'
   );
   assert.strictEqual(
     resolveChatListDrawDistance(700, false),

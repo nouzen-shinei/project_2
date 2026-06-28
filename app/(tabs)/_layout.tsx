@@ -45,10 +45,19 @@ export default function TabLayout() {
   <BirthdayBanner />
 
   <Tabs
-        detachInactiveScreens={false}
+        // Detach inactive screens from the native view hierarchy. The screen
+        // components stay mounted (lazy:false) so state, drafts and scroll are
+        // preserved, but heavy native views (chat media, video players, large
+        // FlashList rows) are released and background video decoding is paused
+        // while another tab is active. Without this the media-heavy chat screen
+        // stays fully attached forever, so retained media/GPU memory climbs the
+        // longer it is open and makes every tab switch progressively slower.
+        detachInactiveScreens={true}
         screenOptions={() => ({
           headerShown: false,
-          // Make tab switches instant by keeping all tabs mounted and attached
+          // Keep tabs mounted for fast switching; freezeOnBlur stops blurred
+          // screens from re-rendering and detachInactiveScreens frees their
+          // native views so memory does not accumulate over time.
           lazy: false,
           freezeOnBlur: true,
           tabBarActiveTintColor: theme.tabBarActive,

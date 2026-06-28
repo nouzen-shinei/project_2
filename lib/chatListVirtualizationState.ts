@@ -121,7 +121,10 @@ export function resolveChatListDrawDistance(
   isWeb: boolean
 ): number {
   if (isWeb) {
-    return Math.max(Math.round(baseHeight * 1.8), 1200);
+    // Web keeps every rendered row in the DOM (no native clipping / detaching),
+    // so a smaller render window meaningfully lowers the amount of media held in
+    // memory while still keeping scrolling smooth.
+    return Math.max(Math.round(baseHeight * 1.3), 900);
   }
 
   return Math.max(Math.round(baseHeight * 1.2), 900);

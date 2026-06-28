@@ -77,6 +77,21 @@ type ThumbnailCacheRecord = {
 
 const webThumbnailCache = new Map<string, ThumbnailCacheRecord>();
 
+// Cap retained generated thumbnails so a long media-heavy session cannot grow
+// this module-level cache without bound. Fulfilled entries are otherwise kept
+// forever, which steadily increases memory the longer the app runs.
+const MAX_WEB_THUMBNAIL_CACHE_ENTRIES = 120;
+
+const evictWebThumbnailCacheIfNeeded = () => {
+  while (webThumbnailCache.size > MAX_WEB_THUMBNAIL_CACHE_ENTRIES) {
+    const oldestKey = webThumbnailCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    webThumbnailCache.delete(oldestKey);
+  }
+};
+
 const cleanupWebThumbnailRecord = (source: string, status: ThumbnailCacheRecord['status']) => {
   if (status !== 'fulfilled') {
     webThumbnailCache.delete(source);
@@ -230,6 +245,7 @@ const generateWebVideoThumbnail = async (sourceUri: string): Promise<string | nu
   };
 
   webThumbnailCache.set(sourceUri, record);
+  evictWebThumbnailCacheIfNeeded();
   return record.promise;
 };
 
@@ -318,6 +334,23 @@ const pauseOtherVideos = (activeId: string) => {
   videoPlaybackRegistry.forEach((pause, id) => {
     if (id !== activeId) {
       pause();
+    }
+  });
+};
+
+/**
+ * Pause every registered video player. Used when the chat screen loses focus
+ * (tab switch) or the app is backgrounded so videos stop decoding/buffering in
+ * the background. Without this a playing `<video>` (web) or expo-video player
+ * (native) keeps consuming CPU and memory while the user is on another tab,
+ * because freezing a screen does not stop already-playing media.
+ */
+export const pauseAllChatVideos = () => {
+  videoPlaybackRegistry.forEach((pause) => {
+    try {
+      pause();
+    } catch {
+      // A failing pause for one player should not block the rest.
     }
   });
 };
@@ -683,8 +716,31 @@ type VideoSourceCacheEntry = {
 
 const videoSourceCache = new Map<string, VideoSourceCacheEntry>();
 
+// Cap the retained per-video metadata so the cache can't grow without bound as
+// more videos are viewed over a long session. Entries are kept in
+// least-recently-used order: reads and writes move the key to the end and the
+// oldest entries are evicted once the limit is exceeded.
+const MAX_VIDEO_SOURCE_CACHE_ENTRIES = 80;
+
+const evictVideoSourceCacheIfNeeded = () => {
+  while (videoSourceCache.size > MAX_VIDEO_SOURCE_CACHE_ENTRIES) {
+    const oldestKey = videoSourceCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    videoSourceCache.delete(oldestKey);
+  }
+};
+
 const getCachedVideoEntry = (key: string): VideoSourceCacheEntry | null => {
-  return videoSourceCache.get(key) ?? null;
+  const entry = videoSourceCache.get(key);
+  if (!entry) {
+    return null;
+  }
+  // LRU touch: re-insert so recently used entries survive eviction.
+  videoSourceCache.delete(key);
+  videoSourceCache.set(key, entry);
+  return entry;
 };
 
 const patchVideoCacheEntry = (key: string, patch: Partial<VideoSourceCacheEntry>) => {
@@ -711,6 +767,7 @@ const patchVideoCacheEntry = (key: string, patch: Partial<VideoSourceCacheEntry>
   };
 
   videoSourceCache.set(key, next);
+  evictVideoSourceCacheIfNeeded();
   return next;
 };
 
