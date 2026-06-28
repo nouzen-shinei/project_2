@@ -1,6 +1,7 @@
 import { logger } from '@/lib/logger';
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { useIsFocused, useFocusEffect } from '@react-navigation/native';
+import { useForegroundInterval, useLingeringFlag } from '@/hooks/useAppForeground';
 import {
   View,
   Text,
@@ -921,15 +922,14 @@ export default function Chat() {
   const typingStatusMetricsRef = useRef(createChatTypingStatusWriteRollupState());
   const replyJumpMetricRollupRef = useRef(createChatReplyJumpMetricRollupState());
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setPresenceRenderTick((prev) => prev + 1);
-    }, 10000);
-
-    return () => {
-      clearInterval(interval);
-    };
-  }, []);
+  // Presence / relative-time re-render tick. Only runs while the Messages tab is
+  // focused AND the app is foregrounded, so it never ticks (or backlogs timer
+  // callbacks) while backgrounded or while another tab is active.
+  useForegroundInterval(
+    () => setPresenceRenderTick((prev) => prev + 1),
+    10000,
+    { enabled: isFocused }
+  );
   const [screenData, setScreenData] = useState(Dimensions.get('window'));
   const [isUserActiveInChat, setIsUserActiveInChat] = useState(false);
   const [lastUserActivityAt, setLastUserActivityAt] = useState<number>(Date.now());
@@ -1181,7 +1181,12 @@ export default function Chat() {
     return 'sticker';
   };
 
-  // Chat data for selected member
+  // Chat data for selected member.
+  // Keep the realtime subscription alive briefly after the app/tab is
+  // backgrounded or the screen blurs, so a quick switch-away-and-back does not
+  // tear down and immediately rebuild the listener (which triggers an expensive
+  // reconcile). Genuine long backgrounding still tears it down to save battery.
+  const chatLiveActive = useLingeringFlag(isFocused && isAppActive, 20000);
   const {
     messages = [],
     loading = false,
@@ -1198,7 +1203,7 @@ export default function Chat() {
     sendGif,
     editMessage: editChatMessage,
     deleteMessage: deleteChatMessage,
-  } = useChat(selectedTeamMember?.id, { live: isFocused && isAppActive });
+  } = useChat(selectedTeamMember?.id, { live: chatLiveActive });
 
   const CHAT_RECONNECT_TIMEOUT_MS = 8000;
   const CHAT_OPEN_LOADING_HANG_MS = 9000;
@@ -3638,27 +3643,20 @@ export default function Chat() {
 
 
 
-  // Get user directly from authService as backup
-  useEffect(() => {
-    const getCurrentUser = () => {
-      const authUser = authService.getCurrentUser();
-      // Only update if user actually changed to prevent unnecessary re-renders
-      setCurrentUser((prevUser: any) => {
-        if (!prevUser && !authUser) return prevUser;
-        if (!prevUser || !authUser) return authUser;
-        if (prevUser.email !== authUser.email || prevUser.isAuthorized !== authUser.isAuthorized) {
-          return authUser;
-        }
-        return prevUser;
-      });
-    };
-    
-    getCurrentUser();
-    // Check every 5 seconds instead of 2 to reduce frequency
-    const interval = setInterval(getCurrentUser, 5000);
-    
-    return () => clearInterval(interval);
-  }, []);
+  // Get user directly from authService as backup. Foreground-gated so it does
+  // not poll (or pile up) while backgrounded; runs once immediately on resume.
+  useForegroundInterval(() => {
+    const authUser = authService.getCurrentUser();
+    // Only update if user actually changed to prevent unnecessary re-renders
+    setCurrentUser((prevUser: any) => {
+      if (!prevUser && !authUser) return prevUser;
+      if (!prevUser || !authUser) return authUser;
+      if (prevUser.email !== authUser.email || prevUser.isAuthorized !== authUser.isAuthorized) {
+        return authUser;
+      }
+      return prevUser;
+    });
+  }, 5000);
 
   // Listen for screen dimension changes
   useEffect(() => {

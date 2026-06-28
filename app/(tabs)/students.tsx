@@ -1078,28 +1078,30 @@ export default function Students() {
         </View>
       </View>
 
-      {shouldShowStudentUsageBanner && (
-        <UsageAlertInlineBanner
-          alert={studentUsageAlert}
-          totalAlerts={studentUsageAlertCount}
-          loading={studentUsageAlertLoading}
-          error={studentUsageAlertError}
-          monthLabel={studentUsageMonthId}
-          onPress={() => router.push('/(tabs)/usage')}
-          onRefresh={refreshStudentUsageAlerts}
-        />
-      )}
-
       {/*
         Scroll container:
+        - Usage banner scrolls away
         - Stats scroll away
         - Search bar stays sticky at top
       */}
       <ScrollView
         style={styles.studentsList}
         showsVerticalScrollIndicator={false}
-        stickyHeaderIndices={[1]}
+        stickyHeaderIndices={[2]}
       >
+        {/* Usage Alert Banner (scrolls away) */}
+        {shouldShowStudentUsageBanner && (
+          <UsageAlertInlineBanner
+            alert={studentUsageAlert}
+            totalAlerts={studentUsageAlertCount}
+            loading={studentUsageAlertLoading}
+            error={studentUsageAlertError}
+            monthLabel={studentUsageMonthId}
+            onPress={() => router.push('/(tabs)/usage')}
+            onRefresh={refreshStudentUsageAlerts}
+          />
+        )}
+
         {/* Student Statistics (scrolls away) */}
         <View style={[styles.statsContainer, { backgroundColor: theme.background }]}>
           <View style={[styles.statCard, { backgroundColor: theme.surface }]}>

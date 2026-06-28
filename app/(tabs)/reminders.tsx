@@ -1,5 +1,6 @@
 import { logger } from '@/lib/logger';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
+import { isAppForeground } from '@/hooks/useAppForeground';
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
@@ -421,6 +422,10 @@ export default function SendReminders() {
     if (!polling) setPolling(true);
 
     const poll = async () => {
+      // Skip network work while the app/tab is backgrounded so status polling
+      // does not pile up requests that all fire on resume. The interval resumes
+      // automatically on the next tick once foregrounded.
+      if (!isAppForeground()) return;
       try {
         const jobIds: string[] = [];
         queuedKeys.forEach(k => { const id = waJobIds.get(k); if (id) jobIds.push(id); });
@@ -490,6 +495,8 @@ export default function SendReminders() {
     if (!historyPolling) setHistoryPolling(true);
 
     const poll = async () => {
+      // Skip network work while backgrounded; resumes on the next tick.
+      if (!isAppForeground()) return;
       try {
         const res = await usageAnalyticsService.getReminderHistoryStatuses(tenantId, ids);
         if (cancelled || !res?.results) return;

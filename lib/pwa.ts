@@ -175,10 +175,28 @@ export function registerServiceWorker() {
 
           newWorker.addEventListener('statechange', () => {
             if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-              // Auto-update after 3 seconds
-              setTimeout(() => {
+              // A new version is ready. Activate it in the background, but do NOT
+              // force a reload while the user is actively viewing the page. An
+              // abrupt `location.reload()` is a major cause of the app appearing
+              // to freeze/hang right after the user switches back to the tab.
+              //
+              // Instead: activate the waiting worker now, then reload only the
+              // next time the page is hidden. If that never happens, the new
+              // version is picked up on the next natural navigation/refresh.
+              try {
+                newWorker.postMessage({ type: 'SKIP_WAITING' });
+              } catch {
+                // ignore
+              }
+
+              let reloaded = false;
+              const reloadWhenHidden = () => {
+                if (reloaded) return;
+                if (typeof document === 'undefined') return;
+                if (document.visibilityState !== 'hidden') return;
+                reloaded = true;
                 try {
-                  newWorker.postMessage({ type: 'SKIP_WAITING' });
+                  document.removeEventListener('visibilitychange', reloadWhenHidden);
                 } catch {
                   // ignore
                 }
@@ -187,7 +205,11 @@ export function registerServiceWorker() {
                 } catch {
                   // ignore
                 }
-              }, 3000);
+              };
+
+              if (typeof document !== 'undefined') {
+                document.addEventListener('visibilitychange', reloadWhenHidden);
+              }
             }
           });
         });

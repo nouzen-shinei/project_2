@@ -1308,16 +1308,20 @@ interface FullControlsProps {
   isPlaying: boolean;
   isMuted: boolean;
   isDownloading: boolean;
-  isDraggingProgress: boolean;
   isWebFullscreenActive: boolean;
   disableSpeedControl: boolean;
   formattedProgressLabel: string;
-  progressPercentage: number;
   bufferedPercentage: number;
   playbackSpeedLabel: string;
   normalizedProgress: number;
   downloadButtonA11yLabel: string;
   shareButtonA11yLabel: string;
+  /** Animated value [0,1] driving fill width and thumb translateX — set synchronously by PanResponder. */
+  thumbAnimValue: Animated.Value;
+  /** Animated value for thumb scale — spring-animated on drag start/end. */
+  thumbScaleAnim: Animated.Value;
+  /** Width of the progress bar in pixels, updated on layout. Used for interpolations. */
+  progressBarPixelWidth: number;
   overlayAnimatedStyle: { opacity: Animated.Value; transform: { scale: Animated.Value }[] };
   overlayPointerEvents: 'box-none' | 'none';
   /** Optional style override for the controls overlay — used for web fullscreen. */
@@ -1343,16 +1347,17 @@ function FullControls({
   isPlaying,
   isMuted,
   isDownloading,
-  isDraggingProgress,
   isWebFullscreenActive,
   disableSpeedControl,
   formattedProgressLabel,
-  progressPercentage,
   bufferedPercentage,
   playbackSpeedLabel,
   normalizedProgress,
   downloadButtonA11yLabel,
   shareButtonA11yLabel,
+  thumbAnimValue,
+  thumbScaleAnim,
+  progressBarPixelWidth,
   overlayAnimatedStyle,
   overlayPointerEvents,
   overlayStyle,
@@ -1367,6 +1372,18 @@ function FullControls({
   onCyclePlaybackSpeed,
   onCloseFullscreen,
 }: FullControlsProps) {
+  // Animated fill width and thumb translateX — both derived from thumbAnimValue.
+  // Computed here in render so outputRange reflects the latest progressBarPixelWidth.
+  const fillWidth = thumbAnimValue.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, Math.max(1, progressBarPixelWidth)],
+    extrapolate: 'clamp',
+  });
+  const thumbPos = thumbAnimValue.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, Math.max(1, progressBarPixelWidth)],
+    extrapolate: 'clamp',
+  });
   return (
     <Animated.View style={[styles.controlsOverlay, overlayStyle, overlayAnimatedStyle]} pointerEvents={overlayPointerEvents}>
       <View
@@ -1413,13 +1430,15 @@ function FullControls({
             >
               <View style={styles.progressBar}>
                 <View style={[styles.progressBuffered, { width: `${bufferedPercentage}%` }]} />
-                <View style={[styles.progressFill, { width: `${progressPercentage}%` }]} />
-                <View
+                <Animated.View style={[styles.progressFill, { width: fillWidth }]} />
+                <Animated.View
                   style={[
                     styles.progressThumb,
                     {
-                      left: `${progressPercentage}%`,
-                      transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
+                      transform: [
+                        { translateX: thumbPos },
+                        { scale: thumbScaleAnim },
+                      ],
                     },
                   ]}
                 />
@@ -1838,6 +1857,29 @@ function VideoPlayerLoaded({
   const readyOpacity = useSharedValue(0);
   const controlsOpacity = useRef(new Animated.Value(showControlsProp ? 1 : 0)).current;
   const controlsScale = useRef(new Animated.Value(1)).current;
+  // Seek bar animated values — drive visual position and thumb scale without going
+  // through React state, eliminating the multi-frame lag on every pointer event.
+  const thumbAnimValue = useRef(new Animated.Value(0)).current;
+  const thumbScaleAnim = useRef(new Animated.Value(1)).current;
+  // Tracks bar width in pixels reactively (updated on layout) so Animated interpolations
+  // can map the [0,1] thumbAnimValue to the correct pixel range.
+  const [progressBarPixelWidth, setProgressBarPixelWidth] = useState(300);
+  // Pause-on-drag state: records whether the video was playing before a scrub began
+  // so resumeAfterScrub can correctly decide whether to resume playback.
+  const wasPlayingBeforeScrubRef = useRef(false);
+  // Committed seek target lock — prevents thumbAnimValue and the time label from
+  // snapping back to stale timeupdate data while the browser processes a seek.
+  // Set in handleScrubCommit, cleared by the seeked event or a timeout fallback.
+  const seekTargetRef = useRef<number | null>(null);
+  const seekTargetClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Defined early so it can be referenced by handleInlineWebSeeked (defined below).
+  const clearSeekTarget = useCallback(() => {
+    seekTargetRef.current = null;
+    if (seekTargetClearTimerRef.current != null) {
+      clearTimeout(seekTargetClearTimerRef.current);
+      seekTargetClearTimerRef.current = null;
+    }
+  }, []);
   const normalizedProgress = useEasedDownloadProgressPercent(
     downloadProgress,
     isDownloading
@@ -1876,10 +1918,13 @@ function VideoPlayerLoaded({
       return;
     }
     const s = webPlayerState;
-    setCurrentTimeSafe(s.currentTime);
+    // Update currentTimeRef immediately so commit/cache writes have fresh data.
+    // setCurrentTimeSafe is the single source of currentTime state on web —
+    // webPlayerState.currentTime flows from useWebVideoPlayer's timeupdate listener.
     if (Number.isFinite(s.currentTime)) {
       currentTimeRef.current = s.currentTime;
     }
+    setCurrentTimeSafe(s.currentTime);
     setIsPlayingSafe(s.isPlaying);
     setWebBufferedPercent(s.bufferedPercent ?? null);
     setWebIsBuffering(s.isBuffering);
@@ -2581,30 +2626,6 @@ function VideoPlayerLoaded({
     });
   }, []);
 
-  const handleTimeUpdate = () => {
-    if (Platform.OS === 'web' && videoRef.current) {
-      const nextTime = videoRef.current.currentTime;
-      if (Number.isFinite(nextTime)) {
-        currentTimeRef.current = nextTime;
-      }
-      setCurrentTimeSafe(nextTime);
-      updateWebBufferedPercent();
-
-      if (Number.isFinite(nextTime)) {
-        const key = cacheKeyRef.current;
-        if (key) {
-          patchVideoCacheEntry(key, {
-            lastKnownTime: nextTime,
-            lastKnownWasPlaying: intendedPlayingRef.current,
-            lastPosition: nextTime,
-          });
-        }
-      }
-
-      // timeupdate is the source of truth on web; keep cache synced directly.
-    }
-  };
-
   const tryFulfillPendingPlay = useCallback(() => {
     // Use ref to avoid stale closure — canplay/canplaythrough events fire
     // before React batches setPendingPlayRequest(true) into the closure.
@@ -2781,6 +2802,9 @@ function VideoPlayerLoaded({
   }, [cacheKey, currentTime, onPreviewAvailable]);
 
   const handleInlineWebSeeked = useCallback(() => {
+    // Browser confirmed seek is complete — release the position lock so normal
+    // timeupdate-driven sync can resume from the accurate seeked position.
+    clearSeekTarget();
     if (!videoRef.current) {
       return;
     }
@@ -2790,6 +2814,8 @@ function VideoPlayerLoaded({
       return;
     }
 
+    // Push the confirmed post-seek position to state so the time label is accurate.
+    setCurrentTimeSafe(nextTime);
     currentTimeRef.current = nextTime;
     const key = cacheKeyRef.current;
     if (key) {
@@ -2799,7 +2825,7 @@ function VideoPlayerLoaded({
         lastPosition: nextTime,
       });
     }
-  }, []);
+  }, [clearSeekTarget, setCurrentTimeSafe]);
 
   const handleInlineWebPlay = useCallback(() => {
     pauseOtherVideos(playbackIdRef.current);
@@ -3205,9 +3231,14 @@ function VideoPlayerLoaded({
 
   useEffect(() => {
     if (Platform.OS !== 'web') {
-      setCurrentTimeSafe(timeUpdate?.currentTime ?? 0);
+      const nativeTime = timeUpdate?.currentTime ?? 0;
+      setCurrentTimeSafe(nativeTime);
+      // Clear seek target when native player position has caught up to the committed time.
+      if (seekTargetRef.current !== null && Math.abs(nativeTime - seekTargetRef.current) <= 0.5) {
+        clearSeekTarget();
+      }
     }
-  }, [setCurrentTimeSafe, timeUpdate?.currentTime]);
+  }, [clearSeekTarget, setCurrentTimeSafe, timeUpdate?.currentTime]);
 
   useEffect(() => {
     if (Platform.OS !== 'web') {
@@ -3262,6 +3293,10 @@ function VideoPlayerLoaded({
       if (pendingCacheSyncRef.current != null) {
         clearTimeout(pendingCacheSyncRef.current as unknown as number);
         pendingCacheSyncRef.current = null;
+      }
+      if (seekTargetClearTimerRef.current != null) {
+        clearTimeout(seekTargetClearTimerRef.current);
+        seekTargetClearTimerRef.current = null;
       }
       const key = cacheKeyRef.current;
       if (!key) {
@@ -3349,31 +3384,127 @@ function VideoPlayerLoaded({
       : player.duration || duration || durationRef.current || 0;
 
   // ─── Progress bar gesture handling (useVideoProgressBar hook) ─────────────
+  // All callbacks are wrapped in useCallback so their identities are stable.
+  // This prevents the panResponder useMemo from rebuilding mid-drag when
+  // currentTime state updates (timeupdate events) cause re-renders.
+
+  // Releases the seek position lock set by handleScrubCommit.
+  // Pause-on-drag: silence audio while the user scrubs.
+  const pauseForScrub = useCallback(() => {    wasPlayingBeforeScrubRef.current = intendedPlayingRef.current;
+    if (Platform.OS === 'web') {
+      webPause();
+    } else {
+      try { player.pause(); } catch {}
+    }
+  }, [player, webPause]);
+
+  // Resume after drag/commit: restore playback only if it was playing before.
+  const resumeAfterScrub = useCallback(() => {
+    if (!wasPlayingBeforeScrubRef.current) return;
+    if (Platform.OS === 'web') {
+      webPlay();
+    } else {
+      try {
+        pauseOtherVideos(playbackIdRef.current);
+        player.play();
+      } catch {}
+    }
+    intendedPlayingRef.current = true;
+  }, [player, webPlay]);
+
+  const handleScrubChange = useCallback((time: number) => {
+    setShowControlsVisible(true);
+    // Update ref immediately for accurate cache sync; state update drives the time label.
+    currentTimeRef.current = time;
+    setCurrentTimeSafe(time);
+  }, [setCurrentTimeSafe, setShowControlsVisible]);
+
+  const handleScrubCommit = useCallback((time: number) => {
+    // Lock thumb at committed position BEFORE any state changes — the sync effect
+    // below will use seekTargetRef.current instead of currentTime state until the
+    // seeked event fires or the timeout expires (defense against stale timeupdates).
+    seekTargetRef.current = time;
+    if (seekTargetClearTimerRef.current != null) clearTimeout(seekTargetClearTimerRef.current);
+    // 3 s fallback: release lock even if seeked event never fires (e.g. no network).
+    seekTargetClearTimerRef.current = setTimeout(() => {
+      seekTargetRef.current = null;
+      seekTargetClearTimerRef.current = null;
+    }, 3000) as unknown as ReturnType<typeof setTimeout>;
+
+    currentTimeRef.current = time;
+    setCurrentTimeSafe(time);
+    setShowControlsVisible(true);
+    if (Platform.OS === 'web' && videoRef.current) {
+      videoRef.current.currentTime = time;
+    } else if (Platform.OS !== 'web') {
+      try { player.currentTime = time; } catch {}
+    }
+    syncPlaybackCache(true, { time, wasPlaying: intendedPlayingRef.current });
+    resumeAfterScrub();
+  }, [player, resumeAfterScrub, setCurrentTimeSafe, setShowControlsVisible, syncPlaybackCache]);
+
+  const handleDragStart = useCallback(() => {
+    setIsDraggingProgress(true);
+    pauseForScrub();
+  }, [pauseForScrub]);
+
+  const handleDragEnd = useCallback(() => {
+    setIsDraggingProgress(false);
+    resumeAfterScrub();
+  }, [resumeAfterScrub]);
+
   const {
     progressBarRef,
-    handleLayout: handleProgressBarLayout,
+    handleLayout: _hookHandleProgressBarLayout,
     panResponder: progressPanResponder,
+    progressBarWidthRef,
   } = useVideoProgressBar({
     duration: effectiveDuration,
-    onScrubChange: (time) => {
-      setShowControlsVisible(true);
-      setCurrentTimeSafe(time);
-    },
-    onScrubCommit: (time) => {
-      currentTimeRef.current = time;
-      setCurrentTimeSafe(time);
-      setShowControlsVisible(true);
-      if (Platform.OS === 'web' && videoRef.current) {
-        videoRef.current.currentTime = time;
-      } else if (Platform.OS !== 'web') {
-        try { player.currentTime = time; } catch {}
-      }
-      syncPlaybackCache(true, { time, wasPlaying: intendedPlayingRef.current });
-    },
-    onDragStart: () => setIsDraggingProgress(true),
-    onDragEnd: () => setIsDraggingProgress(false),
+    onScrubChange: handleScrubChange,
+    onScrubCommit: handleScrubCommit,
+    onDragStart: handleDragStart,
+    onDragEnd: handleDragEnd,
+    thumbAnimValue,
   });
+
+  // Wrapper that also captures the pixel width for animated interpolations.
+  const handleProgressBarLayout = useCallback((event: import('react-native').LayoutChangeEvent) => {
+    const { width } = event.nativeEvent.layout;
+    if (Number.isFinite(width) && width > 0) {
+      setProgressBarPixelWidth(width);
+    }
+    _hookHandleProgressBarLayout(event);
+  }, [_hookHandleProgressBarLayout]);
   // ──────────────────────────────────────────────────────────────────────────
+
+  // Sync thumbAnimValue with playing position when NOT dragging.
+  // Uses seekTargetRef when a seek is in flight to prevent snap-back from stale
+  // timeupdate events firing between the seek assignment and the seeked event.
+  useEffect(() => {
+    if (isDraggingProgress) return;
+    const target = seekTargetRef.current;
+    const displayTime = target !== null ? target : currentTime;
+    const fraction =
+      effectiveDuration > 0 && Number.isFinite(displayTime)
+        ? Math.min(1, Math.max(0, displayTime / effectiveDuration))
+        : 0;
+    thumbAnimValue.setValue(fraction);
+  }, [currentTime, effectiveDuration, isDraggingProgress, thumbAnimValue]);
+
+  // Spring-animate thumb scale when drag state changes.
+  // useNativeDriver must be false here: thumbAnimValue (which drives fillWidth as a
+  // `width` layout property) also appears in the same transform array as thumbScaleAnim.
+  // Mixing native-driver and JS-driver values in one Animated.View causes React Native
+  // to nativize thumbAnimValue, which then fails because `width` is not supported by
+  // the native animated module.
+  useEffect(() => {
+    Animated.spring(thumbScaleAnim, {
+      toValue: isDraggingProgress ? 1.35 : 1,
+      speed: 22,
+      bounciness: 5,
+      useNativeDriver: false,
+    }).start();
+  }, [isDraggingProgress, thumbScaleAnim]);
 
   // ─── Media Session API — notification panel play/pause/seek support ───────
   const msOnPlay = useCallback(() => {
@@ -3479,7 +3610,9 @@ function VideoPlayerLoaded({
   const shouldShowControls = showControlsProp && showControlsVisible && !shouldLockControls;
   const disableSpeedControl = (playbackUxState.isInitialLoading || playbackUxState.isError) || !resolvedUri;
   const formattedProgressLabel = useMemo(() => {
-    return `${formatTime(currentTime)} / ${formatTime(effectiveDuration)}`;
+    // Use seek target when locked — prevents time label from flashing stale position.
+    const displayTime = seekTargetRef.current !== null ? seekTargetRef.current : currentTime;
+    return `${formatTime(displayTime)} / ${formatTime(effectiveDuration)}`;
   }, [currentTime, effectiveDuration]);
   const seekHint = useMemo(
     () => formatSeekHint(seekStepSeconds ?? SEEK_STEP_SECONDS),
@@ -3850,6 +3983,7 @@ function VideoPlayerLoaded({
               // The black background lives on the wrapping container instead.
             } as any}
             onMouseDown={(event) => event.preventDefault?.()}
+            onSeeked={handleInlineWebSeeked}
             muted={isMuted}
             playsInline
             preload="auto"
@@ -4073,16 +4207,17 @@ function VideoPlayerLoaded({
         isPlaying={isPlaying}
         isMuted={isMuted}
         isDownloading={isDownloading}
-        isDraggingProgress={isDraggingProgress}
         isWebFullscreenActive={isWebFullscreenActive}
         disableSpeedControl={disableSpeedControl}
         formattedProgressLabel={formattedProgressLabel}
-        progressPercentage={progressPercentage}
         bufferedPercentage={bufferedPercentage}
         playbackSpeedLabel={playbackSpeedLabel}
         normalizedProgress={normalizedProgress}
         downloadButtonA11yLabel={downloadButtonA11yLabel}
         shareButtonA11yLabel={shareButtonA11yLabel}
+        thumbAnimValue={thumbAnimValue}
+        thumbScaleAnim={thumbScaleAnim}
+        progressBarPixelWidth={progressBarPixelWidth}
         overlayAnimatedStyle={overlayAnimatedStyle}
         overlayPointerEvents={overlayPointerEvents}
         progressBarRef={progressBarRef}
@@ -4183,11 +4318,14 @@ function FullscreenVideoModal({
   const [isLoading, setIsLoading] = useState(true);
   const [showControls, setShowControls] = useState(true);
   const [isDraggingProgress, setIsDraggingProgress] = useState(false);
+  const [progressBarPixelWidth, setProgressBarPixelWidth] = useState(300);
 
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const progressBarRef = useRef<View>(null);
-  const progressBarWidthRef = useRef(1);
-  const progressBarPageXRef = useRef<number | null>(null);
+  const thumbAnimValue = useRef(new Animated.Value(0)).current;
+  const thumbScaleAnim = useRef(new Animated.Value(1)).current;
+  const wasPlayingBeforeScrubRef = useRef(false);
+  const fsSeekTargetRef = useRef<number | null>(null);
+  const fsSeekTargetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playbackIdRef = useRef<string>(createPlaybackId());
   // When using a shared player, the player is already at the correct position and
   // play state — skip the initial sync that would redundantly seek and play.
@@ -4222,6 +4360,15 @@ function FullscreenVideoModal({
       return;
     }
     setDuration((prev) => (Math.abs(prev - next) < 1 / 60 ? prev : next));
+  }, []);
+
+  // clearFsSeekTarget defined early so timeUpdate effect and fsScrubCommit can use it.
+  const clearFsSeekTarget = useCallback(() => {
+    fsSeekTargetRef.current = null;
+    if (fsSeekTargetTimerRef.current != null) {
+      clearTimeout(fsSeekTargetTimerRef.current);
+      fsSeekTargetTimerRef.current = null;
+    }
   }, []);
 
   const playbackSpeedLabel = useMemo(() => {
@@ -4523,13 +4670,21 @@ function FullscreenVideoModal({
 
   useEffect(() => {
     if (typeof timeUpdate?.currentTime === 'number') {
-      setCurrentTimeSafe(timeUpdate.currentTime);
+      const nativeTime = timeUpdate.currentTime;
+      setCurrentTimeSafe(nativeTime);
+      // Clear seek target once native player position catches up (within 0.5 s).
+      if (fsSeekTargetRef.current !== null && Math.abs(nativeTime - fsSeekTargetRef.current) <= 0.5) {
+        clearFsSeekTarget();
+      }
     }
-  }, [setCurrentTimeSafe, timeUpdate?.currentTime]);
+  }, [clearFsSeekTarget, setCurrentTimeSafe, timeUpdate?.currentTime]);
 
   useEffect(() => () => {
     if (controlsTimeoutRef.current) {
       clearTimeout(controlsTimeoutRef.current);
+    }
+    if (fsSeekTargetTimerRef.current != null) {
+      clearTimeout(fsSeekTargetTimerRef.current);
     }
     if (!sharedPlayer) {
       // Only pause when using the own player — the shared player stays under control
@@ -4560,10 +4715,6 @@ function FullscreenVideoModal({
     stallThresholdMs: 4000,
     bufferGapSeconds: 0.4,
   });
-  const progressPercentage =
-    effectiveDuration > 0 && Number.isFinite(currentTime)
-      ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100))
-      : 0;
   const bufferedPercentage = useMemo(() => {
     if (!(effectiveDuration > 0)) {
       return 0;
@@ -4575,118 +4726,100 @@ function FullscreenVideoModal({
     return Math.min(100, Math.max(0, (buffered / effectiveDuration) * 100));
   }, [effectiveDuration, timeUpdate?.bufferedPosition]);
 
-  const handleProgressBarLayout = useCallback(
-    (event: LayoutChangeEvent) => {
-      const { width } = event.nativeEvent.layout;
-      if (Number.isFinite(width) && width > 0) {
-        progressBarWidthRef.current = width;
-      }
+  // Native seek target lock — prevents snap-back from stale timeUpdate events.
+  // Defined before pauseForScrub so fsScrubCommit and timeUpdate effect can use it.
 
-      if (progressBarRef.current && typeof progressBarRef.current.measure === 'function') {
-        progressBarRef.current.measure((_x, _y, measuredWidth, _height, pageX) => {
-          if (Number.isFinite(measuredWidth) && measuredWidth > 0) {
-            progressBarWidthRef.current = measuredWidth;
-          }
-          if (typeof pageX === 'number' && Number.isFinite(pageX)) {
-            progressBarPageXRef.current = pageX;
-          }
-        });
-      }
-    },
-    []
-  );
+  const pauseForScrub = useCallback(() => {
+    wasPlayingBeforeScrubRef.current = intendedPlayingRef.current;
+    try { player.pause(); } catch {}
+  }, [player]);
 
-  const resolveLocationX = useCallback((evt: GestureResponderEvent) => {
-    const { locationX, pageX } = evt.nativeEvent;
-    if (typeof locationX === 'number' && Number.isFinite(locationX)) {
-      return locationX;
+  const resumeAfterScrub = useCallback(() => {
+    if (!wasPlayingBeforeScrubRef.current) return;
+    try {
+      pauseOtherVideos(playbackIdRef.current);
+      player.play();
+    } catch {}
+    intendedPlayingRef.current = true;
+  }, [player]);
+  const fsScrubChange = useCallback((time: number) => {
+    setShowControls(true);
+    setCurrentTimeSafe(time);
+  }, [setCurrentTimeSafe]);
+
+  const fsScrubCommit = useCallback((time: number) => {
+    fsSeekTargetRef.current = time;
+    if (fsSeekTargetTimerRef.current != null) clearTimeout(fsSeekTargetTimerRef.current);
+    fsSeekTargetTimerRef.current = setTimeout(() => {
+      fsSeekTargetRef.current = null;
+      fsSeekTargetTimerRef.current = null;
+    }, 3000) as unknown as ReturnType<typeof setTimeout>;
+
+    setCurrentTimeSafe(time);
+    setShowControls(true);
+    try { player.currentTime = time; } catch (e) {
+      logger.debug?.('FullscreenVideoModal: native seek failed', e);
     }
-    if (
-      typeof pageX === 'number' &&
-      Number.isFinite(pageX) &&
-      progressBarPageXRef.current != null &&
-      Number.isFinite(progressBarPageXRef.current)
-    ) {
-      return pageX - (progressBarPageXRef.current as number);
+    resumeAfterScrub();
+  }, [player, resumeAfterScrub, setCurrentTimeSafe]);
+
+  const fsDragStart = useCallback(() => {
+    setIsDraggingProgress(true);
+    pauseForScrub();
+  }, [pauseForScrub]);
+
+  const fsDragEnd = useCallback(() => {
+    setIsDraggingProgress(false);
+    resumeAfterScrub();
+  }, [resumeAfterScrub]);
+
+  const {
+    progressBarRef,
+    handleLayout: _fsHookLayout,
+    panResponder: progressPanResponder,
+    progressBarWidthRef,
+  } = useVideoProgressBar({
+    duration: effectiveDuration,
+    onScrubChange: fsScrubChange,
+    onScrubCommit: fsScrubCommit,
+    onDragStart: fsDragStart,
+    onDragEnd: fsDragEnd,
+    thumbAnimValue,
+  });
+
+  const handleProgressBarLayout = useCallback((event: LayoutChangeEvent) => {
+    const { width } = event.nativeEvent.layout;
+    if (Number.isFinite(width) && width > 0) {
+      setProgressBarPixelWidth(width);
     }
-    return null;
-  }, []);
+    _fsHookLayout(event);
+  }, [_fsHookLayout]);
 
-  const calculateScrubProgress = useCallback((locationX: number | null) => {
-    if (locationX == null) {
-      return null;
-    }
-    const width = progressBarWidthRef.current;
-    if (!Number.isFinite(width) || width <= 0) {
-      return null;
-    }
-    const ratio = clamp(locationX / width, 0, 1);
-    return ratio * 100;
-  }, []);
+  // Sync thumbAnimValue with playback position when not dragging.
+  useEffect(() => {
+    if (isDraggingProgress) return;
+    const target = fsSeekTargetRef.current;
+    const displayTime = target !== null ? target : currentTime;
+    const fraction =
+      effectiveDuration > 0 && Number.isFinite(displayTime)
+        ? Math.min(1, Math.max(0, displayTime / effectiveDuration))
+        : 0;
+    thumbAnimValue.setValue(fraction);
+  }, [currentTime, effectiveDuration, isDraggingProgress, thumbAnimValue]);
 
-  const applyScrubProgress = useCallback(
-    (progressValue: number | null, commit: boolean) => {
-      if (progressValue == null) {
-        return;
-      }
-
-      const normalized = clamp(progressValue / 100, 0, 1);
-      const baseDuration = effectiveDuration > 0 ? effectiveDuration : 0;
-      const newTime = baseDuration * normalized;
-
-      if (Number.isFinite(newTime)) {
-        setCurrentTimeSafe(newTime);
-      }
-
-      if (!commit) {
-        return;
-      }
-
-      try {
-        player.currentTime = newTime;
-      } catch (error) {
-        logger.debug?.('FullscreenVideoModal: native seek failed', error);
-      }
-    },
-    [effectiveDuration, player, setCurrentTimeSafe]
-  );
-
-  const getProgressFromEvent = useCallback(
-    (evt: GestureResponderEvent) => {
-      const location = resolveLocationX(evt);
-      return calculateScrubProgress(location);
-    },
-    [calculateScrubProgress, resolveLocationX]
-  );
-
-  const progressPanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: (evt) => {
-          setIsDraggingProgress(true);
-          setShowControls(true);
-          applyScrubProgress(getProgressFromEvent(evt), false);
-        },
-        onPanResponderMove: (evt) => {
-          setShowControls(true);
-          applyScrubProgress(getProgressFromEvent(evt), false);
-        },
-        onPanResponderRelease: (evt) => {
-          setIsDraggingProgress(false);
-          setShowControls(true);
-          applyScrubProgress(getProgressFromEvent(evt), true);
-        },
-        onPanResponderTerminate: (evt) => {
-          setIsDraggingProgress(false);
-          setShowControls(true);
-          applyScrubProgress(getProgressFromEvent(evt), true);
-        },
-        onPanResponderTerminationRequest: () => false,
-      }),
-    [applyScrubProgress, getProgressFromEvent]
-  );
+  // Spring-animate thumb scale on drag state change.
+  // useNativeDriver must be false: thumbAnimValue drives both `width` (fillWidth) and
+  // `translateX` (thumbPos) in the same Animated.View transform. Mixing native-driver
+  // thumbScaleAnim with JS-driver thumbPos in one transform would nativize thumbAnimValue,
+  // which then errors because `width` is not supported by the native animated module.
+  useEffect(() => {
+    Animated.spring(thumbScaleAnim, {
+      toValue: isDraggingProgress ? 1.35 : 1,
+      speed: 22,
+      bounciness: 5,
+      useNativeDriver: false,
+    }).start();
+  }, [isDraggingProgress, thumbScaleAnim]);
 
   const restartIfEnded = useCallback(() => {
     const epsilon = 0.35;
@@ -5043,13 +5176,32 @@ function FullscreenVideoModal({
                     >
                       <View style={styles.fullscreenProgressBar}>
                         <View style={[styles.fullscreenProgressBuffered, { width: `${bufferedPercentage}%` }]} />
-                        <View style={[styles.fullscreenProgressFill, { width: `${progressPercentage}%` }]} />
-                        <View
+                        <Animated.View
+                          style={[
+                            styles.fullscreenProgressFill,
+                            {
+                              width: thumbAnimValue.interpolate({
+                                inputRange: [0, 1],
+                                outputRange: [0, Math.max(1, progressBarPixelWidth)],
+                                extrapolate: 'clamp',
+                              }),
+                            },
+                          ]}
+                        />
+                        <Animated.View
                           style={[
                             styles.fullscreenProgressThumb,
                             {
-                              left: `${progressPercentage}%`,
-                              transform: [{ scale: isDraggingProgress ? 1.2 : 1 }],
+                              transform: [
+                                {
+                                  translateX: thumbAnimValue.interpolate({
+                                    inputRange: [0, 1],
+                                    outputRange: [0, Math.max(1, progressBarPixelWidth)],
+                                    extrapolate: 'clamp',
+                                  }),
+                                },
+                                { scale: thumbScaleAnim },
+                              ],
                             },
                           ]}
                         />

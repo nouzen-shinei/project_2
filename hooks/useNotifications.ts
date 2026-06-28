@@ -1,5 +1,6 @@
 import { logger } from '@/lib/logger';
 import { useEffect, useCallback, useState, useRef } from 'react';
+import { useForegroundInterval } from '@/hooks/useAppForeground';
 import { notificationService } from '../services/notificationService';
 import { useAuth } from './useAuthUnified';
 import { ChatMessage, chatService } from '../services/chatService';
@@ -26,40 +27,27 @@ export const useNotifications = () => {
     teamMembersRef.current = teamMembers;
   }, [teamMembers]);
 
-  useEffect(() => {
-    let disposed = false;
-
-    const syncTenantId = async () => {
-      try {
-        if (!user?.email) {
-          if (!disposed) {
-            setActiveTenantId(null);
-          }
-          return;
-        }
-
-        const tenantId = await tenantService.getCachedSelectedTenant();
-        if (!disposed) {
-          setActiveTenantId(tenantId);
-        }
-      } catch (error) {
-        logger.warn('useNotifications: failed to resolve active tenant id', error);
-        if (!disposed) {
-          setActiveTenantId(null);
-        }
+  // Resolve the active tenant id. Foreground-gated and lengthened (was a 5s
+  // global AsyncStorage poll) so it neither drains battery nor backlogs while
+  // the app is backgrounded. Runs once immediately on mount/resume.
+  const syncTenantId = useCallback(async () => {
+    try {
+      if (!user?.email) {
+        setActiveTenantId(null);
+        return;
       }
-    };
 
-    void syncTenantId();
-    const interval = setInterval(() => {
-      void syncTenantId();
-    }, 5000);
-
-    return () => {
-      disposed = true;
-      clearInterval(interval);
-    };
+      const tenantId = await tenantService.getCachedSelectedTenant();
+      setActiveTenantId(tenantId);
+    } catch (error) {
+      logger.warn('useNotifications: failed to resolve active tenant id', error);
+      setActiveTenantId(null);
+    }
   }, [user?.email]);
+
+  useForegroundInterval(() => {
+    void syncTenantId();
+  }, 15000);
 
   // Initialize notification service
   useEffect(() => {
@@ -101,56 +89,59 @@ export const useNotifications = () => {
     };
   }, [user?.email]);
 
-  // Load team members for global chat notifications
-  useEffect(() => {
+  // Load team members for global chat notifications. Foreground-gated so it
+  // stops refetching memberships while backgrounded. A request id guards
+  // against stale responses when the active tenant changes mid-flight.
+  const loadMembersRequestIdRef = useRef(0);
+  const loadMembers = useCallback(async () => {
     if (!user?.email || !activeTenantId) {
       setTeamMembers([]);
       return;
     }
 
-    let disposed = false;
+    const requestId = ++loadMembersRequestIdRef.current;
 
-    const loadMembers = async () => {
-      try {
-        const memberships = await tenantService.getActiveMembershipsForTenant(activeTenantId);
-        if (disposed) return;
+    try {
+      const memberships = await tenantService.getActiveMembershipsForTenant(activeTenantId);
+      if (loadMembersRequestIdRef.current !== requestId) return;
 
-        const members = memberships.map((membership) => {
-          const normalizedEmail = String(membership.email || '').toLowerCase();
-          const rawName = String(membership.displayName || normalizedEmail.split('@')[0] || 'User');
-          const name = rawName
-            .replace(/[._-]+/g, ' ')
-            .replace(/\b\w/g, (letter) => letter.toUpperCase());
+      const members = memberships.map((membership) => {
+        const normalizedEmail = String(membership.email || '').toLowerCase();
+        const rawName = String(membership.displayName || normalizedEmail.split('@')[0] || 'User');
+        const name = rawName
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, (letter) => letter.toUpperCase());
 
-          return {
-            id: normalizedEmail,
-            email: normalizedEmail,
-            name,
-            role: membership.role,
-          };
-        });
+        return {
+          id: normalizedEmail,
+          email: normalizedEmail,
+          name,
+          role: membership.role,
+        };
+      });
 
-        setTeamMembers(members);
-      } catch (error) {
-        logger.warn('useNotifications: failed to load tenant members', {
-          error,
-          tenantId: activeTenantId,
-        });
-        if (!disposed) {
-          setTeamMembers([]);
-        }
+      setTeamMembers(members);
+    } catch (error) {
+      logger.warn('useNotifications: failed to load tenant members', {
+        error,
+        tenantId: activeTenantId,
+      });
+      if (loadMembersRequestIdRef.current === requestId) {
+        setTeamMembers([]);
       }
-    };
+    }
+  }, [user?.email, activeTenantId]);
 
+  useForegroundInterval(() => {
     void loadMembers();
-    const interval = setInterval(() => {
-      void loadMembers();
-    }, 30000);
+  }, 30000, { enabled: Boolean(user?.email && activeTenantId) });
 
-    return () => {
-      disposed = true;
-      clearInterval(interval);
-    };
+  // Clear cached members when there is no user/tenant (the interval above is
+  // disabled in that state, so it cannot clear them itself).
+  useEffect(() => {
+    if (!user?.email || !activeTenantId) {
+      setTeamMembers([]);
+    }
   }, [user?.email, activeTenantId]);
 
   // Global chat message listener for incoming message notifications

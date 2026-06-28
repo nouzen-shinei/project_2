@@ -240,10 +240,34 @@ export function useWebVideoPlayer(options: UseWebVideoPlayerOptions): {
       if (!Number.isFinite(currentTime)) {
         return;
       }
+      // Skip timeupdate events while a seek is in flight — mobile Chrome fires
+      // timeupdate with the OLD position between the seek assignment and the
+      // seeked event, which would push stale data into webPlayerState and cause
+      // the visible seek thumb to snap back before arriving at the target.
+      if (el.seeking) {
+        return;
+      }
       const bufferedPercent = resolveBufferedPercent(el);
       setState((prev) => ({
         ...prev,
         currentTime,
+        bufferedPercent: bufferedPercent ?? prev.bufferedPercent,
+      }));
+    };
+
+    // Fires when the browser has finished seeking to a new position.
+    // Push the confirmed post-seek time so webPlayerState is accurate.
+    const handleSeeked = () => {
+      const currentTime = el.currentTime;
+      if (!Number.isFinite(currentTime)) {
+        return;
+      }
+      const bufferedPercent = resolveBufferedPercent(el);
+      setState((prev) => ({
+        ...prev,
+        currentTime,
+        isBuffering: false,
+        isStalled: false,
         bufferedPercent: bufferedPercent ?? prev.bufferedPercent,
       }));
     };
@@ -332,6 +356,7 @@ export function useWebVideoPlayer(options: UseWebVideoPlayerOptions): {
     el.addEventListener('loadedmetadata', handleLoadedMetadata);
     el.addEventListener('durationchange', handleDurationChange);
     el.addEventListener('timeupdate', handleTimeUpdate);
+    el.addEventListener('seeked', handleSeeked);
     el.addEventListener('progress', handleProgress);
     el.addEventListener('waiting', handleWaiting);
     el.addEventListener('stalled', handleStalled);
@@ -352,6 +377,7 @@ export function useWebVideoPlayer(options: UseWebVideoPlayerOptions): {
       el.removeEventListener('loadedmetadata', handleLoadedMetadata);
       el.removeEventListener('durationchange', handleDurationChange);
       el.removeEventListener('timeupdate', handleTimeUpdate);
+      el.removeEventListener('seeked', handleSeeked);
       el.removeEventListener('progress', handleProgress);
       el.removeEventListener('waiting', handleWaiting);
       el.removeEventListener('stalled', handleStalled);

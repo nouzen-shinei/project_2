@@ -76,6 +76,22 @@ const normalizeMessageForState = (message: HydratedChatMessage | ChatMessage): H
   } as HydratedMessageState;
 };
 
+/**
+ * Compact signature of the mutable metadata of a message (edits + deletion).
+ * Used to detect whether an already-known message actually changed while the
+ * realtime listener was down, so reconcile can skip re-hydrating + updating
+ * messages that are already in sync (the common case on every resume).
+ */
+const buildMessageMetaSignature = (
+  message: { editCount?: number; editedAt?: string; deleted?: boolean } | null | undefined
+): string => {
+  if (!message) return '';
+  const editCount = typeof message.editCount === 'number' ? message.editCount : 0;
+  const editedAt = typeof message.editedAt === 'string' ? message.editedAt : '';
+  const deleted = message.deleted ? 1 : 0;
+  return `${editCount}|${editedAt}|${deleted}`;
+};
+
 export function useChat(recipientId?: string, options?: { live?: boolean }) {
   const liveEnabled = options?.live ?? true;
   const [messages, setMessages] = useState<HydratedMessageState[]>([]);
@@ -98,6 +114,9 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
   const hasMoreRef = useRef<boolean>(true);
   const { user } = useAuth();
   const previousMessageIds = useRef<Set<string>>(new Set());
+  // Tracks the last-known mutable metadata signature per message id so reconcile
+  // can skip messages that have not changed since we last saw them.
+  const messageMetaSignatureRef = useRef<Map<string, string>>(new Map());
   const hydrationAbortRef = useRef<Set<AbortController>>(new Set());
   const hasHydratedInitialWindowRef = useRef(false);
   const activeRecipientRef = useRef<string | null>(recipientId ?? null);
@@ -177,6 +196,18 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
   useEffect(() => {
     hasMoreRef.current = hasMore;
   }, [hasMore]);
+
+  // Keep the metadata signature map in sync with the rendered messages. This
+  // runs after paint and lets reconcile cheaply detect unchanged messages.
+  useEffect(() => {
+    const map = messageMetaSignatureRef.current;
+    map.clear();
+    for (const msg of messages) {
+      if (msg.id) {
+        map.set(msg.id, buildMessageMetaSignature(msg));
+      }
+    }
+  }, [messages]);
 
   const isActiveConversation = useCallback(
     (userEmail?: string | null, peerId?: string | null) =>
@@ -543,6 +574,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     prefetchPromiseRef.current = null;
     hasMoreRef.current = true;
     previousMessageIds.current.clear();
+    messageMetaSignatureRef.current.clear();
     hasHydratedInitialWindowRef.current = false;
   }, [recipientId, applyMessagesUpdate]);
 
@@ -873,6 +905,14 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
             }
             try {
               if (previousMessageIds.current.has(candidate.id)) {
+                // Already known: only pay the hydrate + state-update cost if the
+                // message actually changed (edited/deleted) while we were away.
+                // This avoids a re-render storm on every resume for large
+                // conversations where nothing changed.
+                const signature = buildMessageMetaSignature(candidate);
+                if (messageMetaSignatureRef.current.get(candidate.id) === signature) {
+                  continue;
+                }
                 await handleMessageChange(candidate);
               } else {
                 await processIncomingMessage(candidate);

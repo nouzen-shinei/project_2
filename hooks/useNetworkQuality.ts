@@ -3,6 +3,7 @@ import { Platform } from 'react-native';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import { logger } from '@/lib/logger';
 import { runtimeEndpoints } from '@/services/runtimeEndpoints';
+import { isAppForeground, subscribeAppForeground } from '@/hooks/useAppForeground';
 
 export interface NetworkQuality {
   isSlow: boolean;
@@ -106,9 +107,10 @@ export function useNetworkQuality(): NetworkQuality {
       webUpdate();
       if (webConn && typeof webConn.addEventListener === 'function') {
         webConn.addEventListener('change', webUpdate);
-      } else {
-        webPollTimer = setInterval(webUpdate, 5000);
       }
+      // When the connection `change` event is unavailable we fall back to a
+      // poll, which is started/stopped by the foreground manager below so it
+      // does not run while the tab is hidden.
     }
 
     // Native platforms: use NetInfo details (skip on web)
@@ -226,19 +228,75 @@ export function useNetworkQuality(): NetworkQuality {
         recordSample('timeout');
       }
     };
-    // Initial probe slightly delayed to avoid competing with app boot requests
-    const initial = setTimeout(tick, 1200);
-    intervalRef.current = setInterval(tick, PROBE_INTERVAL_MS);
+
+    // The RTT probe issues a network request on every tick and the web poll
+    // reads connection metadata. Both are paused while the app/tab is
+    // backgrounded so they don't drain battery or fire a backlog burst on
+    // resume; they restart (with one slightly-delayed sample) when foregrounded.
+    let initial: ReturnType<typeof setTimeout> | null = null;
+
+    const startProbe = () => {
+      if (intervalRef.current) return;
+      // Slight delay to avoid competing with the work triggered by resume/boot.
+      initial = setTimeout(tick, 1200);
+      intervalRef.current = setInterval(tick, PROBE_INTERVAL_MS);
+    };
+
+    const stopProbe = () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      if (initial) {
+        clearTimeout(initial);
+        initial = null;
+      }
+      if (abortRef.current) {
+        try { abortRef.current.abort(); } catch {}
+      }
+    };
+
+    const startWebPoll = () => {
+      if (Platform.OS !== 'web') return;
+      if (webPollTimer) return;
+      // If the connection `change` event is supported we rely on it instead.
+      if (webConn && typeof webConn.addEventListener === 'function') return;
+      if (webUpdate) {
+        webUpdate();
+        webPollTimer = setInterval(webUpdate, 5000);
+      }
+    };
+
+    const stopWebPoll = () => {
+      if (webPollTimer) {
+        clearInterval(webPollTimer);
+        webPollTimer = null;
+      }
+    };
+
+    if (isAppForeground()) {
+      startProbe();
+      startWebPoll();
+    }
+
+    const unsubscribeForeground = subscribeAppForeground((active) => {
+      if (active) {
+        startProbe();
+        startWebPoll();
+      } else {
+        stopProbe();
+        stopWebPoll();
+      }
+    });
 
     return () => {
+      unsubscribeForeground();
       try { unsub && unsub(); } catch {}
       if (Platform.OS === 'web') {
         try { if (webConn && webUpdate && typeof webConn.removeEventListener === 'function') webConn.removeEventListener('change', webUpdate); } catch {}
-        if (webPollTimer) clearInterval(webPollTimer);
       }
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      if (initial) clearTimeout(initial);
-      if (abortRef.current) abortRef.current.abort();
+      stopWebPoll();
+      stopProbe();
     };
   }, []);
 
