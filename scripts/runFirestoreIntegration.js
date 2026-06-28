@@ -39,7 +39,10 @@ function ensureAdminApp() {
     return;
   }
 
-  initializeApp({ projectId: 'demo-project' });
+  initializeApp({
+    projectId: 'demo-project',
+    databaseURL: 'https://demo-project-default-rtdb.firebaseio.com',
+  });
 }
 
 async function waitForCondition(predicate, label, timeoutMs = 7000, intervalMs = 30) {

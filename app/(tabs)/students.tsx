@@ -172,6 +172,11 @@ export default function Students() {
     )
   );
 
+  // FlatList re-renders visible cells only when one of these visual inputs
+  // changes, instead of rebuilding the whole roster on every unrelated state
+  // change (modals, form text, image upload, etc.).
+  const studentsListExtraData = { searchQuery, isDeletingStudent, attendanceRecords, theme };
+
   const performanceOptions = ['Excellent', 'Very Good', 'Good', 'Average', 'Needs Improvement'];
 
   const uploadProfileImage = async (
@@ -1084,11 +1089,60 @@ export default function Students() {
         - Stats scroll away
         - Search bar stays sticky at top
       */}
-      <ScrollView
+      {/* Search Bar (pinned at top so it stays accessible on long rosters) */}
+      <View
+        style={[
+          styles.searchStickyWrapper,
+          {
+            backgroundColor: theme.background,
+          },
+        ]}
+      >
+        <View style={[styles.searchContainer, { backgroundColor: theme.surface }]}>
+          <Search size={20} color={theme.textSecondary} style={styles.searchIcon} />
+          <TextInput
+            style={[styles.searchInput, { color: theme.text }]}
+            placeholder="Search students..."
+            placeholderTextColor={theme.textSecondary}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+        </View>
+      </View>
+
+      {/* Search Info */}
+      {searchQuery.length > 0 && (
+        <View style={[styles.searchInfo, { backgroundColor: theme.background }]}>
+          <Text style={[styles.searchInfoText, { color: theme.textSecondary }]}>
+            Found {filteredStudents.length} student{filteredStudents.length !== 1 ? 's' : ''} • Clear search to reorder students
+          </Text>
+        </View>
+      )}
+
+      {/*
+        Virtualized roster:
+        - Usage banner + stats scroll away inside the list header
+        - Only on-screen student cards are mounted/rendered
+      */}
+      <FlatList
         style={styles.studentsList}
         showsVerticalScrollIndicator={false}
-        stickyHeaderIndices={[2]}
-      >
+        data={filteredStudents}
+        keyExtractor={(item) => item.id}
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        windowSize={11}
+        removeClippedSubviews={Platform.OS !== 'web'}
+        extraData={studentsListExtraData}
+        contentContainerStyle={{ flexGrow: 1 }}
+        ListEmptyComponent={(
+          <View style={[styles.emptyState, { backgroundColor: theme.surface }]}>
+            <Text style={[styles.emptyStateText, { color: theme.text }]}>No students found</Text>
+            <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}>Add your first student to get started</Text>
+          </View>
+        )}
+        ListHeaderComponent={(
+          <>
         {/* Usage Alert Banner (scrolls away) */}
         {shouldShowStudentUsageBanner && (
           <UsageAlertInlineBanner
@@ -1130,39 +1184,9 @@ export default function Students() {
           </View>
         </View>
 
-        {/* Search Bar (sticky) */}
-        <View
-          style={[
-            styles.searchStickyWrapper,
-            {
-              backgroundColor: theme.background,
-            },
-          ]}
-        >
-          <View style={[styles.searchContainer, { backgroundColor: theme.surface }]}>
-            <Search size={20} color={theme.textSecondary} style={styles.searchIcon} />
-            <TextInput
-              style={[styles.searchInput, { color: theme.text }]}
-              placeholder="Search students..."
-              placeholderTextColor={theme.textSecondary}
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-            />
-          </View>
-        </View>
-
-        {/* Search Info */}
-        {searchQuery.length > 0 && (
-          <View style={[styles.searchInfo, { backgroundColor: theme.background }]}>
-            <Text style={[styles.searchInfoText, { color: theme.textSecondary }]}>
-              Found {filteredStudents.length} student{filteredStudents.length !== 1 ? 's' : ''} • Clear search to reorder students
-            </Text>
-          </View>
+          </>
         )}
-
-        {/* Students List */}
-        {filteredStudents.length > 0 ? (
-          filteredStudents.map((student, index) => (
+        renderItem={({ item: student, index }) => (
             <TouchableOpacity 
               key={student.id} 
               style={[styles.studentCard, { backgroundColor: theme.surface }]}
@@ -1378,14 +1402,8 @@ export default function Students() {
                 </View>
               </View>
             </TouchableOpacity>
-          ))
-        ) : (
-          <View style={[styles.emptyState, { backgroundColor: theme.surface }]}>
-            <Text style={[styles.emptyStateText, { color: theme.text }]}>No students found</Text>
-            <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}>Add your first student to get started</Text>
-          </View>
         )}
-      </ScrollView>
+      />
 
       {/* Add Student Modal */}
       <Modal
@@ -3325,8 +3343,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     paddingHorizontal: 8, // reduced from 20
     paddingVertical: 6, // reduced from 16
-    marginTop: 10,
-    marginBottom: -5, // reduced from 8
+    marginTop: 8,
+    marginBottom: 8, // reduced from 8
     borderRadius: 8, // reduced from 12
     marginHorizontal: 8, // reduced from 20
     shadowColor: '#000',

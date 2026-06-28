@@ -171,7 +171,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 14,
     padding: 12,
-    marginTop: 20,
+    // marginTop: 20,
     gap: 6,
   },
   loadingRow: {

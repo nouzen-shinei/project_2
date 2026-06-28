@@ -133,7 +133,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
   const [dateTo, setDateTo] = useState<string>('');
   const currentMonthId = useMemo(() => new Date().toISOString().slice(0, 7), []);
   const [selectedMonthId, setSelectedMonthId] = useState<string>(currentMonthId);
-  const [timePreset, setTimePreset] = useState<'all' | '7d' | '30d' | '90d' | 'month' | 'custom'>('month');
+  const [timePreset, setTimePreset] = useState<'all' | '7d' | '30d' | '90d' | 'month' | 'custom'>('all');
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [showMethodPicker, setShowMethodPicker] = useState(false);
   const [showStudentPicker, setShowStudentPicker] = useState(false);
@@ -745,7 +745,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
       }
 
       return (
-        <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
+        <View style={{ paddingHorizontal: 16, paddingBottom: 0, marginTop: 15 }}>
           {renderItem({ item: item.payment })}
         </View>
       );
@@ -865,7 +865,7 @@ export default function FeeHistory({ onClose }: { onClose?: () => void }) {
                 <TypedGHFlatList<string>
                   data={monthOptions}
                   keyExtractor={(id) => id}
-                  style={{ maxHeight: 320 }}
+                  style={{ maxHeight: 240 }}
                   onEndReached={() => setMonthListCount((c) => Math.min(c + 60, maxMonthOptions))}
                   onEndReachedThreshold={0.2}
                   renderItem={({ item: monthId }) => {
@@ -1134,6 +1134,7 @@ const styles = StyleSheet.create({
   filterOptionsModal: {
     width: 320,
     maxWidth: '90%',
+    maxHeight: '80%',
     borderWidth: 1,
     borderRadius: 12,
     padding: 16,

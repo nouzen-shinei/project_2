@@ -6153,7 +6153,15 @@ export default function Fees() {
   // Removed duplicate getCorrectFeeAmount function - using the memoized version above
 
   // Optimized summary calculations with proper memoization
-  const { totalAmount, paidAmount, pendingAmount } = useMemo(() => {
+  const { totalAmount, paidAmount, pendingAmount, collectedThisMonth } = useMemo(() => {
+    const now = new Date();
+    const isInCurrentMonth = (dateStr?: string | null) => {
+      if (!dateStr) return false;
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return false;
+      return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+    };
+
     const total = fees.reduce((sum, record) => sum + getCorrectFeeAmount(record), 0);
     const paid = fees.reduce((sum, record) => {
       const category = categorizeFee(record);
@@ -6165,8 +6173,41 @@ export default function Fees() {
       return sum;
     }, 0);
     const pending = total - paid;
-    
-    return { totalAmount: total, paidAmount: paid, pendingAmount: pending };
+
+    // Only count payments actually made this calendar month
+    const thisMonthPaid = fees.reduce((sum, record) => {
+      const details = record.paymentDetails as any;
+
+      // Structured payments (payment_* keys) — sum only those in current month
+      if (details && typeof details === 'object') {
+        const paymentKeys = Object.keys(details).filter(
+          (k) => k.startsWith('payment_') && details[k] && typeof details[k] === 'object'
+        );
+        if (paymentKeys.length > 0) {
+          return sum + paymentKeys.reduce((acc, key) => {
+            const p = details[key];
+            const pd = p?.paymentDate || p?.date;
+            const amt = Number(p?.amount) || 0;
+            return acc + (isInCurrentMonth(pd) ? amt : 0);
+          }, 0);
+        }
+      }
+
+      // Legacy fully-paid fee with paidDate in current month
+      if (record.status === 'paid' && isInCurrentMonth(record.paidDate)) {
+        return sum + getCorrectFeeAmount(record);
+      }
+
+      // Legacy partial payment made in current month
+      const legacyPaymentDate = (details && details.paymentDate) || record.paidDate;
+      if ((record.paidAmount || 0) > 0 && isInCurrentMonth(legacyPaymentDate)) {
+        return sum + (record.paidAmount || 0);
+      }
+
+      return sum;
+    }, 0);
+
+    return { totalAmount: total, paidAmount: paid, pendingAmount: pending, collectedThisMonth: thisMonthPaid };
   }, [fees, getCorrectFeeAmount, categorizeFee]);
 
   const createFeeButtonState = useMemo(() => {
@@ -6675,9 +6716,12 @@ export default function Fees() {
         </View>
       )}
 
-  {/* Summary & Records */}
+  {/* Summary & Records.
+      The summary scrolls away while the filter/search/sort header stays
+      pinned via stickyHeaderIndices={[1]} (the summary is child 0, the
+      filter header is child 1). */}
   <GHScrollView
-          ref={recordsScrollRef as any}
+    ref={recordsScrollRef as any}
     style={styles.recordsList}
     contentContainerStyle={[styles.recordsContent, { paddingBottom: 120 }]}
     showsVerticalScrollIndicator={false}
@@ -6692,7 +6736,7 @@ export default function Fees() {
           onPress={() => setShowCalendarModal(true)}
           activeOpacity={0.9}
         >
-          <Text style={[styles.summaryAmount, { color: theme.success }]}>₹{paidAmount.toLocaleString()}</Text>
+          <Text style={[styles.summaryAmount, { color: theme.success }]}>₹{collectedThisMonth.toLocaleString()}</Text>
           <Text style={[styles.summaryLabel, { color: theme.textSecondary }]}>Collected This Month</Text>
           <View style={[styles.summaryIcon, { backgroundColor: `${theme.success}15` }] }>
             <CheckCircle size={20} color={theme.success} />
@@ -6712,7 +6756,7 @@ export default function Fees() {
       </View>
     </View>
 
-      {/* Filter Tabs */}
+      {/* Filter Tabs (pinned sticky header) */}
       <View
         style={[
           styles.filterHeader,
@@ -6727,185 +6771,178 @@ export default function Fees() {
           },
         ]}
       >
-        {/* Filter Tabs Row */}
-        <View style={{ width: '100%', marginBottom: 6 }}>
-          <GHScrollView
-            ref={filtersScrollRef as any}
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={{ 
-              minHeight: Platform.select({ web: 48, default: 34 }),
-              maxHeight: Platform.select({ web: 52, default: 38 }),
-              // Parent `recordsContent` already provides horizontal padding.
-              marginTop: 0, 
-              marginBottom: 0
-            }}
-            contentContainerStyle={{ 
-              alignItems: 'center', 
-              paddingVertical: Platform.select({ web: 4, default: 1 }),
-              paddingRight: 8,
-              minHeight: Platform.select({ web: 48, default: 34 })
-            }}
-            nestedScrollEnabled
-            // Prevent parent from interrupting horizontal swipes on Android
-            disallowInterruption
-            simultaneousHandlers={recordsScrollRef}
-            onStartShouldSetResponderCapture={() => true}
-            onMoveShouldSetResponderCapture={() => true}
-            onStartShouldSetResponder={() => true}
-            onMoveShouldSetResponder={() => true}
-            onTouchStart={() => {
-              setRecordsScrollEnabled(false);
-              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: false });
-            }}
-            onTouchEnd={() => {
-              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
-              setRecordsScrollEnabled(true);
-            }}
-            onTouchCancel={() => {
-              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
-              setRecordsScrollEnabled(true);
-            }}
-            onScrollBeginDrag={() => {
-              setRecordsScrollEnabled(false);
-              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: false });
-            }}
-            onScrollEndDrag={() => {
-              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
-              setRecordsScrollEnabled(true);
-            }}
-            onMomentumScrollEnd={() => {
-              recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
-              setRecordsScrollEnabled(true);
-            }}
-          >
-            {filters.map((filter) => (
-              <TouchableOpacity
-                key={filter.key}
-                style={[
-                  styles.filterTab,
-                  {
-                    backgroundColor: selectedFilter === filter.key ? filter.color : theme.background,
-                    borderColor: filter.color,
-                    borderWidth: selectedFilter === filter.key ? 0 : 1,
-                    paddingHorizontal: Platform.select({ web: isSmallScreen ? 16 : 14, default: 10 }),
-                    paddingVertical: Platform.select({ web: isSmallScreen ? 10 : 9, default: 5 }),
-                    borderRadius: Platform.select({ web: 18, default: 14 }),
-                    marginRight: Platform.select({ web: 10, default: 8 }),
-                    minHeight: Platform.select({ web: 38, default: 28 }),
-                    justifyContent: 'center',
-                    alignItems: 'center',
-                  },
-                  selectedFilter === filter.key && styles.activeFilterTab
-                ]}
-                onPress={() => setSelectedFilter(filter.key)}
-              >
-                <Text style={[
-                  styles.filterText,
-                  { 
-                    color: selectedFilter === filter.key ? '#ffffff' : filter.color, 
-                    fontWeight: isSmallScreen ? '500' : '400',
-                    fontSize: Platform.select({ web: isSmallScreen ? 13 : 14, default: 11 }),
-                  }
-                ]}>
-                  {filter.label} ({getFeesCountByCategory(filter.key)})
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </GHScrollView>
-        </View>
-
-        {/* Search box */}
-  <View style={{ width: '100%', marginBottom: 4 }}>
-          <View style={[styles.searchContainer, { borderColor: theme.border, backgroundColor: theme.surface }]}
-          >
-            <Search size={18} color={theme.textSecondary} />
-            <TextInput
-              style={[styles.searchInput, { color: theme.text }]}
-              placeholder="Search by student, parent, grade, subject, amount, due date, or status"
-              placeholderTextColor={theme.textSecondary}
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-              returnKeyType="search"
-              clearButtonMode="while-editing"
-            />
-            {searchQuery.length > 0 && (
-              <TouchableOpacity onPress={() => setSearchQuery('')} accessibilityLabel="Clear search">
-                <X size={18} color={theme.textSecondary} />
-              </TouchableOpacity>
-            )}
-          </View>
-        </View>
-
-        {/* Sort/Hide Paid Row - with proper spacing and padding */}
-        <View style={{ 
-          width: '100%', 
-          flexDirection: 'row', 
+    {/* Filter Tabs Row */}
+    <View style={{ width: '100%', marginBottom: 6 }}>
+      <GHScrollView
+        ref={filtersScrollRef as any}
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={{ 
+          minHeight: Platform.select({ web: 48, default: 34 }),
+          maxHeight: Platform.select({ web: 52, default: 38 }),
+          marginTop: 0, 
+          marginBottom: 0
+        }}
+        contentContainerStyle={{ 
           alignItems: 'center', 
-          marginTop: 0,
-          marginBottom: 5, 
-          justifyContent: 'space-between',
-          minHeight: 44,
-          // Parent `recordsContent` already provides horizontal padding.
-        }}>
-          {/* Sort Button on the left */}
+          paddingVertical: Platform.select({ web: 4, default: 1 }),
+          paddingRight: 8,
+          minHeight: Platform.select({ web: 48, default: 34 })
+        }}
+        nestedScrollEnabled
+        disallowInterruption
+        onStartShouldSetResponderCapture={() => true}
+        onMoveShouldSetResponderCapture={() => true}
+        onStartShouldSetResponder={() => true}
+        onMoveShouldSetResponder={() => true}
+        onTouchStart={() => {
+          setRecordsScrollEnabled(false);
+          recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: false });
+        }}
+        onTouchEnd={() => {
+          recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
+          setRecordsScrollEnabled(true);
+        }}
+        onTouchCancel={() => {
+          recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
+          setRecordsScrollEnabled(true);
+        }}
+        onScrollBeginDrag={() => {
+          setRecordsScrollEnabled(false);
+          recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: false });
+        }}
+        onScrollEndDrag={() => {
+          recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
+          setRecordsScrollEnabled(true);
+        }}
+        onMomentumScrollEnd={() => {
+          recordsScrollRef.current?.setNativeProps?.({ scrollEnabled: true });
+          setRecordsScrollEnabled(true);
+        }}
+      >
+        {filters.map((filter) => (
           <TouchableOpacity
-            style={[styles.sortButton, { 
-              backgroundColor: theme.surface, 
-              borderColor: theme.border,
-              paddingHorizontal: 10,
-              paddingVertical: 6,
-              minHeight: 30,
-              borderRadius: 8
-            }]}
-            onPress={() => {
-              const options = ['date', 'amount', 'student'] as const;
-              const currentIndex = options.indexOf(sortBy);
-              const nextIndex = (currentIndex + 1) % options.length;
-              setSortBy(options[nextIndex]);
-            }}
+            key={filter.key}
+            style={[
+              styles.filterTab,
+              {
+                backgroundColor: selectedFilter === filter.key ? filter.color : theme.background,
+                borderColor: filter.color,
+                borderWidth: selectedFilter === filter.key ? 0 : 1,
+                paddingHorizontal: Platform.select({ web: isSmallScreen ? 16 : 14, default: 10 }),
+                paddingVertical: Platform.select({ web: isSmallScreen ? 10 : 9, default: 5 }),
+                borderRadius: Platform.select({ web: 18, default: 14 }),
+                marginRight: Platform.select({ web: 10, default: 8 }),
+                minHeight: Platform.select({ web: 38, default: 28 }),
+                justifyContent: 'center',
+                alignItems: 'center',
+              },
+              selectedFilter === filter.key && styles.activeFilterTab,
+            ]}
+            onPress={() => setSelectedFilter(filter.key)}
           >
-            <Filter size={14} color={theme.primary} />
-            <Text style={[styles.sortText, { 
-              color: theme.primary, 
-              fontSize: isSmallScreen ? 11 : 12,
-              marginLeft: 4
-            }]}> 
-              Sort by {sortBy === 'date' ? 'Date' : sortBy === 'amount' ? 'Amount' : 'Student'}
+            <Text style={[
+              styles.filterText,
+              { 
+                color: selectedFilter === filter.key ? '#ffffff' : filter.color, 
+                fontWeight: isSmallScreen ? '500' : '400',
+                fontSize: Platform.select({ web: isSmallScreen ? 13 : 14, default: 11 }),
+              }
+            ]}>
+              {filter.label} ({getFeesCountByCategory(filter.key)})
             </Text>
           </TouchableOpacity>
+        ))}
+      </GHScrollView>
+    </View>
 
-          {/* Hide Paid Fees Toggle - Only show when "All" filter is selected */}
-          {selectedFilter === 'All' && (
-            <TouchableOpacity
-              style={[styles.inlineToggleButton, { 
-                paddingHorizontal: 8,
-                paddingVertical: 8,
-                minHeight: 36,
-                flexDirection: 'row',
-                alignItems: 'center',
-                gap: 8
-              }]}
-              onPress={() => setHidePaidFees(!hidePaidFees)}
-            >
-              <Text style={[styles.inlineToggleText, { 
-                color: hidePaidFees ? theme.text : theme.text,
-                fontSize: isSmallScreen ? 12 : 13
-              }]}> 
-                {hidePaidFees ? 'Show Paid' : 'Hide Paid'}
-              </Text>
-              <View style={[styles.smallToggleSwitch, { 
-                backgroundColor: hidePaidFees ? theme.primary : theme.border
-              }]}> 
-                <View style={[styles.smallToggleThumb, { 
-                  backgroundColor: '#ffffff',
-                  transform: [{ translateX: hidePaidFees ? 14 : 2 }]
-                }]} />
-              </View>
-            </TouchableOpacity>
-          )}
-        </View>
+    {/* Search box */}
+    <View style={{ width: '100%', marginBottom: 4 }}>
+      <View style={[styles.searchContainer, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+        <Search size={18} color={theme.textSecondary} />
+        <TextInput
+          style={[styles.searchInput, { color: theme.text }]}
+          placeholder="Search by student, parent, grade, subject, amount, due date, or status"
+          placeholderTextColor={theme.textSecondary}
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          returnKeyType="search"
+          clearButtonMode="while-editing"
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity onPress={() => setSearchQuery('')} accessibilityLabel="Clear search">
+            <X size={18} color={theme.textSecondary} />
+          </TouchableOpacity>
+        )}
       </View>
+    </View>
+
+    {/* Sort / Hide Paid Row */}
+    <View style={{ 
+      width: '100%', 
+      flexDirection: 'row', 
+      alignItems: 'center', 
+      marginTop: 0,
+      marginBottom: 5, 
+      justifyContent: 'space-between',
+      minHeight: 44,
+    }}>
+      <TouchableOpacity
+        style={[styles.sortButton, { 
+          backgroundColor: theme.surface, 
+          borderColor: theme.border,
+          paddingHorizontal: 10,
+          paddingVertical: 6,
+          minHeight: 30,
+          borderRadius: 8
+        }]}
+        onPress={() => {
+          const options = ['date', 'amount', 'student'] as const;
+          const currentIndex = options.indexOf(sortBy);
+          const nextIndex = (currentIndex + 1) % options.length;
+          setSortBy(options[nextIndex]);
+        }}
+      >
+        <Filter size={14} color={theme.primary} />
+        <Text style={[styles.sortText, { 
+          color: theme.primary, 
+          fontSize: isSmallScreen ? 11 : 12,
+          marginLeft: 4
+        }]}> 
+          Sort by {sortBy === 'date' ? 'Date' : sortBy === 'amount' ? 'Amount' : 'Student'}
+        </Text>
+      </TouchableOpacity>
+
+      {selectedFilter === 'All' && (
+        <TouchableOpacity
+          style={[styles.inlineToggleButton, { 
+            paddingHorizontal: 8,
+            paddingVertical: 8,
+            minHeight: 36,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 8
+          }]}
+          onPress={() => setHidePaidFees(!hidePaidFees)}
+        >
+          <Text style={[styles.inlineToggleText, { 
+            color: theme.text,
+            fontSize: isSmallScreen ? 12 : 13
+          }]}> 
+            {hidePaidFees ? 'Show Paid' : 'Hide Paid'}
+          </Text>
+          <View style={[styles.smallToggleSwitch, { 
+            backgroundColor: hidePaidFees ? theme.primary : theme.border
+          }]}> 
+            <View style={[styles.smallToggleThumb, { 
+              backgroundColor: '#ffffff',
+              transform: [{ translateX: hidePaidFees ? 14 : 2 }]
+            }]} />
+          </View>
+        </TouchableOpacity>
+      )}
+    </View>
+  </View>
 
   {/* Fee Records */}
         {Object.keys(groupedRecords).length > 0 ? (
@@ -6922,7 +6959,7 @@ export default function Fees() {
                 : record.amount;
               return sum + (recordAmount - (record.paidAmount || 0));
             }, 0) : 0;
-            
+
             return (
               <View key={month} style={styles.monthGroup}>
                 <View style={[styles.monthHeaderContainer, isOverdue && { backgroundColor: `${getStatusColor('overdue')}10`, padding: 12, borderRadius: 8, borderLeftWidth: 4, borderLeftColor: getStatusColor('overdue') }]}>
@@ -6946,7 +6983,7 @@ export default function Fees() {
                   const category = categorizeFee(record);
                   const StatusIcon = getStatusIcon(category);
                   const statusColor = getStatusColor(category);
-                  const student = students.find(s => s.id === record.studentId);
+                  const student = studentMap[record.studentId];
 
                   return (
                     <TouchableOpacity 
