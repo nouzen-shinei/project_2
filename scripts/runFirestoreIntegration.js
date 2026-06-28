@@ -26,7 +26,7 @@ tsNode.register({
   project: path.join(process.cwd(), 'backend-runtime', 'tsconfig.json'),
 });
 
-const { initializeApp, getApps } = require('firebase-admin/app');
+const { initializeApp, getApps, deleteApp } = require('firebase-admin/app');
 const { getFirestore, Timestamp } = require('firebase-admin/firestore');
 const { getDatabase } = require('firebase-admin/database');
 const {
@@ -337,6 +337,17 @@ async function main() {
 
   if (failures.length > 0) {
     process.exitCode = 2;
+  }
+
+  // Delete the Firebase app to close all open SDK connections and allow the
+  // process to exit cleanly. Without this, the Firestore and RTDB connections
+  // keep the event loop alive indefinitely.
+  const apps = getApps();
+  if (apps.length > 0) {
+    await deleteApp(apps[0]);
+  }
+
+  if (failures.length > 0) {
     throw failures[0];
   }
 }
