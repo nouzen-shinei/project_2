@@ -471,11 +471,51 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         if (index >= 0) {
           const next = [...prev];
           const existing = next[index];
-          next[index] = {
+          const merged: HydratedMessageState = {
             ...existing,
             ...nextMessage,
             isNewMessage: isDeleted ? false : existing.isNewMessage,
           };
+
+          // Read receipts are monotonic: once a message is delivered/read it can
+          // never regress. Cache hydration or an out-of-order realtime event can
+          // otherwise carry a stale `read`/`delivered` flag and silently drop a
+          // freshly applied double/blue tick — which is exactly the "tick does
+          // not update in realtime" symptom. Reconcile the strongest known
+          // status from the existing row, the raw incoming payload, and the
+          // hydrated result so the tick only ever moves forward.
+          const resolvedDeliveredAt =
+            (incoming as ChatMessage).deliveredAt ||
+            nextMessage.deliveredAt ||
+            existing.deliveredAt;
+          const resolvedReadAt =
+            (incoming as ChatMessage).readAt ||
+            nextMessage.readAt ||
+            existing.readAt;
+          const resolvedRead = Boolean(
+            existing.read ||
+              (incoming as ChatMessage).read ||
+              nextMessage.read ||
+              resolvedReadAt
+          );
+          const resolvedDelivered = Boolean(
+            existing.delivered ||
+              (incoming as ChatMessage).delivered ||
+              nextMessage.delivered ||
+              resolvedDeliveredAt ||
+              resolvedRead
+          );
+
+          merged.delivered = resolvedDelivered;
+          merged.read = resolvedRead;
+          if (resolvedDeliveredAt) {
+            merged.deliveredAt = resolvedDeliveredAt;
+          }
+          if (resolvedReadAt) {
+            merged.readAt = resolvedReadAt;
+          }
+
+          next[index] = merged;
           return next;
         }
 
@@ -495,6 +535,50 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       applyMessagesUpdate,
     ]
   );
+
+  // Optimistically reflect that the local user has READ specific incoming
+  // messages, without waiting for the backend receipt round-trip to echo back.
+  //
+  // The recipient's own "unread messages" divider is derived from each message's
+  // `read` flag. If we only flip `read` when the server echoes the receipt,
+  // the divider lingers for a full network round-trip (and the matching blue
+  // tick on the sender appears at that same moment) — they are two symptoms of
+  // the same delay. Flipping `read` locally the instant the message is actually
+  // viewed clears the divider immediately; the receipt is still sent so the
+  // sender's blue tick follows as the network allows. Monotonic by design:
+  // already-read messages are never touched, so this can never regress state.
+  const markMessagesReadLocally = useCallback((messageIds: Iterable<string>) => {
+    const idSet = new Set<string>();
+    for (const rawId of messageIds || []) {
+      const id = rawId == null ? '' : String(rawId).trim();
+      if (id) {
+        idSet.add(id);
+      }
+    }
+    if (idSet.size === 0) {
+      return;
+    }
+
+    const readAt = new Date().toISOString();
+    applyMessagesUpdate((prev) => {
+      let changed = false;
+      const next = prev.map((message) => {
+        const id = message?.id != null ? String(message.id).trim() : '';
+        if (!id || !idSet.has(id) || message.read) {
+          return message;
+        }
+        changed = true;
+        return {
+          ...message,
+          read: true,
+          readAt: message.readAt || readAt,
+          delivered: true,
+          deliveredAt: message.deliveredAt || readAt,
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [applyMessagesUpdate]);
 
   const prefetchNextPage = useCallback(
     (overrideCursor?: string | null, overrideHasMore?: boolean) => {
@@ -1963,5 +2047,6 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
     sendGif,
     editMessage: editExistingMessage,
     deleteMessage: deleteExistingMessage,
+    markMessagesReadLocally,
   };
 }

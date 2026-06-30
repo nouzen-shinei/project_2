@@ -390,6 +390,9 @@ const {
   resolveChatPendingConversationDerivedState,
 } = require('../lib/chatPendingConversationDerived');
 const {
+  resolveChatPendingFooterSignature,
+} = require('../lib/chatPendingFooterSignature');
+const {
   createChatReplyJumpMetricRollupState,
   flushChatReplyJumpMetricRollup,
   recordChatReplyJumpMetricRollup,
@@ -457,6 +460,9 @@ const {
 const {
   resolveChatUnreadDividerDerivedState,
 } = require('../lib/chatUnreadDividerState');
+const {
+  resolveChatUnreadDividerSeed,
+} = require('../lib/chatUnreadDividerSeed');
 const {
   resolveChatUnreadSeparatorReconcilePlan,
 } = require('../lib/chatUnreadSeparatorReconcileState');
@@ -7430,7 +7436,155 @@ function withEnv(overrides, callback) {
     'Unread-divider helper should still derive label from seed count in fallback mode'
   );
 
+  // ── Frozen seed anchor (WhatsApp-style pinning) ──
+  // When a seedAnchorMessageId is supplied and still exists, the divider stays
+  // pinned to it and freezes the count, even though the top message has since
+  // been marked read (so the live "first unread" pointer has moved).
+  const derivedSeededPinned = resolveChatUnreadDividerDerivedState({
+    displayedMessages: [
+      { id: 's1', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: true },
+      { id: 's2', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: false },
+      { id: 's3', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: false },
+    ],
+    effectiveUserEmail: 'teacher@school.com',
+    selectedTeamMemberEmail: 'parent@one.com',
+    unreadDividerSeedCount: 3,
+    seedAnchorMessageId: 's1',
+    normalizeParticipantEmail,
+    normalizeMessageId,
+  });
+
+  assert.strictEqual(
+    derivedSeededPinned.unreadSeparatorAnchorMessageId,
+    's1',
+    'Unread-divider helper should pin the separator to the frozen seed anchor even after it was read'
+  );
+  assert.strictEqual(
+    derivedSeededPinned.unreadDividerDisplayCount,
+    3,
+    'Unread-divider helper should freeze the divider count to the seed count when pinned'
+  );
+
+  // If the seed anchor no longer exists in the window, fall back to live state.
+  const derivedSeededMissing = resolveChatUnreadDividerDerivedState({
+    displayedMessages: [
+      { id: 's2', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: false },
+      { id: 's3', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: false },
+    ],
+    effectiveUserEmail: 'teacher@school.com',
+    selectedTeamMemberEmail: 'parent@one.com',
+    unreadDividerSeedCount: 3,
+    seedAnchorMessageId: 'gone',
+    normalizeParticipantEmail,
+    normalizeMessageId,
+  });
+
+  assert.strictEqual(
+    derivedSeededMissing.unreadSeparatorAnchorMessageId,
+    's2',
+    'Unread-divider helper should fall back to live first-unread when the seed anchor is gone'
+  );
+
+  // ── Strict seed-driven mode (unreadDividerSeeded: true) ──
+  // Opened with zero unread: even though a fresh unread message is now present
+  // (arrived while the user is actively viewing), no divider anchor is produced.
+  const derivedSeededNoAnchor = resolveChatUnreadDividerDerivedState({
+    displayedMessages: [
+      { id: 'live-1', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: false },
+    ],
+    effectiveUserEmail: 'teacher@school.com',
+    selectedTeamMemberEmail: 'parent@one.com',
+    unreadDividerSeedCount: 0,
+    seedAnchorMessageId: null,
+    unreadDividerSeeded: true,
+    normalizeParticipantEmail,
+    normalizeMessageId,
+  });
+  assert.strictEqual(
+    derivedSeededNoAnchor.unreadSeparatorAnchorMessageId,
+    null,
+    'Seeded helper must NOT show a divider for messages arriving while the user is present (opened with 0 unread)'
+  );
+
+  // Opened with unread: stays pinned to the captured anchor in strict mode.
+  const derivedSeededPinnedStrict = resolveChatUnreadDividerDerivedState({
+    displayedMessages: [
+      { id: 'p1', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: true },
+      { id: 'p2', sender: 'parent@one.com', recipientId: 'teacher@school.com', read: false },
+    ],
+    effectiveUserEmail: 'teacher@school.com',
+    selectedTeamMemberEmail: 'parent@one.com',
+    unreadDividerSeedCount: 2,
+    seedAnchorMessageId: 'p1',
+    unreadDividerSeeded: true,
+    normalizeParticipantEmail,
+    normalizeMessageId,
+  });
+  assert.strictEqual(
+    derivedSeededPinnedStrict.unreadSeparatorAnchorMessageId,
+    'p1',
+    'Seeded helper must keep the divider pinned to the captured anchor in strict mode'
+  );
+
   logger.debug('✓ testChatUnreadDividerStateHelper passed');
+})();
+
+(function testChatUnreadDividerSeedHelper() {
+  const normalizeMessageId = (v) => (v === null || v === undefined ? '' : String(v));
+
+  // Live first-unread present -> anchor to it; count is the max of all signals.
+  const liveSeed = resolveChatUnreadDividerSeed({
+    firstUnreadMessageId: 'm5',
+    incomingUnreadCount: 2,
+    incomingConversationMessages: [{ id: 'm3' }, { id: 'm4' }, { id: 'm5' }, { id: 'm6' }],
+    summaryUnreadCount: 5,
+    rosterUnreadCount: 0,
+    normalizeMessageId,
+  });
+  assert.strictEqual(liveSeed.anchorMessageId, 'm5', 'Seed should anchor to the live first-unread message');
+  assert.strictEqual(
+    liveSeed.count,
+    2,
+    'Seed count should prefer the accurate live count over an inflated summary badge count'
+  );
+
+  // No live unread but summary says 3 -> boundary 3 from the end.
+  const boundarySeed = resolveChatUnreadDividerSeed({
+    firstUnreadMessageId: null,
+    incomingUnreadCount: 0,
+    incomingConversationMessages: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }, { id: 'e' }],
+    summaryUnreadCount: 3,
+    rosterUnreadCount: 0,
+    normalizeMessageId,
+  });
+  assert.strictEqual(boundarySeed.anchorMessageId, 'c', 'Seed should fall back to the count boundary when no live unread is loaded');
+  assert.strictEqual(boundarySeed.count, 3, 'Seed count should reflect the summary signal in the boundary case');
+
+  // Roster count exceeds the loaded incoming length -> clamp boundary to start.
+  const clampedSeed = resolveChatUnreadDividerSeed({
+    firstUnreadMessageId: null,
+    incomingUnreadCount: 0,
+    incomingConversationMessages: [{ id: 'x' }, { id: 'y' }],
+    summaryUnreadCount: 0,
+    rosterUnreadCount: 9,
+    normalizeMessageId,
+  });
+  assert.strictEqual(clampedSeed.anchorMessageId, 'x', 'Seed boundary should clamp to the first loaded message');
+  assert.strictEqual(clampedSeed.count, 9, 'Seed count should reflect the roster signal');
+
+  // Nothing unread anywhere -> no anchor, zero count (no divider).
+  const emptySeed = resolveChatUnreadDividerSeed({
+    firstUnreadMessageId: null,
+    incomingUnreadCount: 0,
+    incomingConversationMessages: [{ id: 'only' }],
+    summaryUnreadCount: 0,
+    rosterUnreadCount: 0,
+    normalizeMessageId,
+  });
+  assert.strictEqual(emptySeed.anchorMessageId, null, 'Seed should produce no anchor when nothing is unread');
+  assert.strictEqual(emptySeed.count, 0, 'Seed count should be zero when nothing is unread');
+
+  logger.debug('✓ testChatUnreadDividerSeedHelper passed');
 })();
 
 (function testChatUnreadSeparatorReconcileStateHelper() {
@@ -12563,6 +12717,64 @@ function withEnv(overrides, callback) {
   );
 
   logger.debug('✓ testChatPendingConversationDerivedHelper passed');
+})();
+
+(function testChatPendingFooterSignatureHelper() {
+  const baseInput = {
+    selectedRecipientId: 'recipient-1',
+    pendingMessages: new Map([
+      ['text-1', { recipientId: 'recipient-1', status: 'sending' }],
+      ['text-2', { recipientId: 'recipient-2', status: 'sending' }],
+    ]),
+    pendingMedia: new Map([
+      ['media-1', { recipientId: 'recipient-1', status: 'sending', progress: 42 }],
+    ]),
+    pendingAttachments: new Map([
+      ['att-1', { recipientId: 'recipient-1', status: 'sending', progress: 0 }],
+    ]),
+    isTyping: false,
+    resolvePendingMessageStatus: (m) => m.status,
+  };
+
+  const sig1 = resolveChatPendingFooterSignature(baseInput);
+
+  // Only entries for the selected recipient are included.
+  assert.ok(sig1.includes('t:text-1:sending:0'), 'Signature should include selected-recipient text entry');
+  assert.ok(!sig1.includes('text-2'), 'Signature should exclude other-recipient entries');
+
+  // Status transition (sending -> sent + serverMessageId) must change the signature.
+  const sig2 = resolveChatPendingFooterSignature({
+    ...baseInput,
+    pendingMessages: new Map([
+      ['text-1', { recipientId: 'recipient-1', status: 'sent', serverMessageId: 'srv-1' }],
+      ['text-2', { recipientId: 'recipient-2', status: 'sending' }],
+    ]),
+  });
+  assert.notStrictEqual(sig1, sig2, 'Signature must change when a pending status transitions');
+  assert.ok(sig2.includes('t:text-1:sent:1'), 'Signature should encode sent status and server-id presence');
+
+  // Typing indicator flips the signature.
+  const sigTyping = resolveChatPendingFooterSignature({ ...baseInput, isTyping: true });
+  assert.notStrictEqual(sig1, sigTyping, 'Signature must change when typing state changes');
+
+  // Coarse progress bucketing: small deltas within a bucket collapse, large
+  // deltas change. Base progress 42 buckets to 40; 41 also buckets to 40.
+  const sigProgressSame = resolveChatPendingFooterSignature({
+    ...baseInput,
+    pendingMedia: new Map([['media-1', { recipientId: 'recipient-1', status: 'sending', progress: 41 }]]),
+  });
+  assert.strictEqual(sig1, sigProgressSame, 'Signature should bucket tiny progress changes to avoid re-render storms');
+  const sigProgressDiff = resolveChatPendingFooterSignature({
+    ...baseInput,
+    pendingMedia: new Map([['media-1', { recipientId: 'recipient-1', status: 'sending', progress: 80 }]]),
+  });
+  assert.notStrictEqual(sig1, sigProgressDiff, 'Signature should change on meaningful progress jumps');
+
+  // No selected recipient -> only typing flag.
+  const sigNoRecipient = resolveChatPendingFooterSignature({ ...baseInput, selectedRecipientId: '' });
+  assert.strictEqual(sigNoRecipient, 'typing:0', 'Signature should collapse to typing flag with no recipient');
+
+  logger.debug('✓ testChatPendingFooterSignatureHelper passed');
 })();
 
 (function testChatPendingReconciliationStateHelper() {

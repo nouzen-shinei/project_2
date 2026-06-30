@@ -48,13 +48,16 @@ const AnimatedMessageWrapper = React.memo(function AnimatedMessageWrapper({
     if (isNewMessage && !globalAnimatedMessages.current.has(messageId)) {
       globalAnimatedMessages.current.add(messageId);
 
-      const enterOffsetX = isIncomingMessage ? -12 : 10;
-      const enterOffsetY = isIncomingMessage ? 6 : 4;
-      const enterScale = isIncomingMessage ? 0.985 : 0.99;
-      const fadeDuration = isIncomingMessage ? 320 : 220;
-      const slideXDuration = isIncomingMessage ? 340 : 240;
-      const slideYDuration = isIncomingMessage ? 320 : 220;
-      const scaleDuration = isIncomingMessage ? 270 : 190;
+      // Smooth, WhatsApp-style entrance: messages rise into place with a fade
+      // and gentle scale. We avoid horizontal motion (it reads as a jerk on
+      // recycled rows); the side alignment already comes from the row styles.
+      const enterOffsetX = 0;
+      const enterOffsetY = isIncomingMessage ? 16 : 12;
+      const enterScale = isIncomingMessage ? 0.96 : 0.975;
+      const fadeDuration = isIncomingMessage ? 300 : 240;
+      const slideXDuration = isIncomingMessage ? 300 : 240;
+      const slideYDuration = isIncomingMessage ? 340 : 280;
+      const scaleDuration = isIncomingMessage ? 320 : 260;
 
       // Reset animation values for entrance animation
       fadeAnim.setValue(0);

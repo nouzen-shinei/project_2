@@ -241,6 +241,7 @@ import {
 } from '@/lib/chatUnreadRepairMetrics';
 import { resolveChatLiveConversationSummary } from '@/lib/chatConversationSummaryState';
 import { resolveChatUnreadDividerDerivedState } from '@/lib/chatUnreadDividerState';
+import { resolveChatUnreadDividerSeed } from '@/lib/chatUnreadDividerSeed';
 import { resolveChatUnreadSeparatorReconcilePlan } from '@/lib/chatUnreadSeparatorReconcileState';
 import { resolveChatFilteredTeamMembers } from '@/lib/chatTeamMemberListState';
 import {
@@ -341,6 +342,7 @@ import { resolveChatPendingRetryBatchPlan } from '@/lib/chatPendingRetryBatchSta
 import { resolveChatPendingRetryDispatchPromises } from '@/lib/chatPendingRetryDispatchState';
 import { resolveChatPendingAutoRetryPlan } from '@/lib/chatPendingAutoRetryState';
 import { resolveChatPendingConversationDerivedState } from '@/lib/chatPendingConversationDerived';
+import { resolveChatPendingFooterSignature } from '@/lib/chatPendingFooterSignature';
 import { resolveChatNearBottomState } from '@/lib/chatNearBottomState';
 import {
   resolveChatStickyDateIdleHidePlan,
@@ -394,6 +396,7 @@ import { useDownloadState } from '@/hooks/useDownloadState';
 import { setEditingMessageId, setMessageReactionsForMessage } from '@/lib/messageUiStateStore';
 import { useMessageUiState } from '@/hooks/useMessageUiState';
 import AnimatedMessageWrapper from '@/components/chat/AnimatedMessageWrapper';
+import AnimatedChatDivider from '@/components/chat/AnimatedChatDivider';
 import MessageRow from '@/components/chat/MessageRow';
 import MessageReplySnippet from '@/components/chat/MessageReplySnippet';
 import MessageReactionPills from '@/components/chat/MessageReactionPills';
@@ -1217,6 +1220,7 @@ export default function Chat() {
     sendGif,
     editMessage: editChatMessage,
     deleteMessage: deleteChatMessage,
+    markMessagesReadLocally,
   } = useChat(selectedTeamMember?.id, { live: chatLiveActive });
 
   const CHAT_RECONNECT_TIMEOUT_MS = 8000;
@@ -1224,6 +1228,18 @@ export default function Chat() {
   const [showReconnectFallback, setShowReconnectFallback] = useState(false);
   const [showChatOpenHangActions, setShowChatOpenHangActions] = useState(false);
   const [isChatBootstrapGateDone, setIsChatBootstrapGateDone] = useState(false);
+  // Ref mirror so the (stable) viewability handler can read the gate without
+  // being recreated. While the "Loading conversation…" overlay is up (gate not
+  // done) the FlashList is still mounted behind it, so read receipts / optimistic
+  // read must be held until the chat is genuinely shown and interactive.
+  const isChatBootstrapGateDoneRef = useRef(false);
+  useEffect(() => {
+    isChatBootstrapGateDoneRef.current = isChatBootstrapGateDone;
+  }, [isChatBootstrapGateDone]);
+  const markMessagesReadLocallyRef = useRef(markMessagesReadLocally);
+  useEffect(() => {
+    markMessagesReadLocallyRef.current = markMessagesReadLocally;
+  }, [markMessagesReadLocally]);
   const shouldTrackReconnectFallback =
     Boolean(selectedTeamMember) &&
     Boolean(error) &&
@@ -1593,6 +1609,10 @@ export default function Chat() {
 
   // Global animation tracking to prevent multiple animations per message
   const globalAnimatedMessages = useRef<Set<string>>(new Set());
+  // Tracks which divider keys (unread / new-messages separators) have already
+  // played their entrance animation, so they don't replay on FlashList row
+  // recycling.
+  const animatedDividerKeysRef = useRef<Set<string>>(new Set());
 
   const ensureMessageTonePlayer = useCallback(async () => {
     if (messageTonePlayerRef.current) {
@@ -1608,9 +1628,16 @@ export default function Chat() {
       if (!messageToneAudioModeReadyRef.current) {
         try {
           await setAudioModeAsync({
-            playsInSilentMode: true,
+            // Respect the hardware silent / mute switch for the in-chat tune,
+            // exactly like big chat apps: when the device is silenced, the
+            // in-conversation message sound stays quiet (push notifications are
+            // handled separately by the OS). Setting this to `false` is the
+            // key difference from a generic media player.
+            playsInSilentMode: false,
             allowsRecording: false,
             shouldPlayInBackground: false,
+            // Briefly duck other audio (music/podcasts) for the short tone
+            // instead of pausing it.
             interruptionMode: 'duckOthers',
             interruptionModeAndroid: 'duckOthers',
             shouldRouteThroughEarpiece: false,
@@ -2741,6 +2768,7 @@ export default function Chat() {
       if (viewableEntries.length > 0) {
         const {
           warmTargets,
+          visibleUnreadIncomingIds,
           queueDispatchPlan: viewabilityQueueDispatchPlan,
         } = resolveChatViewabilityReceiptQueueDispatchPlan({
           viewableEntries,
@@ -2786,24 +2814,40 @@ export default function Chat() {
               .catch(() => undefined),
         });
 
-        const viewabilityQueueDispatchEffectsPlan =
-          resolveChatViewabilityQueueDispatchEffectsPlan(
-            viewabilityQueueDispatchPlan
-          );
+        // Hold ALL read/delivery receipt work — and the optimistic local read —
+        // until the conversation is genuinely shown and interactive. The
+        // "Loading conversation…" overlay is drawn on top of an already-mounted
+        // FlashList, so without this gate the viewport reports "viewable" rows
+        // and we would mark messages read/delivered while the user is still
+        // looking at the loading spinner.
+        if (isChatBootstrapGateDoneRef.current) {
+          const viewabilityQueueDispatchEffectsPlan =
+            resolveChatViewabilityQueueDispatchEffectsPlan(
+              viewabilityQueueDispatchPlan
+            );
 
-        if (
-          viewabilityQueueDispatchEffectsPlan.shouldUpdateDeliverySyncMarker &&
-          viewabilityQueueDispatchEffectsPlan.nextDeliverySyncMarker
-        ) {
-          lastConversationDeliverySyncRef.current =
-            viewabilityQueueDispatchEffectsPlan.nextDeliverySyncMarker;
-        }
+          if (
+            viewabilityQueueDispatchEffectsPlan.shouldUpdateDeliverySyncMarker &&
+            viewabilityQueueDispatchEffectsPlan.nextDeliverySyncMarker
+          ) {
+            lastConversationDeliverySyncRef.current =
+              viewabilityQueueDispatchEffectsPlan.nextDeliverySyncMarker;
+          }
 
-        if (viewabilityQueueDispatchEffectsPlan.shouldQueueSync) {
-          queueConversationReceiptSync(
-            viewabilityQueueDispatchEffectsPlan.queueOptions,
-            asyncContinuationGeneration
-          );
+          if (viewabilityQueueDispatchEffectsPlan.shouldQueueSync) {
+            queueConversationReceiptSync(
+              viewabilityQueueDispatchEffectsPlan.queueOptions,
+              asyncContinuationGeneration
+            );
+          }
+
+          // Optimistically reflect the read locally so the recipient's own
+          // unread divider clears the instant a message is actually viewed,
+          // decoupled from the backend echo round-trip. The receipt is still
+          // queued above, so the sender's blue tick follows as it propagates.
+          if (visibleUnreadIncomingIds.length > 0) {
+            markMessagesReadLocallyRef.current(visibleUnreadIncomingIds);
+          }
         }
       }
 
@@ -2963,8 +3007,15 @@ export default function Chat() {
     };
   }, [user?.email]);
 
-  // Stable viewability config
-  const viewabilityConfigRef = useRef({ itemVisiblePercentThreshold: 50 });
+  // Stable viewability config. `minimumViewTime` ensures a message must dwell
+  // in the viewport before it is reported as viewable — so scrolling past a
+  // message does NOT mark it read; only actually looking at it does. This is
+  // what drives accurate, WhatsApp-style read receipts.
+  const viewabilityConfigRef = useRef({
+    itemVisiblePercentThreshold: 50,
+    minimumViewTime: 350,
+    waitForInteraction: false,
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -3187,6 +3238,13 @@ export default function Chat() {
 
   const scheduleUnreadSeparatorDismiss = useCallback((delay: number = UNREAD_DIVIDER_AUTO_DISMISS_MS) => {
     if (!showUnreadSeparatorRef.current) {
+      return;
+    }
+
+    // A seeded divider stays pinned for the whole session (WhatsApp behaviour):
+    // it must not auto-dismiss while the user is still in the conversation. It
+    // is cleared only when switching chats (the reset effect).
+    if (unreadSeedAnchorMessageIdRef.current) {
       return;
     }
 
@@ -3600,6 +3658,22 @@ export default function Chat() {
   const [showUnreadSeparator, setShowUnreadSeparator] = useState(false);
   const [unreadSeparatorMessageId, setUnreadSeparatorMessageId] = useState<string | null>(null);
   const [unreadDividerSeedCount, setUnreadDividerSeedCount] = useState(0);
+  // Frozen "first unread on open" anchor. Captured once per chat so the divider
+  // is pinned to where your unread messages began (WhatsApp/Telegram style):
+  // it shows when you open a chat that has unread messages, stays at a stable
+  // position, and does not vanish as those messages are marked read. It is
+  // INDEPENDENT of the live read state (which drives blue ticks) — opening with
+  // unread shows it; messages arriving later while you're present do not.
+  const [unreadSeedAnchorMessageId, setUnreadSeedAnchorMessageId] = useState<string | null>(null);
+  const unreadSeedAnchorMessageIdRef = useRef<string | null>(null);
+  // Guard so the unread divider is seeded exactly once per chat (see the seed
+  // effect below, which is the single owner of "what was unread on open").
+  const unreadAnchorSeedInitializedChatKeyRef = useRef<string | null>(null);
+  // True once the open-time seed decision has been made for the current chat.
+  // After this, the divider is driven STRICTLY by the seed anchor, so a chat
+  // opened with zero unread never shows a divider for messages that arrive
+  // while the user is present and actively viewing them.
+  const [unreadDividerSeeded, setUnreadDividerSeeded] = useState(false);
   const unreadSeparatorDismissTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const unreadSeparatorMessageIdRef = useRef<string | null>(null);
   const showUnreadSeparatorRef = useRef(false);
@@ -3608,7 +3682,6 @@ export default function Chat() {
   const hasAcknowledgedUnreadRef = useRef(false);
   const incomingUnreadCountRef = useRef(0);
   const unreadDividerSeedCountRef = useRef(0);
-  const unreadSeedInitializedChatKeyRef = useRef<string | null>(null);
   const unreadDividerDismissedStateRef = useRef<{
     anchorMessageId: string;
     latestIncomingMessageId: string | null;
@@ -3658,6 +3731,18 @@ export default function Chat() {
   const clearNewMessageDivider = useCallback(() => {
     setShowNewDivider((current) => (current ? false : current));
     setNewDividerMessageId((current) => (current === null ? current : null));
+  }, []);
+
+  // Retire the seeded unread divider for the rest of the session (cleared on
+  // chat switch, when the next message arrives at the bottom, or when the user
+  // sends). Clearing the seed anchor makes the strict helper yield no anchor;
+  // the seed guard prevents it from re-appearing this session.
+  const clearUnreadDivider = useCallback(() => {
+    unreadSeedAnchorMessageIdRef.current = null;
+    setUnreadSeedAnchorMessageId((current) => (current === null ? current : null));
+    setShowUnreadSeparator((current) => (current ? false : current));
+    setUnreadSeparatorMessageId((current) => (current === null ? current : null));
+    unreadSeparatorIsVisibleRef.current = false;
   }, []);
 
   const showNewMessageDividerAt = useCallback((messageId: unknown) => {
@@ -3733,6 +3818,8 @@ export default function Chat() {
       effectiveUserEmail: effectiveUser?.email,
       selectedTeamMemberEmail: selectedTeamMember?.email,
       unreadDividerSeedCount,
+      seedAnchorMessageId: unreadSeedAnchorMessageId,
+      unreadDividerSeeded,
       normalizeParticipantEmail,
       normalizeMessageId,
     });
@@ -3743,6 +3830,8 @@ export default function Chat() {
     normalizeParticipantEmail,
     selectedTeamMember?.email,
     unreadDividerSeedCount,
+    unreadSeedAnchorMessageId,
+    unreadDividerSeeded,
   ]);
 
   const {
@@ -3758,18 +3847,73 @@ export default function Chat() {
     unreadDividerLabel,
   } = unreadDividerDerivedState;
 
-  const dismissUnreadDividerForCurrentBatch = useCallback((delay: number = UNREAD_DIVIDER_ACTION_DISMISS_MS) => {
-    const activeAnchorId = unreadSeparatorAnchorMessageId || unreadSeparatorMessageIdRef.current;
-    if (activeAnchorId) {
-      unreadDividerDismissedStateRef.current = {
-        anchorMessageId: activeAnchorId,
-        latestIncomingMessageId: latestIncomingMessageId || null,
-      };
+  const dismissUnreadDividerForCurrentBatch = useCallback((_delay: number = UNREAD_DIVIDER_ACTION_DISMISS_MS) => {
+    // No-op by design. The unread divider is owned entirely by the seed model:
+    // it is shown when the chat is opened with unread messages and cleared only
+    // on chat switch (the reset effect). The legacy "dismiss this batch on
+    // scroll/send" behaviour is intentionally disabled — it used to record a
+    // dismissed-batch marker that the Smart effect then matched against the
+    // freshly-seeded anchor and hid the divider instantly ("not even for a
+    // second"). Disabling it makes the divider reliably visible.
+  }, []);
+
+  // ── Seed the unread divider once per chat (WhatsApp / Telegram behaviour) ──
+  //    This is the SINGLE owner of "what was unread when this chat opened". It
+  //    runs once, on the first loaded snapshot for the conversation, and freezes
+  //    both the divider's anchor and its count via `resolveChatUnreadDividerSeed`
+  //    (live first-unread, else a summary/roster-count boundary). From then on
+  //    the divider is pinned for the session: it shows when you open a chat that
+  //    had unread messages, stays at a stable position, does not move as
+  //    messages are read, and does not vanish on read — it is INDEPENDENT of the
+  //    live read state (which drives blue ticks). Cleared only on chat switch.
+  useEffect(() => {
+    const chatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
+    if (!chatKey || !selectedTeamMember?.email || !effectiveUser?.email) {
+      return;
+    }
+    if (loading || !Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      return;
+    }
+    if (unreadAnchorSeedInitializedChatKeyRef.current === chatKey) {
+      return;
     }
 
-    hasAcknowledgedUnreadRef.current = true;
-    scheduleUnreadSeparatorDismissRef.current?.(delay);
-  }, [latestIncomingMessageId, unreadSeparatorAnchorMessageId]);
+    // Lock only once we have the participants AND the loaded messages, so the
+    // anchor is captured from the true "unread on open" snapshot. (Locking
+    // earlier could freeze an empty seed and suppress the divider entirely.)
+    unreadAnchorSeedInitializedChatKeyRef.current = chatKey;
+
+    const normalizedPartnerEmail = normalizeParticipantEmail(selectedTeamMember?.email);
+    const seed = resolveChatUnreadDividerSeed({
+      firstUnreadMessageId,
+      incomingUnreadCount,
+      incomingConversationMessages,
+      summaryUnreadCount: normalizedPartnerEmail
+        ? conversationSummaries.get(normalizedPartnerEmail)?.unreadCount
+        : 0,
+      rosterUnreadCount: (selectedTeamMember as any)?.unreadCount,
+      normalizeMessageId,
+    });
+
+    if (seed.anchorMessageId) {
+      unreadSeedAnchorMessageIdRef.current = seed.anchorMessageId;
+      setUnreadSeedAnchorMessageId(seed.anchorMessageId);
+    }
+    unreadDividerSeedCountRef.current = seed.count;
+    setUnreadDividerSeedCount(seed.count);
+    setUnreadDividerSeeded(true);
+  }, [
+    selectedTeamMember,
+    effectiveUser?.email,
+    loading,
+    displayedMessages,
+    firstUnreadMessageId,
+    incomingUnreadCount,
+    incomingConversationMessages,
+    conversationSummaries,
+    normalizeParticipantEmail,
+    normalizeMessageId,
+  ]);
 
   const liveSelectedConversationSummary = useMemo<ConversationSummary | null>(() => {
     return resolveChatLiveConversationSummary({
@@ -3811,7 +3955,12 @@ export default function Chat() {
       userEmail: effectiveUser?.email,
       isFocused,
       isAppActive,
-      readMessageIds: incomingUnreadMessageIds,
+      // Opening/focusing a conversation must NOT mark messages as read. Read
+      // receipts are driven purely by per-message viewability (see the
+      // onViewableItemsChanged handler), so the sender only sees "read" once
+      // the recipient has actually scrolled the specific message into view and
+      // dwelled on it. Here we only confirm delivery for the unread batch.
+      readMessageIds: [],
       requestConversationDelivered: incomingUnreadMessageIds.length > 0,
       queueGeneration: activeQueueGeneration,
       activeGeneration: activeQueueGeneration,
@@ -4868,6 +5017,7 @@ export default function Chat() {
         isAppActive &&
         !loading &&
         isInitialAnchorSettled &&
+        isChatBootstrapGateDone &&
         Date.now() >= messageToneCooldownUntilRef.current;
 
       if (canAttemptTone) {
@@ -4921,6 +5071,7 @@ export default function Chat() {
     isFocused,
     loading,
     isInitialAnchorSettled,
+    isChatBootstrapGateDone,
     normalizeParticipantEmail,
     playMessageSound,
     selectedTeamMember?.email,
@@ -5037,10 +5188,39 @@ export default function Chat() {
       animated?: boolean;
       delay?: number;
       skipAutoFlag?: boolean;
+      immediate?: boolean;
     }
   ) => {
-    const { animated = true, delay = 100, skipAutoFlag = false } = options ?? {};
-    const run = () => scrollToBottom(animated, delay, skipAutoFlag);
+    const { animated = true, delay = 100, skipAutoFlag = false, immediate = false } = options ?? {};
+    const run = () => scrollToBottom(animated, immediate ? 0 : delay, skipAutoFlag);
+
+    // ── Immediate path (user-initiated sends) ──────────────────────────────
+    //    InteractionManager.runAfterInteractions waits for every in-flight
+    //    interaction/animation to finish before running its callback. The
+    //    optimistic bubble's own entrance animation (Animated.timing) registers
+    //    an interaction handle, so routing the sender's snap-to-bottom through
+    //    InteractionManager held the scroll until that animation (and any
+    //    others) completed — which is exactly why a freshly sent message
+    //    appeared seconds late on the sender's device even though it had
+    //    already been delivered. For sends we bypass InteractionManager and
+    //    scroll on the next frame. A double rAF guarantees the newly inserted
+    //    footer bubble is committed and laid out before we compute the bottom
+    //    offset; the scrollToBottom retry loop then settles any residual gap.
+    if (immediate) {
+      const raf = globalThis.requestAnimationFrame;
+      if (typeof raf === 'function') {
+        raf(() => {
+          if (typeof raf === 'function') {
+            raf(run);
+          } else {
+            run();
+          }
+        });
+      } else {
+        setTimeout(run, 0);
+      }
+      return;
+    }
 
     if (InteractionManager?.runAfterInteractions) {
       InteractionManager.runAfterInteractions(run);
@@ -6275,6 +6455,16 @@ export default function Chat() {
     if (!messages || messages.length === 0) return;
     if (hasAnchoredInitialScrollRef.current) return;
 
+    // Wait until the unread divider seed is decided before choosing where to
+    // land. Until then we don't know whether to scroll to the unread divider or
+    // to the bottom, and anchoring early races the seed and wrongly snaps to the
+    // bottom (hiding the divider). The list stays hidden until anchored, so this
+    // wait is invisible to the user.
+    if (!unreadDividerSeeded) {
+      pendingInitialAnchorRef.current = true;
+      return;
+    }
+
     if (unreadSeparatorAnchorMessageId && !scrollToUnreadAttemptedRef.current) {
       scheduleScrollToUnread(unreadSeparatorAnchorMessageId);
       return;
@@ -6282,7 +6472,7 @@ export default function Chat() {
 
     pendingInitialAnchorRef.current = true;
     tryAnchorToBottom();
-  }, [messages, unreadSeparatorAnchorMessageId, selectedTeamMember?.id]);
+  }, [messages, unreadSeparatorAnchorMessageId, unreadDividerSeeded, selectedTeamMember?.id]);
 
   useEffect(() => {
     if (!messages || messages.length === 0) {
@@ -6316,10 +6506,52 @@ export default function Chat() {
     }
 
     if (isAtBottomRef.current) {
+      const prevTailId = lastTailIdRef.current;
       lastTailIdRef.current = lastId;
       resetUnseenCount();
       setShowScrollToBottomSafely(false);
+      // A message arrived while the user is at the bottom (caught up) — retire
+      // BOTH dividers: the new-messages divider and the seeded unread divider.
       clearNewMessageDivider();
+      clearUnreadDivider();
+
+      // The user is parked at the bottom of an interactive conversation, so any
+      // freshly-arrived incoming messages are being viewed as they land. Mark
+      // them read immediately (locally + receipt) so no unread divider ever
+      // flashes above them and the sender's blue tick follows promptly. Gated
+      // on the bootstrap gate + focus + active so nothing fires while the
+      // loading overlay is still up or the screen is backgrounded.
+      if (isFocused && isAppActive && isChatBootstrapGateDoneRef.current) {
+        const displayed = displayedMessagesRef.current;
+        const prevIdx = prevTailId
+          ? (displayedMessageIndexRef.current.get(String(prevTailId)) ?? -1)
+          : -1;
+        const arrived = prevIdx >= 0 ? displayed.slice(prevIdx + 1) : displayed.slice(-1);
+        const normalizedPartner = normalizeParticipantEmail(selectedTeamMember?.email);
+        const normalizedMe = normalizeParticipantEmail(effectiveUser?.email);
+        const arrivedReadIds: string[] = [];
+        if (normalizedPartner && normalizedMe) {
+          for (const arrivedMessage of arrived) {
+            if (!arrivedMessage || arrivedMessage.deleted || arrivedMessage.read) {
+              continue;
+            }
+            if (
+              normalizeParticipantEmail(arrivedMessage.sender) === normalizedPartner &&
+              normalizeParticipantEmail(arrivedMessage.recipientId) === normalizedMe
+            ) {
+              const arrivedId = normalizeMessageId(arrivedMessage.id);
+              if (arrivedId) {
+                arrivedReadIds.push(arrivedId);
+              }
+            }
+          }
+        }
+        if (arrivedReadIds.length > 0) {
+          markMessagesReadLocallyRef.current(arrivedReadIds);
+          queueConversationReceiptSync({ readMessageIds: arrivedReadIds });
+        }
+      }
+
       scheduleScrollToBottom({ animated: true, delay: 140 });
       return;
     }
@@ -6330,12 +6562,19 @@ export default function Chat() {
     const additional = idx >= 0 ? Math.max(0, displayed.length - (idx + 1)) : 1;
     incrementUnseenCount(additional);
     setShowScrollToBottomSafely(true);
-    const firstNewId = idx >= 0 ? (displayed[idx + 1]?.id ?? lastId) : lastId;
-    if (firstNewId) {
-      showNewMessageDividerAt(firstNewId);
+    // Anchor the "New messages" divider to the FIRST new message, and only once.
+    // If it's already showing from an earlier batch, keep it in place so that
+    // multiple batches of new messages share a SINGLE divider positioned just
+    // before the first of them — instead of the line hopping down to each new
+    // batch as it arrives.
+    if (!showNewDividerRef.current) {
+      const firstNewId = idx >= 0 ? (displayed[idx + 1]?.id ?? lastId) : lastId;
+      if (firstNewId) {
+        showNewMessageDividerAt(firstNewId);
+      }
     }
     lastTailIdRef.current = lastId;
-  }, [messages, clearNewMessageDivider, incrementUnseenCount, resetUnseenCount, setShowScrollToBottomSafely, showNewMessageDividerAt]);
+  }, [messages, clearNewMessageDivider, clearUnreadDivider, incrementUnseenCount, resetUnseenCount, setShowScrollToBottomSafely, showNewMessageDividerAt, isFocused, isAppActive, selectedTeamMember?.email, effectiveUser?.email, normalizeParticipantEmail, normalizeMessageId, queueConversationReceiptSync]);
 
   // Auto scroll to bottom when typing indicator appears/disappears
   useEffect(() => {
@@ -6528,58 +6767,22 @@ export default function Chat() {
     }
 
     if (unreadSeparatorAnchorMessageId) {
-      const dismissedState = unreadDividerDismissedStateRef.current;
-      const isDismissedBatchStillCurrent = Boolean(
-        dismissedState &&
-          dismissedState.anchorMessageId === unreadSeparatorAnchorMessageId &&
-          dismissedState.latestIncomingMessageId === (latestIncomingMessageId || null)
-      );
-
-      if (isDismissedBatchStillCurrent) {
-        setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
-        setShowUnreadSeparator(false);
-        unreadSeparatorIsVisibleRef.current = false;
-        return;
-      }
-
-      unreadDividerDismissedStateRef.current = null;
-
-      if (unreadSeparatorDismissTimeoutRef.current) {
-        clearTimeout(unreadSeparatorDismissTimeoutRef.current);
-        unreadSeparatorDismissTimeoutRef.current = null;
-      }
-      if (unreadSeparatorMessageIdRef.current !== unreadSeparatorAnchorMessageId) {
-        hasAcknowledgedUnreadRef.current = false;
-      }
+      // Anchor present → show. The seeded anchor is produced by the seed effect
+      // and retired by clearUnreadDivider (send / at-bottom arrival) or the
+      // chat-switch reset, so there is nothing else to reconcile here.
       setUnreadSeparatorMessageId(unreadSeparatorAnchorMessageId);
       setShowUnreadSeparator(true);
       return;
     }
 
-    // No unread anchor left: clear stale divider immediately when conversation is fully read.
-    if (incomingUnreadCountRef.current === 0 && unreadDividerSeedCountRef.current === 0) {
-      unreadDividerDismissedStateRef.current = null;
-      if (hasAcknowledgedUnreadRef.current) {
-        if (!unreadSeparatorIsVisibleRef.current) {
-          scheduleUnreadSeparatorDismiss(UNREAD_DIVIDER_AUTO_DISMISS_MS);
-        }
-      } else {
-        if (unreadSeparatorDismissTimeoutRef.current) {
-          clearTimeout(unreadSeparatorDismissTimeoutRef.current);
-          unreadSeparatorDismissTimeoutRef.current = null;
-        }
-        setShowUnreadSeparator(false);
-        setUnreadSeparatorMessageId(null);
-        unreadDividerSeedCountRef.current = 0;
-        setUnreadDividerSeedCount(0);
-      }
-    }
+    // No anchor → ensure the divider is hidden.
+    setShowUnreadSeparator(false);
+    setUnreadSeparatorMessageId(null);
+    unreadSeparatorIsVisibleRef.current = false;
   }, [
     unreadSeparatorAnchorMessageId,
-    latestIncomingMessageId,
     selectedTeamMember?.email,
     effectiveUser?.email,
-    scheduleUnreadSeparatorDismiss,
   ]);
 
   useEffect(() => {
@@ -6624,7 +6827,10 @@ export default function Chat() {
     previousIncomingUnreadRef.current = 0;
     unreadDividerSeedCountRef.current = 0;
     lastNearBottomUnreadDismissAnchorRef.current = null;
-    unreadSeedInitializedChatKeyRef.current = null;
+    unreadAnchorSeedInitializedChatKeyRef.current = null;
+    unreadSeedAnchorMessageIdRef.current = null;
+    setUnreadSeedAnchorMessageId(null);
+    setUnreadDividerSeeded(false);
     if (unreadSeparatorDismissTimeoutRef.current) {
       clearTimeout(unreadSeparatorDismissTimeoutRef.current);
       unreadSeparatorDismissTimeoutRef.current = null;
@@ -6667,49 +6873,6 @@ export default function Chat() {
     messageToneEligibleSinceRef.current = now;
     messageToneCooldownUntilRef.current = now + CHAT_OPEN_TONE_COOLDOWN_MS;
   }, [selectedTeamMember?.id, selectedTeamMember?.email, isFocused, isAppActive]);
-
-  useEffect(() => {
-    const chatKey = String(selectedTeamMember?.id || selectedTeamMember?.email || '');
-    if (!chatKey) {
-      unreadSeedInitializedChatKeyRef.current = null;
-      unreadDividerSeedCountRef.current = 0;
-      setUnreadDividerSeedCount(0);
-      return;
-    }
-
-    const normalizedPartnerEmail = normalizeParticipantEmail(selectedTeamMember?.email);
-    const summaryUnreadRaw = Number(
-      normalizedPartnerEmail
-        ? conversationSummaries.get(normalizedPartnerEmail)?.unreadCount
-        : 0
-    );
-    const summaryUnread = Number.isFinite(summaryUnreadRaw)
-      ? Math.max(0, Math.trunc(summaryUnreadRaw))
-      : 0;
-
-    const selectedUnreadRaw = Number((selectedTeamMember as any)?.unreadCount);
-    const selectedUnread = Number.isFinite(selectedUnreadRaw)
-      ? Math.max(0, Math.trunc(selectedUnreadRaw))
-      : 0;
-
-    const alreadyInitialized = unreadSeedInitializedChatKeyRef.current === chatKey;
-    const seedCount = alreadyInitialized
-      ? summaryUnread
-      : Math.max(selectedUnread, summaryUnread);
-
-    if (alreadyInitialized) {
-      if (seedCount <= 0) {
-        return;
-      }
-      if (unreadDividerSeedCountRef.current > 0 || showUnreadSeparatorRef.current) {
-        return;
-      }
-    }
-
-    unreadSeedInitializedChatKeyRef.current = chatKey;
-    unreadDividerSeedCountRef.current = seedCount;
-    setUnreadDividerSeedCount(seedCount);
-  }, [selectedTeamMember?.id, selectedTeamMember?.email, conversationSummaries, normalizeParticipantEmail]);
 
   // Helper function to clear input field without affecting keyboard
   const clearActiveTypingStatus = useCallback((reason: TypingStatusWriteReason = 'clear_active') => {
@@ -7302,7 +7465,8 @@ export default function Chat() {
         position: 'top',
       });
 
-      dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+      clearNewMessageDivider();
+      clearUnreadDivider();
 
       return;
     }
@@ -7328,13 +7492,19 @@ export default function Chat() {
         isSpecialMessage = true;
       }
 
+      // Resolve rich content synchronously so the sticker-vs-text decision is
+      // made without crossing an async boundary. This lets the optimistic text
+      // bubble render on the same frame the user taps send (no flicker, and no
+      // risk of briefly showing a text bubble for an emoji that becomes a
+      // sticker).
       if (!isSpecialMessage) {
-        const rich = await handleRichTextInput(messageText);
+        const rich = resolveChatRichTextInputResult(messageText);
         if (rich.type === 'sticker' && typeof rich.content === 'object') {
           await handleStickerSelect(rich.content, { replyTo: activeReplyContext });
-          dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+          clearNewMessageDivider();
+          clearUnreadDivider();
           if (isAtBottomRef.current) {
-              scheduleScrollToBottom();
+              scheduleScrollToBottom({ immediate: true });
           } else {
             setShowScrollToBottomSafely(true);
             incrementUnseenCount();
@@ -7358,6 +7528,9 @@ export default function Chat() {
         return;
       }
 
+      // 1) Optimistic insert — fully synchronous so the message appears
+      //    instantly with a clock ("Sending...") icon, exactly like
+      //    WhatsApp/Telegram. No await precedes this state update.
       const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       optimisticTempId = tempId;
       optimisticPendingMessage = buildPendingTextMessage(tempId, messageText, 'sending', activeReplyContext);
@@ -7368,21 +7541,33 @@ export default function Chat() {
         return next;
       });
 
-      try {
-        await PendingMessageStorage.addPendingMessage(tempId, optimisticPendingMessage);
-      } catch (storageError) {
-        logger.warn('Failed to persist sending pending message:', storageError);
-      }
+      // Snap the sender to the bottom right away so they always see their own
+      // message land, and retire both dividers — sending is an explicit
+      // "caught up" action. `immediate` bypasses InteractionManager so the
+      // reveal is not held behind the bubble's entrance animation.
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
 
+      // Persist for crash/offline recovery, but do NOT block the network send
+      // on disk I/O — durability here is best-effort and runs in parallel.
+      void PendingMessageStorage.addPendingMessage(tempId, optimisticPendingMessage).catch((storageError) => {
+        logger.warn('Failed to persist sending pending message:', storageError);
+      });
+
+      // 2) Fire the actual send. Once the backend acknowledges with a server
+      //    message id, advance the bubble from clock -> single check ("Sent").
+      //    The realtime listener then swaps in the server bubble, which carries
+      //    the delivered (double check) and read (blue) receipts.
       const serverMessageId = await sendMessage(messageText, isSpecialMessage, recipient.id, {
         replyTo: activeReplyContext,
       });
 
       if (optimisticTempId) {
         const idToUpdate = optimisticTempId;
-        const stillSendingPendingMessage: PendingMessage = {
+        const sentPendingMessage: PendingMessage = {
           ...(optimisticPendingMessage as PendingMessage),
-          status: 'sending',
+          status: 'sent',
           serverMessageId,
         };
 
@@ -7392,18 +7577,17 @@ export default function Chat() {
           if (existing) {
             next.set(idToUpdate, {
               ...existing,
-              status: 'sending',
+              status: 'sent',
               serverMessageId,
             });
           }
           return next;
         });
 
-        try {
-          await PendingMessageStorage.addPendingMessage(idToUpdate, stillSendingPendingMessage);
-        } catch (storageError) {
-          logger.warn('Failed to persist sending pending message before reconciliation:', storageError);
-        }
+        // Best-effort persistence of the acknowledged state.
+        void PendingMessageStorage.addPendingMessage(idToUpdate, sentPendingMessage).catch((storageError) => {
+          logger.warn('Failed to persist sent pending message before reconciliation:', storageError);
+        });
       }
 
       void sendMessageNotification(messageText, isSpecialMessage);
@@ -7417,14 +7601,9 @@ export default function Chat() {
         });
       }
 
-      dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
-
-      if (isAtBottomRef.current) {
-        scheduleScrollToBottom({ animated: true, delay: 150 });
-      } else {
-        setShowScrollToBottomSafely(true);
-        incrementUnseenCount();
-      }
+      // Both dividers were already retired on the optimistic insert above; the
+      // sender's own message is "caught up", so there is nothing to reposition
+      // here.
     } catch (error) {
       if (optimisticTempId && optimisticPendingMessage) {
         const failedPending: PendingMessage = {
@@ -7670,6 +7849,28 @@ export default function Chat() {
       resetFilePreviewModal,
     ])
   );
+
+  // Web: push a history entry when entering a conversation so the browser back
+  // button returns to the chat list instead of navigating away from the chat tab
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    if (selectedTeamMember) {
+      window.history.pushState({ chatConversationOpen: true }, '');
+    }
+  }, [selectedTeamMember]);
+
+  // Web: intercept the browser popstate (back / forward navigation) to go back
+  // to the chat list when a conversation is open, instead of leaving the tab
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const handlePopState = () => {
+      if (selectedTeamMember) {
+        handleBackToChatList();
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [selectedTeamMember, handleBackToChatList]);
 
   const buildWebDroppedFiles = useCallback(async (droppedFiles: any): Promise<any[]> => {
     const items = Array.from(droppedFiles || []);
@@ -8157,6 +8358,13 @@ export default function Chat() {
         return next;
       });
 
+      // Snap to the bottom immediately so the sender sees the attachment
+      // bubble land, mirroring the instant text-message behaviour. `immediate`
+      // bypasses InteractionManager so the reveal is not held behind animations.
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
+
       // Prepare files for batch upload
       const filesToUpload = selectedFiles.map(file => ({
         ...(() => {
@@ -8574,6 +8782,13 @@ export default function Chat() {
         source: 'picker',
       }));
 
+      // Snap to the bottom immediately so the sender sees the sticker land,
+      // mirroring the instant text-message behaviour. `immediate` bypasses
+      // InteractionManager so the reveal is not held behind animations.
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
+
       const serverMessageId = await sendSticker(sticker, selectedTeamMember.id, {
         replyTo: activeReplyContext,
       });
@@ -8678,6 +8893,13 @@ export default function Chat() {
         status: 'sending',
         source: 'picker',
       }));
+
+      // Snap to the bottom immediately so the sender sees the GIF land,
+      // mirroring the instant text-message behaviour. `immediate` bypasses
+      // InteractionManager so the reveal is not held behind animations.
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
 
       const serverMessageId = await sendGif(gif, selectedTeamMember.id, {
         replyTo: activeReplyContext,
@@ -9393,23 +9615,33 @@ export default function Chat() {
             )}
 
             {shouldShowUnreadSeparator && unreadSepId && (
-              <View style={styles.dateSeparatorContainer}>
-                <View style={[styles.dateSeparatorLine, themedStyles.unreadSepLine]} />
-                <Text style={[styles.dateSeparatorText, themedStyles.unreadSepText]}> 
-                  {currentUnreadDividerLabel}
-                </Text>
-                <View style={[styles.dateSeparatorLine, themedStyles.unreadSepLine]} />
-              </View>
+              <AnimatedChatDivider
+                animationKey={`unread-${unreadSepId}`}
+                animatedKeys={animatedDividerKeysRef}
+              >
+                <View style={styles.dateSeparatorContainer}>
+                  <View style={[styles.dateSeparatorLine, themedStyles.unreadSepLine]} />
+                  <Text style={[styles.dateSeparatorText, themedStyles.unreadSepText]}> 
+                    {currentUnreadDividerLabel}
+                  </Text>
+                  <View style={[styles.dateSeparatorLine, themedStyles.unreadSepLine]} />
+                </View>
+              </AnimatedChatDivider>
             )}
 
             {shouldShowNewDivider && (
-              <View style={styles.dateSeparatorContainer}>
-                <View style={[styles.dateSeparatorLine, themedStyles.newDividerLine]} />
-                <Text style={[styles.dateSeparatorText, themedStyles.newDividerText]}> 
-                  New messages
-                </Text>
-                <View style={[styles.dateSeparatorLine, themedStyles.newDividerLine]} />
-              </View>
+              <AnimatedChatDivider
+                animationKey={`new-${itemId}`}
+                animatedKeys={animatedDividerKeysRef}
+              >
+                <View style={styles.dateSeparatorContainer}>
+                  <View style={[styles.dateSeparatorLine, themedStyles.newDividerLine]} />
+                  <Text style={[styles.dateSeparatorText, themedStyles.newDividerText]}> 
+                    New messages
+                  </Text>
+                  <View style={[styles.dateSeparatorLine, themedStyles.newDividerLine]} />
+                </View>
+              </AnimatedChatDivider>
             )}
 
             <MessageRow item={item} />
@@ -9425,6 +9657,36 @@ export default function Chat() {
       shouldUseManualAnchorPreservation,
       normalizeMessageId,
       themedStyles,
+    ]
+  );
+
+  // ── Pending-footer re-render signal ───────────────────────────────────────
+  //    The optimistic pending bubbles live in the FlashList footer, which is
+  //    served through a stable ref callback. FlashList only re-renders that
+  //    footer when `data` or `extraData` change. Pending state is NOT part of
+  //    `data`, so we derive a compact signature of all pending text/media/
+  //    attachment entries (plus the typing indicator) and feed it into
+  //    `extraData` below. Without this, a sender's own message would not paint
+  //    until the server echo later mutated `data` — the exact sender-side
+  //    delay we are fixing. The signature only changes on meaningful pending
+  //    transitions, so it does not cause needless re-renders. ──
+  const pendingFooterSignature = useMemo(
+    () =>
+      resolveChatPendingFooterSignature({
+        selectedRecipientId: selectedTeamMember?.id,
+        pendingMessages,
+        pendingMedia,
+        pendingAttachments,
+        isTyping,
+        resolvePendingMessageStatus,
+      }),
+    [
+      selectedTeamMember?.id,
+      pendingMessages,
+      pendingMedia,
+      pendingAttachments,
+      isTyping,
+      resolvePendingMessageStatus,
     ]
   );
 
@@ -9444,6 +9706,7 @@ export default function Chat() {
       showNew: showNewDivider,
       newDividerId: newDividerMessageId,
       metaVersion: messageRowMetaById,
+      pendingFooter: pendingFooterSignature,
     }),
     [
       conversationSearchHighlightMessageId,
@@ -9456,6 +9719,7 @@ export default function Chat() {
       showNewDivider,
       newDividerMessageId,
       messageRowMetaById,
+      pendingFooterSignature,
     ]
   );
 
@@ -11468,12 +11732,13 @@ export default function Chat() {
     resetUnseenCount();
     setShowScrollToBottomSafely(nextFabState.showScrollToBottom);
     setShowReplyJumpToLatestSafely(nextFabState.showReplyJumpToLatest);
-    clearNewMessageDivider();
-    dismissUnreadDividerForCurrentBatch(UNREAD_DIVIDER_ACTION_DISMISS_MS);
+    // Intentionally do NOT clear the new-messages / unread dividers here. The
+    // button just navigates to the bottom; the dividers stay so the user can see
+    // where the new/unread messages begin (matching a manual scroll-to-bottom),
+    // and they retire on their own (unread → caught-up auto-dismiss; new → when
+    // the next message arrives while at the bottom, or on chat switch).
     scrollToBottom();
   }, [
-    clearNewMessageDivider,
-    dismissUnreadDividerForCurrentBatch,
     resetUnseenCount,
     scrollToBottom,
     setShowReplyJumpToLatestSafely,
@@ -11877,6 +12142,7 @@ export default function Chat() {
       forceChatKey &&
       selectedChatKey &&
       forceChatKey === selectedChatKey &&
+      unreadDividerSeeded &&
       !unreadSeparatorAnchorMessageId &&
       hasLayout &&
       hasContent;
@@ -11905,6 +12171,14 @@ export default function Chat() {
     }
 
     if (hasAnchoredInitialScrollRef.current) {
+      return;
+    }
+
+    // Don't make the initial anchor decision until the unread divider seed is
+    // resolved (see the seed effect). This prevents racing the seed and snapping
+    // to the bottom while an unread anchor is still pending.
+    if (!unreadDividerSeeded) {
+      pendingInitialAnchorRef.current = true;
       return;
     }
 
@@ -11951,7 +12225,11 @@ export default function Chat() {
           setShowScrollToBottomSafely(nextFabState.showScrollToBottom);
           setShowReplyJumpToLatestSafely(nextFabState.showReplyJumpToLatest);
           resetUnseenCount();
-          clearNewMessageDivider();
+          // Intentionally do NOT clear the new-messages divider here. Scrolling
+          // down to read the new messages should keep the divider visible so the
+          // user can see where they begin; it is cleared only when the next
+          // message arrives while at the bottom (the new-tail at-bottom branch)
+          // or on chat switch.
         }
 
         lastNearBottomUnreadDismissAnchorRef.current = nearBottomState.nextDismissedUnreadAnchorId;
