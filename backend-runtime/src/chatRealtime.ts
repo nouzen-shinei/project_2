@@ -66,6 +66,7 @@ export interface ChatMessagePayload {
   deleted?: boolean;
   deletedAt?: string;
   deletedBy?: string;
+  reactions?: Record<string, string[]>;
 }
 
 export interface ChatStatusPayload {
@@ -258,6 +259,10 @@ function normalizeSnapshot(
     deleted: raw.deleted === true ? true : undefined,
     deletedAt: normalizeTimestampField(raw.deletedAt),
     deletedBy: normalizeEmail(raw.deletedBy) || undefined,
+    reactions:
+      raw.reactions && typeof raw.reactions === 'object' && !Array.isArray(raw.reactions)
+        ? (raw.reactions as Record<string, string[]>)
+        : undefined,
   };
   return payload;
 }

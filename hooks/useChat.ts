@@ -86,19 +86,29 @@ const normalizeMessageForState = (message: HydratedChatMessage | ChatMessage): H
 };
 
 /**
- * Compact signature of the mutable metadata of a message (edits + deletion).
+ * Compact signature of the mutable metadata of a message (edits, deletion,
+ * and reactions).
  * Used to detect whether an already-known message actually changed while the
  * realtime listener was down, so reconcile can skip re-hydrating + updating
  * messages that are already in sync (the common case on every resume).
  */
 const buildMessageMetaSignature = (
-  message: { editCount?: number; editedAt?: string; deleted?: boolean } | null | undefined
+  message: { editCount?: number; editedAt?: string; deleted?: boolean; reactions?: Record<string, string[]> } | null | undefined
 ): string => {
   if (!message) return '';
   const editCount = typeof message.editCount === 'number' ? message.editCount : 0;
   const editedAt = typeof message.editedAt === 'string' ? message.editedAt : '';
   const deleted = message.deleted ? 1 : 0;
-  return `${editCount}|${editedAt}|${deleted}`;
+  // Include a lightweight reactions hash so reconcile can detect reaction-only
+  // changes that happen while the realtime listener is down (e.g. app backgrounded).
+  const reactions =
+    message.reactions && typeof message.reactions === 'object'
+      ? Object.entries(message.reactions)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([type, users]) => `${type}:${Array.isArray(users) ? users.slice().sort().join(',') : ''}`)
+          .join(';')
+      : '';
+  return `${editCount}|${editedAt}|${deleted}|${reactions}`;
 };
 
 export function useChat(recipientId?: string, options?: { live?: boolean }) {
@@ -440,6 +450,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         deletedBy?: string;
         editedAt?: string;
         editCount?: number;
+        reactions?: Record<string, string[]>;
       };
 
       if (typeof incomingMeta.editCount === 'number') {
@@ -447,6 +458,16 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       }
       if (typeof incomingMeta.editedAt === 'string') {
         nextMessage.editedAt = incomingMeta.editedAt;
+      }
+      // Explicitly apply reactions from the incoming payload onto nextMessage.
+      // hydrateMessages resolves local media/cache and may return a copy that
+      // pre-dates the reaction change, so – just like editCount/editedAt – we
+      // must stamp the authoritative server value over whatever hydration returned.
+      // A defined value (including `{}` for "all reactions removed") is always
+      // used; an absent/undefined value leaves the hydrated copy untouched so
+      // that unrelated updates (e.g. delivery ticks) don't wipe reactions.
+      if (incomingMeta.reactions !== undefined) {
+        (nextMessage as any).reactions = incomingMeta.reactions;
       }
 
       const isDeleted = Boolean(incomingMeta.deleted);

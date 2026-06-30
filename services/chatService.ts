@@ -3366,6 +3366,10 @@ class ChatService {
           deleted: typeof msg.deleted === 'boolean' ? msg.deleted : undefined,
           deletedAt: typeof msg.deletedAt === 'string' ? msg.deletedAt : undefined,
           deletedBy: this.normalizeEmail(msg.deletedBy) || undefined,
+          reactions:
+            msg.reactions && typeof msg.reactions === 'object' && !Array.isArray(msg.reactions)
+              ? (msg.reactions as Record<string, string[]>)
+              : undefined,
         };
 
         callback(updatedMessage);

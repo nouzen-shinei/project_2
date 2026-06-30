@@ -26,6 +26,7 @@ export interface ChatRealtimeMessageForSignature {
   replyTo?: ChatRealtimeReplyPayload | null;
   sticker?: unknown;
   gif?: unknown;
+  reactions?: Record<string, string[]>;
 }
 
 function normalizeEmail(value: unknown): string {
@@ -140,5 +141,6 @@ export function buildChatRealtimeMessageContentSignature(payload: ChatRealtimeMe
     stableStringify(payload.replyTo || null),
     stableStringify(payload.sticker || null),
     stableStringify(payload.gif || null),
+    stableStringify(payload.reactions || null),
   ].join('|');
 }
