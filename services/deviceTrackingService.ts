@@ -1118,6 +1118,9 @@ class DeviceTrackingService {
       webPushClientLastReceiptTag: isLogoutReason ? deleteField() : undefined,
       webPushClientLastReceiptTitle: isLogoutReason ? deleteField() : undefined,
     }).catch(() => undefined);
+    // Clear stored SW delivery credentials so a stale token is not used
+    // after the user logs out or revokes notification permission.
+    this.clearSwDeliveryCredentials();
   }
 
   async syncCurrentWebPushSubscription(context: string = 'manual'): Promise<void> {
@@ -1256,6 +1259,9 @@ class DeviceTrackingService {
       }).catch(() => undefined);
 
       logger.debug('Web push subscription synced', { deviceId: this.currentDeviceId, context });
+      // Refresh SW delivery credentials after every successful subscription so
+      // the SW always has a current token for direct delivery confirmation.
+      await this.pushSwDeliveryCredentials();
     })().finally(() => {
       this.webPushSyncInFlight = null;
     });
@@ -6157,7 +6163,14 @@ class DeviceTrackingService {
                   ? { ...(event.data.notificationData as Record<string, any>) }
                   : undefined;
 
-              if (notificationData) {
+              // The SW confirms delivery directly when it has stored credentials
+              // (push event fires even when all tabs are backgrounded/throttled).
+              // `shouldConfirmDelivery` is true for exactly ONE client so multiple
+              // open tabs don't race to call the same API endpoint.
+              const swDeliveryConfirmed = event.data.swDeliveryConfirmed === true;
+              const shouldConfirmDelivery = event.data.shouldConfirmDelivery === true;
+
+              if (notificationData && !swDeliveryConfirmed && shouldConfirmDelivery) {
                 try {
                   await confirmInboundChatDeliveryFromNotificationData(notificationData, 'received', {
                     currentUserEmail: this.currentUserEmail,
@@ -6170,6 +6183,55 @@ class DeviceTrackingService {
                   logger.debug('Failed to confirm inbound chat delivery from service-worker receipt message', {
                     error,
                   });
+                }
+              }
+
+              // When the page is visible the SW skips its own showNotification
+              // (to avoid a system-tray duplicate on top of the page notification).
+              // We show the notification here immediately — before the RTDB
+              // listener fires — so there is no perceived delay for the user.
+              // The SW path only runs for chat_message / team_chat_message types.
+              if (
+                notificationData &&
+                Platform.OS === 'web' &&
+                typeof document !== 'undefined' &&
+                document.visibilityState === 'visible'
+              ) {
+                const diagPayload =
+                  event.data?.payload && typeof event.data.payload === 'object'
+                    ? (event.data.payload as Record<string, any>)
+                    : null;
+                const pushTitle =
+                  typeof diagPayload?.title === 'string' && diagPayload.title.trim()
+                    ? diagPayload.title
+                    : 'Tuition Manager';
+                const pushBody =
+                  typeof diagPayload?.body === 'string' ? diagPayload.body : '';
+                const pushType =
+                  typeof notificationData.type === 'string' ? notificationData.type : '';
+
+                if (pushType === 'chat_message' || pushType === 'team_chat_message') {
+                  try {
+                    await getNotificationService().sendLocalNotification({
+                      title: pushTitle,
+                      body: pushBody,
+                      data: {
+                        type: pushType,
+                        messageId: notificationData.messageId ?? undefined,
+                        senderEmail: notificationData.senderEmail ?? undefined,
+                        recipientEmail: notificationData.recipientEmail ?? undefined,
+                        chatId: notificationData.chatId ?? undefined,
+                        tenantId: notificationData.tenantId ?? undefined,
+                        timestamp: notificationData.timestamp ?? undefined,
+                        // Stable ID so sendLocalNotification's dedup cache
+                        // prevents a second identical notification when the
+                        // RTDB listener also fires for the same message.
+                        notificationId: diagPayload?.notificationId ?? undefined,
+                      },
+                    });
+                  } catch (err) {
+                    logger.debug('Failed to show foreground push notification from SW message', { error: err });
+                  }
                 }
               }
 
@@ -6203,6 +6265,9 @@ class DeviceTrackingService {
       logger.debug('Web notification listener initialized for device:', this.currentDeviceId);
       await this.syncStoredWebPushDiagnostics('listener_init');
       await this.syncCurrentWebPushSubscription('listener_init');
+      // Push fresh auth credentials to the SW so it can confirm chat delivery
+      // directly from within push event.waitUntil without needing a live tab.
+      await this.pushSwDeliveryCredentials();
     } catch (error) {
       logger.error('Error initializing web notification listener:', error);
     }
@@ -6240,6 +6305,96 @@ class DeviceTrackingService {
       logger.debug('Remote web notification displayed:', notificationData.title);
     } catch (error) {
       logger.error('Error displaying web notification:', error);
+    }
+  }
+
+  /**
+   * Push auth credentials to the service worker so it can call
+   * /chat/receipts/outbound-delivered directly from within push event.waitUntil.
+   *
+   * This makes delivery confirmation work even when all browser tabs are
+   * backgrounded or throttled — the SW handles it without any live page JS.
+   *
+   * Credentials are short-lived (~3 min TTL) and refreshed on every successful
+   * subscription sync.  They are never written outside of the SW-controlled
+   * IndexedDB (tm-sw-state), so they are not accessible to page JS.
+   */
+  private async pushSwDeliveryCredentials(): Promise<void> {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || typeof navigator === 'undefined') {
+      return;
+    }
+    if (!('serviceWorker' in navigator)) {
+      return;
+    }
+
+    const baseUrl = this.getBackendApiBaseUrl();
+    if (!baseUrl) {
+      return;
+    }
+
+    try {
+      internalTokenManager.setBaseUrl(baseUrl);
+      const token = await internalTokenManager.getToken(baseUrl);
+      if (!token) {
+        return;
+      }
+
+      const tenantId = await this.getWebPushTenantId();
+
+      const creds = {
+        type: 'SW_SET_DELIVERY_CREDENTIALS',
+        baseUrl,
+        token,
+        // Conservative TTL: tokens are valid for ~4 min, we use 3 min so the
+        // SW rejects a credential that is too close to expiry.
+        expiresAt: Date.now() + 180_000,
+        tenantId: tenantId || null,
+        userEmail: this.currentUserEmail || null,
+      };
+
+      // Prefer the controlling SW (the one managing this page); fall back to
+      // the active SW from the registration.
+      const controller = navigator.serviceWorker.controller;
+      if (controller) {
+        controller.postMessage(creds);
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.ready;
+      registration?.active?.postMessage(creds);
+    } catch {
+      // Non-critical: if this fails the page-based delivery fallback still works.
+    }
+  }
+
+  /**
+   * Tell the SW to clear its stored delivery credentials.
+   * Called on logout or when the push subscription is revoked.
+   */
+  private clearSwDeliveryCredentials(): void {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || typeof navigator === 'undefined') {
+      return;
+    }
+    if (!('serviceWorker' in navigator)) {
+      return;
+    }
+
+    const msg = { type: 'SW_CLEAR_DELIVERY_CREDENTIALS' };
+
+    try {
+      const controller = navigator.serviceWorker.controller;
+      if (controller) {
+        controller.postMessage(msg);
+        return;
+      }
+      // If no controller yet, post once the SW is ready.
+      navigator.serviceWorker.ready
+        .then((reg) => {
+          reg?.active?.postMessage(msg);
+        })
+        .catch(() => undefined);
+    } catch {
+      // ignore
     }
   }
 }

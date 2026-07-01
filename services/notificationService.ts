@@ -2800,82 +2800,169 @@ class NotificationService {
   }
 
   /**
-   * Send web notification using browser notification API
+   * Send web notification using the Service Worker registration API.
+   *
+   * Chrome 86+ silently blocks `new Notification()` for pages that have a
+   * service worker registered — only `registration.showNotification()` is
+   * guaranteed to work in all modern Chrome versions, including when the
+   * browser window is in the foreground.
+   *
+   * Strategy:
+   *   1. Primary  — navigator.serviceWorker.ready → registration.showNotification()
+   *   2. Fallback — new Notification()  (used when no SW is available, e.g. dev mode)
    */
   private sendWebNotification(notification: NotificationData): void {
     try {
-      if (typeof window !== 'undefined' && 'Notification' in window) {
-        const data = this.normalizeNotificationPayload(notification.data);
-        const notificationId = typeof data.notificationId === 'string' && data.notificationId.trim()
+      if (typeof window === 'undefined' || !('Notification' in window)) {
+        logger.warn('🚫 Notifications not supported in this browser');
+        return;
+      }
+
+      const data = this.normalizeNotificationPayload(notification.data);
+      const notificationId =
+        typeof data.notificationId === 'string' && data.notificationId.trim()
           ? data.notificationId.trim()
           : `web:${data.type || 'general'}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-        data.notificationId = notificationId;
+      data.notificationId = notificationId;
 
-        const deepLink = this.resolveNotificationDeepLink(data);
-        if (deepLink && typeof data.deepLink !== 'string') {
-          data.deepLink = deepLink;
+      const deepLink = this.resolveNotificationDeepLink(data);
+      if (deepLink && typeof data.deepLink !== 'string') {
+        data.deepLink = deepLink;
+      }
+
+      // Compute the click URL so the SW notificationclick handler can navigate
+      // to the right screen when the user taps the notification.
+      const clickUrl: string = (() => {
+        if (
+          (data.type === 'chat_message' || data.type === 'team_chat_message') &&
+          typeof data.senderEmail === 'string' &&
+          data.senderEmail.trim()
+        ) {
+          const params = new URLSearchParams();
+          params.set('senderEmail', data.senderEmail.trim());
+          if (typeof data.chatId === 'string' && data.chatId.trim()) {
+            params.set('chatId', data.chatId.trim());
+          }
+          if (typeof data.messageId === 'string' && data.messageId.trim()) {
+            params.set('messageId', data.messageId.trim());
+          }
+          if (typeof data.senderName === 'string' && data.senderName.trim()) {
+            params.set('senderName', data.senderName.trim());
+          }
+          return `/(tabs)/chat?${params.toString()}`;
         }
+        return typeof deepLink === 'string' ? deepLink : '/(tabs)';
+      })();
 
-        const tag = typeof data.noticeId === 'string' && data.noticeId.trim()
+      const tag =
+        typeof data.noticeId === 'string' && data.noticeId.trim()
           ? `notice:${data.noticeId.trim()}`
           : typeof data.messageId === 'string' && data.messageId.trim()
-            ? `message:${data.messageId.trim()}`
-            : notificationId;
-        const keepVisible = data.type === 'daily_quote';
-        const requireInteraction =
-          keepVisible ||
-          data.type === 'chat_message' ||
-          data.type === 'team_chat_message' ||
-          data.type === 'notice_created' ||
-          data.priority === 'high';
-        const autoCloseMs = keepVisible ? null : requireInteraction ? 12_000 : 8_000;
-        
-        if (Notification.permission === 'granted') {
-          logger.debug('✅ Permission granted, creating notification');
-          const browserNotification = new Notification(notification.title, {
-            body: notification.body,
-            icon: '/favicon.ico',
-            tag,
-            badge: '/favicon.ico',
-            requireInteraction,
-            silent: false,
-            data,
-          });
-          
-          browserNotification.onclick = () => {
-            window.focus();
-            this.handleNotificationNavigation(data);
-            browserNotification.close();
-          };
+          ? `message:${data.messageId.trim()}`
+          : notificationId;
 
-          if (typeof autoCloseMs === 'number') {
-            setTimeout(() => {
-              if (browserNotification) {
-                browserNotification.close();
-              }
-            }, autoCloseMs);
-          }
-          
-        } else if (Notification.permission !== 'denied') {
-          logger.debug('🤔 Permission not granted, requesting permission');
-          Notification.requestPermission().then((permission) => {
+      const keepVisible = data.type === 'daily_quote';
+      const requireInteraction =
+        keepVisible ||
+        data.type === 'chat_message' ||
+        data.type === 'team_chat_message' ||
+        data.type === 'notice_created' ||
+        data.priority === 'high';
+      const autoCloseMs = keepVisible ? null : requireInteraction ? 12_000 : 8_000;
+
+      const notifOptions: NotificationOptions = {
+        body: notification.body,
+        icon: '/favicon.ico',
+        tag,
+        badge: '/favicon.ico',
+        requireInteraction,
+        silent: false,
+        // Include clickUrl in data so the SW notificationclick handler can
+        // navigate to the correct screen when the user taps the notification.
+        data: { ...data, clickUrl },
+      };
+
+      if (Notification.permission === 'granted') {
+        logger.debug('✅ Permission granted, showing notification');
+
+        // Primary path: use the SW registration API. This is the only method
+        // that works reliably in Chrome 86+ when a service worker is registered.
+        if ('serviceWorker' in navigator) {
+          void navigator.serviceWorker.ready
+            .then((registration) =>
+              registration.showNotification(notification.title, notifOptions).then(() => {
+                // SW notifications don't support onclick from the page; the SW
+                // notificationclick event handles navigation via data.clickUrl.
+                // Auto-close by polling getNotifications after the timeout.
+                if (typeof autoCloseMs === 'number') {
+                  setTimeout(() => {
+                    void navigator.serviceWorker.ready
+                      .then((reg) => reg.getNotifications({ tag }))
+                      .then((notifs) => notifs.forEach((n) => n.close()))
+                      .catch(() => {});
+                  }, autoCloseMs);
+                }
+              })
+            )
+            .catch(() => {
+              // SW registration not ready or showNotification failed — fall back
+              // to the direct Notification constructor.
+              this._showDirectNotification(
+                notification.title,
+                notifOptions,
+                data,
+                autoCloseMs
+              );
+            });
+          return;
+        }
+
+        // No service worker available (e.g. dev mode with SW disabled).
+        this._showDirectNotification(notification.title, notifOptions, data, autoCloseMs);
+      } else if (Notification.permission !== 'denied') {
+        logger.debug('🤔 Permission not granted, requesting permission');
+        Notification.requestPermission()
+          .then((permission) => {
             logger.debug('📋 Permission request result:', permission);
             if (permission === 'granted') {
-              setTimeout(() => {
-                this.sendWebNotification(notification);
-              }, 100);
+              setTimeout(() => this.sendWebNotification(notification), 100);
             }
-          }).catch((error) => {
+          })
+          .catch((error) => {
             logger.error('Error requesting notification permission:', error);
           });
-        } else {
-          logger.warn('🚫 Notification permission denied');
-        }
       } else {
-        logger.warn('🚫 Notifications not supported in this browser');
+        logger.warn('🚫 Notification permission denied');
       }
     } catch (error) {
       logger.error('Error in sendWebNotification:', error);
+    }
+  }
+
+  /**
+   * Fallback: show a notification via the direct `new Notification()` constructor.
+   * Used when no service worker is available (e.g. dev builds with SW disabled).
+   */
+  private _showDirectNotification(
+    title: string,
+    options: NotificationOptions,
+    data: Record<string, any>,
+    autoCloseMs: number | null
+  ): void {
+    try {
+      const n = new Notification(title, options);
+      n.onclick = () => {
+        window.focus();
+        this.handleNotificationNavigation(data);
+        n.close();
+      };
+      if (typeof autoCloseMs === 'number') {
+        setTimeout(() => {
+          try { n.close(); } catch { /* ignore */ }
+        }, autoCloseMs);
+      }
+    } catch {
+      // new Notification() may throw in some browser/OS combinations — ignore.
     }
   }
 

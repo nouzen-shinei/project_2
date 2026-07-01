@@ -6506,54 +6506,66 @@ export default function Chat() {
     }
 
     if (isAtBottomRef.current) {
-      const prevTailId = lastTailIdRef.current;
-      lastTailIdRef.current = lastId;
-      resetUnseenCount();
-      setShowScrollToBottomSafely(false);
-      // A message arrived while the user is at the bottom (caught up) — retire
-      // BOTH dividers: the new-messages divider and the seeded unread divider.
-      clearNewMessageDivider();
-      clearUnreadDivider();
-
-      // The user is parked at the bottom of an interactive conversation, so any
-      // freshly-arrived incoming messages are being viewed as they land. Mark
-      // them read immediately (locally + receipt) so no unread divider ever
-      // flashes above them and the sender's blue tick follows promptly. Gated
-      // on the bootstrap gate + focus + active so nothing fires while the
-      // loading overlay is still up or the screen is backgrounded.
-      if (isFocused && isAppActive && isChatBootstrapGateDoneRef.current) {
-        const displayed = displayedMessagesRef.current;
-        const prevIdx = prevTailId
-          ? (displayedMessageIndexRef.current.get(String(prevTailId)) ?? -1)
-          : -1;
-        const arrived = prevIdx >= 0 ? displayed.slice(prevIdx + 1) : displayed.slice(-1);
-        const normalizedPartner = normalizeParticipantEmail(selectedTeamMember?.email);
-        const normalizedMe = normalizeParticipantEmail(effectiveUser?.email);
-        const arrivedReadIds: string[] = [];
-        if (normalizedPartner && normalizedMe) {
-          for (const arrivedMessage of arrived) {
-            if (!arrivedMessage || arrivedMessage.deleted || arrivedMessage.read) {
-              continue;
-            }
-            if (
-              normalizeParticipantEmail(arrivedMessage.sender) === normalizedPartner &&
-              normalizeParticipantEmail(arrivedMessage.recipientId) === normalizedMe
-            ) {
-              const arrivedId = normalizeMessageId(arrivedMessage.id);
-              if (arrivedId) {
-                arrivedReadIds.push(arrivedId);
+      // Only treat an arrival as "watched live" when the user is genuinely
+      // present. If the app is backgrounded or the browser tab is hidden,
+      // fall through to the shared away-path so the "New messages" divider
+      // is anchored at the first missed message — exactly what would happen
+      // if they had scrolled up before leaving. When they return they will
+      // see the divider and the scroll-to-bottom badge rather than a bare
+      // auto-scrolled list with no indication that messages arrived while away.
+      const isUserPresent = isFocused && isAppActive;
+      if (isUserPresent) {
+        const prevTailId = lastTailIdRef.current;
+        lastTailIdRef.current = lastId;
+        resetUnseenCount();
+        setShowScrollToBottomSafely(false);
+        // A message arrived while the user is at the bottom (caught up) — retire
+        // BOTH dividers: the new-messages divider and the seeded unread divider.
+        clearNewMessageDivider();
+        clearUnreadDivider();
+        // The user is parked at the bottom of an interactive conversation, so any
+        // freshly-arrived incoming messages are being viewed as they land. Mark
+        // them read immediately (locally + receipt) so no unread divider ever
+        // flashes above them and the sender's blue tick follows promptly. Gated
+        // on the bootstrap gate so nothing fires while the loading overlay is
+        // still up.
+        if (isChatBootstrapGateDoneRef.current) {
+          const displayed = displayedMessagesRef.current;
+          const prevIdx = prevTailId
+            ? (displayedMessageIndexRef.current.get(String(prevTailId)) ?? -1)
+            : -1;
+          const arrived = prevIdx >= 0 ? displayed.slice(prevIdx + 1) : displayed.slice(-1);
+          const normalizedPartner = normalizeParticipantEmail(selectedTeamMember?.email);
+          const normalizedMe = normalizeParticipantEmail(effectiveUser?.email);
+          const arrivedReadIds: string[] = [];
+          if (normalizedPartner && normalizedMe) {
+            for (const arrivedMessage of arrived) {
+              if (!arrivedMessage || arrivedMessage.deleted || arrivedMessage.read) {
+                continue;
+              }
+              if (
+                normalizeParticipantEmail(arrivedMessage.sender) === normalizedPartner &&
+                normalizeParticipantEmail(arrivedMessage.recipientId) === normalizedMe
+              ) {
+                const arrivedId = normalizeMessageId(arrivedMessage.id);
+                if (arrivedId) {
+                  arrivedReadIds.push(arrivedId);
+                }
               }
             }
           }
+          if (arrivedReadIds.length > 0) {
+            markMessagesReadLocallyRef.current(arrivedReadIds);
+            queueConversationReceiptSync({ readMessageIds: arrivedReadIds });
+          }
         }
-        if (arrivedReadIds.length > 0) {
-          markMessagesReadLocallyRef.current(arrivedReadIds);
-          queueConversationReceiptSync({ readMessageIds: arrivedReadIds });
-        }
+        scheduleScrollToBottom({ animated: true, delay: 140 });
+        return;
       }
-
-      scheduleScrollToBottom({ animated: true, delay: 140 });
-      return;
+      // User was at the bottom but is not currently present (backgrounded /
+      // other browser tab active). Fall through so the unseen-count badge and
+      // "New messages" divider are set — on foreground return the user will
+      // see the divider anchored at the first message that arrived while away.
     }
 
     const prevId = lastTailIdRef.current;

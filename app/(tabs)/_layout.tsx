@@ -2,13 +2,15 @@ import { Tabs } from 'expo-router';
 import { View, Platform, Dimensions } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useBirthdays } from '../../components/BirthdayProvider';
-import { LayoutDashboard, Users, CreditCard, MessageCircle, Settings, Bell, Shield } from 'lucide-react-native';
+import { LayoutDashboard, Users, CreditCard, Settings, Bell, Shield } from 'lucide-react-native';
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth } from '../../hooks/useAuthUnified';
 import { useTenant } from '../../hooks/useTenantContext';
 import { useNetworkStatus } from '../../hooks/useNetworkStatus';
+import { useUnreadChatCount } from '../../hooks/useUnreadChatCount';
 import AutoNetworkBanner from '../../components/AutoNetworkBanner';
 import BirthdayBanner from '../../components/BirthdayBanner';
+import { ChatTabIcon } from '../../components/ChatTabIcon';
 
 export default function TabLayout() {
   const { theme } = useTheme();
@@ -36,6 +38,11 @@ export default function TabLayout() {
 
   // Reduce applied compensation so header shrinks less (avoid large blank gap).
   const effectiveComp = Math.max(0, Math.min(headerCompensation || 0, 60) * 0.5);
+
+  // Single Firebase RTDB subscription — returns a stable boolean that only
+  // flips when the unread state crosses the zero boundary. No unnecessary
+  // re-renders from count changes that stay on the same side of zero.
+  const hasUnreadChat = useUnreadChatCount();
 
   return (
   <View style={{ flex: 1, paddingTop: effectiveComp, backgroundColor: theme.background }}>
@@ -114,7 +121,12 @@ export default function TabLayout() {
           options={{
             title: 'Messages',
             tabBarIcon: ({ size, color }: { size: number; color: string }) => (
-              <MessageCircle size={size} color={color} />
+              <ChatTabIcon
+                size={size}
+                color={color}
+                hasUnread={hasUnreadChat}
+                badgeBorderColor={theme.tabBar}
+              />
             ),
           }}
         />
