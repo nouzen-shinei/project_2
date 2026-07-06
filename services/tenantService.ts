@@ -1357,6 +1357,34 @@ class TenantService {
     });
   }
 
+  async expireStaleJoinCodes(tenantId: string): Promise<{ expired: number }> {
+    const now = new Date().toISOString();
+    const q = query(
+      this.codeRef,
+      where('tenantId', '==', tenantId),
+      where('status', '==', 'active'),
+    );
+    const snapshot = await getDocs(q);
+    const expiredDocs = snapshot.docs.filter((docSnap) => {
+      const data = docSnap.data() as TenantCode;
+      if (!data.expiresAt) return false;
+      const expiresMs = Date.parse(data.expiresAt);
+      return !Number.isNaN(expiresMs) && expiresMs <= Date.now();
+    });
+    if (expiredDocs.length === 0) {
+      return { expired: 0 };
+    }
+    await Promise.all(
+      expiredDocs.map((docSnap) =>
+        updateDoc(docSnap.ref, { status: 'expired', updatedAt: now }).catch((err) =>
+          logger.warn('tenantService.expireStaleJoinCodes: updateDoc failed', err),
+        ),
+      ),
+    );
+    logger.info(`tenantService.expireStaleJoinCodes: expired ${expiredDocs.length} codes for tenant ${tenantId}`);
+    return { expired: expiredDocs.length };
+  }
+
   async expireStaleInvites(cutoffDate: Date): Promise<void> {
     const q = query(
       this.inviteRef,
@@ -1727,10 +1755,26 @@ class TenantService {
       unsubscribe = onSnapshot(
         q,
         (snapshot) => {
-          const codes = snapshot.docs.map((docSnap) => ({
-            id: docSnap.id,
-            ...docSnap.data(),
-          })) as TenantCode[];
+          const now = Date.now();
+          const nowIso = new Date().toISOString();
+
+          const codes = snapshot.docs.map((docSnap) => {
+            const data = { id: docSnap.id, ...docSnap.data() } as TenantCode;
+            // Proactively mark expired codes in the database when we detect them.
+            if (data.status === 'active' && data.expiresAt) {
+              const expiresMs = Date.parse(data.expiresAt);
+              if (!Number.isNaN(expiresMs) && expiresMs <= now) {
+                // Fire-and-forget: update DB so status becomes 'expired'.
+                void updateDoc(docSnap.ref, { status: 'expired', updatedAt: nowIso }).catch((err) =>
+                  logger.warn('tenantService.listenToCodes: failed to expire stale code', { id: docSnap.id, err }),
+                );
+                // Return the corrected status immediately so the UI is consistent.
+                return { ...data, status: 'expired' as const };
+              }
+            }
+            return data;
+          });
+
           onSuccess(codes);
         },
         (error) => {

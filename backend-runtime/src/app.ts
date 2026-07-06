@@ -18154,6 +18154,16 @@ export function createApp(options: CreateAppOptions = {}){
     500,
   );
 
+  const TENANT_CODE_COLLECTION = 'tenantCodes';
+  const JOIN_CODE_AUTO_EXPIRE_ACTOR = 'system:auto-expire';
+  const JOIN_CODE_EXPIRY_SWEEP_INTERVAL_MS = Number(
+    process.env.JOIN_CODE_EXPIRY_SWEEP_INTERVAL_MS || 60 * 60 * 1000,
+  );
+  const JOIN_CODE_EXPIRY_SWEEP_BATCH_SIZE = Math.min(
+    Math.max(Number(process.env.JOIN_CODE_EXPIRY_SWEEP_BATCH_SIZE || 200), 1),
+    500,
+  );
+
   const PRESENCE_SWEEP_INTERVAL_MS = Number(process.env.PRESENCE_SWEEP_INTERVAL_MS || 300000);
   const PRESENCE_STALE_MINUTES = Number(process.env.PRESENCE_STALE_MINUTES || 5);
   const PRESENCE_STALE_WINDOW_MS = PRESENCE_STALE_MINUTES * 60_000;
@@ -18291,6 +18301,73 @@ export function createApp(options: CreateAppOptions = {}){
     }
   }
 
+  async function expireJoinCodesOnce() {
+    try {
+      ensureFirebase();
+      const db = admin.firestore();
+      const nowIso = new Date().toISOString();
+      const nowTs = admin.firestore.Timestamp.now();
+      let expired = 0;
+
+      const expireCodeBatch = async (snapshot: admin.firestore.QuerySnapshot<admin.firestore.DocumentData>) => {
+        if (snapshot.empty) return 0;
+        const batch = db.batch();
+        snapshot.docs.forEach((docSnap) => {
+          batch.update(docSnap.ref, {
+            status: 'expired',
+            updatedAt: nowIso,
+            expiredBy: JOIN_CODE_AUTO_EXPIRE_ACTOR,
+          });
+        });
+        await batch.commit();
+        return snapshot.size;
+      };
+
+      // Sweep codes where expiresAt is stored as an ISO string (primary format).
+      while (true) {
+        const snapshot = await db
+          .collection(TENANT_CODE_COLLECTION)
+          .where('status', '==', 'active')
+          .where('expiresAt', '<=', nowIso)
+          .limit(JOIN_CODE_EXPIRY_SWEEP_BATCH_SIZE)
+          .get();
+        const processed = await expireCodeBatch(snapshot);
+        expired += processed;
+        if (processed === 0 || processed < JOIN_CODE_EXPIRY_SWEEP_BATCH_SIZE) {
+          break;
+        }
+      }
+
+      // Defensive: sweep codes where expiresAt might be a Firestore Timestamp.
+      while (true) {
+        let snapshot: admin.firestore.QuerySnapshot<admin.firestore.DocumentData>;
+        try {
+          snapshot = await db
+            .collection(TENANT_CODE_COLLECTION)
+            .where('status', '==', 'active')
+            .where('expiresAt', '<=', nowTs)
+            .limit(JOIN_CODE_EXPIRY_SWEEP_BATCH_SIZE)
+            .get();
+        } catch {
+          break;
+        }
+        const processed = await expireCodeBatch(snapshot);
+        expired += processed;
+        if (processed === 0 || processed < JOIN_CODE_EXPIRY_SWEEP_BATCH_SIZE) {
+          break;
+        }
+      }
+
+      if (expired) {
+        console.log(`[join_code_expiry] expired ${expired} active join codes (cutoff ${nowIso})`);
+      }
+      return { expired };
+    } catch (error: any) {
+      console.warn('[join_code_expiry] sweep error', error?.message || error);
+      throw error;
+    }
+  }
+
   if (!isTestProcess && JOIN_REQUEST_EXPIRY_SWEEP_INTERVAL_MS > 0) {
     const scheduleJoinExpirySweep = () =>
       expireJoinRequestsOnce().catch((error) =>
@@ -18327,8 +18404,27 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  if (!isTestProcess && JOIN_CODE_EXPIRY_SWEEP_INTERVAL_MS > 0) {
+    const scheduleJoinCodeExpirySweep = () =>
+      expireJoinCodesOnce().catch((error) =>
+        console.warn('[join_code_expiry] periodic error', error instanceof Error ? error.message : error),
+      );
+    setInterval(scheduleJoinCodeExpirySweep, JOIN_CODE_EXPIRY_SWEEP_INTERVAL_MS).unref?.();
+    setTimeout(scheduleJoinCodeExpirySweep, 14000).unref?.();
+  }
+
+  app.post('/internal/join-codes/expire', async (_req, res) => {
+    try {
+      const result = await expireJoinCodesOnce();
+      res.json({ ok: true, ...result });
+    } catch (error: any) {
+      res.status(500).json({ ok: false, error: error?.message || String(error) });
+    }
+  });
+
   // Expose for tests
   (app as any)._expireInvitesOnce = expireInvitesOnce;
+  (app as any)._expireJoinCodesOnce = expireJoinCodesOnce;
 
   function parseAnyTimestamp(val: any): Date | null {
     try {
