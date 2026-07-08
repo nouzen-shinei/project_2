@@ -4,11 +4,13 @@
 //   node scripts/bumpVersion.js patch|minor|major
 //   node scripts/bumpVersion.js set 1.2.3
 // Also updates:
-// - eas.json EXPO_PUBLIC_RELEASE_MONTH for preview/production to current Month YYYY
+// - EXPO_PUBLIC_RELEASE_MONTH for the preview/production EAS environments (via `eas env:create --force`)
+//   Build-time env vars now live in EAS (see: eas env:list <environment>), not inlined in eas.json.
 // - .env: EXPO_PUBLIC_APP_VERSION, EXPO_PUBLIC_APP_BUILD, EXPO_PUBLIC_RELEASE_MONTH
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 function readJson(p) {
   return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -38,13 +40,31 @@ function monthYearString(date = new Date()) {
   return date.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 }
 
-function setReleaseMonth(eas) {
-  const month = monthYearString();
-  if (eas.build && eas.build.preview && eas.build.preview.env) {
-    eas.build.preview.env.EXPO_PUBLIC_RELEASE_MONTH = month;
-  }
-  if (eas.build && eas.build.production && eas.build.production.env) {
-    eas.build.production.env.EXPO_PUBLIC_RELEASE_MONTH = month;
+function setReleaseMonthOnEas(month) {
+  // Build-time EXPO_PUBLIC_* values now live in EAS environment variables
+  // (see eas.json "environment" links), not inlined in eas.json. Push the
+  // updated release month to the preview/production EAS environments so
+  // builds pick it up. Best-effort: warn (don't fail the version bump) if
+  // the EAS CLI isn't available or the user isn't authenticated.
+  for (const environment of ['preview', 'production']) {
+    try {
+      execFileSync(
+        'npx',
+        [
+          'eas-cli', 'env:create',
+          '--name', 'EXPO_PUBLIC_RELEASE_MONTH',
+          '--value', month,
+          '--visibility', 'plaintext',
+          '--environment', environment,
+          '--force',
+          '--non-interactive',
+        ],
+        { stdio: 'pipe' }
+      );
+    } catch (e) {
+      console.warn(`Warning: failed to update EXPO_PUBLIC_RELEASE_MONTH on EAS (${environment}):`, e?.message || e);
+      console.warn(`  Run manually: eas env:create --name EXPO_PUBLIC_RELEASE_MONTH --value "${month}" --visibility plaintext --environment ${environment} --force`);
+    }
   }
 }
 
@@ -58,12 +78,10 @@ function ensureEnvLine(lines, key, value) {
   const root = process.cwd();
   const appJsonPath = path.join(root, 'app.json');
   const pkgJsonPath = path.join(root, 'package.json');
-  const easJsonPath = path.join(root, 'eas.json');
   const dotEnvPath = path.join(root, '.env');
 
   const appJson = readJson(appJsonPath);
   const pkgJson = readJson(pkgJsonPath);
-  const easJson = readJson(easJsonPath);
   const envExists = fs.existsSync(dotEnvPath);
   const envRaw = envExists ? fs.readFileSync(dotEnvPath, 'utf8') : '';
   const envLines = envRaw.split(/\r?\n/).filter(Boolean);
@@ -96,11 +114,12 @@ function ensureEnvLine(lines, key, value) {
   appJson.expo.version = nextVersion;
   pkgJson.version = nextVersion;
 
-  // Update release month env
-  setReleaseMonth(easJson);
-
   // Update .env for web builds
   const month = monthYearString();
+
+  // Push the release month to EAS environments (preview/production) so build-time
+  // EXPO_PUBLIC_RELEASE_MONTH stays in sync now that it's not inlined in eas.json.
+  setReleaseMonthOnEas(month);
   // Compute a simple build code: YYYYMM.patch (increase patch per bump)
   const now = new Date();
   const yyyymm = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
@@ -144,7 +163,6 @@ function ensureEnvLine(lines, key, value) {
 
   writeJson(appJsonPath, appJson);
   writeJson(pkgJsonPath, pkgJson);
-  writeJson(easJsonPath, easJson);
   fs.writeFileSync(dotEnvPath, envLines.join('\n') + '\n');
 
   console.log(`Bumped version: ${curVersion} -> ${nextVersion}`);

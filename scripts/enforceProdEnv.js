@@ -56,13 +56,31 @@ function warn(msg) {
   console.warn('[enforceProdEnv] WARN: ' + msg);
 }
 
+function isTruthy(val) {
+  return val === '1' || /^(true|yes)$/i.test(val || '');
+}
+
 // Rules
 if (buildEnv !== 'development') {
-  if (env.EXPO_PUBLIC_DEBUG_AUTH === '1' || /^(true|yes)$/i.test(env.EXPO_PUBLIC_DEBUG_AUTH || '')) {
+  if (isTruthy(env.EXPO_PUBLIC_DEBUG_AUTH)) {
     fail('EXPO_PUBLIC_DEBUG_AUTH must not be enabled for ' + buildEnv + ' builds.');
   }
   if ((env.EXPO_PUBLIC_LOG_LEVEL || '').toLowerCase() === 'debug') {
     warn('LOG_LEVEL=debug in ' + buildEnv + ' (consider lowering to info).');
+  }
+
+  // Dev-only bypass values that must never ship in a client bundle for
+  // preview/production. These are all "insecure by design" escape hatches
+  // (direct third-party API tokens, internal auth bypass secrets, or a
+  // reviewer bypass join code) that are safe only on developer machines.
+  if ((env.EXPO_PUBLIC_WABA_ACCESS_TOKEN || '').trim()) {
+    fail('EXPO_PUBLIC_WABA_ACCESS_TOKEN (dev-only direct WhatsApp token) must not be set for ' + buildEnv + ' builds. Use the backend proxy instead.');
+  }
+  if ((env.EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET || '').trim()) {
+    fail('EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET (dev-only auth bypass) must not be set for ' + buildEnv + ' builds.');
+  }
+  if (isTruthy(env.EXPO_PUBLIC_REVIEWER_QUICK_JOIN_ENABLED)) {
+    warn('EXPO_PUBLIC_REVIEWER_QUICK_JOIN_ENABLED=1 in ' + buildEnv + '. Confirm this temporary reviewer bypass is still intended before shipping; disable it after the review window (see docs/reviewer-quick-join-temporary.md).');
   }
 }
 
