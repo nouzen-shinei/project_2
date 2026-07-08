@@ -37,6 +37,9 @@ yarn-error.*
 .DS_Store
 *.pem
 
+# Firebase CLI local deploy cache (hosting file-hash cache, regenerated per machine)
+.firebase/
+
 # Firebase Service Account Keys - NEVER COMMIT THESE!
 serviceAccountKey.json
 firebase-service-account.json

@@ -20,6 +20,9 @@ yarn-error.log*
 .vscode/
 .idea/
 
+# Firebase CLI local deploy cache (web hosting only, irrelevant to native builds)
+.firebase/
+
 # Build outputs
 android/app/build
 android/build

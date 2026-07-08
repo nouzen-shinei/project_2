@@ -5,45 +5,29 @@
 android/
 ios/
 
-# Local deps and caches
-node_modules/
-.expo/
-.expo-export/
-.expo-shared/
-
-# Web build output (generated during Vercel build)
-dist/
-
-# Local build artifacts
-*.apk
-*.aab
-*.ipa
-*.xcarchive
-
 # Backend/runtime stuff not needed for the web-only deploy
 backend-runtime/
 email-backend/
 
-# Misc
+# VCS / editor / OS metadata
+.git/
+.github/
+.vscode/
+.idea/
 **/.DS_Store
-**/coverage/
-**/.turbo/
-**/.next/
-
-
+*.pem
 
 # dependencies
 node_modules/
-
 .venv
 
 # expo
 .expo/
 .expo-export/
+.expo-shared/
 dist/
 web-build/
 expo-env.d.ts
-.expo-shared/
 
 # native
 *.orig.*
@@ -52,40 +36,43 @@ expo-env.d.ts
 *.p12
 *.key
 *.mobileprovision
+*.keystore
 
 # metro
 .metro-health-check*
 
-# debug
+# debug logs
 npm-debug.*
 yarn-debug.*
 yarn-error.*
+firestore-debug.log
+email-backend/logs/
 
-# macos
-.DS_Store
-*.pem
+# Firebase CLI local deploy cache (regenerated per machine)
+.firebase/
 
-# Firebase Service Account Keys - NEVER COMMIT THESE!
+# Firebase Service Account Keys - NEVER COMMIT/UPLOAD THESE!
 serviceAccountKey.json
 firebase-service-account.json
 scripts/serviceAccountKey.json
 scripts/firebase-service-account.json
 *-service-account*.json
 *serviceAccount*.json
+.tmp-service-account.json
 backend-runtime/firebase_sa.b64
 email-backend/firebase_sa.b64
 
-# local env files
+# local env files (secrets stay off Vercel's upload; real values come from Vercel project env vars)
 .env
 .env*.local
 .env.*
 !.env.example
 eas.json
 
-# local runtime artifacts (keep local, don't commit)
+# local runtime artifacts (keep local, don't commit/upload)
 reports/
-firestore-debug.log
-email-backend/logs/
+.tmp/
+.kiro/
 
 # typescript
 *.tsbuildinfo
@@ -94,8 +81,6 @@ email-backend/logs/
 # android builds
 *.apk
 *.aab
-
-# android build directories and config
 android/app/build/
 android/build/
 android/.gradle/
@@ -107,11 +92,6 @@ ios/DerivedData/
 ios/Pods/
 *.ipa
 *.xcarchive
-
-# additional signing artifacts
-*.keystore
-
-# iOS Xcode project/workspace noise
 ios/*.xcodeproj/xcuserdata/
 ios/*.xcworkspace/xcuserdata/
 *.xcuserstate
@@ -123,8 +103,10 @@ web-build/**/*.tar.gz
 # coverage reports
 coverage/
 backend-runtime/coverage/
+**/.turbo/
+**/.next/
 
-# Firebase/Google config and locks (do not commit)
+# Firebase/Google config and locks (do not commit/upload)
 android/app/google-services.json
 app/google-services.json
 package-lock.json
