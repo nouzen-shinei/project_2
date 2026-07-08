@@ -16,13 +16,16 @@ import {
 } from 'react-native';
 import { X, Search, Smile, Star } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
+import {
+  fetchGifs,
+  fetchStickers,
+  isGifStickerProviderConfigured,
+  STICKER_CATEGORIES,
+  type GifStickerCategory,
+  type GifStickerMedia,
+} from '../services/gifStickerProviderService';
 
-interface StickerPack {
-  id: string;
-  name: string;
-  preview: string;
-  searchTerm: string;
-}
+type StickerPack = GifStickerCategory;
 
 interface Sticker {
   id: string;
@@ -33,14 +36,17 @@ interface Sticker {
   height?: number;
 }
 
-interface GifData {
-  id: string;
-  url: string;
-  thumbnailUrl: string;
-  width: number;
-  height: number;
-  title: string;
-  source: string;
+type GifData = GifStickerMedia;
+
+function toSticker(media: GifStickerMedia, packId: string): Sticker {
+  return {
+    id: media.id,
+    url: media.url,
+    name: media.title,
+    pack: packId,
+    width: media.width,
+    height: media.height,
+  };
 }
 
 interface StickerGifPickerMobileProps {
@@ -85,49 +91,6 @@ const getNumColumns = () => {
 
 const ITEM_SIZE = getItemSize();
 const NUM_COLUMNS = getNumColumns();
-
-// Tenor API configuration
-const TENOR_API_KEY = process.env.EXPO_PUBLIC_TENOR_API_KEY;
-const TENOR_BASE_URL = 'https://tenor.googleapis.com/v2';
-
-// Sticker categories for Tenor API
-const STICKER_CATEGORIES: StickerPack[] = [
-  { id: 'trending', name: 'Trending', searchTerm: 'emoji face reactions sticker', preview: '🔥' },
-  { id: 'reactions', name: 'Reactions', searchTerm: 'emoji reactions faces happy sad angry surprised', preview: '😂' },
-  { id: 'love', name: 'Love', searchTerm: 'heart love emoji valentine romantic', preview: '❤️' },
-  { id: 'animals', name: 'Animals', searchTerm: 'cute animal emoji cat dog', preview: '🐱' },
-  { id: 'celebrations', name: 'Party', searchTerm: 'party celebration emoji birthday confetti', preview: '🎉' },
-  { id: 'activities', name: 'Activities', searchTerm: 'sports activities emoji games', preview: '⚽' },
-  { id: 'thumbs', name: 'Thumbs', searchTerm: 'thumbs up down like emoji approval', preview: '👍' },
-  { id: 'greeting', name: 'Greetings', searchTerm: 'hello hi bye wave emoji hand', preview: '👋' },
-];
-
-// Convert Tenor response interfaces
-interface TenorResult {
-  id: string;
-  title: string;
-  media_formats: {
-    gif?: { url: string; dims: number[]; size: number; duration?: number };
-    mediumgif?: { url: string; dims: number[]; size: number };
-    tinygif?: { url: string; dims: number[]; size: number };
-    nanogif?: { url: string; dims: number[]; size: number };
-    webp?: { url: string; dims: number[]; size: number };
-    tinywebp?: { url: string; dims: number[]; size: number };
-  nanowebp?: { url: string; dims: number[]; size: number };
-  mp4?: { url: string; dims: number[]; size: number };
-  tinymp4?: { url: string; dims: number[]; size: number };
-  nanomp4?: { url: string; dims: number[]; size: number };
-  loopedmp4?: { url: string; dims: number[]; size: number };
-    preview?: string;
-  };
-  tags: string[];
-  content_description?: string;
-}
-
-interface TenorResponse {
-  results: TenorResult[];
-  next?: string;
-}
 
 // Enhanced image cache with size limit for mobile
 const imageCache = new Map<string, boolean>();
@@ -231,15 +194,15 @@ export function StickerGifPickerMobile({
   const scrollViewRef = useRef<ScrollView>(null);
   
   const [activeTab, setActiveTab] = useState<'stickers' | 'gifs'>('stickers');
-  const [selectedCategory, setSelectedCategory] = useState(STICKER_CATEGORIES[0]);
+  const [selectedCategory, setSelectedCategory] = useState<GifStickerCategory>(STICKER_CATEGORIES[0]);
   const [searchQuery, setSearchQuery] = useState('');
   const [stickers, setStickers] = useState<Sticker[]>([]);
   const [gifs, setGifs] = useState<GifData[]>([]);
   const [isLoadingStickers, setIsLoadingStickers] = useState(false);
   const [isLoadingGifs, setIsLoadingGifs] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [nextStickerPos, setNextStickerPos] = useState<string | null>(null);
-  const [nextGifPos, setNextGifPos] = useState<string | null>(null);
+  const [nextStickerPage, setNextStickerPage] = useState(0);
+  const [nextGifPage, setNextGifPage] = useState(0);
   const [hasMoreStickers, setHasMoreStickers] = useState(true);
   const [hasMoreGifs, setHasMoreGifs] = useState(true);
   const stickerLoadMoreInFlightRef = useRef(false);
@@ -248,92 +211,11 @@ export function StickerGifPickerMobile({
   const normalizedSearchQuery = trimmedSearchQuery.toLowerCase();
   const hasSearchQuery = normalizedSearchQuery.length > 0;
 
-  // Convert Tenor result to Sticker format
-  // Important: React Native Image has limited/varied WebP support on mobile builds.
-  // To ensure stickers render on iOS/Android, prefer GIF variants on native and keep WebP on web for quality/alpha.
-  const convertTenorToSticker = (result: TenorResult): Sticker => {
-    const isWeb = Platform.OS === 'web';
-    // Pick best URL per platform
-    const webFirst =
-      result.media_formats.webp?.url ||
-      result.media_formats.tinywebp?.url ||
-      result.media_formats.gif?.url ||
-      result.media_formats.mediumgif?.url ||
-      result.media_formats.tinygif?.url ||
-      result.media_formats.nanogif?.url ||
-      '';
-
-    const nativeFirst =
-      result.media_formats.tinygif?.url ||
-      result.media_formats.nanogif?.url ||
-      result.media_formats.gif?.url ||
-      result.media_formats.mediumgif?.url ||
-      result.media_formats.webp?.url ||
-      result.media_formats.tinywebp?.url ||
-      '';
-
-    const url = isWeb ? webFirst : nativeFirst;
-
-    // Dimensions: fallback through available formats
-    const dims =
-      (isWeb ? result.media_formats.webp?.dims : result.media_formats.tinygif?.dims) ||
-      result.media_formats.gif?.dims ||
-      result.media_formats.mediumgif?.dims ||
-      result.media_formats.tinywebp?.dims ||
-      result.media_formats.nanogif?.dims ||
-      [150, 150];
-
-    return {
-      id: result.id,
-      url,
-      name: result.title || result.content_description || 'Sticker',
-      pack: selectedCategory.id,
-      width: dims[0] || 150,
-      height: dims[1] || 150,
-    };
-  };
-
-  // Convert Tenor result to GIF format
-  // Keep GIF URL for compatibility; use static thumbnail to avoid grid jank.
-  const convertTenorToGif = (result: TenorResult): GifData => {
-    const url =
-      result.media_formats.gif?.url ||
-      result.media_formats.mediumgif?.url ||
-      result.media_formats.mp4?.url ||
-      '';
-
-    const thumbnailUrl =
-      (typeof result.media_formats.preview === 'string' ? result.media_formats.preview : undefined) ||
-      result.media_formats.nanowebp?.url ||
-      result.media_formats.tinywebp?.url ||
-      result.media_formats.webp?.url ||
-      result.media_formats.nanogif?.url ||
-      result.media_formats.tinygif?.url ||
-      result.media_formats.gif?.url ||
-      '';
-
-    const dims =
-      result.media_formats.nanogif?.dims ||
-      result.media_formats.tinygif?.dims ||
-      result.media_formats.gif?.dims ||
-      result.media_formats.mp4?.dims ||
-      [320, 180];
-
-    return {
-      id: result.id,
-      url,
-      thumbnailUrl,
-      width: dims[0] || 320,
-      height: dims[1] || 180,
-      title: result.title || result.content_description || 'GIF',
-      source: 'tenor',
-    };
-  };
-
-  // Fetch stickers from Tenor API
-  const fetchStickers = async (searchTerm?: string, isLoadMore = false) => {
-    if (!TENOR_API_KEY) {
-      logger.warn('Tenor API key not found');
+  // Load a page of stickers from the configured provider (Giphy preferred,
+  // Klipy as automatic fallback; see gifStickerProviderService).
+  const loadStickers = async (searchTerm?: string, isLoadMore = false) => {
+    if (!isGifStickerProviderConfigured()) {
+      logger.warn('No GIF/sticker provider API key configured');
       return;
     }
 
@@ -342,45 +224,24 @@ export function StickerGifPickerMobile({
     } else {
       setIsLoadingStickers(true);
       setStickers([]);
-      setNextStickerPos(null);
+      setNextStickerPage(0);
       setHasMoreStickers(true);
     }
 
     try {
-  const query = searchTerm || selectedCategory.searchTerm;
-  // Request Tenor sticker results with a basic media set to ensure GIF variants are available on native
-  let url = `${TENOR_BASE_URL}/search?q=${encodeURIComponent(query)}&key=${TENOR_API_KEY}&limit=20&searchfilter=sticker&media_filter=basic`;
-      
-      if (isLoadMore && nextStickerPos) {
-        url += `&pos=${nextStickerPos}`;
-      }
-      
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-      
-      const data: TenorResponse = await response.json();
-      
-      // Filter results that have media formats
-      const validResults = data.results.filter(result => 
-        result.media_formats && 
-        Object.keys(result.media_formats).length > 0
-      );
-      
-      const stickerResults = validResults.map(convertTenorToSticker);
-      
+      const query = searchTerm || selectedCategory.searchTerm || undefined;
+      const page = isLoadMore ? nextStickerPage : 0;
+      const result = await fetchStickers(query, page);
+      const stickerResults = result.items.map((item) => toSticker(item, selectedCategory.id));
+
       if (isLoadMore) {
         setStickers(prev => [...prev, ...stickerResults]);
       } else {
         setStickers(stickerResults);
       }
-      
-      // Update pagination
-      setNextStickerPos(data.next || null);
-      setHasMoreStickers(!!data.next && stickerResults.length > 0);
-      
+
+      setNextStickerPage(result.nextPage);
+      setHasMoreStickers(result.hasMore);
     } catch (error) {
       logger.error('Error fetching stickers:', error);
       if (!isLoadMore) {
@@ -392,10 +253,10 @@ export function StickerGifPickerMobile({
     }
   };
 
-  // Fetch GIFs from Tenor API
-  const fetchGifs = async (searchTerm?: string, isLoadMore = false) => {
-    if (!TENOR_API_KEY) {
-      logger.warn('Tenor API key not found');
+  // Load a page of GIFs from the configured provider.
+  const loadGifs = async (searchTerm?: string, isLoadMore = false) => {
+    if (!isGifStickerProviderConfigured()) {
+      logger.warn('No GIF/sticker provider API key configured');
       return;
     }
 
@@ -404,39 +265,23 @@ export function StickerGifPickerMobile({
     } else {
       setIsLoadingGifs(true);
       setGifs([]);
-      setNextGifPos(null);
+      setNextGifPage(0);
       setHasMoreGifs(true);
     }
 
     try {
-  const query = searchTerm || 'trending';
-  // Request a basic set that includes preview/webp for static thumbnails
-  let url = `${TENOR_BASE_URL}/search?q=${encodeURIComponent(query)}&key=${TENOR_API_KEY}&limit=20&media_filter=basic`;
-      
-      if (isLoadMore && nextGifPos) {
-        url += `&pos=${nextGifPos}`;
-      }
-      
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-      
-      const data: TenorResponse = await response.json();
-      
-      const gifResults = data.results.map(convertTenorToGif);
-      
+      const query = searchTerm || undefined;
+      const page = isLoadMore ? nextGifPage : 0;
+      const result = await fetchGifs(query, page);
+
       if (isLoadMore) {
-        setGifs(prev => [...prev, ...gifResults]);
+        setGifs(prev => [...prev, ...result.items]);
       } else {
-        setGifs(gifResults);
+        setGifs(result.items);
       }
-      
-      // Update pagination
-      setNextGifPos(data.next || null);
-      setHasMoreGifs(!!data.next && gifResults.length > 0);
-      
+
+      setNextGifPage(result.nextPage);
+      setHasMoreGifs(result.hasMore);
     } catch (error) {
       logger.error('Error fetching GIFs:', error);
       if (!isLoadMore) {
@@ -489,7 +334,7 @@ export function StickerGifPickerMobile({
     stickerLoadMoreInFlightRef.current = true;
     const loadMoreQuery = hasSearchQuery ? trimmedSearchQuery : undefined;
 
-    Promise.resolve(fetchStickers(loadMoreQuery, true))
+    Promise.resolve(loadStickers(loadMoreQuery, true))
       .catch((error) => {
         logger.error('Error loading more stickers:', error);
       })
@@ -507,7 +352,7 @@ export function StickerGifPickerMobile({
     gifLoadMoreInFlightRef.current = true;
     const loadMoreQuery = hasSearchQuery ? trimmedSearchQuery : undefined;
 
-    Promise.resolve(fetchGifs(loadMoreQuery, true))
+    Promise.resolve(loadGifs(loadMoreQuery, true))
       .catch((error) => {
         logger.error('Error loading more GIFs:', error);
       })
@@ -521,15 +366,15 @@ export function StickerGifPickerMobile({
     const timeoutId = setTimeout(() => {
       if (activeTab === 'stickers') {
         if (hasSearchQuery) {
-          fetchStickers(trimmedSearchQuery);
+          loadStickers(trimmedSearchQuery);
         } else {
-          fetchStickers();
+          loadStickers();
         }
       } else {
         if (hasSearchQuery) {
-          fetchGifs(trimmedSearchQuery);
+          loadGifs(trimmedSearchQuery);
         } else {
-          fetchGifs();
+          loadGifs();
         }
       }
     }, 300);
@@ -541,9 +386,9 @@ export function StickerGifPickerMobile({
   useEffect(() => {
     if (visible) {
       if (activeTab === 'stickers') {
-        fetchStickers();
+        loadStickers();
       } else {
-        fetchGifs();
+        loadGifs();
       }
     }
   }, [visible, activeTab, selectedCategory]);

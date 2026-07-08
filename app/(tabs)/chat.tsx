@@ -192,12 +192,6 @@ import {
   resolveChatNormalizedMessageValue,
   resolveChatNormalizedParticipantEmail,
 } from '@/lib/chatNormalizationState';
-import {
-  resolveChatTenorGifCandidateUrl,
-  resolveChatTenorIdFromUrl,
-  resolveChatTenorPostsLookupUrl,
-  resolveChatTenorWebpToGifGuess,
-} from '@/lib/chatTenorUrlState';
 import { resolveChatTimestampMs } from '@/lib/chatTimestampState';
 import { resolveChatRealtimeOnline } from '@/lib/chatPresenceState';
 import { resolveChatReplyPreviewText } from '@/lib/chatReplyPreview';
@@ -1307,11 +1301,13 @@ export default function Chat() {
   const reactionOptimisticUntilRef = useRef<Map<string, number>>(new Map());
 
   // Emoji picker state for all messages
-  // Tenor fallback for sticker URLs on native (webp -> gif)
-  const TENOR_API_KEY = process.env.EXPO_PUBLIC_TENOR_API_KEY;
-  const TENOR_BASE_URL = 'https://tenor.googleapis.com/v2';
-  const [stickerUrlMap, setStickerUrlMap] = useState<Map<string, string>>(new Map());
-  const [gifUrlMap, setGifUrlMap] = useState<Map<string, string>>(new Map());
+  // Sticker/GIF URLs from the configured provider (Giphy/Klipy) are already
+  // direct, playable CDN URLs, so no per-platform URL resolution/fallback is
+  // needed anymore (previously required for Tenor's webp/gif variants).
+  // These maps and resolvers are kept as stable no-ops since ChatContext,
+  // ChatMessageItem, and the viewability prefetcher still reference them.
+  const [stickerUrlMap] = useState<Map<string, string>>(new Map());
+  const [gifUrlMap] = useState<Map<string, string>>(new Map());
   // Centralized offline-aware loading gate (prevents empty chat UI on cold offline start)
   const { showLoading: showOfflineLoadingChat, offlineHint: offlineHintChat } = useOfflineDataGate(
     [teamMembers],
@@ -1319,89 +1315,13 @@ export default function Chat() {
   );
   // Defer early return until after all hooks are declared
 
-  const headOk = useCallback(async (url: string) => {
-    try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
-      clearTimeout(t);
-      return res.ok;
-    } catch {
-      return false;
-    }
+  const resolveNativeSafeStickerUrl = useCallback(async (originalUrl: string): Promise<string | null> => {
+    return originalUrl;
   }, []);
 
-  const resolveNativeSafeStickerUrl = useCallback(async (originalUrl: string): Promise<string | null> => {
-    if (Platform.OS === 'web') return originalUrl;
-    // Already mapped
-    const mapped = stickerUrlMap.get(originalUrl);
-    if (mapped) return mapped;
-    // If already gif, keep
-    if (/\.gif($|\?)/i.test(originalUrl)) return originalUrl;
-
-    // Quick extension swap try for Tenor
-    const guessedGifUrl = resolveChatTenorWebpToGifGuess(originalUrl);
-    if (guessedGifUrl) {
-      const guess = guessedGifUrl;
-      if (await headOk(guess)) {
-        setStickerUrlMap(prev => new Map(prev).set(originalUrl, guess));
-        return guess;
-      }
-    }
-
-    // Use Tenor posts lookup by id to find gif variant
-    const id = resolveChatTenorIdFromUrl(originalUrl);
-    const lookupUrl = resolveChatTenorPostsLookupUrl({
-      tenorBaseUrl: TENOR_BASE_URL,
-      tenorApiKey: TENOR_API_KEY,
-      tenorId: id,
-    });
-    if (lookupUrl) {
-      try {
-        const res = await fetch(lookupUrl);
-        if (res.ok) {
-          const data = await res.json();
-          const result = data?.results?.[0];
-          const alt = resolveChatTenorGifCandidateUrl({
-            mediaFormats: result?.media_formats,
-          });
-          if (alt) {
-            setStickerUrlMap(prev => new Map(prev).set(originalUrl, alt));
-            return alt;
-          }
-        }
-      } catch {}
-    }
-    return null;
-  }, [TENOR_API_KEY, TENOR_BASE_URL, headOk, stickerUrlMap]);
-
-  // Prefer smaller Tenor GIF variant for performance
   const resolveOptimizedGifUrl = useCallback(async (originalUrl: string): Promise<string> => {
-    const mapped = gifUrlMap.get(originalUrl);
-    if (mapped) return mapped;
-    const id = resolveChatTenorIdFromUrl(originalUrl);
-    const lookupUrl = resolveChatTenorPostsLookupUrl({
-      tenorBaseUrl: TENOR_BASE_URL,
-      tenorApiKey: TENOR_API_KEY,
-      tenorId: id,
-    });
-    if (lookupUrl) {
-      try {
-        const res = await fetch(lookupUrl);
-        if (res.ok) {
-          const data = await res.json();
-          const result = data?.results?.[0];
-          const alt = resolveChatTenorGifCandidateUrl({
-            mediaFormats: result?.media_formats,
-            fallbackUrl: originalUrl,
-          }) || originalUrl;
-          setGifUrlMap(prev => new Map(prev).set(originalUrl, alt));
-          return alt;
-        }
-      } catch {}
-    }
     return originalUrl;
-  }, [TENOR_API_KEY, TENOR_BASE_URL, gifUrlMap]);
+  }, []);
   const [emojiPickerVisible, setEmojiPickerVisible] = useState(false);
   const [selectedMessageForReaction, setSelectedMessageForReaction] = useState<string | null>(null);
   const [reactionPickerPosition, setReactionPickerPosition] = useState({ x: 0, y: 0 });

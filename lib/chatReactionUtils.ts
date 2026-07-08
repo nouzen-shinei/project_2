@@ -72,7 +72,7 @@ export function getReplyPreviewText(
 
   // Fallback labels for media-only messages
   if (message.stickerUrl || message.stickerId) return '🎨 Sticker';
-  if (message.gifUrl || message.tenorGifId) return '🎬 GIF';
+  if (message.gifUrl || message.gifId) return '🎬 GIF';
   if (message.imageUrl || message.mediaUrl) return '📷 Image';
   if (message.audioUrl) return '🎤 Voice message';
 

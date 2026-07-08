@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Modal , Platform } from 'react-native';
+import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Modal } from 'react-native';
 import ProgressiveImage from './ui/ProgressiveImage';
 import { HydratedChatMessage, chatCacheService } from '../services/chatCacheService';
 import { useTheme } from '../hooks/useTheme';
@@ -30,10 +30,6 @@ function EnhancedMessageRendererInner({
 }: EnhancedMessageRendererProps) {
   const { theme } = useTheme();
   const [gifModalVisible, setGifModalVisible] = useState(false);
-  const TENOR_API_KEY = process.env.EXPO_PUBLIC_TENOR_API_KEY;
-  const TENOR_BASE_URL = 'https://tenor.googleapis.com/v2';
-  const [stickerUrlMap, setStickerUrlMap] = useState<Map<string, string>>(new Map());
-  const [gifUrlMap, setGifUrlMap] = useState<Map<string, string>>(new Map());
   const [resolvedStickerUri, setResolvedStickerUri] = useState<string | null>(null);
   const [resolvedGifUri, setResolvedGifUri] = useState<string | null>(null);
 
@@ -56,87 +52,10 @@ function EnhancedMessageRendererInner({
     }
   };
 
-  // Tenor/GIF helpers
-  const extractTenorIdFromUrl = useCallback((url: string): string | null => {
-    try {
-      const u = new URL(url);
-      if (!u.hostname.includes('tenor.com')) return null;
-      const parts = u.pathname.split('/').filter(Boolean);
-      if (parts.length >= 1) return parts[0];
-      return null;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  const headOk = useCallback(async (url: string) => {
-    try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
-      clearTimeout(t);
-      return res.ok;
-    } catch {
-      return false;
-    }
-  }, []);
-
-  const resolveNativeSafeStickerUrl = useCallback(async (originalUrl: string): Promise<string | null> => {
-    if (Platform.OS === 'web') return originalUrl;
-    const mapped = stickerUrlMap.get(originalUrl);
-    if (mapped) return mapped;
-    if (/\.gif($|\?)/i.test(originalUrl)) return originalUrl;
-    if (/tenor\.com/.test(originalUrl) && /\.webp($|\?)/i.test(originalUrl)) {
-      const guess = originalUrl.replace(/\.webp(\?|$)/i, '.gif$1');
-      if (await headOk(guess)) {
-        setStickerUrlMap(prev => new Map(prev).set(originalUrl, guess));
-        return guess;
-      }
-    }
-    const id = extractTenorIdFromUrl(originalUrl);
-    if (id && TENOR_API_KEY) {
-      try {
-        const url = `${TENOR_BASE_URL}/posts?ids=${encodeURIComponent(id)}&key=${TENOR_API_KEY}&media_filter=basic`;
-        const res = await fetch(url);
-        if (res.ok) {
-          const data = await res.json();
-          const result = data?.results?.[0];
-          const fm = result?.media_formats || {};
-          const alt = fm.tinygif?.url || fm.nanogif?.url || fm.gif?.url || fm.mediumgif?.url || null;
-          if (alt) {
-            setStickerUrlMap(prev => new Map(prev).set(originalUrl, alt));
-            return alt;
-          }
-        }
-      } catch {}
-    }
-    return null;
-  }, [TENOR_API_KEY, extractTenorIdFromUrl, headOk, stickerUrlMap]);
-
-  const resolveOptimizedGifUrl = useCallback(async (originalUrl: string): Promise<string> => {
-    const mapped = gifUrlMap.get(originalUrl);
-    if (mapped) return mapped;
-    const id = extractTenorIdFromUrl(originalUrl);
-    if (id && TENOR_API_KEY) {
-      try {
-        const url = `${TENOR_BASE_URL}/posts?ids=${encodeURIComponent(id)}&key=${TENOR_API_KEY}&media_filter=basic`;
-        const res = await fetch(url);
-        if (res.ok) {
-          const data = await res.json();
-          const result = data?.results?.[0];
-          const fm = result?.media_formats || {};
-          const alt = fm.tinygif?.url || fm.nanogif?.url || fm.gif?.url || fm.mediumgif?.url || originalUrl;
-          setGifUrlMap(prev => new Map(prev).set(originalUrl, alt));
-          return alt;
-        }
-      } catch {}
-    }
-    return originalUrl;
-  }, [TENOR_API_KEY, extractTenorIdFromUrl, gifUrlMap]);
-
-  const stickerAltUrl = message.sticker?.url ? stickerUrlMap.get(message.sticker.url) : undefined;
-  const gifAltUrl = message.gif?.url ? gifUrlMap.get(message.gif.url) : undefined;
-
+  // Sticker/GIF URLs from the configured provider (Giphy/Klipy) are already
+  // direct, playable CDN URLs — no per-render resolution is needed. We still
+  // route them through the local media cache so repeat views load instantly
+  // and work offline.
   useEffect(() => {
     let cancelled = false;
     const hydrateSticker = async () => {
@@ -145,32 +64,17 @@ function EnhancedMessageRendererInner({
         return;
       }
 
-      const base = stickerAltUrl || message.sticker.url;
-      setResolvedStickerUri(base);
-
-      if (Platform.OS === 'web') {
-        return;
-      }
+      const originalUrl = message.sticker.url;
+      setResolvedStickerUri(originalUrl);
 
       try {
-        let candidate = base;
-        if (!stickerAltUrl) {
-          const alt = await resolveNativeSafeStickerUrl(message.sticker.url);
-          if (alt) {
-            candidate = alt;
-            if (!cancelled) {
-              setResolvedStickerUri(alt);
-            }
-          }
-        }
-
-  const localUri = await chatCacheService.getMediaForDownload(candidate, message.sticker?.name, undefined, 'normal');
+        const localUri = await chatCacheService.getMediaForDownload(originalUrl, message.sticker?.name, undefined, 'normal');
         if (!cancelled) {
-          setResolvedStickerUri(localUri || candidate);
+          setResolvedStickerUri(localUri || originalUrl);
         }
-      } catch (error) {
+      } catch {
         if (!cancelled) {
-          setResolvedStickerUri(base);
+          setResolvedStickerUri(originalUrl);
         }
       }
     };
@@ -179,7 +83,7 @@ function EnhancedMessageRendererInner({
     return () => {
       cancelled = true;
     };
-  }, [message.sticker?.url, message.sticker?.name, stickerAltUrl, resolveNativeSafeStickerUrl]);
+  }, [message.sticker?.url, message.sticker?.name]);
 
   useEffect(() => {
     let cancelled = false;
@@ -190,29 +94,22 @@ function EnhancedMessageRendererInner({
         return;
       }
 
-      let candidate = gifAltUrl || message.gif.url;
-      setResolvedGifUri(candidate);
+      const originalUrl = message.gif.url;
+      setResolvedGifUri(originalUrl);
 
       try {
-        if (!gifAltUrl) {
-          candidate = await resolveOptimizedGifUrl(message.gif.url);
-          if (!cancelled) {
-            setResolvedGifUri(candidate);
-          }
-        }
-
         const localUri = await chatCacheService.getMediaForDownload(
-          candidate,
+          originalUrl,
           message.gif?.title || message.gif?.source,
           undefined,
           'normal'
         );
         if (!cancelled) {
-          setResolvedGifUri(localUri || candidate);
+          setResolvedGifUri(localUri || originalUrl);
         }
       } catch {
         if (!cancelled) {
-          setResolvedGifUri(gifAltUrl || message.gif.url);
+          setResolvedGifUri(originalUrl);
         }
       }
     };
@@ -222,7 +119,7 @@ function EnhancedMessageRendererInner({
     return () => {
       cancelled = true;
     };
-  }, [message.gif?.url, message.gif?.title, message.gif?.source, gifAltUrl, resolveOptimizedGifUrl]);
+  }, [message.gif?.url, message.gif?.title, message.gif?.source]);
 
   const renderSticker = () => {
     if (!message.sticker) {
@@ -235,9 +132,7 @@ function EnhancedMessageRendererInner({
 
     const width = message.sticker.width ? Math.min(message.sticker.width, stickerSize) : stickerSize;
     const height = message.sticker.height ? Math.min(message.sticker.height, stickerSize) : stickerSize;
-    const originalUrl = message.sticker.url;
-  const displayUrl = Platform.OS === 'web' ? originalUrl : (stickerUrlMap.get(originalUrl) || originalUrl);
-  const stickerUri = resolvedStickerUri || displayUrl;
+    const stickerUri = resolvedStickerUri || message.sticker.url;
 
     return (
       <View style={styles.stickerContainer}>
@@ -245,11 +140,6 @@ function EnhancedMessageRendererInner({
           uri={stickerUri}
           style={[styles.stickerImage, { width, height }]}
           resizeMode="contain"
-          onError={async () => {
-            if (Platform.OS !== 'web') {
-              await resolveNativeSafeStickerUrl(originalUrl);
-            }
-          }}
         />
         <View style={styles.badgeContainer}>
           <Text style={styles.badgeText}>Sticker</Text>
@@ -281,9 +171,7 @@ function EnhancedMessageRendererInner({
       displayWidth = displayWidth * ratio;
     }
 
-    const originalUrl = message.gif.url;
-  const displayUrl = Platform.OS === 'web' ? originalUrl : (gifUrlMap.get(originalUrl) || originalUrl);
-  const gifUri = resolvedGifUri || displayUrl;
+    const gifUri = resolvedGifUri || message.gif.url;
     return (
       <View>
         <TouchableOpacity 
@@ -294,11 +182,6 @@ function EnhancedMessageRendererInner({
             uri={gifUri}
             style={[styles.gifImage, { width: displayWidth, height: displayHeight }]}
             resizeMode="cover"
-            onError={async () => {
-              if (Platform.OS !== 'web') {
-                await resolveOptimizedGifUrl(originalUrl);
-              }
-            }}
           />
           <View style={styles.badgeContainer}>
             <Text style={styles.badgeText}>GIF</Text>

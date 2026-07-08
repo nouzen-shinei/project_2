@@ -104,7 +104,7 @@ export interface ChatMessage {
     width?: number;
     height?: number;
     title?: string;
-    source?: string; // e.g., 'giphy', 'tenor'
+    source?: string; // e.g., 'giphy', 'klipy'
   };
   // Message status for WhatsApp-style ticks
   delivered?: boolean; // Double tick

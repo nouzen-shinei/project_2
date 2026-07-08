@@ -147,12 +147,6 @@ const {
   resolveChatNormalizedParticipantEmail,
 } = require('../lib/chatNormalizationState');
 const {
-  resolveChatTenorGifCandidateUrl,
-  resolveChatTenorIdFromUrl,
-  resolveChatTenorPostsLookupUrl,
-  resolveChatTenorWebpToGifGuess,
-} = require('../lib/chatTenorUrlState');
-const {
   resolveChatPresenceTimestamp,
   resolveChatRealtimeOnline,
 } = require('../lib/chatPresenceState');
@@ -5292,74 +5286,6 @@ function withEnv(overrides, callback) {
   );
 
   logger.debug('✓ testChatPresenceStateHelper passed');
-})();
-
-(function testChatTenorUrlStateHelper() {
-  assert.strictEqual(
-    resolveChatTenorIdFromUrl('https://media.tenor.com/abc123/some-file.webp'),
-    'abc123',
-    'Tenor URL helper should extract tenor id from media.tenor.com paths'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorIdFromUrl('https://example.com/not-tenor.webp'),
-    null,
-    'Tenor URL helper should ignore non-tenor hosts'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorWebpToGifGuess('https://media.tenor.com/abc123/file.webp?foo=1'),
-    'https://media.tenor.com/abc123/file.gif?foo=1',
-    'Tenor URL helper should convert tenor webp URLs to gif guesses'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorWebpToGifGuess('https://media.tenor.com/abc123/file.gif'),
-    null,
-    'Tenor URL helper should return null when no webp conversion is needed'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorPostsLookupUrl({
-      tenorBaseUrl: 'https://tenor.googleapis.com/v2',
-      tenorApiKey: 'key-123',
-      tenorId: 'abc 123',
-    }),
-    'https://tenor.googleapis.com/v2/posts?ids=abc%20123&key=key-123&media_filter=basic',
-    'Tenor URL helper should build encoded lookup URLs'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorPostsLookupUrl({
-      tenorBaseUrl: 'https://tenor.googleapis.com/v2',
-      tenorApiKey: '',
-      tenorId: 'abc123',
-    }),
-    null,
-    'Tenor URL helper should return null when api key is missing'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorGifCandidateUrl({
-      mediaFormats: {
-        mediumgif: { url: 'https://cdn.test/medium.gif' },
-        tinygif: { url: 'https://cdn.test/tiny.gif' },
-      },
-    }),
-    'https://cdn.test/tiny.gif',
-    'Tenor URL helper should prioritize tinygif candidates'
-  );
-
-  assert.strictEqual(
-    resolveChatTenorGifCandidateUrl({
-      mediaFormats: null,
-      fallbackUrl: 'https://cdn.test/fallback.gif',
-    }),
-    'https://cdn.test/fallback.gif',
-    'Tenor URL helper should return fallback when media formats do not provide gif URLs'
-  );
-
-  logger.debug('✓ testChatTenorUrlStateHelper passed');
 })();
 
 (function testChatSanitizeStateHelper() {
