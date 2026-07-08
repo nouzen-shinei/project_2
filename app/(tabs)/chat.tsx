@@ -332,6 +332,7 @@ import {
 } from '@/lib/chatPendingVisibilityState';
 import { resolveChatPendingRetryOutcomeSummary } from '@/lib/chatPendingRetryOutcomeState';
 import { resolveChatPendingRetryAllGuard } from '@/lib/chatPendingRetryEligibilityState';
+import { resolveChatPendingCancelAllGuard } from '@/lib/chatPendingCancelEligibilityState';
 import { resolveChatPendingRetryBatchPlan } from '@/lib/chatPendingRetryBatchState';
 import { resolveChatPendingRetryDispatchPromises } from '@/lib/chatPendingRetryDispatchState';
 import { resolveChatPendingAutoRetryPlan } from '@/lib/chatPendingAutoRetryState';
@@ -400,6 +401,12 @@ import { ChatFilePreviewModal } from '@/components/chat/ChatFilePreviewModal';
 import { ChatImageViewerModal } from '@/components/chat/ChatImageViewerModal';
 import { ChatContextProvider } from '@/components/chat/ChatContext';
 import { ChatHeader } from '@/components/chat/ChatHeader';
+import {
+  ChatPendingMedia,
+  ChatPendingAttachments,
+  type PendingMediaItem,
+  type PendingAttachmentItem,
+} from '@/components/chat/ChatPendingMedia';
 import AnimatedTypingIndicator from '@/components/AnimatedTypingIndicator';
 import type { ChatStableContextValue, ChatReactiveContextValue } from '@/components/chat/ChatContext';
 
@@ -810,6 +817,7 @@ export default function Chat() {
   const [pendingMedia, setPendingMedia] = useState<Map<string, PendingMediaItem>>(new Map());
   const [pendingAttachments, setPendingAttachments] = useState<Map<string, PendingAttachmentItem>>(new Map());
   const [isRetryingAllPending, setIsRetryingAllPending] = useState(false);
+  const [isCancelingAllPending, setIsCancelingAllPending] = useState(false);
   const attachmentUploadCancelMap = useRef<Map<string, () => void | Promise<void>>>(new Map());
   const attachmentFinalizeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const tenantMembersRequestIdRef = useRef(0);
@@ -1144,44 +1152,9 @@ export default function Chat() {
     pinnedSerial?: number;
   }
 
-  interface PendingMediaItem {
-    id: string;
-    kind: 'gif' | 'sticker';
-    previewUri: string;
-    width?: number;
-    height?: number;
-    nameOrTitle?: string;
-    timestamp: string;
-    recipientId: string;
-    sender: string;
-    status: 'sending' | 'failed' | 'queued' | 'sent';
-    serverMessageId?: string;
-    replyTo?: ChatReplyContext;
-    mime?: string;
-    source?: 'keyboard' | 'picker';
-    progress?: number; // 0-100 upload progress for local uploads
-  }
-
-  interface PendingAttachmentItem {
-    id: string;
-    files: {
-      uri: string;
-      fileName: string;
-      fileType: string;
-      fileSize?: number;
-      webFile?: Blob;
-    }[];
-    messageText: string;
-    recipientId: string;
-    sender: string;
-    status: 'sending' | 'failed' | 'finalizing' | 'sent';
-    serverMessageId?: string;
-    replyTo?: ChatReplyContext;
-    progress: number; // 0-100 overall progress
-    cancelable?: boolean;
-    cancelRequested?: boolean;
-    failureReason?: 'error' | 'canceled';
-  }
+  // PendingMediaItem / PendingAttachmentItem now live in
+  // @/components/chat/ChatPendingMedia alongside the components that render
+  // them, so the shape and the rendering logic can't drift apart.
 
   // Helper to detect media type (gif vs sticker/image) from uri/mime
   const detectMediaTypeFromUri = (uri?: string, mime?: string): 'gif' | 'sticker' => {
@@ -8253,30 +8226,70 @@ export default function Chat() {
   const handleSendWithFiles = async () => {
     if (!selectedTeamMember || selectedFiles.length === 0) return;
     const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
-    
+
+    const tempId = `pa_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const buildPendingAttachmentFiles = () => selectedFiles.map(f => ({
+      ...(() => {
+        const candidate = (f as any)?.webFile ?? (f as any)?.file;
+        const webFile =
+          Platform.OS === 'web' && typeof Blob !== 'undefined' && candidate instanceof Blob
+            ? candidate
+            : undefined;
+        return webFile ? { webFile } : {};
+      })(),
+      uri: f.uri,
+      fileName: f.fileName || f.name || 'file',
+      fileType: f.mimeType || 'application/octet-stream',
+      fileSize: f.fileSize || f.size,
+    }));
+
+    // Mirror the text-message offline flow: don't attempt the upload at all
+    // while offline. Mark it 'queued' (not 'failed') so it's visually
+    // distinct from a real send failure and gets picked up by auto-retry once
+    // connectivity returns.
+    if (isOffline) {
+      setPendingAttachments(prev => {
+        const next = new Map(prev);
+        next.set(tempId, {
+          id: tempId,
+          files: buildPendingAttachmentFiles(),
+          messageText: message.trim(),
+          recipientId: selectedTeamMember.id,
+          sender: effectiveUser?.email || '',
+          replyTo: activeReplyContext,
+          status: 'queued',
+          progress: 0,
+          cancelable: false,
+          cancelRequested: false,
+          failureReason: undefined,
+        });
+        return next;
+      });
+
+      clearInputField();
+      resetFilePreviewModal();
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
+
+      Toast.show({
+        type: 'info',
+        text1: 'Files Queued',
+        text2: 'You are offline. They will be sent when you reconnect.',
+        position: 'top',
+      });
+      return;
+    }
+
     setIsUploading(true);
     setUploadProgress(0);
-  const tempId = `pa_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-  try {
+    try {
       // Create optimistic pending attachment bubble
       setPendingAttachments(prev => {
         const next = new Map(prev);
         next.set(tempId, {
           id: tempId,
-          files: selectedFiles.map(f => ({
-            ...(() => {
-              const candidate = (f as any)?.webFile ?? (f as any)?.file;
-              const webFile =
-                Platform.OS === 'web' && typeof Blob !== 'undefined' && candidate instanceof Blob
-                  ? candidate
-                  : undefined;
-              return webFile ? { webFile } : {};
-            })(),
-            uri: f.uri,
-            fileName: f.fileName || f.name || 'file',
-            fileType: f.mimeType || 'application/octet-stream',
-            fileSize: f.fileSize || f.size,
-          })),
+          files: buildPendingAttachmentFiles(),
           messageText: message.trim(),
           recipientId: selectedTeamMember.id,
           sender: effectiveUser?.email || '',
@@ -8698,6 +8711,40 @@ export default function Chat() {
 
     // Optimistic pending sticker
     const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    // Mirror the text-message offline flow: don't attempt the network call at
+    // all while offline. Mark it 'queued' (not 'failed') so it's visually
+    // distinct from a real send failure and gets picked up by auto-retry once
+    // connectivity returns.
+    if (isOffline) {
+      setPendingMedia(prev => new Map(prev).set(tempId, {
+        id: tempId,
+        kind: 'sticker',
+        previewUri: sticker.url,
+        width: sticker.width,
+        height: sticker.height,
+        nameOrTitle: sticker.name,
+        timestamp: new Date().toISOString(),
+        recipientId: selectedTeamMember.id,
+        sender: effectiveUser.email,
+        replyTo: activeReplyContext,
+        status: 'queued',
+        source: 'picker',
+      }));
+
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
+
+      Toast.show({
+        type: 'info',
+        text1: 'Sticker Queued',
+        text2: 'You are offline. It will be sent when you reconnect.',
+        position: 'top',
+      });
+      return;
+    }
+
     try {
       setPendingMedia(prev => new Map(prev).set(tempId, {
         id: tempId,
@@ -8810,6 +8857,40 @@ export default function Chat() {
 
     // Optimistic pending GIF
     const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    // Mirror the text-message offline flow: don't attempt the network call at
+    // all while offline. Mark it 'queued' (not 'failed') so it's visually
+    // distinct from a real send failure and gets picked up by auto-retry once
+    // connectivity returns.
+    if (isOffline) {
+      setPendingMedia(prev => new Map(prev).set(tempId, {
+        id: tempId,
+        kind: 'gif',
+        previewUri: gif.url,
+        width: gif.width,
+        height: gif.height,
+        nameOrTitle: gif.title || 'GIF',
+        timestamp: new Date().toISOString(),
+        recipientId: selectedTeamMember.id,
+        sender: effectiveUser.email,
+        replyTo: activeReplyContext,
+        status: 'queued',
+        source: 'picker',
+      }));
+
+      clearNewMessageDivider();
+      clearUnreadDivider();
+      scheduleScrollToBottom({ animated: true, immediate: true });
+
+      Toast.show({
+        type: 'info',
+        text1: 'GIF Queued',
+        text2: 'You are offline. It will be sent when you reconnect.',
+        position: 'top',
+      });
+      return;
+    }
+
     try {
       setPendingMedia(prev => new Map(prev).set(tempId, {
         id: tempId,
@@ -9666,6 +9747,11 @@ export default function Chat() {
 
     const item = pendingMedia.get(tempId);
     if (!item || !selectedTeamMember) return false;
+    // Guard against double-dispatch: manual "Retry all" and the
+    // auto-retry-on-reconnect effect share this function, so a concurrent
+    // call for the same item must be a no-op rather than firing a second
+    // network request.
+    if (item.status === 'sending' || item.status === 'sent') return false;
     try {
       // Mark as sending
       setPendingMedia(prev => {
@@ -9749,10 +9835,13 @@ export default function Chat() {
       return true;
     } catch (err) {
       logger.error('Retry send failed:', err);
+      // Guard against resurrecting an item that was removed in the meantime
+      // (e.g. via "Cancel all") while this retry was in flight.
       setPendingMedia(prev => {
+        const cur = prev.get(tempId);
+        if (!cur) return prev;
         const next = new Map(prev);
-        const cur = next.get(tempId);
-        if (cur) next.set(tempId, { ...cur, status: 'failed' });
+        next.set(tempId, { ...cur, status: 'failed' });
         return next;
       });
       if (!options?.silent) {
@@ -9773,6 +9862,14 @@ export default function Chat() {
 
       const entry = pendingAttachments.get(tempId);
       if (!entry || !selectedTeamMember || entry.recipientId !== selectedTeamMember.id) {
+        return false;
+      }
+
+      // Guard against double-dispatch: manual "Retry all" and the
+      // auto-retry-on-reconnect effect share this function, so a concurrent
+      // call for the same item must be a no-op rather than firing a second
+      // upload.
+      if (entry.status === 'sending' || entry.status === 'finalizing' || entry.status === 'sent') {
         return false;
       }
 
@@ -9860,18 +9957,19 @@ export default function Chat() {
         } else {
           logger.error('Retry attachment send failed:', error);
         }
+        // Guard against resurrecting an item that was removed in the meantime
+        // (e.g. via "Cancel all") while this retry was in flight.
         setPendingAttachments((prev) => {
+          const current = prev.get(tempId);
+          if (!current) return prev;
           const next = new Map(prev);
-          const current = next.get(tempId);
-          if (current) {
-            next.set(tempId, {
-              ...current,
-              status: 'failed',
-              cancelable: false,
-              cancelRequested: false,
-              failureReason: error instanceof ChatUploadCanceledError ? 'canceled' : 'error',
-            });
-          }
+          next.set(tempId, {
+            ...current,
+            status: 'failed',
+            cancelable: false,
+            cancelRequested: false,
+            failureReason: error instanceof ChatUploadCanceledError ? 'canceled' : 'error',
+          });
           return next;
         });
         if (error instanceof ChatUploadCanceledError) {
@@ -9979,278 +10077,6 @@ export default function Chat() {
     pruneMapByKeySet(retryPendingAttachmentPressHandlersRef.current, activeIds);
     pruneMapByKeySet(cancelPendingAttachmentPressHandlersRef.current, activeIds);
   }, [pendingAttachments]);
-
-  // Render pending rich media (stickers/GIFs) with a clock icon until sent
-  const renderPendingMedia = (tempId: string, item: PendingMediaItem) => {
-    if (!selectedTeamMember) return null;
-    const inferredServerMessageId = findLikelyServerMessageIdForPendingMedia(item);
-    const pendingMediaVisibilityState = resolveChatPendingServerMatchVisibility({
-      selectedRecipientId: selectedTeamMember.id,
-      itemRecipientId: item.recipientId,
-      serverMessageId: item.serverMessageId || inferredServerMessageId,
-      deliveredMessageIds,
-      normalizeMessageId,
-    });
-    if (!pendingMediaVisibilityState.shouldRender) {
-      return null;
-    }
-
-    const rowAnim = getPendingRowAnimation(buildChatPendingRowAnimationKey('media', tempId), 'outgoing');
-    const pendingMediaStatusState = resolveChatPendingStatusDisplayState({
-      status: item.status,
-      isOffline,
-    });
-    const pendingMediaReplyPreviewState = resolveChatPendingReplyPreviewState({
-      replyTo: item.replyTo,
-      maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
-      resolvePreviewText: resolveChatReplyPreviewText,
-    });
-    const pendingReplyPreview = pendingMediaReplyPreviewState.previewText;
-    const pendingReplySenderLabel = pendingMediaReplyPreviewState.shouldShowPreview
-      ? resolveChatReplySenderLabel(item.replyTo)
-      : '';
-    const isSticker = item.kind === 'sticker';
-    const size = {
-      width: Math.min(item.width || 200, 200),
-      height: Math.min(item.height || 200, 200),
-    };
-    return (
-      <Animated.View
-        key={tempId}
-        style={{
-          opacity: rowAnim.opacity,
-          transform: [{ translateX: rowAnim.translateX }, { scale: rowAnim.scale }],
-        }}
-      >
-      <View style={[styles.messageContainer, styles.ownMessage]}>
-        {pendingReplyPreview && (
-          <TouchableOpacity
-            style={[styles.replySnippet, styles.replySnippetOwn, { borderLeftColor: 'rgba(255, 255, 255, 0.7)' }]}
-            activeOpacity={0.85}
-            onPress={() => {
-              void jumpToReplyMessage(item.replyTo);
-            }}
-          >
-            <Text style={[styles.replySnippetSender, styles.replySnippetSenderOwn]} numberOfLines={1}>
-              {pendingReplySenderLabel}
-            </Text>
-            <Text style={[styles.replySnippetText, styles.replySnippetTextOwn]} numberOfLines={1}>
-              {pendingReplyPreview}
-            </Text>
-          </TouchableOpacity>
-        )}
-        <View style={[styles.stickerContainer, styles.ownSticker]}>
-          {isSticker && (!item.previewUri || item.previewUri.trim().length === 0) ? (
-            <View style={styles.emojiStickerContainer}>
-              <Text style={[
-                styles.emojiStickerText,
-                { fontSize: Math.min(item.width || 100, 100) * 0.8 }
-              ]}>
-                {item.nameOrTitle || '🙂'}
-              </Text>
-            </View>
-          ) : (
-            <Image
-              source={{ uri: item.previewUri }}
-              style={[styles.stickerImage, size]}
-              resizeMode="contain"
-            />
-          )}
-          {/* Upload/progress overlay for pending media */}
-          {item.status === 'sending' && typeof item.progress === 'number' && (
-            <View style={styles.pendingMediaOverlay}>
-              <PendingUploadProgressBar
-                progress={item.progress}
-                label="Uploading..."
-                textStyle={{ color: '#fff', fontSize: 12, fontWeight: '600' }}
-                trackStyle={{
-                  height: 4,
-                  backgroundColor: 'rgba(255,255,255,0.3)',
-                  borderRadius: 4,
-                  marginTop: 4,
-                }}
-                fillStyle={{
-                  height: 4,
-                  backgroundColor: '#fff',
-                  borderRadius: 4,
-                }}
-              />
-            </View>
-          )}
-
-          <View style={[styles.stickerFooter, styles.ownStickerFooter, styles.alignItemsCenter]}>
-            <Text style={[styles.stickerTime, themedStyles.colorTextSecondary]}>
-              {pendingMediaStatusState.statusLabel}
-            </Text>
-            {pendingMediaStatusState.effectiveStatus === 'sending' ? (
-              <Clock size={12} color={theme.textSecondary} />
-            ) : pendingMediaStatusState.effectiveStatus === 'sent' ? (
-              <CheckCircle2 size={12} color={theme.textSecondary} />
-            ) : pendingMediaStatusState.effectiveStatus === 'queued' ? (
-              <Clock size={12} color={theme.textSecondary} />
-            ) : (
-              <AlertCircle size={12} color={theme.error} />
-            )}
-            {pendingMediaStatusState.canRetry && (
-              <TouchableOpacity
-                onPress={getRetryPendingMediaPressHandler(tempId)}
-                disabled={isOffline}
-                style={isOffline ? themedStyles.retryButtonDisabled : themedStyles.retryButton}
-              >
-                <Text style={themedStyles.retryText}>Retry</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        </View>
-      </View>
-      </Animated.View>
-    );
-  };
-
-  // Render pending file attachments message (optimistic bubble)
-  const renderPendingAttachments = (tempId: string, item: PendingAttachmentItem) => {
-    if (!selectedTeamMember) return null;
-    const pendingAttachmentVisibilityState = resolveChatPendingServerMatchVisibility({
-      selectedRecipientId: selectedTeamMember.id,
-      itemRecipientId: item.recipientId,
-      serverMessageId: item.serverMessageId,
-      deliveredMessageIds,
-      normalizeMessageId,
-    });
-    if (!pendingAttachmentVisibilityState.shouldRender) {
-      return null;
-    }
-
-    const rowAnim = getPendingRowAnimation(buildChatPendingRowAnimationKey('attachment', tempId), 'outgoing');
-    const showRetry = item.status === 'failed';
-    const pendingAttachmentReplyPreviewState = resolveChatPendingReplyPreviewState({
-      replyTo: item.replyTo,
-      maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
-      resolvePreviewText: resolveChatReplyPreviewText,
-    });
-    const pendingReplyPreview = pendingAttachmentReplyPreviewState.previewText;
-    const pendingReplySenderLabel = pendingAttachmentReplyPreviewState.shouldShowPreview
-      ? resolveChatReplySenderLabel(item.replyTo)
-      : '';
-
-    return (
-      <Animated.View
-        key={tempId}
-        style={{
-          opacity: rowAnim.opacity,
-          transform: [{ translateX: rowAnim.translateX }, { scale: rowAnim.scale }],
-        }}
-      >
-      <View style={[styles.messageContainer, styles.ownMessage]}>        
-        <View style={[styles.messageBubble, styles.ownBubble, { backgroundColor: theme.primary }]}>          
-          {pendingReplyPreview && (
-            <TouchableOpacity
-              style={[styles.replySnippet, styles.replySnippetOwn, { borderLeftColor: 'rgba(255, 255, 255, 0.7)' }]}
-              activeOpacity={0.85}
-              onPress={() => {
-                void jumpToReplyMessage(item.replyTo);
-              }}
-            >
-              <Text style={[styles.replySnippetSender, styles.replySnippetSenderOwn]} numberOfLines={1}>
-                {pendingReplySenderLabel}
-              </Text>
-              <Text style={[styles.replySnippetText, styles.replySnippetTextOwn]} numberOfLines={1}>
-                {pendingReplyPreview}
-              </Text>
-            </TouchableOpacity>
-          )}
-          {item.messageText ? (
-            <StyledText
-              text={item.messageText}
-              style={[styles.messageText, styles.ownMessageText]}
-              linkStyle={{ color: 'rgba(255,255,255,0.9)', fontWeight: '600' }}
-              highlightQuery={inlineConversationSearchHighlightQuery}
-              highlightStyle={styles.searchInlineHighlightOwn}
-            />
-          ) : null}
-          <View style={item.messageText ? styles.marginTop8 : null}>
-            {item.files.map((f, idx) => (
-              <View key={idx} style={idx < item.files.length - 1 ? styles.marginBottom8 : null}>
-                <View style={[styles.deletedFileAttachment, { backgroundColor: theme.background, borderColor: theme.border }]}> 
-                  <View style={styles.fileInfo}>
-                    <Text style={[styles.fileName, { color: theme.text }]} numberOfLines={1}>{f.fileName}</Text>
-                    <Text style={[styles.fileSize, { color: theme.textSecondary }]}>
-                      {f.fileType.replace('/',' · ')}{f.fileSize ? ` · ${formatFileSize(f.fileSize)}` : ''}
-                    </Text>
-                  </View>
-                </View>
-              </View>
-            ))}
-          </View>
-          {/* Upload/progress overlay */}
-          {item.status === 'sending' && (
-            <View style={styles.marginTop8}>
-              <View style={styles.pendingAttachmentHeader}>
-                <View style={styles.flex1}>
-                  <PendingUploadProgressBar
-                    progress={item.progress}
-                    label={item.cancelRequested ? 'Canceling...' : 'Uploading...'}
-                    showPercent={!item.cancelRequested}
-                    textStyle={styles.pendingSentText}
-                    trackStyle={styles.pendingProgressBarOuter}
-                    fillStyle={styles.pendingProgressBarInner}
-                  />
-                </View>
-                {item.cancelable && !item.cancelRequested && (
-                  <TouchableOpacity
-                    onPress={getCancelPendingAttachmentPressHandler(tempId)}
-                    style={styles.pendingAttachmentCancelButton}
-                    accessibilityRole="button"
-                    accessibilityLabel="Cancel upload"
-                  >
-                    <Text style={styles.pendingAttachmentCancelButtonText}>Cancel</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </View>
-          )}
-          {item.status === 'finalizing' && (
-            <View style={styles.marginTop8}>
-              <View style={styles.pendingAttachmentHeader}>
-                <Text style={styles.pendingSentText}>
-                  Sent
-                </Text>
-                <CheckCircle2 size={14} color={'#fff'} />
-              </View>
-              <View style={styles.pendingProgressBarOuter}>
-                <View style={styles.pendingProgressBarInner} />
-              </View>
-            </View>
-          )}
-          {item.status === 'failed' && (
-            <View style={styles.pendingFailedContainer}>
-              <AlertCircle size={14} color={'#fff'} />
-              <Text style={styles.pendingFailedText}>
-                {item.failureReason === 'canceled' ? 'Canceled' : 'Failed'}
-              </Text>
-            </View>
-          )}
-          {showRetry && (
-            <View style={styles.pendingFailedContainer}>
-              <TouchableOpacity
-                onPress={getRetryPendingAttachmentPressHandler(tempId)}
-                disabled={isOffline}
-                style={[
-                  styles.pendingRetryButton,
-                  { opacity: isOffline ? 0.6 : 1 }
-                ]}
-              >
-                <RotateCcw size={12} color={'#fff'} />
-                <Text style={styles.pendingRetryButtonText}>Retry</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-        </View>
-      </View>
-      </Animated.View>
-    );
-  };
-
 
   const renderMessageInfoModal = () => {
     return (
@@ -11091,119 +10917,6 @@ export default function Chat() {
     }
   }, [pendingMessages, resolvePendingMessageStatus, getPendingMessageBubbleOpacity]);
 
-  // Retry pending messages when back online
-  const retryPendingMessages = async () => {
-    if (pendingMessages.size === 0 || isOffline) return;
-
-    const messagesToRetry = Array.from(pendingMessages.entries()).filter(([, pendingMsg]) => {
-      return resolvePendingMessageStatus(pendingMsg) === 'queued';
-    });
-
-    if (messagesToRetry.length === 0) {
-      return;
-    }
-
-    const successfulMessages: string[] = [];
-    const sentMessagesToPersist: { tempId: string; message: PendingMessage }[] = [];
-
-    for (const [tempId, pendingMsg] of messagesToRetry) {
-      setPendingMessages((prev) => {
-        const next = new Map(prev);
-        const existing = next.get(tempId);
-        if (existing) {
-          next.set(tempId, {
-            ...existing,
-            status: 'sending',
-          });
-        }
-        return next;
-      });
-
-      try {
-        const serverMessageId = await sendMessage(
-          pendingMsg.text,
-          false,
-          pendingMsg.recipientId,
-          { replyTo: pendingMsg.replyTo }
-        );
-        successfulMessages.push(tempId);
-
-        const sentPendingMessage: PendingMessage = {
-          ...pendingMsg,
-          status: 'sent',
-          serverMessageId,
-        };
-        sentMessagesToPersist.push({ tempId, message: sentPendingMessage });
-
-        setPendingMessages((prev) => {
-          const next = new Map(prev);
-          const existing = next.get(tempId);
-          if (existing) {
-            next.set(tempId, {
-              ...existing,
-              status: 'sent',
-              serverMessageId,
-            });
-          }
-          return next;
-        });
-      } catch (error) {
-        logger.error('❌ Failed to retry message:', tempId, error);
-
-        const failedPending: PendingMessage = {
-          ...pendingMsg,
-          status: 'failed',
-        };
-
-        setPendingMessages((prev) => {
-          const next = new Map(prev);
-          const existing = next.get(tempId);
-          next.set(tempId, {
-            ...(existing || pendingMsg),
-            status: 'failed',
-          });
-          return next;
-        });
-
-        try {
-          await PendingMessageStorage.addPendingMessage(tempId, failedPending);
-        } catch (storageError) {
-          logger.warn('Failed to persist queued message retry failure:', storageError);
-        }
-      }
-    }
-
-    // Persist successfully retried messages as sent.
-    // They remain in storage until realtime reconciliation confirms delivery.
-    if (successfulMessages.length > 0) {
-      try {
-        await Promise.all(
-          sentMessagesToPersist.map(({ tempId, message }) =>
-            PendingMessageStorage.addPendingMessage(tempId, message)
-          )
-        );
-      } catch (error) {
-        logger.error('❌ Failed to persist sent retried messages:', error);
-      }
-
-      if (successfulMessages.length === messagesToRetry.length) {
-        Toast.show({
-          type: 'success',
-          text1: 'Messages Sent',
-          text2: 'All pending messages have been sent successfully.',
-          position: 'top',
-        });
-      } else {
-        Toast.show({
-          type: 'info',
-          text1: 'Partial Success',
-          text2: `${successfulMessages.length} of ${messagesToRetry.length} messages were sent. Retry the rest manually.`,
-          position: 'top',
-        });
-      }
-    }
-  };
-
   const retryPendingMessage = useCallback(
     async (tempId: string, options?: { silent?: boolean }): Promise<boolean> => {
       if (isOffline) {
@@ -11287,20 +11000,30 @@ export default function Chat() {
           status: 'failed',
         };
 
+        // Guard against resurrecting an item that was removed in the meantime
+        // (e.g. via "Cancel all" or delivery reconciliation) while this retry
+        // was in flight.
+        let stillPending = false;
         setPendingMessages((prev) => {
+          const current = prev.get(tempId);
+          if (!current) {
+            return prev;
+          }
+          stillPending = true;
           const next = new Map(prev);
-          const current = next.get(tempId);
           next.set(tempId, {
-            ...(current || pendingMsg),
+            ...current,
             status: 'failed',
           });
           return next;
         });
 
-        try {
-          await PendingMessageStorage.addPendingMessage(tempId, failedPending);
-        } catch (storageError) {
-          logger.warn('Failed to persist pending message retry failure:', storageError);
+        if (stillPending) {
+          try {
+            await PendingMessageStorage.addPendingMessage(tempId, failedPending);
+          } catch (storageError) {
+            logger.warn('Failed to persist pending message retry failure:', storageError);
+          }
         }
 
         if (!options?.silent) {
@@ -11377,22 +11100,148 @@ export default function Chat() {
     }
   }, [selectedTeamMember?.id, isOffline, pendingConversationDerived, isRetryingAllPending, retryPendingMessage, retryPendingMedia, retryPendingAttachment]);
 
-  // Effect to retry pending messages when connection is restored
+  // Cancel every currently failed/queued pending item (text, media, attachments)
+  // for the active conversation. This mirrors retryAllPendingSends' target set
+  // (the same items shown in the "N pending items not sent" banner) but removes
+  // them instead of resending them, from in-memory state, persistent storage,
+  // and any in-flight upload cancel handles.
+  const cancelAllPendingSends = useCallback(() => {
+    const {
+      retryableTextIds,
+      retryableMediaIds,
+      retryableAttachmentIds,
+    } = pendingConversationDerived;
+    const cancelBatchPlan = resolveChatPendingRetryBatchPlan({
+      retryableTextIds,
+      retryableMediaIds,
+      retryableAttachmentIds,
+    });
+    const total = cancelBatchPlan.totalCount;
+
+    const cancelAllGuard = resolveChatPendingCancelAllGuard({
+      selectedRecipientId: selectedTeamMember?.id,
+      totalCount: total,
+      isCancelingAllPending,
+    });
+    if (!cancelAllGuard.shouldRun) {
+      return;
+    }
+
+    setIsCancelingAllPending(true);
+
+    try {
+      const textIdsToRemove: string[] = [];
+      const mediaIdsToRemove: string[] = [];
+      const attachmentIdsToRemove: string[] = [];
+
+      cancelBatchPlan.orderedTargets.forEach((target) => {
+        if (target.kind === 'text') {
+          textIdsToRemove.push(target.tempId);
+        } else if (target.kind === 'media') {
+          mediaIdsToRemove.push(target.tempId);
+        } else {
+          attachmentIdsToRemove.push(target.tempId);
+        }
+      });
+
+      if (textIdsToRemove.length > 0) {
+        setPendingMessages((prev) => resolveChatPendingMapAfterRemovingIds(prev, textIdsToRemove));
+        void PendingMessageStorage.removePendingMessages(textIdsToRemove).catch((error) => {
+          logger.warn('Failed to remove canceled pending messages from storage:', error);
+        });
+      }
+
+      if (mediaIdsToRemove.length > 0) {
+        setPendingMedia((prev) => resolveChatPendingMapAfterRemovingIds(prev, mediaIdsToRemove));
+      }
+
+      if (attachmentIdsToRemove.length > 0) {
+        attachmentIdsToRemove.forEach((tempId) => {
+          clearAttachmentFinalizeTimer(tempId);
+          attachmentUploadCancelMap.current.delete(tempId);
+        });
+        setPendingAttachments((prev) => resolveChatPendingMapAfterRemovingIds(prev, attachmentIdsToRemove));
+      }
+
+      Toast.show({
+        type: 'success',
+        text1: 'Canceled',
+        text2: total === 1 ? 'Removed 1 pending item.' : `Removed ${total} pending items.`,
+        position: 'top',
+      });
+    } finally {
+      setIsCancelingAllPending(false);
+    }
+  }, [pendingConversationDerived, selectedTeamMember?.id, isCancelingAllPending, clearAttachmentFinalizeTimer]);
+
+  // Auto-retry-on-reconnect shares the exact same per-item retry functions
+  // (retryPendingMessage / retryPendingMedia / retryPendingAttachment) as
+  // "Retry all", so a fix to how an item is resent never needs to be applied
+  // in two places. It only targets items that are 'queued' (queued purely
+  // because the device was offline), not items that are 'failed' for another
+  // reason — those still require an explicit user retry.
+  const retryAllQueuedPendingSends = useCallback(async () => {
+    const { queuedTextIds, queuedMediaIds, queuedAttachmentIds } = pendingConversationDerived;
+    const queuedBatchPlan = resolveChatPendingRetryBatchPlan({
+      retryableTextIds: queuedTextIds,
+      retryableMediaIds: queuedMediaIds,
+      retryableAttachmentIds: queuedAttachmentIds,
+    });
+    const total = queuedBatchPlan.totalCount;
+    if (total === 0 || isOffline) {
+      return;
+    }
+
+    const retryPromises = resolveChatPendingRetryDispatchPromises({
+      orderedTargets: queuedBatchPlan.orderedTargets,
+      handlers: {
+        text: (tempId) => retryPendingMessage(tempId, { silent: true }),
+        media: (tempId) => retryPendingMedia(tempId, { silent: true }),
+        attachment: (tempId) => retryPendingAttachment(tempId, { silent: true }),
+      },
+    });
+
+    const settled = await Promise.allSettled(retryPromises);
+    const successCount = settled.filter((r) => r.status === 'fulfilled' && r.value === true).length;
+
+    if (successCount === 0) {
+      return;
+    }
+
+    if (successCount === total) {
+      Toast.show({
+        type: 'success',
+        text1: 'Messages Sent',
+        text2: 'All queued items have been sent successfully.',
+        position: 'top',
+      });
+    } else {
+      Toast.show({
+        type: 'info',
+        text1: 'Partial Success',
+        text2: `${successCount} of ${total} queued items were sent. Retry the rest manually.`,
+        position: 'top',
+      });
+    }
+  }, [pendingConversationDerived, isOffline, retryPendingMessage, retryPendingMedia, retryPendingAttachment]);
+
+  // Effect to retry queued pending items (text, media, attachments) when
+  // connection is restored.
   useEffect(() => {
     const pendingAutoRetryPlan = resolveChatPendingAutoRetryPlan({
       isOffline,
-      pendingMessageCount: pendingMessages.size,
+      pendingMessageCount: pendingConversationDerived.queuedAllCount,
       defaultDelayMs: 1000,
     });
 
     if (pendingAutoRetryPlan.shouldSchedule) {
       // Wait a moment for connection to stabilize
       const timer = setTimeout(() => {
-        retryPendingMessages();
+        void retryAllQueuedPendingSends();
       }, pendingAutoRetryPlan.delayMs);
       return () => clearTimeout(timer);
     }
-  }, [isOffline, pendingMessages.size]);
+  }, [isOffline, pendingConversationDerived.queuedAllCount, retryAllQueuedPendingSends]);
 
   // Clear optimistic text rows once their server message shows up in conversation data.
   useEffect(() => {
@@ -11684,6 +11533,10 @@ export default function Chat() {
   const handleRetryAllPendingPress = useCallback(() => {
     void retryAllPendingSends();
   }, [retryAllPendingSends]);
+
+  const handleCancelAllPendingPress = useCallback(() => {
+    cancelAllPendingSends();
+  }, [cancelAllPendingSends]);
 
   const appendFormattingText = useCallback((suffix: string) => {
     const baseText = typeof latestMessageRef.current === 'string' ? latestMessageRef.current : '';
@@ -12198,11 +12051,39 @@ export default function Chat() {
   const chatListFooterComponent = (
     <View>
       {/* Optimistic pending media (stickers/GIFs) */}
-      {pendingConversationDerived.mediaEntries.map(([tempId, item]) => {
+      {selectedTeamMember && pendingConversationDerived.mediaEntries.map(([tempId, item]) => {
         if (!tempId || !item) return null;
-        const rendered = renderPendingMedia(tempId, item);
-        if (typeof rendered === 'string') return null;
-        return rendered;
+        // Fall back to a heuristically-matched server message id when the
+        // item hasn't been explicitly reconciled yet, so a media bubble that
+        // has already landed on the server doesn't linger as "pending".
+        const effectiveItem = item.serverMessageId
+          ? item
+          : (() => {
+              const inferred = findLikelyServerMessageIdForPendingMedia(item);
+              return inferred ? { ...item, serverMessageId: inferred } : item;
+            })();
+        return (
+          <ChatPendingMedia
+            key={tempId}
+            tempId={tempId}
+            item={effectiveItem}
+            selectedTeamMemberId={selectedTeamMember.id}
+            deliveredMessageIds={deliveredMessageIds}
+            normalizeMessageId={normalizeMessageId}
+            getPendingRowAnimation={getPendingRowAnimation}
+            buildChatPendingRowAnimationKey={buildChatPendingRowAnimationKey}
+            isOffline={isOffline}
+            CHAT_REPLY_PREVIEW_MAX_CHARS={CHAT_REPLY_PREVIEW_MAX_CHARS}
+            resolveChatReplyPreviewText={resolveChatReplyPreviewText}
+            resolveChatReplySenderLabel={resolveChatReplySenderLabel}
+            jumpToReplyMessage={jumpToReplyMessage}
+            getRetryPendingMediaPressHandler={getRetryPendingMediaPressHandler}
+            PendingUploadProgressBar={PendingUploadProgressBar}
+            theme={theme}
+            themedStyles={themedStyles}
+            styles={styles}
+          />
+        );
       })}
 
       {/* Pending text messages (queued/sending/sent/failed) */}
@@ -12217,11 +12098,33 @@ export default function Chat() {
       })}
 
       {/* Optimistic pending file attachments */}
-      {pendingConversationDerived.attachmentEntries.map(([tempId, item]) => {
+      {selectedTeamMember && pendingConversationDerived.attachmentEntries.map(([tempId, item]) => {
         if (!tempId || !item) return null;
-        const rendered = renderPendingAttachments(tempId, item);
-        if (typeof rendered === 'string') return null;
-        return rendered;
+        return (
+          <ChatPendingAttachments
+            key={tempId}
+            tempId={tempId}
+            item={item}
+            selectedTeamMemberId={selectedTeamMember.id}
+            deliveredMessageIds={deliveredMessageIds}
+            normalizeMessageId={normalizeMessageId}
+            getPendingRowAnimation={getPendingRowAnimation}
+            buildChatPendingRowAnimationKey={buildChatPendingRowAnimationKey}
+            isOffline={isOffline}
+            CHAT_REPLY_PREVIEW_MAX_CHARS={CHAT_REPLY_PREVIEW_MAX_CHARS}
+            resolveChatReplyPreviewText={resolveChatReplyPreviewText}
+            resolveChatReplySenderLabel={resolveChatReplySenderLabel}
+            jumpToReplyMessage={jumpToReplyMessage}
+            getRetryPendingAttachmentPressHandler={getRetryPendingAttachmentPressHandler}
+            getCancelPendingAttachmentPressHandler={getCancelPendingAttachmentPressHandler}
+            formatFileSize={formatFileSize}
+            PendingUploadProgressBar={PendingUploadProgressBar}
+            inlineConversationSearchHighlightQuery={inlineConversationSearchHighlightQuery}
+            theme={theme}
+            themedStyles={themedStyles}
+            styles={styles}
+          />
+        );
       })}
 
       {/* Typing indicator */}
@@ -13074,6 +12977,8 @@ export default function Chat() {
         retryAllPendingCount={retryAllPendingCount}
         isRetryingAllPending={isRetryingAllPending}
         handleRetryAllPendingPress={handleRetryAllPendingPress}
+        isCancelingAllPending={isCancelingAllPending}
+        handleCancelAllPendingPress={handleCancelAllPendingPress}
         replyingToMessage={replyingToMessage}
         replyingSenderLabel={replyingSenderLabel}
         replyingPreviewText={replyingPreviewText}

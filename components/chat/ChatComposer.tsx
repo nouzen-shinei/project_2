@@ -30,6 +30,8 @@ export interface ChatComposerProps {
   retryAllPendingCount: number;
   isRetryingAllPending: boolean;
   handleRetryAllPendingPress: () => void;
+  isCancelingAllPending: boolean;
+  handleCancelAllPendingPress: () => void;
   
   // Replying
   replyingToMessage: any;
@@ -81,6 +83,8 @@ export function ChatComposer({
   retryAllPendingCount,
   isRetryingAllPending,
   handleRetryAllPendingPress,
+  isCancelingAllPending,
+  handleCancelAllPendingPress,
   
   replyingToMessage,
   replyingSenderLabel,
@@ -263,26 +267,50 @@ export function ChatComposer({
               {retryAllPendingCount} pending {retryAllPendingCount === 1 ? 'item' : 'items'} not sent
             </Text>
           </View>
-          <TouchableOpacity
-            onPress={handleRetryAllPendingPress}
-            disabled={isRetryingAllPending || isOffline}
-            style={[
-              styles.retryAllBannerButton,
-              {
-                backgroundColor: theme.primary,
-                opacity: isRetryingAllPending || isOffline ? 0.65 : 1,
-              },
-            ]}
-          >
-            {isRetryingAllPending ? (
-              <ActivityIndicator size="small" color="#ffffff" />
-            ) : (
-              <RotateCcw size={14} color="#ffffff" />
-            )}
-            <Text style={styles.retryAllBannerButtonText}>
-              {isRetryingAllPending ? 'Retrying...' : 'Retry all'}
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.retryAllBannerActions}>
+            <TouchableOpacity
+              onPress={handleCancelAllPendingPress}
+              disabled={isCancelingAllPending || isRetryingAllPending}
+              style={[
+                styles.cancelAllBannerButton,
+                {
+                  borderColor: theme.border,
+                  opacity: isCancelingAllPending || isRetryingAllPending ? 0.65 : 1,
+                },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel all pending items"
+            >
+              {isCancelingAllPending ? (
+                <ActivityIndicator size="small" color={theme.textSecondary} />
+              ) : (
+                <X size={14} color={theme.textSecondary} />
+              )}
+              <Text style={[styles.cancelAllBannerButtonText, { color: theme.textSecondary }]}>
+                {isCancelingAllPending ? 'Canceling...' : 'Cancel all'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={handleRetryAllPendingPress}
+              disabled={isRetryingAllPending || isOffline || isCancelingAllPending}
+              style={[
+                styles.retryAllBannerButton,
+                {
+                  backgroundColor: theme.primary,
+                  opacity: isRetryingAllPending || isOffline || isCancelingAllPending ? 0.65 : 1,
+                },
+              ]}
+            >
+              {isRetryingAllPending ? (
+                <ActivityIndicator size="small" color="#ffffff" />
+              ) : (
+                <RotateCcw size={14} color="#ffffff" />
+              )}
+              <Text style={styles.retryAllBannerButtonText}>
+                {isRetryingAllPending ? 'Retrying...' : 'Retry all'}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
       )}
       {/* Input Area - Mobile vs Web */}
@@ -489,16 +517,34 @@ const styles = StyleSheet.create({
     fontFamily: 'Inter-Medium',
     marginLeft: 8,
   },
+  retryAllBannerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
   retryAllBannerButton: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 14,
-    marginLeft: 12,
+    marginLeft: 8,
   },
   retryAllBannerButtonText: {
     color: '#ffffff',
+    fontSize: 12,
+    fontFamily: 'Inter-SemiBold',
+    marginLeft: 6,
+  },
+  cancelAllBannerButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 14,
+    borderWidth: 1,
+    marginLeft: 12,
+  },
+  cancelAllBannerButtonText: {
     fontSize: 12,
     fontFamily: 'Inter-SemiBold',
     marginLeft: 6,

@@ -37,7 +37,7 @@ export interface PendingMediaItem {
   sender: string;
   status: 'sending' | 'failed' | 'queued' | 'sent';
   serverMessageId?: string;
-  replyTo?: ChatReplyContext | null;
+  replyTo?: ChatReplyContext;
   mime?: string;
   source?: 'keyboard' | 'picker';
   progress?: number;
@@ -55,9 +55,9 @@ export interface PendingAttachmentItem {
   messageText: string;
   recipientId: string;
   sender: string;
-  status: 'sending' | 'failed' | 'finalizing' | 'sent';
+  status: 'sending' | 'failed' | 'finalizing' | 'sent' | 'queued';
   serverMessageId?: string;
-  replyTo?: ChatReplyContext | null;
+  replyTo?: ChatReplyContext;
   progress: number;
   cancelable?: boolean;
   cancelRequested?: boolean;
@@ -78,18 +78,26 @@ interface PendingUploadProgressBarProps {
 // Shared props types
 // ──────────────────────────────────────────────────────────────────────────────
 
+type ChatPendingRowAnimationKind = 'text' | 'media' | 'attachment';
+type ChatPendingRowAnimationDirection = 'incoming' | 'outgoing';
+
+interface ChatPendingRowAnimationValues {
+  opacity: Animated.Value;
+  translateX: Animated.Value;
+  scale: Animated.Value;
+}
+
 export interface ChatPendingMediaProps {
   tempId: string;
   item: PendingMediaItem;
   selectedTeamMemberId: string | undefined;
   deliveredMessageIds: Set<string>;
   normalizeMessageId: (id: unknown) => string;
-  getPendingRowAnimation: (key: string, direction: string) => {
-    opacity: Animated.Value;
-    translateX: Animated.Value;
-    scale: Animated.Value;
-  };
-  buildChatPendingRowAnimationKey: (kind: string, tempId: string) => string;
+  getPendingRowAnimation: (
+    key: string,
+    direction?: ChatPendingRowAnimationDirection
+  ) => ChatPendingRowAnimationValues;
+  buildChatPendingRowAnimationKey: (kind: ChatPendingRowAnimationKind, tempId: string) => string;
   isOffline: boolean;
   CHAT_REPLY_PREVIEW_MAX_CHARS: number;
   resolveChatReplyPreviewText: (args: any) => string;
@@ -108,12 +116,11 @@ export interface ChatPendingAttachmentsProps {
   selectedTeamMemberId: string | undefined;
   deliveredMessageIds: Set<string>;
   normalizeMessageId: (id: unknown) => string;
-  getPendingRowAnimation: (key: string, direction: string) => {
-    opacity: Animated.Value;
-    translateX: Animated.Value;
-    scale: Animated.Value;
-  };
-  buildChatPendingRowAnimationKey: (kind: string, tempId: string) => string;
+  getPendingRowAnimation: (
+    key: string,
+    direction?: ChatPendingRowAnimationDirection
+  ) => ChatPendingRowAnimationValues;
+  buildChatPendingRowAnimationKey: (kind: ChatPendingRowAnimationKind, tempId: string) => string;
   isOffline: boolean;
   CHAT_REPLY_PREVIEW_MAX_CHARS: number;
   resolveChatReplyPreviewText: (args: any) => string;
@@ -318,7 +325,7 @@ export const ChatPendingAttachments = React.memo(function ChatPendingAttachments
     buildChatPendingRowAnimationKey('attachment', tempId),
     'outgoing',
   );
-  const showRetry = item.status === 'failed';
+  const showRetry = item.status === 'failed' || (item.status === 'queued' && !isOffline);
   const pendingAttachmentReplyPreviewState = resolveChatPendingReplyPreviewState({
     replyTo: item.replyTo,
     maxLength: CHAT_REPLY_PREVIEW_MAX_CHARS,
@@ -419,6 +426,12 @@ export const ChatPendingAttachments = React.memo(function ChatPendingAttachments
               <Text style={styles.pendingFailedText}>
                 {item.failureReason === 'canceled' ? 'Canceled' : 'Failed'}
               </Text>
+            </View>
+          )}
+          {item.status === 'queued' && (
+            <View style={styles.pendingFailedContainer}>
+              <Clock size={14} color={'#fff'} />
+              <Text style={styles.pendingFailedText}>Queued</Text>
             </View>
           )}
           {showRetry && (

@@ -10,6 +10,15 @@ export interface ChatPendingConversationDerivedState<
   retryableMediaIds: string[];
   retryableAttachmentIds: string[];
   retryAllCount: number;
+  // "Queued" is a strict subset of "retryable" (retryable also includes items
+  // that failed outright). Auto-retry-on-reconnect should only resend items
+  // that were queued purely because the device was offline, not items that
+  // failed for another reason (rate limiting, server error, etc.) — those
+  // require an explicit user-initiated retry.
+  queuedTextIds: string[];
+  queuedMediaIds: string[];
+  queuedAttachmentIds: string[];
+  queuedAllCount: number;
 }
 
 export interface ResolveChatPendingConversationDerivedStateInput<
@@ -32,8 +41,15 @@ function shouldRetryPendingMediaStatus(status: unknown): boolean {
   return status === 'failed' || status === 'queued';
 }
 
+// Attachments now support an explicit 'queued' status for offline sends (see
+// PendingAttachmentItem), so they are retryable in the same two cases as text
+// and media.
 function shouldRetryPendingAttachmentStatus(status: unknown): boolean {
-  return status === 'failed';
+  return status === 'failed' || status === 'queued';
+}
+
+function isQueuedStatus(status: unknown): boolean {
+  return status === 'queued';
 }
 
 function hasSelectedRecipient(value: unknown): boolean {
@@ -64,6 +80,10 @@ export function resolveChatPendingConversationDerivedState<
       retryableMediaIds: [],
       retryableAttachmentIds: [],
       retryAllCount: 0,
+      queuedTextIds: [],
+      queuedMediaIds: [],
+      queuedAttachmentIds: [],
+      queuedAllCount: 0,
     };
   }
 
@@ -74,6 +94,9 @@ export function resolveChatPendingConversationDerivedState<
   const retryableTextIds: string[] = [];
   const retryableMediaIds: string[] = [];
   const retryableAttachmentIds: string[] = [];
+  const queuedTextIds: string[] = [];
+  const queuedMediaIds: string[] = [];
+  const queuedAttachmentIds: string[] = [];
 
   input.pendingMessages.forEach((pendingMessage, tempId) => {
     if (!pendingMessage || !hasMatchingRecipient(pendingMessage.recipientId, selectedRecipientId)) {
@@ -85,6 +108,9 @@ export function resolveChatPendingConversationDerivedState<
     if (shouldRetryPendingTextStatus(status)) {
       retryableTextIds.push(tempId);
     }
+    if (isQueuedStatus(status)) {
+      queuedTextIds.push(tempId);
+    }
   });
 
   input.pendingMedia.forEach((pendingMediaItem, tempId) => {
@@ -95,6 +121,9 @@ export function resolveChatPendingConversationDerivedState<
     mediaEntries.push([tempId, pendingMediaItem]);
     if (shouldRetryPendingMediaStatus(pendingMediaItem.status)) {
       retryableMediaIds.push(tempId);
+    }
+    if (isQueuedStatus(pendingMediaItem.status)) {
+      queuedMediaIds.push(tempId);
     }
   });
 
@@ -110,6 +139,9 @@ export function resolveChatPendingConversationDerivedState<
     if (shouldRetryPendingAttachmentStatus(pendingAttachmentItem.status)) {
       retryableAttachmentIds.push(tempId);
     }
+    if (isQueuedStatus(pendingAttachmentItem.status)) {
+      queuedAttachmentIds.push(tempId);
+    }
   });
 
   return {
@@ -121,5 +153,9 @@ export function resolveChatPendingConversationDerivedState<
     retryableAttachmentIds,
     retryAllCount:
       retryableTextIds.length + retryableMediaIds.length + retryableAttachmentIds.length,
+    queuedTextIds,
+    queuedMediaIds,
+    queuedAttachmentIds,
+    queuedAllCount: queuedTextIds.length + queuedMediaIds.length + queuedAttachmentIds.length,
   };
 }

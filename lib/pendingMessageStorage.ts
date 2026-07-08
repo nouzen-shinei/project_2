@@ -52,7 +52,7 @@ export interface PendingAttachmentMessage {
   messageText: string;
   recipientId: string;
   sender: string;
-  status: 'sending' | 'failed' | 'finalizing' | 'sent';
+  status: 'sending' | 'failed' | 'finalizing' | 'sent' | 'queued';
   serverMessageId?: string;
   progress: number;
   cancelable?: boolean;

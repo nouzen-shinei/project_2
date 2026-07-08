@@ -375,6 +375,7 @@ const {
 } = require('../lib/chatPendingRetrySummaryState');
 const { resolveChatPendingRetryOutcomeSummary } = require('../lib/chatPendingRetryOutcomeState');
 const { resolveChatPendingRetryAllGuard } = require('../lib/chatPendingRetryEligibilityState');
+const { resolveChatPendingCancelAllGuard } = require('../lib/chatPendingCancelEligibilityState');
 const { resolveChatPendingRetryBatchPlan } = require('../lib/chatPendingRetryBatchState');
 const {
   resolveChatPendingRetryDispatchPromises,
@@ -12578,6 +12579,7 @@ function withEnv(overrides, callback) {
       ['attachment-1', { recipientId: 'recipient-1', status: 'failed' }],
       ['attachment-2', { recipientId: 'recipient-1', status: 'finalizing' }],
       ['attachment-3', { recipientId: 'recipient-2', status: 'failed' }],
+      ['attachment-4', { recipientId: 'recipient-1', status: 'queued' }],
     ]),
     resolvePendingMessageStatus: (pendingMessage) => pendingMessage.status,
   });
@@ -12594,7 +12596,7 @@ function withEnv(overrides, callback) {
   );
   assert.deepStrictEqual(
     derived.attachmentEntries.map(([id]) => id),
-    ['attachment-1', 'attachment-2'],
+    ['attachment-1', 'attachment-2', 'attachment-4'],
     'Pending conversation helper should only include attachment entries for selected recipient'
   );
   assert.deepStrictEqual(
@@ -12609,13 +12611,33 @@ function withEnv(overrides, callback) {
   );
   assert.deepStrictEqual(
     derived.retryableAttachmentIds,
-    ['attachment-1'],
-    'Pending conversation helper should classify only failed attachment entries as retryable'
+    ['attachment-1', 'attachment-4'],
+    'Pending conversation helper should classify queued/failed attachment entries as retryable, consistent with text and media'
   );
   assert.strictEqual(
     derived.retryAllCount,
-    3,
+    4,
     'Pending conversation helper should expose combined retry target count'
+  );
+  assert.deepStrictEqual(
+    derived.queuedTextIds,
+    ['text-1'],
+    'Pending conversation helper should classify only queued text entries as auto-retry targets'
+  );
+  assert.deepStrictEqual(
+    derived.queuedMediaIds,
+    [],
+    'Pending conversation helper should exclude media-3 from queued ids since it belongs to a different recipient'
+  );
+  assert.deepStrictEqual(
+    derived.queuedAttachmentIds,
+    ['attachment-4'],
+    'Pending conversation helper should classify only queued attachment entries as auto-retry targets'
+  );
+  assert.strictEqual(
+    derived.queuedAllCount,
+    2,
+    'Pending conversation helper should expose combined queued-only target count (a subset of retryAllCount)'
   );
 
   const emptyDerived = resolveChatPendingConversationDerivedState({
@@ -12638,6 +12660,10 @@ function withEnv(overrides, callback) {
       retryableMediaIds: [],
       retryableAttachmentIds: [],
       retryAllCount: 0,
+      queuedTextIds: [],
+      queuedMediaIds: [],
+      queuedAttachmentIds: [],
+      queuedAllCount: 0,
     },
     'Pending conversation helper should return empty derived state when no selected recipient exists'
   );
@@ -13089,6 +13115,54 @@ function withEnv(overrides, callback) {
   );
 
   logger.debug('✓ testChatPendingRetryEligibilityStateHelper passed');
+})();
+
+(function testChatPendingCancelEligibilityStateHelper() {
+  const missingRecipientGuard = resolveChatPendingCancelAllGuard({
+    selectedRecipientId: '',
+    totalCount: 3,
+    isCancelingAllPending: false,
+  });
+  assert.deepStrictEqual(
+    missingRecipientGuard,
+    { shouldRun: false },
+    'Pending cancel eligibility helper should block cancel-all when no recipient is selected'
+  );
+
+  const emptyTotalGuard = resolveChatPendingCancelAllGuard({
+    selectedRecipientId: 'recipient-1',
+    totalCount: 0,
+    isCancelingAllPending: false,
+  });
+  assert.deepStrictEqual(
+    emptyTotalGuard,
+    { shouldRun: false },
+    'Pending cancel eligibility helper should block cancel-all when no cancel targets exist'
+  );
+
+  const alreadyCancelingGuard = resolveChatPendingCancelAllGuard({
+    selectedRecipientId: 'recipient-1',
+    totalCount: 4,
+    isCancelingAllPending: true,
+  });
+  assert.deepStrictEqual(
+    alreadyCancelingGuard,
+    { shouldRun: false },
+    'Pending cancel eligibility helper should block duplicate cancel-all runs while one is active'
+  );
+
+  const offlineButRunnableGuard = resolveChatPendingCancelAllGuard({
+    selectedRecipientId: 'recipient-1',
+    totalCount: 4,
+    isCancelingAllPending: false,
+  });
+  assert.deepStrictEqual(
+    offlineButRunnableGuard,
+    { shouldRun: true },
+    'Pending cancel eligibility helper should allow cancel-all even while offline, since it is a local-only operation'
+  );
+
+  logger.debug('✓ testChatPendingCancelEligibilityStateHelper passed');
 })();
 
 (function testChatPendingRetryBatchStateHelper() {
