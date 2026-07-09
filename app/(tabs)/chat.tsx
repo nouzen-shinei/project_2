@@ -8254,6 +8254,7 @@ export default function Chat() {
           id: tempId,
           files: buildPendingAttachmentFiles(),
           messageText: message.trim(),
+          timestamp: new Date().toISOString(),
           recipientId: selectedTeamMember.id,
           sender: effectiveUser?.email || '',
           replyTo: activeReplyContext,
@@ -8291,6 +8292,7 @@ export default function Chat() {
           id: tempId,
           files: buildPendingAttachmentFiles(),
           messageText: message.trim(),
+          timestamp: new Date().toISOString(),
           recipientId: selectedTeamMember.id,
           sender: effectiveUser?.email || '',
           replyTo: activeReplyContext,
@@ -10775,6 +10777,153 @@ export default function Chat() {
     pendingMediaMessageCandidatesByKey,
   ]);
 
+  // Attachment messages are matched the same way sticker/GIF messages are:
+  // sender + recipient + a signature of the actual files being sent (name +
+  // size for each file, order-independent). File identity is used instead of
+  // the message text/caption because the caption is often a generic
+  // auto-generated string ("Sent an image", "Sent a file", ...) that many
+  // unrelated messages between the same two people can share — matching on
+  // that alone caused a brand-new upload to falsely "match" an older,
+  // already-delivered message with the same caption and get hidden
+  // instantly, which is what made the upload progress bar disappear.
+  //
+  // Matching is also only ever attempted once the upload has actually
+  // finished (status 'finalizing' or 'sent') — while status is 'sending' the
+  // files are still uploading and the server message cannot exist yet, so
+  // there is nothing valid to match against and the progress UI must stay
+  // untouched.
+  const buildPendingAttachmentMatchKey = useCallback((
+    sender: string,
+    recipient: string,
+    fileSignature: string
+  ) => `${sender}|${recipient}|${fileSignature}`, []);
+
+  const buildAttachmentFileSignature = useCallback((files?: readonly { fileName?: string; fileSize?: number }[] | null): string => {
+    if (!Array.isArray(files) || files.length === 0) {
+      return '';
+    }
+
+    const parts = files
+      .map((file) => `${(file?.fileName || '').trim().toLowerCase()}:${Number.isFinite(file?.fileSize) ? file?.fileSize : ''}`)
+      .filter(Boolean)
+      .sort();
+
+    if (parts.length === 0) {
+      return '';
+    }
+
+    return parts.join(',');
+  }, []);
+
+  const pendingAttachmentMessageCandidatesByKey = useMemo(() => {
+    const candidatesByKey = new Map<string, { id: string; timestampMs: number }[]>();
+    if (!Array.isArray(displayedMessages) || displayedMessages.length === 0) {
+      return candidatesByKey;
+    }
+
+    for (const msg of displayedMessages) {
+      if (!msg || msg.deleted) {
+        continue;
+      }
+
+      // Only server messages that actually carry file attachments are valid
+      // candidates for reconciling a pending attachment bubble.
+      const candidateFiles = Array.isArray(msg.attachments) && msg.attachments.length > 0
+        ? msg.attachments
+        : msg.fileUrl
+          ? [{ fileName: msg.fileName, fileSize: msg.fileSize }]
+          : null;
+      if (!candidateFiles) {
+        continue;
+      }
+
+      const candidateId = normalizeMessageId(msg?.id);
+      if (!candidateId) {
+        continue;
+      }
+
+      const candidateSender = normalizeParticipantEmail(msg?.sender);
+      const candidateRecipient = normalizeParticipantEmail(msg?.recipientId);
+      const candidateFileSignature = buildAttachmentFileSignature(candidateFiles);
+      if (!candidateSender || !candidateRecipient || !candidateFileSignature) {
+        continue;
+      }
+
+      const matchKey = buildPendingAttachmentMatchKey(candidateSender, candidateRecipient, candidateFileSignature);
+      const entry = {
+        id: candidateId,
+        timestampMs: resolveTimestampMs(msg?.timestamp),
+      };
+
+      const bucket = candidatesByKey.get(matchKey);
+      if (bucket) {
+        bucket.push(entry);
+      } else {
+        candidatesByKey.set(matchKey, [entry]);
+      }
+    }
+
+    return candidatesByKey;
+  }, [
+    displayedMessages,
+    normalizeMessageId,
+    normalizeParticipantEmail,
+    buildAttachmentFileSignature,
+    buildPendingAttachmentMatchKey,
+  ]);
+
+  const findLikelyServerMessageIdForPendingAttachment = useCallback((pendingItem?: PendingAttachmentItem): string => {
+    if (!pendingItem) {
+      return '';
+    }
+
+    // Note: matching is intentionally allowed while status is still
+    // 'sending'. The real server message only ever shows up in
+    // `displayedMessages` (and therefore in the candidates map below) once
+    // the upload has actually finished server-side, so there is nothing to
+    // match against mid-upload regardless of this bubble's local status —
+    // the realtime sync of the real message can still outrace the local
+    // `sendMessageWithFiles` promise (which also awaits push-notification
+    // dispatch), leaving this bubble stuck in 'sending' with no way to
+    // reconcile if matching were restricted to 'finalizing'/'sent' only.
+    // Correctness instead comes from the match key below being a specific
+    // per-file signature (name + size) rather than the generic auto-caption
+    // text, so it can't cross-match an unrelated older message.
+    const fileSignature = buildAttachmentFileSignature(pendingItem.files);
+    const normalizedSender = normalizeParticipantEmail(
+      pendingItem.sender || effectiveUser?.email || user?.email || ''
+    );
+    const normalizedRecipient = normalizeParticipantEmail(pendingItem.recipientId);
+    const pendingTimestamp = resolveTimestampMs(pendingItem.timestamp);
+    if (!fileSignature || !normalizedSender || !normalizedRecipient) {
+      return '';
+    }
+
+    const matchKey = buildPendingAttachmentMatchKey(
+      normalizedSender,
+      normalizedRecipient,
+      fileSignature
+    );
+    const candidates = pendingAttachmentMessageCandidatesByKey.get(matchKey);
+
+    return resolveChatPendingServerMessageIdFromCandidates({
+      pendingStatus: 'sent',
+      normalizedPendingText: fileSignature,
+      normalizedSender,
+      normalizedRecipient,
+      pendingTimestampMs: pendingTimestamp,
+      candidates: candidates || [],
+      maxTimestampDeltaMs: 20000,
+    });
+  }, [
+    buildAttachmentFileSignature,
+    normalizeParticipantEmail,
+    effectiveUser?.email,
+    user?.email,
+    buildPendingAttachmentMatchKey,
+    pendingAttachmentMessageCandidatesByKey,
+  ]);
+
   useEffect(() => {
     if (pendingMessages.size === 0) {
       return;
@@ -10883,6 +11032,71 @@ export default function Chat() {
       return next;
     });
   }, [pendingMedia, normalizeMessageId, findLikelyServerMessageIdForPendingMedia]);
+
+  // Background inference for pending file/media attachment bubbles, mirroring
+  // the sticker/GIF logic above. Without this, an attachment upload has no
+  // way to learn its server message id until the local send promise resolves
+  // (which also awaits push-notification dispatch), so the optimistic
+  // "Uploading.../Sent" bubble can remain visible at the same time as the
+  // real message that already landed via the realtime listener — this was
+  // the root cause of the duplicate status indicator shown for file sends.
+  useEffect(() => {
+    if (pendingAttachments.size === 0) {
+      return;
+    }
+
+    const updates: { tempId: string; serverMessageId: string }[] = [];
+    for (const [tempId, pendingItem] of pendingAttachments.entries()) {
+      if (!pendingItem) {
+        continue;
+      }
+
+      // 'sending' is intentionally included: the realtime sync of the real
+      // message can outrace the local upload promise (which also awaits
+      // push-notification dispatch), so a bubble can still be 'sending'
+      // locally even though the server message already exists. Matching is
+      // safe here because the match key is a specific per-file signature
+      // (name + size), not the generic auto-caption text, so it can't
+      // cross-match an unrelated message.
+      if (
+        pendingItem.status !== 'sending' &&
+        pendingItem.status !== 'finalizing' &&
+        pendingItem.status !== 'sent'
+      ) {
+        continue;
+      }
+
+      const existingServerMessageId = normalizeMessageId(pendingItem.serverMessageId);
+      if (existingServerMessageId) {
+        continue;
+      }
+
+      const guessedServerMessageId = findLikelyServerMessageIdForPendingAttachment(pendingItem);
+      if (!guessedServerMessageId) {
+        continue;
+      }
+
+      updates.push({ tempId, serverMessageId: guessedServerMessageId });
+    }
+
+    if (updates.length === 0) {
+      return;
+    }
+
+    setPendingAttachments((prev) => {
+      const next = new Map(prev);
+      updates.forEach(({ tempId, serverMessageId }) => {
+        const current = next.get(tempId);
+        if (current) {
+          next.set(tempId, {
+            ...current,
+            serverMessageId,
+          });
+        }
+      });
+      return next;
+    });
+  }, [pendingAttachments, normalizeMessageId, findLikelyServerMessageIdForPendingAttachment]);
 
   useEffect(() => {
     const activePendingIds = new Set<string>();
@@ -12100,11 +12314,21 @@ export default function Chat() {
       {/* Optimistic pending file attachments */}
       {selectedTeamMember && pendingConversationDerived.attachmentEntries.map(([tempId, item]) => {
         if (!tempId || !item) return null;
+        // Fall back to a heuristically-matched server message id when the
+        // item hasn't been explicitly reconciled yet, so an attachment bubble
+        // that has already landed on the server doesn't linger alongside the
+        // real message (see findLikelyServerMessageIdForPendingAttachment).
+        const effectiveItem = item.serverMessageId
+          ? item
+          : (() => {
+              const inferred = findLikelyServerMessageIdForPendingAttachment(item);
+              return inferred ? { ...item, serverMessageId: inferred } : item;
+            })();
         return (
           <ChatPendingAttachments
             key={tempId}
             tempId={tempId}
-            item={item}
+            item={effectiveItem}
             selectedTeamMemberId={selectedTeamMember.id}
             deliveredMessageIds={deliveredMessageIds}
             normalizeMessageId={normalizeMessageId}

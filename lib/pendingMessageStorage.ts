@@ -50,6 +50,7 @@ export interface PendingAttachmentMessage {
     fileSize?: number;
   }[];
   messageText: string;
+  timestamp?: string;
   recipientId: string;
   sender: string;
   status: 'sending' | 'failed' | 'finalizing' | 'sent' | 'queued';

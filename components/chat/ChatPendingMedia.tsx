@@ -53,6 +53,7 @@ export interface PendingAttachmentItem {
     webFile?: Blob;
   }[];
   messageText: string;
+  timestamp?: string;
   recipientId: string;
   sender: string;
   status: 'sending' | 'failed' | 'finalizing' | 'sent' | 'queued';
