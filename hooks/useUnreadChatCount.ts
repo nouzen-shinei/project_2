@@ -22,6 +22,7 @@
 
 import { useEffect, useState } from 'react';
 import { chatService } from '../services/chatService';
+import { isSelfConversation } from '../lib/chatReceiptState';
 import { useAuth } from './useAuthUnified';
 import { useTenant } from './useTenantContext';
 
@@ -48,12 +49,19 @@ export function useUnreadChatCount(): boolean {
       (records) => {
         if (!isActive) return;
 
-        // Mirror the tenant-scoped filter that chat.tsx applies in buildSummaryMap.
+        // Mirror the tenant-scoped filter that chat.tsx applies in buildSummaryMap,
+        // and exclude self-conversations before deriving hasUnread so a
+        // self-conversation summary can never light the badge (belt-and-braces —
+        // chatService already reconciles their stored count to 0).
         const trimmedTenantId = tenantId.trim();
         const next = Object.values(records).some(
           (summary) =>
             summary?.tenantId?.trim() === trimmedTenantId &&
-            summary.unreadCount > 0,
+            summary.unreadCount > 0 &&
+            !isSelfConversation({
+              partnerEmail: summary.partnerEmail,
+              viewerEmail: userEmail,
+            }),
         );
 
         // React skips re-render when the value is unchanged — this is the

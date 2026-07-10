@@ -9,7 +9,10 @@
       "$tenantId": {
         "conversationMessages": {
           "$conversation": {
-            ".indexOn": ["timestamp", "sender", "recipientId"]
+            ".indexOn": ["timestamp", "sender", "recipientId", "read"],
+            "$messageId": {
+              ".validate": "!(newData.hasChild('sender') && newData.hasChild('recipientId')) || newData.child('sender').val() != newData.child('recipientId').val()"
+            }
           }
         },
         "messageIndex": {

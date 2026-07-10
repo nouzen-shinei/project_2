@@ -25,6 +25,13 @@ type HydratedMessageState = HydratedChatMessage & { isNewMessage?: boolean };
 
 interface SendChatTextMessageOptions {
   replyTo?: ChatMessage['replyTo'];
+  // Stable client-generated identity threaded into the send payload so the
+  // server upsert is idempotent across re-drives (stuck-message-delivery-fix).
+  clientMsgId?: string;
+}
+
+function normalizeChatEmail(value?: string | null): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
 const paginationProfile = getChatPaginationProfile(Platform.OS === 'web' ? 'web' : 'native');
@@ -1476,11 +1483,21 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       if (!user?.email) {
         throw new Error('User not authenticated');
       }
-      
+
+      // Self-address prevention (stuck-message-delivery-fix, Defect A / Property 3):
+      // never let recipient resolution fall back to the sender. Reject before the
+      // send so no self-conversation is ever created.
+      if (recipientId && normalizeChatEmail(recipientId) === normalizeChatEmail(user.email)) {
+        const err = new Error('You cannot send a message to yourself.');
+        (err as any).selfAddressed = true;
+        throw err;
+      }
+
       const messageId = await chatService.sendMessage({
         text,
         sender: user.email,
         recipientId,
+        clientMsgId: options?.clientMsgId,
         isSpecial,
         replyTo: options?.replyTo,
       });

@@ -384,6 +384,7 @@ const { resolveChatPendingAutoRetryPlan } = require('../lib/chatPendingAutoRetry
 const {
   resolveChatPendingConversationDerivedState,
 } = require('../lib/chatPendingConversationDerived');
+const { generatePendingId, sanitizeClientMsgId } = require('../lib/pendingId');
 const {
   resolveChatPendingFooterSignature,
 } = require('../lib/chatPendingFooterSignature');
@@ -12602,7 +12603,12 @@ function withEnv(overrides, callback) {
   assert.deepStrictEqual(
     derived.retryableTextIds,
     ['text-1'],
-    'Pending conversation helper should classify only queued/failed text entries as retryable'
+    'Pending conversation helper should classify ONLY genuinely failed/queued text entries as manually retryable (the "N pending items not sent" banner). An in-flight sending/sent entry (text-2) must NOT light the banner (stuck-message-delivery-fix hotfix, Fix B)'
+  );
+  assert.deepStrictEqual(
+    derived.autoRedriveTextIds,
+    ['text-2'],
+    'Pending conversation helper should expose accepted-but-not-confirmed (sending/sent) text entries via the auto-redrive seam so the self-heal driver can idempotently re-drive them, without inflating the manual retry banner (stuck-message-delivery-fix hotfix, Fix B)'
   );
   assert.deepStrictEqual(
     derived.retryableMediaIds,
@@ -12617,7 +12623,7 @@ function withEnv(overrides, callback) {
   assert.strictEqual(
     derived.retryAllCount,
     4,
-    'Pending conversation helper should expose combined retry target count'
+    'Pending conversation helper should expose combined MANUAL retry target count (failed/queued text + media + attachments); an in-flight sent text entry is excluded (stuck-message-delivery-fix hotfix, Fix B)'
   );
   assert.deepStrictEqual(
     derived.queuedTextIds,
@@ -12660,6 +12666,7 @@ function withEnv(overrides, callback) {
       retryableMediaIds: [],
       retryableAttachmentIds: [],
       retryAllCount: 0,
+      autoRedriveTextIds: [],
       queuedTextIds: [],
       queuedMediaIds: [],
       queuedAttachmentIds: [],
@@ -12668,7 +12675,103 @@ function withEnv(overrides, callback) {
     'Pending conversation helper should return empty derived state when no selected recipient exists'
   );
 
+  // Focused seam check (stuck-message-delivery-fix hotfix, Fix B): a `sending`
+  // item must NOT appear in the manual retry banner (retryableTextIds /
+  // retryAllCount) but MUST be auto-redrive eligible; a `failed` item IS in the
+  // manual banner and is NOT auto-redrive eligible.
+  const seamDerived = resolveChatPendingConversationDerivedState({
+    selectedRecipientId: 'recipient-1',
+    pendingMessages: new Map([
+      ['sending-1', { recipientId: 'recipient-1', status: 'sending' }],
+      ['failed-1', { recipientId: 'recipient-1', status: 'failed' }],
+    ]),
+    pendingMedia: new Map(),
+    pendingAttachments: new Map(),
+    resolvePendingMessageStatus: (pendingMessage) => pendingMessage.status,
+  });
+  assert.ok(
+    !seamDerived.retryableTextIds.includes('sending-1'),
+    'A sending item must NOT be in retryableTextIds (it must not light the manual retry banner)'
+  );
+  assert.ok(
+    seamDerived.autoRedriveTextIds.includes('sending-1'),
+    'A sending item MUST be auto-redrive eligible (self-heal seam)'
+  );
+  assert.ok(
+    seamDerived.retryableTextIds.includes('failed-1'),
+    'A failed item MUST be in retryableTextIds (manual retry banner)'
+  );
+  assert.ok(
+    !seamDerived.autoRedriveTextIds.includes('failed-1'),
+    'A failed item must NOT be auto-redrive eligible (it needs an explicit user retry, not silent self-heal)'
+  );
+  assert.strictEqual(
+    seamDerived.retryAllCount,
+    1,
+    'Only the failed item contributes to the manual retry banner count; the in-flight sending item does not'
+  );
+
   logger.debug('✓ testChatPendingConversationDerivedHelper passed');
+})();
+
+(function testPendingIdIsRtdbPathSafe() {
+  // stuck-message-delivery-fix hotfix, Fix A: a pending/temp id becomes the
+  // clientMsgId and thus an RTDB path segment on the backend idempotency index.
+  // It must NEVER contain a character RTDB forbids in a path: . # $ [ ] /
+  const ILLEGAL = ['.', '#', '$', '[', ']', '/'];
+  const containsIllegal = (value) => ILLEGAL.some((ch) => String(value).includes(ch));
+
+  for (const prefix of ['pending', 'pa', 'pm']) {
+    for (let i = 0; i < 2000; i++) {
+      const id = generatePendingId(prefix);
+      assert.ok(
+        typeof id === 'string' && id.length > 0,
+        `generatePendingId(${prefix}) should return a non-empty string`
+      );
+      assert.ok(
+        !containsIllegal(id),
+        `generatePendingId(${prefix}) must never contain an illegal RTDB path char, got: ${id}`
+      );
+      assert.ok(
+        id.startsWith(`${prefix}_`),
+        `generatePendingId(${prefix}) should keep its prefix, got: ${id}`
+      );
+    }
+  }
+
+  // An id minted with a prefix that itself contains illegal chars is still safe.
+  assert.ok(
+    !containsIllegal(generatePendingId('a.b#c$[d]/e')),
+    'generatePendingId should sanitize an illegal prefix'
+  );
+
+  // sanitizeClientMsgId replaces each illegal char with `_`, trims, and is
+  // deterministic + idempotent, and identical in behavior to the server helper.
+  assert.strictEqual(
+    sanitizeClientMsgId('pending_123_0.2959597461785538'),
+    'pending_123_0_2959597461785538',
+    'sanitizeClientMsgId should replace a dot from a raw-Math.random id with _'
+  );
+  assert.strictEqual(
+    sanitizeClientMsgId('a.b#c$d[e]f/g'),
+    'a_b_c_d_e_f_g',
+    'sanitizeClientMsgId should replace all six illegal RTDB path chars with _'
+  );
+  assert.strictEqual(
+    sanitizeClientMsgId('   trimmed.value   '),
+    'trimmed_value',
+    'sanitizeClientMsgId should trim surrounding whitespace before sanitizing'
+  );
+  const once = sanitizeClientMsgId('x.y#z');
+  assert.strictEqual(
+    sanitizeClientMsgId(once),
+    once,
+    'sanitizeClientMsgId must be idempotent'
+  );
+  assert.strictEqual(sanitizeClientMsgId(undefined), '', 'sanitizeClientMsgId(undefined) -> ""');
+  assert.strictEqual(sanitizeClientMsgId(42), '', 'sanitizeClientMsgId(non-string) -> ""');
+
+  logger.debug('✓ testPendingIdIsRtdbPathSafe passed');
 })();
 
 (function testChatPendingFooterSignatureHelper() {

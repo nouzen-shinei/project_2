@@ -177,6 +177,10 @@ export interface SendChatMessageInput {
   senderEmail: string;
   recipientEmail: string;
   tenantId: string;
+  // Stable client-generated message identity used as the server idempotency key
+  // so a retried/re-driven send upserts the same durable record instead of
+  // creating a duplicate (stuck-message-delivery-fix, Defect A).
+  clientMsgId?: string;
   text?: string;
   isSpecial?: boolean;
   fileUrl?: string;
@@ -212,6 +216,7 @@ export interface ChatMessageRecord {
   text: string;
   sender: string;
   recipientId?: string;
+  clientMsgId?: string;
   timestamp: string;
   conversationKey: string;
   tenantId?: string | null;
@@ -519,6 +524,75 @@ function pruneUndefined<T extends Record<string, unknown>>(value: T): T {
     }
   }
   return result as T;
+}
+
+// A self-conversation key has two identical participant halves (emailA == emailB).
+function isSelfConversationKey(conversationKey?: string | null): boolean {
+  if (typeof conversationKey !== 'string') {
+    return false;
+  }
+  const halves = conversationKey.split('__').filter(Boolean);
+  return halves.length === 2 && halves[0] === halves[1];
+}
+
+// The six characters Firebase RTDB forbids in a path segment: . # $ [ ] /
+const ILLEGAL_RTDB_PATH_CHARS = /[.#$[\]/]/g;
+
+/**
+ * Deterministically map a clientMsgId to an RTDB-path-safe form by replacing each
+ * illegal path character (`.`, `#`, `$`, `[`, `]`, `/`) with `_`. Trims first.
+ * MUST remain byte-for-byte identical to the client implementation in
+ * `lib/pendingId.ts` so the idempotency index key matches regardless of which
+ * side computed it. A malformed-but-nonempty clientMsgId is sanitized and used —
+ * never thrown on — so the writer can never 500 on a bad path segment
+ * (stuck-message-delivery-fix hotfix, Fix A).
+ *
+ * Idempotent: sanitizeClientMsgId(sanitizeClientMsgId(x)) === sanitizeClientMsgId(x).
+ */
+function sanitizeClientMsgId(id: unknown): string {
+  if (typeof id !== 'string') {
+    return '';
+  }
+  return id.trim().replace(ILLEGAL_RTDB_PATH_CHARS, '_');
+}
+
+/**
+ * Look up a previously-persisted durable record for a (conversation, clientMsgId)
+ * pair so a retried/re-driven send returns the existing message instead of
+ * creating a duplicate. Returns null when no prior record is indexed or the
+ * indexed record no longer exists (stuck-message-delivery-fix, Defect A).
+ */
+async function findChatMessageByClientMsgId(
+  db: admin.database.Database,
+  tenantId: string,
+  conversationKey: string,
+  clientMsgId: string
+): Promise<ChatMessageRecord | null> {
+  // Defensive: always sanitize before using as a `.child()` path segment so a
+  // caller that forgot to sanitize can never crash the lookup. Idempotent, so
+  // an already-sanitized id is unchanged.
+  const safeClientMsgId = sanitizeClientMsgId(clientMsgId);
+  if (!safeClientMsgId) {
+    return null;
+  }
+  const indexSnap = await tenantChatRootRef(db, tenantId)
+    .child('conversationClientMsgIndex')
+    .child(conversationKey)
+    .child(safeClientMsgId)
+    .get();
+  const mappedId = indexSnap.exists() ? indexSnap.val() : null;
+  if (typeof mappedId !== 'string' || !mappedId) {
+    return null;
+  }
+  const messageSnap = await tenantChatRootRef(db, tenantId)
+    .child('conversationMessages')
+    .child(conversationKey)
+    .child(mappedId)
+    .get();
+  if (!messageSnap.exists()) {
+    return null;
+  }
+  return messageSnap.val() as ChatMessageRecord;
 }
 
 function getTimestampMs(value?: string | number | Date | null): number {
@@ -1552,11 +1626,67 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
     throw new Error('Unable to derive conversation key');
   }
 
+  // Self-address prevention (stuck-message-delivery-fix, Defect A / Property 3).
+  // Reject a send whose resolved recipient equals the sender (or whose derived
+  // conversation key is a self key) at the durable-write boundary so no message
+  // record, self-conversation node, or self summary is ever persisted. This
+  // backstops the client guard and closes the outage path that stranded a
+  // message in a self-conversation.
+  if (sender === recipient || isSelfConversationKey(conversationKey)) {
+    throw new ChatMessageActionError(
+      'Self-addressed chat messages are not allowed',
+      'not_allowed',
+      { sender, recipient, conversationKey }
+    );
+  }
+
+  // Sanitize the incoming clientMsgId to an RTDB-path-safe form BEFORE it is used
+  // as a `.child()` index path segment or stored on the record. A malformed id
+  // (e.g. one containing a `.` from a legacy offline-queued tempId) is sanitized
+  // and used, never thrown on — the writer must never 500 on a bad clientMsgId
+  // (stuck-message-delivery-fix hotfix, Fix A). The stored `clientMsgId` and the
+  // index key are the same sanitized value, so re-drives dedupe consistently.
+  const rawClientMsgId =
+    typeof input.clientMsgId === 'string' && input.clientMsgId.trim()
+      ? input.clientMsgId.trim()
+      : undefined;
+  const clientMsgId = rawClientMsgId ? sanitizeClientMsgId(rawClientMsgId) || undefined : undefined;
+
+  // Idempotent upsert keyed on clientMsgId: a retried/re-driven send returns the
+  // existing durable record instead of creating a second one.
+  if (clientMsgId) {
+    const existing = await findChatMessageByClientMsgId(db, tenantId, conversationKey, clientMsgId);
+    if (existing) {
+      return existing;
+    }
+  }
+
   const conversationRef = tenantChatRootRef(db, tenantId).child('conversationMessages').child(conversationKey);
   const newMessageRef = conversationRef.push();
   const messageId = newMessageRef.key;
   if (!messageId) {
     throw new Error('Failed to allocate message id');
+  }
+
+  // Atomically claim the clientMsgId → messageId mapping. If another concurrent
+  // write already claimed it, defer to that existing record (idempotency).
+  if (clientMsgId) {
+    const indexRef = tenantChatRootRef(db, tenantId)
+      .child('conversationClientMsgIndex')
+      .child(conversationKey)
+      .child(clientMsgId);
+    const claim = await indexRef.transaction((current: unknown) =>
+      typeof current === 'string' && current ? current : messageId
+    );
+    const claimedId = claim.snapshot.val();
+    if (typeof claimedId === 'string' && claimedId && claimedId !== messageId) {
+      const existing = await findChatMessageByClientMsgId(db, tenantId, conversationKey, clientMsgId);
+      if (existing) {
+        return existing;
+      }
+      // The prior claim points to a missing record — reclaim with our messageId.
+      await indexRef.set(messageId);
+    }
   }
 
   const timestamp = new Date().toISOString();
@@ -1576,6 +1706,7 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
     text: input.text ?? '',
     sender,
     recipientId: recipient,
+    clientMsgId,
     timestamp,
     conversationKey,
     tenantId,

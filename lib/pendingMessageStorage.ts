@@ -10,6 +10,14 @@ export interface PendingMessage {
   replyTo?: PendingMessageReplyContext;
   status?: 'queued' | 'sending' | 'sent' | 'failed';
   serverMessageId?: string;
+  // Stable client-generated identity, minted once per user send and reused on
+  // every re-drive so the server upsert is idempotent (no duplicate delivery).
+  // See stuck-message-delivery-fix (Defect A, tasks 10.2/10.3).
+  clientMsgId?: string;
+  // Number of automatic re-drive attempts made for a not-yet-confirmed send.
+  // Used by the outbox self-heal driver to apply bounded backoff and, once the
+  // cap is exhausted, dead-letter the item to `failed` (tasks 10.5/10.6).
+  retryCount?: number;
 }
 
 export interface PendingMessageReplyContext {

@@ -146,7 +146,7 @@ import {
 } from '@/lib/chatLoadOlderState';
 import { clearDownloadState, setDownloadState } from '@/lib/downloadStateStore';
 import { resolveDownloadProgressLabel } from '@/lib/uploadProgressDisplayEasing';
-import { reconcileConversationUnreadCount, shouldRefreshChatSummariesOnForegroundResume } from '@/lib/chatReceiptState';
+import { isSelfConversation, reconcileConversationUnreadCount, shouldRefreshChatSummariesOnForegroundResume } from '@/lib/chatReceiptState';
 import {
   applyChatReceiptRequestedReadMutation,
   applyChatReceiptSyncRunFinalizePlan,
@@ -337,6 +337,7 @@ import { resolveChatPendingRetryBatchPlan } from '@/lib/chatPendingRetryBatchSta
 import { resolveChatPendingRetryDispatchPromises } from '@/lib/chatPendingRetryDispatchState';
 import { resolveChatPendingAutoRetryPlan } from '@/lib/chatPendingAutoRetryState';
 import { resolveChatPendingConversationDerivedState } from '@/lib/chatPendingConversationDerived';
+import { generatePendingId } from '@/lib/pendingId';
 import { resolveChatPendingFooterSignature } from '@/lib/chatPendingFooterSignature';
 import { resolveChatNearBottomState } from '@/lib/chatNearBottomState';
 import {
@@ -417,6 +418,21 @@ const CHAT_MESSAGE_MAX_CHARS = 500;
 const CHAT_MESSAGE_MAX_WORDS = 100;
 const CHAT_REPLY_PREVIEW_MAX_CHARS = 120;
 const MESSAGE_INFO_COPIED_RESET_DELAY_MS = 1400;
+// Outbox self-heal driver (stuck-message-delivery-fix, tasks 10.5/10.6).
+// A send that was accepted locally but is not yet confirmed as durably persisted
+// for the intended recipient is automatically re-driven with bounded exponential
+// backoff (reusing its clientMsgId so the server upsert is idempotent). After the
+// attempt cap is exhausted without confirmation, the item is dead-lettered to an
+// explicit, actionable `failed` state — never left as a misleading "Sent".
+const OUTBOX_MAX_REDRIVE_ATTEMPTS = 5;
+// Grace period before the first re-drive so we never race the initial in-flight
+// send that is still awaiting its own promise.
+const OUTBOX_MIN_STALE_MS = 8000;
+const OUTBOX_BASE_BACKOFF_MS = 8000;
+const OUTBOX_MAX_BACKOFF_MS = 5 * 60 * 1000;
+const OUTBOX_DRIVER_TICK_MS = 5000;
+const resolveOutboxBackoffMs = (attempts: number): number =>
+  Math.min(OUTBOX_MAX_BACKOFF_MS, OUTBOX_BASE_BACKOFF_MS * Math.pow(2, Math.max(0, attempts)));
 const CONVERSATION_SEARCH_SCOPE_LABELS: Record<ChatConversationSearchScope, string> = {
   all: 'All',
   text: 'Text',
@@ -4338,12 +4354,23 @@ export default function Chat() {
       return new Map();
     }
 
+    const viewerEmail = effectiveUser?.email;
+
     return new Map(
       Object.entries(records || {})
-        .filter(([, summary]) => summary?.tenantId?.trim() === targetTenantId)
+        // Tenant scope + self-conversation exclusion: a self-conversation is not a
+        // supported feature and must never appear in the conversation list.
+        .filter(
+          ([email, summary]) =>
+            summary?.tenantId?.trim() === targetTenantId &&
+            !isSelfConversation({
+              partnerEmail: summary.partnerEmail ?? email,
+              viewerEmail,
+            })
+        )
         .map(([email, summary]) => [email.toLowerCase(), summary])
     );
-  }, [activeTenant?.id]);
+  }, [activeTenant?.id, effectiveUser?.email]);
 
   const refreshChatSummaries = useCallback(async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent);
@@ -4361,6 +4388,12 @@ export default function Chat() {
     try {
       await chatService.rebuildConversationSummariesForUser(effectiveUser.email).catch((error) => {
         logger.warn('Failed to rebuild conversation summaries before refresh', error);
+      });
+      // Reconcile stored unread counts against the true-unread set and clean up any
+      // stuck self-conversation summary/mirror so the badge converges and cannot
+      // regenerate. Idempotent and bounded (O(unread)).
+      await chatService.reconcileUnreadForUser(effectiveUser.email).catch((error) => {
+        logger.debug('Failed to reconcile unread state before refresh', error);
       });
       const records = await chatService.getConversationSummaries(effectiveUser.email);
       setConversationSummaries(buildSummaryMap(records));
@@ -7329,6 +7362,25 @@ export default function Chat() {
     }
 
     const senderEmail = effectiveUser?.email || user?.email || '';
+
+    // Self-address prevention (stuck-message-delivery-fix, Defect A / Property 3):
+    // recipient resolution must never fall back to the sender. Block a self-
+    // addressed send at the UI entry point so no self-conversation is created.
+    const normalizeSelfCheckEmail = (value?: string | null): string =>
+      typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (
+      normalizeSelfCheckEmail(recipient.id) &&
+      normalizeSelfCheckEmail(recipient.id) === normalizeSelfCheckEmail(senderEmail)
+    ) {
+      Toast.show({
+        type: 'info',
+        text1: 'Cannot message yourself',
+        text2: 'Messaging yourself is not supported.',
+        position: 'top',
+      });
+      return;
+    }
+
     const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
     const buildPendingTextMessage = (
       tempId: string,
@@ -7343,10 +7395,17 @@ export default function Chat() {
       sender: senderEmail,
       replyTo,
       status,
+      // Stable client identity minted once per send; reused on every re-drive so
+      // the server upsert stays idempotent (stuck-message-delivery-fix, task 10.2).
+      clientMsgId: tempId,
     });
 
     if (isOffline) {
-      const tempId = `pending_${Date.now()}_${Math.random()}`;
+      // Path-safe id: this tempId becomes the clientMsgId and thus an RTDB path
+      // segment on the backend idempotency index. Raw Math.random() produced a
+      // dot (e.g. "0.2959…") which RTDB rejects, so a queued message could never
+      // send on reconnect (stuck-message-delivery-fix hotfix, Fix A).
+      const tempId = generatePendingId('pending');
       const pendingMessage = buildPendingTextMessage(tempId, trimmedMessage, 'queued', activeReplyContext);
 
       setPendingMessages((prev) => {
@@ -7436,7 +7495,7 @@ export default function Chat() {
       // 1) Optimistic insert — fully synchronous so the message appears
       //    instantly with a clock ("Sending...") icon, exactly like
       //    WhatsApp/Telegram. No await precedes this state update.
-      const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const tempId = generatePendingId('pending');
       optimisticTempId = tempId;
       optimisticPendingMessage = buildPendingTextMessage(tempId, messageText, 'sending', activeReplyContext);
 
@@ -7466,13 +7525,23 @@ export default function Chat() {
       //    the delivered (double check) and read (blue) receipts.
       const serverMessageId = await sendMessage(messageText, isSpecialMessage, recipient.id, {
         replyTo: activeReplyContext,
+        clientMsgId: tempId,
       });
 
       if (optimisticTempId) {
         const idToUpdate = optimisticTempId;
-        const sentPendingMessage: PendingMessage = {
+        // Do NOT promote to terminal "Sent" just because the send promise
+        // resolved (stuck-message-delivery-fix, task 10.4). A resolved promise
+        // only means the write was accepted — not that a durable record exists
+        // for the intended recipient. Keep the item in the retriable
+        // confirmed-pending state ("Sending…") carrying its serverMessageId, and
+        // let the delivered-reconciliation effect promote/clear it only once the
+        // record for the intended recipient is independently confirmed (its
+        // serverMessageId surfaces in the live conversation). Un-confirmed items
+        // are auto-re-driven by the outbox self-heal driver.
+        const acknowledgedPendingMessage: PendingMessage = {
           ...(optimisticPendingMessage as PendingMessage),
-          status: 'sent',
+          status: 'sending',
           serverMessageId,
         };
 
@@ -7482,16 +7551,16 @@ export default function Chat() {
           if (existing) {
             next.set(idToUpdate, {
               ...existing,
-              status: 'sent',
+              status: 'sending',
               serverMessageId,
             });
           }
           return next;
         });
 
-        // Best-effort persistence of the acknowledged state.
-        void PendingMessageStorage.addPendingMessage(idToUpdate, sentPendingMessage).catch((storageError) => {
-          logger.warn('Failed to persist sent pending message before reconciliation:', storageError);
+        // Best-effort persistence of the acknowledged (not-yet-confirmed) state.
+        void PendingMessageStorage.addPendingMessage(idToUpdate, acknowledgedPendingMessage).catch((storageError) => {
+          logger.warn('Failed to persist acknowledged pending message before reconciliation:', storageError);
         });
       }
 
@@ -8227,7 +8296,7 @@ export default function Chat() {
     if (!selectedTeamMember || selectedFiles.length === 0) return;
     const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
 
-    const tempId = `pa_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const tempId = generatePendingId('pa');
     const buildPendingAttachmentFiles = () => selectedFiles.map(f => ({
       ...(() => {
         const candidate = (f as any)?.webFile ?? (f as any)?.file;
@@ -8712,7 +8781,7 @@ export default function Chat() {
     const activeReplyContext = options?.replyTo ?? (replyingToMessage ? { ...replyingToMessage } : undefined);
 
     // Optimistic pending sticker
-    const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const tempId = generatePendingId('pm');
 
     // Mirror the text-message offline flow: don't attempt the network call at
     // all while offline. Mark it 'queued' (not 'failed') so it's visually
@@ -8858,7 +8927,7 @@ export default function Chat() {
     const activeReplyContext = options?.replyTo ?? (replyingToMessage ? { ...replyingToMessage } : undefined);
 
     // Optimistic pending GIF
-    const tempId = `pm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const tempId = generatePendingId('pm');
 
     // Mirror the text-message offline flow: don't attempt the network call at
     // all while offline. Mark it 'queued' (not 'failed') so it's visually
@@ -11174,12 +11243,17 @@ export default function Chat() {
           pendingMsg.text,
           false,
           pendingMsg.recipientId,
-          { replyTo: pendingMsg.replyTo }
+          { replyTo: pendingMsg.replyTo, clientMsgId: pendingMsg.clientMsgId || tempId }
         );
 
-        const sentPendingMessage: PendingMessage = {
+        // Keep the item in the confirmed-pending state ("Sending…") rather than
+        // promoting straight to terminal "Sent" — a resolved promise is not proof
+        // of a durable record for the intended recipient (stuck-message-delivery-fix,
+        // task 10.4). The delivered-reconciliation effect clears it only once the
+        // record surfaces in the live conversation.
+        const acknowledgedPendingMessage: PendingMessage = {
           ...pendingMsg,
-          status: 'sent',
+          status: 'sending',
           serverMessageId,
         };
 
@@ -11189,7 +11263,7 @@ export default function Chat() {
           if (current) {
             next.set(tempId, {
               ...current,
-              status: 'sent',
+              status: 'sending',
               serverMessageId,
             });
           }
@@ -11197,9 +11271,9 @@ export default function Chat() {
         });
 
         try {
-          await PendingMessageStorage.addPendingMessage(tempId, sentPendingMessage);
+          await PendingMessageStorage.addPendingMessage(tempId, acknowledgedPendingMessage);
         } catch (error) {
-          logger.warn('Failed to persist sent pending message after retry:', error);
+          logger.warn('Failed to persist acknowledged pending message after retry:', error);
         }
 
         if (!options?.silent) {
@@ -11255,6 +11329,195 @@ export default function Chat() {
     },
     [isOffline, pendingMessages, selectedTeamMember, sendMessage, resolvePendingMessageStatus]
   );
+
+  // ---- Outbox self-heal driver (stuck-message-delivery-fix, tasks 10.5/10.6) ----
+  // Tracks per-item re-drive bookkeeping (attempt count + next eligible time) so
+  // un-confirmed sends are automatically re-driven with bounded exponential
+  // backoff and dead-lettered once the cap is exhausted. Kept in a ref so driver
+  // ticks never trigger re-renders on their own.
+  const outboxRedriveStateRef = useRef<Map<string, { attempts: number; nextAt: number }>>(new Map());
+
+  const deadLetterPendingMessage = useCallback((tempId: string) => {
+    let failedPending: PendingMessage | null = null;
+    setPendingMessages((prev) => {
+      const current = prev.get(tempId);
+      if (!current) {
+        return prev;
+      }
+      const next = new Map(prev);
+      failedPending = { ...current, status: 'failed' };
+      next.set(tempId, failedPending);
+      return next;
+    });
+    if (failedPending) {
+      void PendingMessageStorage.addPendingMessage(tempId, failedPending).catch((error) => {
+        logger.warn('Failed to persist dead-lettered pending message:', error);
+      });
+    }
+  }, []);
+
+  // Re-drive a single not-yet-confirmed send to the intended recipient, reusing
+  // its clientMsgId so the server upsert is idempotent (no duplicate delivery).
+  const reDriveUnconfirmedPendingMessage = useCallback(
+    async (tempId: string): Promise<void> => {
+      if (isOffline) {
+        return;
+      }
+      const pendingMsg = pendingMessages.get(tempId) as PendingMessage | undefined;
+      if (!pendingMsg || !selectedTeamMember || pendingMsg.recipientId !== selectedTeamMember.id) {
+        return;
+      }
+      if (resolvePendingMessageStatus(pendingMsg) !== 'sending') {
+        return;
+      }
+      // Already durably confirmed for the intended recipient (its server record
+      // surfaced in the live conversation)? The reconciliation effect clears it —
+      // never re-drive a confirmed message.
+      const serverId = normalizeMessageId(pendingMsg.serverMessageId);
+      if (serverId && deliveredMessageIds.has(serverId)) {
+        return;
+      }
+
+      const state = outboxRedriveStateRef.current.get(tempId) ?? {
+        attempts: pendingMsg.retryCount ?? 0,
+        nextAt: 0,
+      };
+      const attempts = state.attempts + 1;
+
+      // Dead-letter once the bounded retry policy is exhausted (task 10.6):
+      // surface an explicit, actionable `failed` state rather than a phantom Sent.
+      if (attempts > OUTBOX_MAX_REDRIVE_ATTEMPTS) {
+        outboxRedriveStateRef.current.delete(tempId);
+        deadLetterPendingMessage(tempId);
+        return;
+      }
+
+      // Reserve the next backoff window before awaiting so overlapping driver
+      // ticks never double-drive the same item.
+      outboxRedriveStateRef.current.set(tempId, {
+        attempts,
+        nextAt: Date.now() + resolveOutboxBackoffMs(attempts),
+      });
+
+      try {
+        const serverMessageId = await sendMessage(
+          pendingMsg.text,
+          false,
+          pendingMsg.recipientId,
+          { replyTo: pendingMsg.replyTo, clientMsgId: pendingMsg.clientMsgId || tempId }
+        );
+        const redrivenPending: PendingMessage = {
+          ...pendingMsg,
+          status: 'sending',
+          serverMessageId,
+          retryCount: attempts,
+        };
+        setPendingMessages((prev) => {
+          const current = prev.get(tempId);
+          if (!current) {
+            return prev;
+          }
+          const next = new Map(prev);
+          next.set(tempId, { ...current, status: 'sending', serverMessageId, retryCount: attempts });
+          return next;
+        });
+        void PendingMessageStorage.addPendingMessage(tempId, redrivenPending).catch(() => undefined);
+      } catch (error) {
+        logger.debug('Outbox re-drive attempt failed; will retry after backoff', { tempId, error });
+        // Leave the item in 'sending' so the next tick retries after backoff.
+      }
+    },
+    [
+      isOffline,
+      pendingMessages,
+      selectedTeamMember,
+      resolvePendingMessageStatus,
+      normalizeMessageId,
+      deliveredMessageIds,
+      sendMessage,
+      deadLetterPendingMessage,
+    ]
+  );
+
+  const driveUnconfirmedOutbox = useCallback(() => {
+    if (isOffline || !selectedTeamMember) {
+      return;
+    }
+    const now = Date.now();
+    const recipientId = selectedTeamMember.id;
+    const eligible: string[] = [];
+    pendingMessages.forEach((pendingMsg, tempId) => {
+      if (!pendingMsg || pendingMsg.recipientId !== recipientId) {
+        return;
+      }
+      if (resolvePendingMessageStatus(pendingMsg) !== 'sending') {
+        return;
+      }
+      const serverId = normalizeMessageId(pendingMsg.serverMessageId);
+      if (serverId && deliveredMessageIds.has(serverId)) {
+        return; // confirmed for the intended recipient — reconciliation will clear it
+      }
+      // Don't race the initial in-flight send: only consider items that have been
+      // pending for longer than the grace window.
+      const ageMs = now - resolveTimestampMs(pendingMsg.timestamp);
+      if (ageMs < OUTBOX_MIN_STALE_MS) {
+        return;
+      }
+      const existingState = outboxRedriveStateRef.current.get(tempId);
+      if (!existingState) {
+        // First time we notice this stranded item: arm the initial backoff window
+        // rather than re-driving immediately.
+        outboxRedriveStateRef.current.set(tempId, {
+          attempts: pendingMsg.retryCount ?? 0,
+          nextAt: now + OUTBOX_BASE_BACKOFF_MS,
+        });
+        return;
+      }
+      if (now < existingState.nextAt) {
+        return;
+      }
+      eligible.push(tempId);
+    });
+    eligible.forEach((tempId) => {
+      void reDriveUnconfirmedPendingMessage(tempId);
+    });
+  }, [
+    isOffline,
+    selectedTeamMember,
+    pendingMessages,
+    deliveredMessageIds,
+    resolvePendingMessageStatus,
+    normalizeMessageId,
+    reDriveUnconfirmedPendingMessage,
+  ]);
+
+  // Periodically (and promptly on reconnect / foreground / relaunch via the
+  // isOffline flip and mount) drive the outbox so a not-yet-confirmed send
+  // self-heals to the intended recipient without any user action.
+  useEffect(() => {
+    if (isOffline) {
+      return;
+    }
+    driveUnconfirmedOutbox();
+    const interval = setInterval(() => {
+      driveUnconfirmedOutbox();
+    }, OUTBOX_DRIVER_TICK_MS);
+    return () => clearInterval(interval);
+  }, [isOffline, driveUnconfirmedOutbox]);
+
+  // Prune driver bookkeeping for items that are no longer pending (delivered,
+  // reconciled, canceled, or dead-lettered) so the map does not grow unbounded.
+  useEffect(() => {
+    const state = outboxRedriveStateRef.current;
+    if (state.size === 0) {
+      return;
+    }
+    for (const tempId of Array.from(state.keys())) {
+      if (!pendingMessages.has(tempId)) {
+        state.delete(tempId);
+      }
+    }
+  }, [pendingMessages]);
 
   const pendingConversationDerived = useMemo(() => {
     return resolveChatPendingConversationDerivedState({

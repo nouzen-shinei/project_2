@@ -6,6 +6,7 @@ import {
   resolveChatUploadProgressPercentFromBytes,
 } from '@/lib/chatUploadProgress';
 import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chatUploadUtils';
+import { sanitizeClientMsgId } from '@/lib/pendingId';
 import { sharedFileService } from '@/services/sharedFileService';
 import { database, storage, auth } from '@/config/firebase';
 import { Alert, Platform } from 'react-native';
@@ -76,6 +77,11 @@ export interface ChatMessage {
   text: string;
   sender: string; // Email address of the sender
   recipientId?: string; // For targeting specific users
+  // Stable, client-generated identity minted once per user send. Threaded into
+  // the send payload and used as the server idempotency/dedupe key so that an
+  // automatic re-drive of a not-yet-confirmed message upserts the same durable
+  // record instead of creating a duplicate. See stuck-message-delivery-fix.
+  clientMsgId?: string;
   timestamp: string;
   conversationKey?: string;
   tenantId?: string | null;
@@ -719,6 +725,37 @@ class ChatService {
     return [keyA, keyB].sort().join('__');
   }
 
+  // A self-conversation key has two identical participant halves (emailA == emailB).
+  private isSelfConversationKey(conversationKey?: string | null): boolean {
+    if (typeof conversationKey !== 'string') {
+      return false;
+    }
+    const halves = conversationKey.split('__').filter(Boolean);
+    return halves.length === 2 && halves[0] === halves[1];
+  }
+
+  // True when the resolved recipient equals the sender (self-addressed send).
+  private isSelfAddressed(sender?: string | null, recipientId?: string | null): boolean {
+    const normalizedSender = this.normalizeEmail(sender);
+    const normalizedRecipient = this.normalizeEmail(recipientId);
+    if (!normalizedSender || !normalizedRecipient) {
+      return false;
+    }
+    return normalizedSender === normalizedRecipient;
+  }
+
+  // Throws a non-falling-back validation error for a self-addressed send. Used as
+  // a guard at every send entry point so recipient resolution can never fall back
+  // to the sender and persist a self-conversation.
+  private assertNotSelfAddressed(sender?: string | null, recipientId?: string | null): void {
+    if (this.isSelfAddressed(sender, recipientId)) {
+      const err = new Error('You cannot send a message to yourself.');
+      (err as any).preventFallback = true;
+      (err as any).selfAddressed = true;
+      throw err;
+    }
+  }
+
   private getConversationMessagesPath(emailA?: string | null, emailB?: string | null, messageId?: string | null): string | null {
     const conversationKey = this.getConversationKey(emailA, emailB);
     if (!conversationKey) {
@@ -1229,6 +1266,14 @@ class ChatService {
     const summaryWrites: Promise<void>[] = [];
 
     for (const [conversationKey, entry] of Object.entries(conversationIndex)) {
+      // Never (re)build a self-conversation summary. A self-conversation is not a
+      // supported feature; skipping it here means its partnerEmail is never added
+      // to `partnerEmails`, so any pre-existing self summary is pruned below and
+      // cannot regenerate from a stray self message node.
+      if (this.isSelfConversationKey(conversationKey)) {
+        continue;
+      }
+
       let partnerEmail = this.normalizeEmail(entry?.partnerEmail);
       const existingPartnerKey = this.normalizeKey(entry?.partnerKey);
       const partnerKeyFromConversation = this.getPartnerKeyFromConversationKey(userKey, conversationKey);
@@ -1367,6 +1412,12 @@ class ChatService {
 
       partnerEmail = this.normalizeEmail(partnerEmail);
       if (!partnerEmail) {
+        continue;
+      }
+
+      // Resolved partner is the user themselves — a self-conversation. Skip so it
+      // is neither written nor kept (it will be pruned below).
+      if (partnerEmail === normalizedUser) {
         continue;
       }
 
@@ -1830,6 +1881,211 @@ class ChatService {
     await Promise.all(metadataUpdates);
   }
 
+  // Bounded unread recompute for a single conversation.
+  //
+  // Uses a query over the indexed `read == false` set so the read cost scales
+  // with the number of UNREAD messages in the conversation, not the whole
+  // history (O(unread), not O(all messages)). The remaining predicate
+  // (`recipientId == viewer` and not `deleted`) is applied to that bounded set.
+  //
+  // Returns the true unread count for `viewerEmail`, or `null` when the bounded
+  // read could not be completed (caller keeps the previously stored count so a
+  // transient read failure never wipes a genuine unread count).
+  private async computeTrueUnreadCount(
+    tenantId: string,
+    viewerEmail: string,
+    conversationKey: string
+  ): Promise<number | null> {
+    const viewer = this.normalizeEmail(viewerEmail);
+    if (!viewer || !conversationKey) {
+      return null;
+    }
+
+    try {
+      const messagesRef = this.tenantConversationMessagesRef(tenantId, conversationKey);
+      const unreadQuery = query(messagesRef, orderByChild('read'), equalTo(false));
+      const snapshot = await get(unreadQuery);
+      if (!snapshot.exists()) {
+        return 0;
+      }
+
+      const raw = snapshot.val() || {};
+      let count = 0;
+      for (const value of Object.values(raw)) {
+        const data = value as any;
+        if (!data || typeof data !== 'object') {
+          continue;
+        }
+        // `read`/`deleted` re-checked here because the mock and any non-indexed
+        // fallback may return a superset of the bounded query.
+        if (data.read === true || data.deleted === true) {
+          continue;
+        }
+        if (this.normalizeEmail(data.recipientId) !== viewer) {
+          continue;
+        }
+        count += 1;
+      }
+      return count;
+    } catch (error) {
+      logger.debug('Bounded unread recompute failed; retaining stored count', {
+        conversationKey,
+        error,
+      });
+      return null;
+    }
+  }
+
+  // Turn a raw conversationSummaries node into the reconciled, self-aware map the
+  // badge / unread total / conversation list consume:
+  //   - self-conversations (identical key halves, OR sender == recipientId, OR
+  //     partnerEmail == viewer) are forced to unreadCount 0 so they can never
+  //     light the badge or contribute to the total; and
+  //   - non-self conversations have their stored unreadCount recomputed from the
+  //     true-unread set so a desynced/stale counter (e.g. soft-deleted-while-
+  //     unread) converges to reality.
+  // Cost is O(summaries) plus O(total unread) across the bounded per-conversation
+  // recomputes.
+  // Collect summary records from a conversationSummaries node. A summary record
+  // is identified by a string `partnerEmail` field; recursion stops as soon as
+  // one is found so nested record fields (e.g. lastMessage) are never mistaken
+  // for records. Walking recursively also tolerates partner keys that contain a
+  // path separator (so a record nested a level deeper is still surfaced).
+  private collectSummaryRecordsFromNode(node: unknown, out: any[] = []): any[] {
+    if (!node || typeof node !== 'object') {
+      return out;
+    }
+    if (typeof (node as any).partnerEmail === 'string') {
+      out.push(node);
+      return out;
+    }
+    for (const value of Object.values(node as Record<string, unknown>)) {
+      this.collectSummaryRecordsFromNode(value, out);
+    }
+    return out;
+  }
+
+  private async deriveReconciledSummaryMap(
+    tenantId: string,
+    viewerEmail: string,
+    rawSummaries: Record<string, unknown>
+  ): Promise<Record<string, ConversationSummary>> {
+    const viewer = this.normalizeEmail(viewerEmail);
+    const normalized: ConversationSummary[] = [];
+    this.collectSummaryRecordsFromNode(rawSummaries).forEach((value: any) => {
+      const summary = this.normalizeConversationSummaryRecord(value);
+      if (summary) {
+        normalized.push(summary);
+      }
+    });
+
+    const result: Record<string, ConversationSummary> = {};
+    await Promise.all(
+      normalized.map(async (summary) => {
+        const partnerEmail = summary.partnerEmail;
+        const conversationKey = this.getConversationKey(viewer, partnerEmail);
+
+        if (
+          !conversationKey ||
+          this.isSelfConversationKey(conversationKey) ||
+          this.isSelfAddressed(viewer, partnerEmail)
+        ) {
+          result[partnerEmail] = { ...summary, unreadCount: 0 };
+          return;
+        }
+
+        const trueUnread = await this.computeTrueUnreadCount(tenantId, viewer, conversationKey);
+        result[partnerEmail] = {
+          ...summary,
+          unreadCount: trueUnread === null ? summary.unreadCount : trueUnread,
+        };
+      })
+    );
+
+    return result;
+  }
+
+  // Durable, idempotent unread reconciliation for a user. Cleans up the confirmed
+  // phantom-dot source and folds in the general true-unread reconciliation:
+  //   - removes any pre-existing self-conversation summary
+  //     (conversationSummaries/{user}/{selfKey}), its userConversations mirror
+  //     (userConversations/{user}/{selfConversationKey}), and the self
+  //     conversationMessages node, so the stuck dot clears and cannot regenerate;
+  //   - for every non-self conversation, recomputes the stored unreadCount from
+  //     the true-unread set (bounded, O(unread)) and writes it back ONLY when it
+  //     differs, so re-running is a no-op (no oscillation).
+  // Safe to call on cheap triggers (conversation open, foreground/summary load,
+  // after mark-as-read).
+  async reconcileUnreadForUser(userEmail: string, tenantId?: string | null): Promise<void> {
+    const normalizedUser = this.normalizeEmail(userEmail);
+    const userKey = this.sanitizeEmailKey(normalizedUser);
+    if (!normalizedUser || !userKey) {
+      return;
+    }
+
+    const resolvedTenantId = tenantId ? tenantId : await tenantService.getCachedSelectedTenant();
+    const tenantScopeId = this.requireTenantId(resolvedTenantId);
+
+    try {
+      const summariesRef = this.tenantConversationSummariesRef(tenantScopeId, userKey);
+      const snapshot = await get(summariesRef);
+      if (!snapshot.exists()) {
+        return;
+      }
+
+      const raw = (snapshot.val() ?? {}) as Record<string, any>;
+      const writes: Promise<unknown>[] = [];
+
+      for (const [partnerKey, value] of Object.entries(raw)) {
+        const summary = this.normalizeConversationSummaryRecord(value);
+        if (!summary) {
+          continue;
+        }
+
+        const partnerEmail = summary.partnerEmail;
+        const conversationKey = this.getConversationKey(normalizedUser, partnerEmail);
+        const isSelf =
+          !conversationKey ||
+          this.isSelfConversationKey(conversationKey) ||
+          this.isSelfAddressed(normalizedUser, partnerEmail);
+
+        if (isSelf) {
+          // Remove the stuck self-conversation summary, its mirror, and the self
+          // message node. Self-messaging is unsupported; this data is orphaned
+          // and can never be opened/read.
+          writes.push(Promise.resolve(set(child(summariesRef, partnerKey), null)));
+          if (conversationKey) {
+            writes.push(
+              Promise.resolve(
+                set(child(this.tenantUserConversationsRef(tenantScopeId, userKey), conversationKey), null)
+              )
+            );
+            writes.push(
+              Promise.resolve(set(this.tenantConversationMessagesRef(tenantScopeId, conversationKey), null))
+            );
+          }
+          continue;
+        }
+
+        const trueUnread = await this.computeTrueUnreadCount(tenantScopeId, normalizedUser, conversationKey);
+        if (trueUnread !== null && trueUnread !== summary.unreadCount) {
+          writes.push(Promise.resolve(update(child(summariesRef, partnerKey), { unreadCount: trueUnread })));
+          writes.push(
+            Promise.resolve(
+              update(child(this.tenantUserConversationsRef(tenantScopeId, userKey), conversationKey), {
+                unreadCount: trueUnread,
+              })
+            )
+          );
+        }
+      }
+
+      await Promise.all(writes);
+    } catch (error) {
+      logger.debug('Failed to reconcile unread state for user', { error });
+    }
+  }
+
   private normalizeConversationSummaryRecord(raw: any): ConversationSummary | null {
     if (!raw || typeof raw !== 'object') {
       return null;
@@ -1889,15 +2145,9 @@ class ChatService {
       }
 
       const raw = snapshot.val() || {};
-      const result: Record<string, ConversationSummary> = {};
-      Object.values(raw).forEach((value: any) => {
-        const summary = this.normalizeConversationSummaryRecord(value);
-        if (summary) {
-          result[summary.partnerEmail] = summary;
-        }
-      });
-
-      return result;
+      // Self-aware, self-healing derivation: excludes self-conversations from the
+      // unread total and recomputes non-self counts from the true-unread set.
+      return await this.deriveReconciledSummaryMap(tenantScopeId, userEmail, raw);
     } catch (error) {
       logger.warn('Error fetching conversation summaries:', error);
       return {};
@@ -1923,17 +2173,7 @@ class ChatService {
       const tenantScopeId = this.requireTenantId(resolvedTenantId);
       const userRef = this.tenantConversationSummariesRef(tenantScopeId, userKey);
 
-      const listener = (snapshot: any) => {
-        const raw = snapshot?.val() || {};
-        const result: Record<string, ConversationSummary> = {};
-        Object.values(raw).forEach((value: any) => {
-          const summary = this.normalizeConversationSummaryRecord(value);
-          if (summary) {
-            result[summary.partnerEmail] = summary;
-          }
-        });
-        callback(result);
-
+      const emitMetric = (raw: Record<string, unknown>) => {
         let payloadBytes = 0;
         try {
           payloadBytes = JSON.stringify(raw).length;
@@ -1946,6 +2186,48 @@ class ChatService {
         logger.metric('chat.summary.listener_payload', {
           bytes: payloadBytes,
         });
+      };
+
+      // Synchronous, self-conversation-excluding fallback used if the bounded
+      // true-unread recompute cannot complete. Self summaries are still forced to
+      // 0 so a self-conversation can never light the badge.
+      const buildSelfExcludedFallback = (raw: Record<string, unknown>): Record<string, ConversationSummary> => {
+        const fallback: Record<string, ConversationSummary> = {};
+        this.collectSummaryRecordsFromNode(raw).forEach((value: any) => {
+          const summary = this.normalizeConversationSummaryRecord(value);
+          if (!summary) {
+            return;
+          }
+          const conversationKey = this.getConversationKey(normalizedUser, summary.partnerEmail);
+          const isSelf =
+            !conversationKey ||
+            this.isSelfConversationKey(conversationKey) ||
+            this.isSelfAddressed(normalizedUser, summary.partnerEmail);
+          fallback[summary.partnerEmail] = isSelf ? { ...summary, unreadCount: 0 } : summary;
+        });
+        return fallback;
+      };
+
+      const listener = (snapshot: any) => {
+        const raw = (snapshot?.val() || {}) as Record<string, unknown>;
+        void this.deriveReconciledSummaryMap(tenantScopeId, normalizedUser, raw)
+          .then((result) => {
+            if (cancelled) {
+              return;
+            }
+            callback(result);
+            emitMetric(raw);
+          })
+          .catch((error) => {
+            if (cancelled) {
+              return;
+            }
+            logger.debug('Failed to derive reconciled conversation summaries; emitting self-excluded fallback', {
+              error,
+            });
+            callback(buildSelfExcludedFallback(raw));
+            emitMetric(raw);
+          });
       };
 
       onValue(userRef, listener);
@@ -2606,6 +2888,14 @@ class ChatService {
   }
 
   async sendMessage(message: Omit<ChatMessage, 'id' | 'timestamp'>): Promise<string> {
+    // Self-address prevention (stuck-message-delivery-fix, Defect A / Property 3).
+    // A send whose resolved recipient equals the sender must be rejected at the
+    // entry point and NEVER persisted — self-messaging is not a supported feature
+    // and this is precisely the outage path that stranded a message in a
+    // self-conversation. Reject before any tenant resolution or durable write so
+    // no message record, self-conversation node, or self summary is ever created.
+    this.assertNotSelfAddressed(message.sender, message.recipientId);
+
     const tenantId = await this.ensureTenantChatScope(message.sender, message.recipientId);
     const messageWithTenant: Omit<ChatMessage, 'id' | 'timestamp'> = {
       ...message,
@@ -2640,6 +2930,16 @@ class ChatService {
       const conversationKey = this.getConversationKey(normalizedSender, normalizedRecipient);
       const tenantId = typeof message.tenantId === 'string' ? message.tenantId : null;
 
+      // Defense-in-depth self-address guard at the durable-write boundary: never
+      // persist a self-addressed message or a self-conversation node/summary.
+      this.assertNotSelfAddressed(normalizedSender, normalizedRecipient);
+      if (this.isSelfConversationKey(conversationKey)) {
+        const err = new Error('You cannot send a message to yourself.');
+        (err as any).preventFallback = true;
+        (err as any).selfAddressed = true;
+        throw err;
+      }
+
       if (!normalizedSender || !conversationKey) {
         throw new Error('Unable to resolve conversation key for message send');
       }
@@ -2659,6 +2959,15 @@ class ChatService {
         id: newMessageRef.key,
         sender: normalizedSender,
         recipientId: normalizedRecipient || undefined,
+        // Sanitize to an RTDB-path-safe form before persisting. The stored value
+        // must match the sanitized index key the backend computes so idempotent
+        // re-drives dedupe correctly, and it recovers messages already stuck in
+        // the offline queue whose persisted tempId contains a dot
+        // (stuck-message-delivery-fix hotfix, Fix A).
+        clientMsgId:
+          typeof message.clientMsgId === 'string'
+            ? sanitizeClientMsgId(message.clientMsgId) || undefined
+            : undefined,
         timestamp,
         conversationKey,
         tenantId,
@@ -2722,6 +3031,8 @@ class ChatService {
     if (!normalizedSender || !normalizedRecipient) {
       return null;
     }
+    // Defense-in-depth self-address guard at the backend send boundary.
+    this.assertNotSelfAddressed(normalizedSender, normalizedRecipient);
     if (!tenantId) {
       throw new Error('Unable to determine coaching center for this chat message.');
     }
@@ -2729,6 +3040,14 @@ class ChatService {
     const payload = this.pruneUndefined<{ [key: string]: unknown }>({
       recipientId: normalizedRecipient,
       tenantId,
+      // Sanitize the clientMsgId to an RTDB-path-safe form before it leaves the
+      // client so the backend can use it as a `.child()` index segment without a
+      // 500, and so an already-queued message whose tempId contains a dot is
+      // recovered on re-send (stuck-message-delivery-fix hotfix, Fix A).
+      clientMsgId:
+        typeof message.clientMsgId === 'string'
+          ? sanitizeClientMsgId(message.clientMsgId) || undefined
+          : undefined,
       text: message.text,
       isSpecial: message.isSpecial,
       fileUrl: message.fileUrl,
@@ -3718,6 +4037,10 @@ class ChatService {
 
       await update(conversationRef, patch);
       await this.rebuildConversationSummariesForUser(me, tenantScopeId);
+      // After marking a conversation read, reconcile stored unread counts against
+      // the true-unread set and clean up any stuck self-conversation summary so
+      // the badge converges. Idempotent and bounded (O(unread)).
+      await this.reconcileUnreadForUser(me, tenantScopeId);
 
       logger.metric('chat.conversation.read_all', {
         conversationKey,

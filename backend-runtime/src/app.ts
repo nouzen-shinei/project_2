@@ -514,6 +514,7 @@ const chatMessagePayloadSchema = z
   .object({
     recipientId: z.string().min(1),
     tenantId: z.string().min(1),
+    clientMsgId: z.string().trim().min(1).max(200).optional(),
     text: z.string().max(5000).optional(),
     isSpecial: z.boolean().optional(),
     fileUrl: z.string().url().optional(),
@@ -9579,6 +9580,7 @@ export function createApp(options: CreateAppOptions = {}){
         senderEmail,
         recipientEmail: normalizedRecipient,
         tenantId,
+        clientMsgId: payload.clientMsgId,
         text: payload.text,
         isSpecial: payload.isSpecial,
         fileUrl: payload.fileUrl,
@@ -9594,8 +9596,20 @@ export function createApp(options: CreateAppOptions = {}){
         read: payload.read,
       });
 
-      return res.json({ ok: true, message });
+      // Echo both the durable serverMessageId and the caller's clientMsgId so the
+      // client can confirm the durable write for the intended recipient exactly
+      // once and reconcile idempotently (stuck-message-delivery-fix, Defect A).
+      return res.json({
+        ok: true,
+        message,
+        serverMessageId: message.id,
+        clientMsgId: message.clientMsgId ?? payload.clientMsgId,
+      });
     } catch (error) {
+      // A self-addressed send is a client validation error, not a server fault.
+      if (error instanceof ChatMessageActionError && error.code === 'not_allowed') {
+        return res.status(400).json({ error: 'self_addressed_not_allowed' });
+      }
       console.error('[chat_messages] send failed', error);
       return res.status(500).json({ error: 'send_failed' });
     }

@@ -11,6 +11,132 @@ interface SharedConversationWatch {
   nextSubscriberId: number;
   cleanupFirebase: (() => void) | null;
   initPromise: Promise<void>;
+  // Guards against the Firebase `.off()` teardown running more than once for a
+  // single watch instance (stuck-message-delivery-fix hotfix, Fix C).
+  torndown: boolean;
+  // Handle for a deferred grace-window release, scheduled when the LAST
+  // subscriber leaves. Kept on the watch so an incoming subscriber can cancel it
+  // (reusing the still-live Firebase listeners) and so release/cancel can clear
+  // it. `null` when no release is pending.
+  pendingReleaseTimer: ReturnType<typeof setTimeout> | null;
+}
+
+/**
+ * Grace window (ms) kept between the LAST subscriber leaving a shared
+ * conversation watch and the Firebase `.off()` teardown. Holding the watch alive
+ * briefly eliminates rapid teardown/re-attach churn — the exact churn that trips
+ * Firebase's "listen() called twice for same path/queryId" internal assert when
+ * a new subscriber re-attaches before the SDK released the prior listen. If a new
+ * subscriber attaches within this window the pending release is cancelled and the
+ * live listeners are reused (no `.off()`, no re-attach).
+ * (stuck-message-delivery-fix hotfix — grace-window release hardening.)
+ */
+export const DEFAULT_SHARED_WATCH_RELEASE_GRACE_MS = 5000;
+
+let sharedWatchReleaseGraceMs = DEFAULT_SHARED_WATCH_RELEASE_GRACE_MS;
+
+/**
+ * Test hook: override the grace window (ms) used for deferred watch release.
+ * Values `<= 0` fall back to immediate release. Not part of the public runtime
+ * API — exported only so tests can drive release timing deterministically.
+ */
+export function __setSharedWatchReleaseGraceMs(ms: number): void {
+  if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+    sharedWatchReleaseGraceMs = ms;
+  }
+}
+
+/** Test hook: read the current grace window (ms). */
+export function __getSharedWatchReleaseGraceMs(): number {
+  return sharedWatchReleaseGraceMs;
+}
+
+/** Test hook: reset the grace window to its default. */
+export function __resetSharedWatchReleaseGraceMs(): void {
+  sharedWatchReleaseGraceMs = DEFAULT_SHARED_WATCH_RELEASE_GRACE_MS;
+}
+
+/**
+ * Test hook: is a deferred release currently pending for this conversation
+ * watch? A pending release means the last subscriber has left but the Firebase
+ * listeners are still attached (inside the grace window).
+ */
+export function __hasPendingRelease(tenantId: string, conversationKey: string): boolean {
+  const watchKey = [
+    typeof tenantId === 'string' ? tenantId.trim() : '',
+    typeof conversationKey === 'string' ? conversationKey.trim() : '',
+  ].join('::');
+  const watch = sharedConversationWatches.get(watchKey);
+  return !!watch && watch.pendingReleaseTimer !== null;
+}
+
+/** Test hook: number of watches with a deferred release pending. */
+export function __getPendingReleaseCount(): number {
+  let count = 0;
+  for (const watch of sharedConversationWatches.values()) {
+    if (watch.pendingReleaseTimer !== null) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Detect the Firebase SDK internal assertion that fires when `.on()` is invoked
+ * for a path/queryId that still has an active listen — e.g. under connection
+ * churn when a new subscriber re-attaches before the SDK released the prior
+ * listen. Message shape: "Firebase Database INTERNAL ASSERT FAILED: listen()
+ * called twice for same path/queryId".
+ */
+function isListenCalledTwiceError(error: unknown): boolean {
+  const message =
+    typeof error === 'string'
+      ? error
+      : error && typeof (error as { message?: unknown }).message === 'string'
+        ? (error as { message: string }).message
+        : '';
+  return /listen\(\) called twice/i.test(message);
+}
+
+/**
+ * Attach a Realtime Database child listener defensively (stuck-message-delivery-fix
+ * hotfix, Fix C). If the SDK throws the "listen() called twice" internal assert,
+ * detach any lingering listen for this exact (ref, event, callback) and re-attach
+ * exactly once. If the re-attach still fails, detach again so we never leave a
+ * half-registered listener, then surface the error cleanly. Any other error is
+ * rethrown unchanged.
+ */
+function safeAttachListener(
+  ref: admin.database.Reference,
+  eventType: 'child_added' | 'child_changed',
+  callback: (snapshot: admin.database.DataSnapshot) => void
+): void {
+  try {
+    ref.on(eventType, callback);
+    return;
+  } catch (error) {
+    if (!isListenCalledTwiceError(error)) {
+      throw error;
+    }
+  }
+
+  // Recovery path: release the stale listen, then re-attach once.
+  try {
+    ref.off(eventType, callback);
+  } catch {
+    // Best-effort detach; ignore failures releasing a listener that may not exist.
+  }
+
+  try {
+    ref.on(eventType, callback);
+  } catch (retryError) {
+    try {
+      ref.off(eventType, callback);
+    } catch {
+      // Best-effort detach so no half-registered listener is left behind.
+    }
+    throw retryError;
+  }
 }
 
 const MAX_SHARED_WATCH_CACHE_ENTRIES = 1200;
@@ -318,6 +444,69 @@ function trimWatchCaches(
   }
 }
 
+/**
+ * Cancel a pending grace-window release, if any. Called when a new subscriber
+ * attaches to a watch that is inside its release window — the live Firebase
+ * listeners are reused, so no `.off()` / re-attach churn occurs.
+ */
+function cancelPendingRelease(watch: SharedConversationWatch): void {
+  if (watch.pendingReleaseTimer !== null) {
+    clearTimeout(watch.pendingReleaseTimer);
+    watch.pendingReleaseTimer = null;
+  }
+}
+
+/**
+ * Run the idempotent Firebase teardown for a watch and drop it from the cache.
+ * Guards: (1) never release a watch that has (re)gained subscribers; (2) only
+ * delete the cache entry if it still points at this exact watch instance;
+ * (3) `cleanupFirebase` is itself idempotent (the `torndown` guard), so a
+ * double-release is harmless.
+ */
+function releaseSharedWatch(watchKey: string, watch: SharedConversationWatch): void {
+  if (watch.subscribers.size > 0) {
+    // A subscriber attached after the release was scheduled — keep the watch.
+    return;
+  }
+
+  cancelPendingRelease(watch);
+
+  if (sharedConversationWatches.get(watchKey) === watch) {
+    sharedConversationWatches.delete(watchKey);
+  }
+
+  watch.cleanupFirebase?.();
+}
+
+/**
+ * Schedule a deferred release after the LAST subscriber leaves, keeping the
+ * Firebase listeners alive for `SHARED_WATCH_RELEASE_GRACE_MS`. A zero/negative
+ * grace window releases immediately. The timer handle is stored on the watch and
+ * `unref()`'d so it never keeps the Node process alive; it is cleared when the
+ * timer fires, when a new subscriber cancels it, or on release.
+ */
+function scheduleSharedWatchRelease(watchKey: string, watch: SharedConversationWatch): void {
+  // Already torn down, or a release is already scheduled — idempotent no-op.
+  if (watch.torndown || watch.pendingReleaseTimer !== null) {
+    return;
+  }
+
+  const graceMs = sharedWatchReleaseGraceMs;
+  if (graceMs <= 0) {
+    releaseSharedWatch(watchKey, watch);
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    watch.pendingReleaseTimer = null;
+    releaseSharedWatch(watchKey, watch);
+  }, graceMs);
+
+  // Never keep the Node event loop alive purely for a deferred watch release.
+  timer.unref?.();
+  watch.pendingReleaseTimer = timer;
+}
+
 export async function watchConversationRealtime(
   tenantId: string,
   conversationKey: string,
@@ -335,6 +524,13 @@ export async function watchConversationRealtime(
 
   const watchKey = [normalizedTenantId, normalizedConversationKey].join('::');
   let watch = sharedConversationWatches.get(watchKey);
+
+  if (watch) {
+    // Reusing a live watch. If it was inside its grace-window release, cancel the
+    // pending teardown and reuse the still-attached Firebase listeners — no
+    // `.off()`, no re-attach (this is what avoids "listen() called twice" churn).
+    cancelPendingRelease(watch);
+  }
 
   if (!watch) {
     const db = admin.database();
@@ -407,6 +603,8 @@ export async function watchConversationRealtime(
       nextSubscriberId: 1,
       cleanupFirebase: null,
       initPromise: Promise.resolve(),
+      torndown: false,
+      pendingReleaseTimer: null,
     };
 
     watch.initPromise = (async () => {
@@ -423,10 +621,17 @@ export async function watchConversationRealtime(
         return false;
       });
 
-      conversationRef.on('child_added', listeners.messageListener);
-      conversationRef.on('child_changed', listeners.changeListener);
+      safeAttachListener(conversationRef, 'child_added', listeners.messageListener);
+      safeAttachListener(conversationRef, 'child_changed', listeners.changeListener);
 
+      // Idempotent teardown: `.off()` runs at most once per watch instance even
+      // if cleanup is invoked more than once (stuck-message-delivery-fix hotfix,
+      // Fix C).
       watch!.cleanupFirebase = () => {
+        if (watch!.torndown) {
+          return;
+        }
+        watch!.torndown = true;
         conversationRef.off('child_added', listeners.messageListener);
         conversationRef.off('child_changed', listeners.changeListener);
       };
@@ -443,7 +648,13 @@ export async function watchConversationRealtime(
   } catch (error) {
     watch.subscribers.delete(subscriberId);
     if (watch.subscribers.size === 0) {
-      sharedConversationWatches.delete(watchKey);
+      // Init failed before any listener could be reused — release immediately
+      // (no grace window is useful for a watch that never came up).
+      cancelPendingRelease(watch);
+      if (sharedConversationWatches.get(watchKey) === watch) {
+        sharedConversationWatches.delete(watchKey);
+      }
+      watch.cleanupFirebase?.();
     }
     throw error;
   }
@@ -455,8 +666,12 @@ export async function watchConversationRealtime(
     }
     current.subscribers.delete(subscriberId);
     if (current.subscribers.size === 0) {
-      current.cleanupFirebase?.();
-      sharedConversationWatches.delete(watchKey);
+      // Grace-window release: keep the Firebase listeners alive for a short
+      // window instead of tearing down immediately, so a quick re-subscribe
+      // reuses them rather than re-attaching (which can trip Firebase's
+      // "listen() called twice" assert). Teardown runs when the window elapses
+      // with zero subscribers.
+      scheduleSharedWatchRelease(watchKey, current);
     }
   };
 }
