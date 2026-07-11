@@ -1,8 +1,8 @@
 /**
  * useUnreadChatCount
  *
- * Subscribes to the current user's conversation summaries via a single
- * Firebase RTDB listener and returns a stable `hasUnread` boolean.
+ * Subscribes to the current user's conversation summaries and returns a stable
+ * `hasUnread` boolean.
  *
  * Design choices for production / performance:
  *
@@ -16,8 +16,12 @@
  *  • Re-subscribes only when the user email or active tenant id change; all
  *    other component renders are free.
  *
- *  • The firebase listener is already debounced / batched by the RTDB SDK;
- *    no additional debounce is needed here.
+ *  • `chatService.onConversationSummariesChange` is a SHARED, ref-counted
+ *    subscription (chat-production-hardening Task 9): this app-global badge hook
+ *    and the chat screen attach to ONE underlying RTDB listen, and a burst of
+ *    summary changes is coalesced into a single true-unread recompute pass that
+ *    only re-queries the conversation(s) that actually changed. No additional
+ *    debounce is needed here.
  */
 
 import { useEffect, useState } from 'react';

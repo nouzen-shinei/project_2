@@ -36,7 +36,10 @@ import {
   toggleChatMessageReaction,
   syncChatConversationReceipts,
   confirmOutboundChatDelivery,
-  markPendingChatMessagesDeliveredForRecipient,
+  promotePendingDeliveryForRecipientThrottled,
+  markChatConversationRead,
+  reconcileChatUnreadForUser,
+  rebuildChatSummariesForUser,
   ChatMessageActionError,
 } from './chatMessageWriter';
 import {
@@ -526,8 +529,10 @@ const chatMessagePayloadSchema = z
     replyTo: chatReplyContextSchema.optional(),
     sticker: chatStickerSchema.optional(),
     gif: chatGifSchema.optional(),
-    delivered: z.boolean().optional(),
-    read: z.boolean().optional(),
+    // NOTE: client-supplied `delivered`/`read` are intentionally NOT accepted on
+    // the initial send (chat-production-hardening, finding P2-4). Receipts are set
+    // only via the dedicated delivery/read endpoints, never trusted from the
+    // sender. Any such fields in the body are dropped by this schema.
   })
   .superRefine((value, ctx) => {
     const hasText = typeof value.text === 'string' && value.text.trim().length > 0;
@@ -609,6 +614,26 @@ const chatOutboundDeliverySchema = z
       });
     }
   });
+
+// chat-production-hardening (finding P0-1 — Model A): the client no longer marks
+// a conversation read or reconciles unread counters by writing to RTDB directly.
+// It calls these authenticated endpoints instead, so the reader identity is bound
+// to the token and can never be spoofed.
+const chatConversationReadSchema = z.object({
+  tenantId: z.string().min(1),
+  partnerEmail: z.string().email(),
+});
+
+const chatUnreadReconcileSchema = z.object({
+  tenantId: z.string().min(1),
+});
+
+// chat-production-hardening (finding P0-1 — Model A): summary reconstruction was
+// the last client direct-writer. It now runs server-side through this endpoint so
+// the RTDB writes happen under the Admin SDK bound to the caller's token.
+const chatSummariesRebuildSchema = z.object({
+  tenantId: z.string().min(1),
+});
 
 const teamMembershipRoleEnum = z.enum(['owner', 'admin', 'staff', 'member', 'user']);
 const tenantMembershipRoleSchema = z.enum(['owner', 'admin', 'staff', 'member']);
@@ -5528,6 +5553,9 @@ export interface CreateAppOptions {
     sendChatMessage?: typeof sendChatMessage;
     syncChatConversationReceipts?: typeof syncChatConversationReceipts;
     confirmOutboundChatDelivery?: typeof confirmOutboundChatDelivery;
+    markChatConversationRead?: typeof markChatConversationRead;
+    reconcileChatUnreadForUser?: typeof reconcileChatUnreadForUser;
+    rebuildChatSummariesForUser?: typeof rebuildChatSummariesForUser;
     requireTenantMembershipAccess?: TenantMembershipAccessFn;
     isTenantEmailActiveMember?: TenantEmailMemberChecker;
     runNotificationHistoryInspector?: typeof runNotificationHistoryInspector;
@@ -5717,6 +5745,12 @@ export function createApp(options: CreateAppOptions = {}){
     options.overrides?.syncChatConversationReceipts ?? syncChatConversationReceipts;
   const confirmOutboundChatDeliveryImpl =
     options.overrides?.confirmOutboundChatDelivery ?? confirmOutboundChatDelivery;
+  const markChatConversationReadImpl =
+    options.overrides?.markChatConversationRead ?? markChatConversationRead;
+  const reconcileChatUnreadForUserImpl =
+    options.overrides?.reconcileChatUnreadForUser ?? reconcileChatUnreadForUser;
+  const rebuildChatSummariesForUserImpl =
+    options.overrides?.rebuildChatSummariesForUser ?? rebuildChatSummariesForUser;
   const requireTenantMembershipAccessImpl = options.overrides?.requireTenantMembershipAccess ?? requireTenantMembershipAccess;
   const isTenantEmailActiveMemberImpl = options.overrides?.isTenantEmailActiveMember ?? isTenantEmailActiveMember;
   const runNotificationHistoryInspectorImpl = options.overrides?.runNotificationHistoryInspector ?? runNotificationHistoryInspector;
@@ -9592,8 +9626,8 @@ export function createApp(options: CreateAppOptions = {}){
         replyTo: payload.replyTo,
         sticker: payload.sticker,
         gif: payload.gif,
-        delivered: payload.delivered,
-        read: payload.read,
+        // delivered/read are intentionally omitted — the write boundary forces
+        // both false on the initial send (chat-production-hardening, P2-4).
       });
 
       // Echo both the durable serverMessageId and the caller's clientMsgId so the
@@ -10550,6 +10584,165 @@ export function createApp(options: CreateAppOptions = {}){
       }
       console.error('[chat_receipts_outbound_delivered] failed', error);
       return res.status(500).json({ error: 'outbound_delivery_confirmation_failed' });
+    }
+  });
+
+  // Mark a whole conversation read on behalf of the authenticated reader
+  // (chat-production-hardening, finding P0-1 — Model A: backend is the only
+  // writer). The reader is bound to the token via resolveAuthenticatedEmail, so a
+  // caller can only ever mark THEIR OWN incoming messages read — a forged actor
+  // is impossible. Tenant membership of both the actor and the partner is
+  // enforced before any write.
+  app.post('/chat/conversations/read', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatConversationReadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    const normalizedPartner = normalizeEmail(parsed.data.partnerEmail);
+    if (!normalizedPartner) {
+      return res.status(400).json({ error: 'invalid_partner' });
+    }
+
+    const partnerIsMember = await isTenantEmailActiveMemberImpl(tenantAccess.tenantId, normalizedPartner);
+    if (!partnerIsMember) {
+      return res.status(403).json({ error: 'partner_not_in_tenant' });
+    }
+
+    try {
+      const result = await markChatConversationReadImpl({
+        tenantId: tenantAccess.tenantId,
+        actorEmail,
+        partnerEmail: normalizedPartner,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_conversations_read] failed', error);
+      return res.status(500).json({ error: 'mark_conversation_read_failed' });
+    }
+  });
+
+  // Reconcile the authenticated user's stored unread counters against the true
+  // unread set and clean up any stuck self-conversation nodes
+  // (chat-production-hardening, finding P0-1 — Model A). The user is bound to the
+  // token, so a caller can only reconcile THEIR OWN counters.
+  app.post('/chat/unread/reconcile', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatUnreadReconcileSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    try {
+      const result = await reconcileChatUnreadForUserImpl({
+        tenantId: tenantAccess.tenantId,
+        actorEmail,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_unread_reconcile] failed', error);
+      return res.status(500).json({ error: 'unread_reconcile_failed' });
+    }
+  });
+
+  // Reconstruct the authenticated user's conversation summaries server-side
+  // (chat-production-hardening, finding P0-1 — Model A). This replaces the
+  // client's former direct RTDB rebuild, which now fails under the `.write:false`
+  // lockdown. The user is bound to the token via resolveAuthenticatedEmail, so a
+  // caller can only ever rebuild THEIR OWN summaries — a forged actor is
+  // impossible.
+  app.post('/chat/summaries/rebuild', requireMemberTenantAccess, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = chatSummariesRebuildSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'not_authorized', message: 'Tenant mismatch' });
+    }
+
+    const actorEmail = await resolveAuthenticatedEmail(authContext);
+    if (!actorEmail) {
+      return res.status(400).json({ error: 'actor_email_unavailable' });
+    }
+
+    try {
+      const result = await rebuildChatSummariesForUserImpl({
+        tenantId: tenantAccess.tenantId,
+        actorEmail,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      if (error instanceof ChatMessageActionError) {
+        const status = statusForChatActionError(error);
+        return res.status(status).json({
+          error: error.code,
+          message: error.message,
+          details: error.details || undefined,
+        });
+      }
+      console.error('[chat_summaries_rebuild] failed', error);
+      return res.status(500).json({ error: 'summaries_rebuild_failed' });
     }
   });
 
@@ -17355,7 +17548,14 @@ export function createApp(options: CreateAppOptions = {}){
       }
       await userRef.set(parentUpdate, { merge: true });
 
-      void markPendingChatMessagesDeliveredForRecipient({
+      // Fire-and-forget, THROTTLED: bursty pings for the same (tenant, recipient)
+      // coalesce into at most one promotion per short window so the hot ping path
+      // does not re-enumerate every conversation on each heartbeat. A skipped
+      // (throttled) call resolves to null; the next ping after the window — or the
+      // next inbound message — still promotes, so no receipt is dropped. The
+      // graceful index fallback inside the promotion means a not-yet-deployed
+      // `.indexOn` no longer hard-fails this path.
+      void promotePendingDeliveryForRecipientThrottled({
         tenantId,
         recipientEmail: normalizedEmail,
       }).catch((error) => {

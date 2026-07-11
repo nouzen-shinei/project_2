@@ -23,6 +23,42 @@ type StreamMode = 'sse' | 'websocket';
 
 const STREAM_RETRY_BASE_MS = 500;
 const STREAM_RETRY_MAX_MS = 6000;
+const STREAM_RETRY_GROWTH_FACTOR = 1.6;
+
+/**
+ * Resolve the reconnect backoff delay (ms) for a given retry attempt.
+ *
+ * The delay is built from an exponential ceiling (growth factor 1.6) that keeps
+ * doubling-ish until it saturates at `max`, then FULL JITTER is applied across
+ * `[0, ceiling]`. Full jitter de-synchronizes many clients that reconnect after
+ * the same backend blip so they don't stampede the server (thundering herd),
+ * while the exponential ceiling + hard `max` cap keep the delay from growing
+ * unbounded. The returned value is always clamped to `[0, max]`.
+ *
+ * `rng` defaults to `Math.random` and is injectable so callers/tests can make
+ * the jitter deterministic.
+ *
+ * Attempt indexing matches the previous behavior: attempt 1 -> base * 1.6,
+ * attempt 2 -> base * 1.6^2, ... (the original loop grew the delay before its
+ * first sleep, so the first reconnect ceiling is `base * 1.6`).
+ */
+export function resolveStreamRetryDelay(
+  attempt: number,
+  base: number = STREAM_RETRY_BASE_MS,
+  max: number = STREAM_RETRY_MAX_MS,
+  rng: () => number = Math.random,
+): number {
+  const safeBase = Number.isFinite(base) && base > 0 ? base : STREAM_RETRY_BASE_MS;
+  const safeMax = Number.isFinite(max) && max >= safeBase ? max : safeBase;
+  const safeAttempt = Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 1;
+  // Deterministic exponential ceiling, capped at the max delay.
+  const ceiling = Math.min(safeMax, Math.round(safeBase * Math.pow(STREAM_RETRY_GROWTH_FACTOR, safeAttempt)));
+  // Full jitter: pick a delay in [0, ceiling] so reconnects fan out over time.
+  const sample = typeof rng === 'function' ? rng() : Math.random();
+  const bounded = Number.isFinite(sample) ? Math.min(1, Math.max(0, sample)) : Math.random();
+  const jittered = Math.round(bounded * ceiling);
+  return Math.min(safeMax, Math.max(0, jittered));
+}
 
 function buildStreamUrl(baseUrl: string, path: string): string {
   const trimmed = baseUrl.replace(/\/$/, '');
@@ -59,8 +95,16 @@ export class ChatRealtimeStream {
     await this.teardown(key);
 
     let closed = false;
-    let retryDelay = STREAM_RETRY_BASE_MS;
+    let retryAttempt = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let currentClose: CloseFn | null = null;
+
+    const clearRetryTimer = () => {
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
 
     const start = async (): Promise<void> => {
       if (closed) {
@@ -93,7 +137,8 @@ export class ChatRealtimeStream {
             onMessageDelete,
             onStatus,
             onOpen: () => {
-              retryDelay = STREAM_RETRY_BASE_MS;
+              // A healthy connection resets the backoff to its base.
+              retryAttempt = 0;
               onOpen?.();
             },
             onError: (error) => {
@@ -111,7 +156,8 @@ export class ChatRealtimeStream {
             onMessageDelete,
             onStatus,
             onOpen: () => {
-              retryDelay = STREAM_RETRY_BASE_MS;
+              // A healthy connection resets the backoff to its base.
+              retryAttempt = 0;
               onOpen?.();
             },
             onError: (error) => {
@@ -133,17 +179,35 @@ export class ChatRealtimeStream {
       if (closed) {
         return;
       }
-      retryDelay = Math.min(STREAM_RETRY_MAX_MS, Math.round(retryDelay * 1.6));
-      setTimeout(() => {
+      // Only ever keep ONE pending reconnect timer; drop any prior one so the
+      // handle we store is always the live timer we can cancel on close().
+      clearRetryTimer();
+      retryAttempt += 1;
+      const delay = resolveStreamRetryDelay(retryAttempt, STREAM_RETRY_BASE_MS, STREAM_RETRY_MAX_MS);
+      retryTimer = setTimeout(() => {
+        // The timer has fired; drop the stale handle before (maybe) reconnecting.
+        retryTimer = null;
+        if (closed) {
+          return;
+        }
         void start();
-      }, retryDelay);
+      }, delay);
     };
 
     await start();
 
     const close: CloseFn = () => {
+      // Idempotent: safe to call multiple times. Always ensure no reconnect timer
+      // lingers so start() can never be invoked again after close().
+      if (closed) {
+        clearRetryTimer();
+        return;
+      }
       closed = true;
-      currentClose?.();
+      clearRetryTimer();
+      try {
+        currentClose?.();
+      } catch {}
       this.activeSubscriptions.delete(key);
     };
 

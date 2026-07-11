@@ -1,25 +1,39 @@
 {
   "rules": {
-    ".read": "auth != null",
-    ".write": "auth != null",
-    "messages": {
-      ".indexOn": ["recipientId", "sender"]
-    },
     "tenantChat": {
       "$tenantId": {
+        ".write": false,
         "conversationMessages": {
           "$conversation": {
-            ".indexOn": ["timestamp", "sender", "recipientId", "read"],
+            ".read": "auth != null && ($conversation.beginsWith(auth.token.email.toLowerCase().replace('@','_').replace('.','_') + '__') || $conversation.endsWith('__' + auth.token.email.toLowerCase().replace('@','_').replace('.','_')))",
+            ".indexOn": ["timestamp", "sender", "recipientId", "read", "delivered"],
             "$messageId": {
-              ".validate": "!(newData.hasChild('sender') && newData.hasChild('recipientId')) || newData.child('sender').val() != newData.child('recipientId').val()"
+              ".validate": "newData.hasChildren(['sender', 'timestamp']) && (!(newData.hasChild('sender') && newData.hasChild('recipientId')) || newData.child('sender').val() != newData.child('recipientId').val())",
+              "sender": { ".validate": "newData.isString() && newData.val().length <= 320 && newData.val() == auth.token.email" },
+              "recipientId": { ".validate": "newData.isString() && newData.val().length <= 320" },
+              "text": { ".validate": "newData.isString() && newData.val().length <= 5000" },
+              "clientMsgId": { ".validate": "newData.isString() && newData.val().length <= 200" },
+              "read": { ".validate": "newData.isBoolean()" },
+              "delivered": { ".validate": "newData.isBoolean()" },
+              "timestamp": { ".validate": "newData.isString() || newData.isNumber()" },
+              "$other": { ".validate": true }
             }
           }
         },
         "messageIndex": {
+          ".read": "auth != null",
           ".indexOn": ["timestamp", "conversationKey", "recipientId", "sender"]
+        },
+        "conversationClientMsgIndex": {
+          ".read": false,
+          ".write": false,
+          "$conversation": {
+            ".indexOn": [".value"]
+          }
         },
         "conversationSummaries": {
           "$user": {
+            ".read": "auth != null && $user === auth.token.email.toLowerCase().replace('@','_').replace('.','_')",
             "$partner": {
               ".indexOn": ["updatedAt", "partnerEmail"]
             }
@@ -27,11 +41,13 @@
         },
         "conversationLatest": {
           "$conversation": {
+            ".read": "auth != null && ($conversation.beginsWith(auth.token.email.toLowerCase().replace('@','_').replace('.','_') + '__') || $conversation.endsWith('__' + auth.token.email.toLowerCase().replace('@','_').replace('.','_')))",
             ".indexOn": ["timestamp"]
           }
         },
         "userConversations": {
           "$user": {
+            ".read": "auth != null && $user === auth.token.email.toLowerCase().replace('@','_').replace('.','_')",
             ".indexOn": ["updatedAt", "partnerEmail"]
           }
         },
@@ -39,13 +55,9 @@
         "messageReactions": { ".read": false, ".write": false }
       }
     },
-
-    "conversationMessages": { ".read": false, ".write": false },
-    "messageIndex": { ".read": false, ".write": false },
-    "conversationSummaries": { ".read": false, ".write": false },
-    "conversationLatest": { ".read": false, ".write": false },
-    "userConversations": { ".read": false, ".write": false },
-    "messageReactions": { ".read": false, ".write": false },
-    "typing": { ".read": false, ".write": false }
+    "chatRateLimit": {
+      ".read": false,
+      ".write": false
+    }
   }
 }

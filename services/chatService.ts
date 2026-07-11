@@ -365,6 +365,47 @@ export interface UploadSessionOptions {
   registerCancel?: (cancel: () => void | Promise<void>) => void;
 }
 
+// chat-production-hardening (Task 9, finding P2-1). A single, ref-counted RTDB
+// `onValue` listen on a user's conversationSummaries node, multiplexed to every
+// consumer (the app-global unread badge hook + the chat screen). Mirrors the
+// shared-watcher pattern used by the backend conversation realtime watch
+// (backend-runtime/src/chatRealtime.ts): consumers attach/detach by id and the
+// underlying Firebase listen is torn down only when the LAST consumer leaves.
+// A burst of summary-node changes is coalesced into ONE recompute pass, and each
+// pass recomputes true-unread ONLY for the conversation(s) whose summary record
+// actually changed (diffed against the last-seen snapshot), backed by a
+// short-TTL per-conversation cache so unchanged conversations are never
+// re-queried.
+interface SharedSummarySubscription {
+  key: string;
+  tenantScopeId: string;
+  normalizedUser: string;
+  userKey: string;
+  subscribers: Map<number, (summaries: Record<string, ConversationSummary>) => void>;
+  nextSubscriberId: number;
+  detachFirebase: (() => void) | null;
+  torndown: boolean;
+  // Latest raw snapshot awaiting a coalesced recompute pass.
+  pendingRaw: Record<string, unknown> | null;
+  hasPending: boolean;
+  // A recompute pass is currently running (async).
+  isRecomputing: boolean;
+  // Whether at least one recompute pass has started. The FIRST pass runs on the
+  // leading edge (immediately, no added latency for the initial paint); later
+  // passes are trailing-debounced to coalesce bursts.
+  hasStartedFirstPass: boolean;
+  // Trailing-debounce handle for coalescing a burst of snapshots into one pass.
+  coalesceTimer: ReturnType<typeof setTimeout> | null;
+  // Last broadcast result, replayed immediately to a newly-attached consumer so
+  // it does not have to wait for the next snapshot.
+  lastResult: Record<string, ConversationSummary> | null;
+  // Per-partnerEmail signature of the last-seen summary record (change detection).
+  lastSeenSignatures: Map<string, string>;
+  // Short-TTL per-conversationKey true-unread cache (avoids redundant indexed
+  // queries for conversations that did not change this pass).
+  unreadCache: Map<string, { count: number; expiresAt: number }>;
+}
+
 class ChatService {
   // Tenant-partitioned chat data root (RTDB)
   // Structure:
@@ -381,6 +422,53 @@ class ChatService {
   private static readonly ENABLE_CHAT_UPLOAD_DEBUG = false;
   private static readonly NETWORK_ALERT_COOLDOWN_MS = 5000;
   private lastUploadNetworkAlertAt = 0;
+
+  // --- Client-side unread-reconcile throttle + in-flight guard --------------
+  // chat-production-hardening (Task 7, finding P3-4). `reconcileUnreadForUser`
+  // fires on several redundant client triggers (summary refresh, mark-as-read)
+  // and, with multiple devices, produces redundant/racy (though idempotent)
+  // writes. On a SINGLE client we (a) coalesce near-simultaneous triggers into
+  // the one reconcile already in flight and (b) throttle repeat calls inside a
+  // short window. Callers that just mutated state (e.g. after mark-as-read) may
+  // pass `{ force: true }` so a genuinely-needed reconcile is never starved by
+  // the throttle. This is purely a client-side noise reducer: the reconcile
+  // itself stays idempotent and only-on-drift.
+  //
+  // NOTE: authoritative reconciliation should eventually live entirely
+  // server-side. The backend `/chat/unread/reconcile` endpoint already performs
+  // only-on-drift counter writes and self-conversation cleanup bound to the
+  // caller's auth token (see backend-runtime/src/chatMessageWriter.ts). This
+  // client throttle is a stopgap to reduce cross-device churn until then.
+  private static readonly UNREAD_RECONCILE_THROTTLE_MS = 4000;
+  private unreadReconcileThrottleMs = ChatService.UNREAD_RECONCILE_THROTTLE_MS;
+  private unreadReconcileState = new Map<string, { inFlight: Promise<void> | null; lastRunAt: number }>();
+  // Injectable clock so tests can advance the throttle window deterministically.
+  private unreadReconcileNow: () => number = () => Date.now();
+
+  // --- Shared summaries subscription + coalesced true-unread recompute -------
+  // chat-production-hardening (Task 9, finding P2-1). Previously BOTH
+  // `useUnreadChatCount` (app-global badge) and `app/(tabs)/chat.tsx` each opened
+  // their OWN `onValue` listen on conversationSummaries and, on EVERY change,
+  // recomputed true-unread for ALL K conversations via a per-conversation indexed
+  // query (`orderByChild('read').equalTo(false)`) — a read/callback storm of
+  // ~2·K reads per event. `onConversationSummariesChange` now:
+  //   (1) shares ONE underlying listen per (user, tenant) across all consumers,
+  //       ref-counted and torn down when the last consumer unsubscribes;
+  //   (2) coalesces a burst of snapshots into a single recompute pass; and
+  //   (3) recomputes true-unread ONLY for conversations whose summary record
+  //       changed (diffed against the last-seen snapshot), serving unchanged
+  //       conversations from a short-TTL per-conversation cache.
+  // The badge stays correct: any change to a conversation's unread state is
+  // reflected in its stored summary record, so its true-unread is recomputed on
+  // the next pass; the cache only elides re-queries for records that did not
+  // change within the TTL.
+  private static readonly SUMMARY_RECOMPUTE_COALESCE_MS = 50;
+  private static readonly SUMMARY_UNREAD_CACHE_TTL_MS = 3000;
+  private summaryCoalesceWindowMs = ChatService.SUMMARY_RECOMPUTE_COALESCE_MS;
+  private summaryUnreadCacheTtlMs = ChatService.SUMMARY_UNREAD_CACHE_TTL_MS;
+  private summarySubscriptions = new Map<string, SharedSummarySubscription>();
+  // Injectable clock so tests can drive the cache TTL deterministically.
+  private summaryNow: () => number = () => Date.now();
 
   private requireTenantId(value: string | null | undefined): string {
     const normalized = typeof value === 'string' ? value.trim() : '';
@@ -812,6 +900,72 @@ class ChatService {
     return this.getConversationKey(emailA, emailB);
   }
 
+  /**
+   * Authoritative, cheap existence check for a single durable message record in
+   * the intended (non-self) conversation (chat-production-hardening, P1-2).
+   *
+   * This is a single keyed `get` on
+   * `tenantChat/{tenantId}/conversationMessages/{conversationKey}/{serverMessageId}`
+   * — NOT a scan — used as a safety net before the outbox driver dead-letters an
+   * exhausted send to `failed`. It returns true only when a live record exists
+   * that is addressed to the intended recipient (`recipientId == recipient`),
+   * is not self-addressed, and is not deleted — i.e. the recipient's listener can
+   * surface it. Best-effort: any resolution/read error returns false so genuine
+   * failures still dead-letter.
+   */
+  public async messageExistsById(
+    senderEmail: string,
+    recipientEmail: string,
+    serverMessageId: string,
+    tenantId?: string | null
+  ): Promise<boolean> {
+    const sender = this.normalizeEmail(senderEmail);
+    const recipient = this.normalizeEmail(recipientEmail);
+    const messageId = typeof serverMessageId === 'string' ? serverMessageId.trim() : '';
+    if (!sender || !recipient || !messageId) {
+      return false;
+    }
+    // Never confirm a self-addressed record: self-conversations are not a
+    // delivered state (stuck-message-delivery-fix, Defect A).
+    if (this.isSelfAddressed(sender, recipient)) {
+      return false;
+    }
+    const conversationKey = this.getConversationKey(sender, recipient);
+    if (!conversationKey || this.isSelfConversationKey(conversationKey)) {
+      return false;
+    }
+    try {
+      const resolvedTenantId = tenantId ? tenantId : await tenantService.getCachedSelectedTenant();
+      const tenantScopeId = this.requireTenantId(resolvedTenantId);
+      const messageRef = child(
+        this.tenantConversationMessagesRef(tenantScopeId, conversationKey),
+        messageId
+      );
+      const snapshot = await get(messageRef);
+      if (!snapshot.exists()) {
+        return false;
+      }
+      const raw = snapshot.val() as Record<string, unknown> | null;
+      if (!raw || typeof raw !== 'object') {
+        return false;
+      }
+      if ((raw as { deleted?: unknown }).deleted === true) {
+        return false;
+      }
+      // The durable record must target the intended (non-self) recipient.
+      if (this.normalizeEmail((raw as { recipientId?: string }).recipientId) !== recipient) {
+        return false;
+      }
+      if (this.normalizeEmail((raw as { sender?: string }).sender) === recipient) {
+        return false;
+      }
+      return true;
+    } catch (error) {
+      logger.debug('chat.messageExistsById.failed', { conversationKey, messageId, error });
+      return false;
+    }
+  }
+
   private async ensureTenantChatScope(senderEmail: string, recipientEmail?: string | null): Promise<string> {
     const tenantId = await tenantService.getCachedSelectedTenant();
     if (!tenantId) {
@@ -1235,7 +1389,47 @@ class ChatService {
     return null;
   }
 
+  // Reconstruct a user's conversation summaries (repair path used before a
+  // summary refresh and on chat bootstrap).
+  //
+  // chat-production-hardening (finding P0-1 — Model A: backend is the only chat
+  // writer): when the chat backend is configured, the rebuild runs through the
+  // authenticated `/chat/summaries/rebuild` endpoint so the RTDB writes happen
+  // server-side, bound to the caller's token. Under the deployed rules the client
+  // chat write paths are locked to `.write:false`, so the former direct
+  // `set(...)`/`update(...)` here fail with permission_denied — this dispatcher is
+  // the fix. The direct-write path is retained ONLY as the no-backend fallback
+  // (parity with `markConversationAsRead` / `reconcileUnreadForUser`).
   async rebuildConversationSummariesForUser(userEmail: string, tenantId?: string | null): Promise<void> {
+    const normalizedUser = this.normalizeEmail(userEmail);
+    const userKey = this.sanitizeEmailKey(normalizedUser);
+    if (!normalizedUser || !userKey) {
+      return;
+    }
+
+    if (this.getChatBackendBaseUrl()) {
+      try {
+        const resolvedTenantId = tenantId ? tenantId : await tenantService.getCachedSelectedTenant();
+        const tenantScopeId = this.requireTenantId(resolvedTenantId);
+        await this.performChatAction('POST', '/chat/summaries/rebuild', {
+          tenantId: tenantScopeId,
+        });
+      } catch (error) {
+        logger.warn('Failed to rebuild conversation summaries via backend', { error });
+      }
+      return;
+    }
+
+    await this.rebuildConversationSummariesForUserDirect(userEmail, tenantId);
+  }
+
+  // No-backend fallback: the original client direct-write rebuild. Under a
+  // backend-only-writer deployment this path is NOT reached (the dispatcher above
+  // routes to the endpoint); it remains for local/no-backend configurations.
+  private async rebuildConversationSummariesForUserDirect(
+    userEmail: string,
+    tenantId?: string | null
+  ): Promise<void> {
     const normalizedUser = this.normalizeEmail(userEmail);
     const userKey = this.sanitizeEmailKey(normalizedUser);
     if (!normalizedUser || !userKey) {
@@ -1881,20 +2075,61 @@ class ChatService {
     await Promise.all(metadataUpdates);
   }
 
+  // Count the unread-for-`viewer` messages inside a raw conversationMessages
+  // node. A message counts as unread when it is NOT explicitly read
+  // (`read !== true`, so a record MISSING the `read` field is treated as unread),
+  // is not `deleted`, and is addressed to `viewer`. Applied to the (bounded)
+  // subset returned by either indexed query, and to the full node returned by
+  // no-op query mocks — the predicate is what makes the result correct either way.
+  private countUnreadInRawNode(raw: Record<string, unknown>, viewer: string): number {
+    let count = 0;
+    for (const value of Object.values(raw)) {
+      const data = value as any;
+      if (!data || typeof data !== 'object') {
+        continue;
+      }
+      // A missing `read` key is `undefined` (NOT `=== true`) → counted as unread.
+      if (data.read === true || data.deleted === true) {
+        continue;
+      }
+      if (this.normalizeEmail(data.recipientId) !== viewer) {
+        continue;
+      }
+      count += 1;
+    }
+    return count;
+  }
+
   // Bounded unread recompute for a single conversation.
   //
-  // Uses a query over the indexed `read == false` set so the read cost scales
-  // with the number of UNREAD messages in the conversation, not the whole
-  // history (O(unread), not O(all messages)). The remaining predicate
-  // (`recipientId == viewer` and not `deleted`) is applied to that bounded set.
+  // Primary path: query over the indexed `read == false` set so the read cost
+  // scales with the number of UNREAD messages, not the whole history (O(unread),
+  // not O(all messages)). The remaining predicate (`recipientId == viewer` and
+  // not `deleted`) is applied to that bounded set.
   //
-  // Returns the true unread count for `viewerEmail`, or `null` when the bounded
-  // read could not be completed (caller keeps the previously stored count so a
-  // transient read failure never wipes a genuine unread count).
+  // Robustness (chat-production-hardening, finding P3-1): RTDB `equalTo(false)`
+  // matches ONLY records whose `read` value is exactly `false`; a record that
+  // lacks a `read` key entirely is invisible to that index, so a legacy/foreign
+  // write missing `read` would be UNDER-counted. All first-party writers now
+  // force `read: false` on new messages (client `sendMessageDirect` + backend
+  // `sendChatMessage`), so in steady state the `read` index already covers every
+  // record and the primary path is exact. To cover the residual legacy/foreign
+  // case WITHOUT regressing the hot path, a bounded fallback fires ONLY when the
+  // caller's `storedUnreadHint` claims MORE unread than the `read` index found
+  // (a suspected under-count/drift): it recounts over the indexed
+  // `recipientId == viewer` set (also `.indexOn` → O(messages-to-viewer), never a
+  // full-history `get`) and treats a missing `read` as unread. The fallback never
+  // runs on the common in-sync path, so the O(unread) bound is preserved there.
+  //
+  // Returns the true unread count for `viewerEmail`, or `null` when the primary
+  // bounded read could not be completed (caller keeps the previously stored count
+  // so a transient read failure never wipes a genuine unread count). A failure of
+  // ONLY the fallback query degrades to the primary `read`-index count, never null.
   private async computeTrueUnreadCount(
     tenantId: string,
     viewerEmail: string,
-    conversationKey: string
+    conversationKey: string,
+    storedUnreadHint?: number | null
   ): Promise<number | null> {
     const viewer = this.normalizeEmail(viewerEmail);
     if (!viewer || !conversationKey) {
@@ -1905,28 +2140,37 @@ class ChatService {
       const messagesRef = this.tenantConversationMessagesRef(tenantId, conversationKey);
       const unreadQuery = query(messagesRef, orderByChild('read'), equalTo(false));
       const snapshot = await get(unreadQuery);
-      if (!snapshot.exists()) {
-        return 0;
+      const indexedCount = snapshot.exists()
+        ? this.countUnreadInRawNode(snapshot.val() || {}, viewer)
+        : 0;
+
+      // Bounded missing-`read` fallback (P3-1): only when the stored counter
+      // suspects more unread than the `read` index surfaced. Recounting over the
+      // `recipientId == viewer` index catches records missing a `read` key while
+      // staying bounded (indexed) — never a full-history scan. `recipCount` is
+      // always >= `indexedCount` (every `read == false` record for the viewer is
+      // also a `recipientId == viewer` record), so this never under-counts.
+      if (
+        typeof storedUnreadHint === 'number' &&
+        Number.isFinite(storedUnreadHint) &&
+        storedUnreadHint > indexedCount
+      ) {
+        try {
+          const recipientQuery = query(messagesRef, orderByChild('recipientId'), equalTo(viewer));
+          const recipientSnapshot = await get(recipientQuery);
+          return recipientSnapshot.exists()
+            ? this.countUnreadInRawNode(recipientSnapshot.val() || {}, viewer)
+            : 0;
+        } catch (fallbackError) {
+          logger.debug('Bounded recipientId unread fallback failed; using read-index count', {
+            conversationKey,
+            error: fallbackError,
+          });
+          return indexedCount;
+        }
       }
 
-      const raw = snapshot.val() || {};
-      let count = 0;
-      for (const value of Object.values(raw)) {
-        const data = value as any;
-        if (!data || typeof data !== 'object') {
-          continue;
-        }
-        // `read`/`deleted` re-checked here because the mock and any non-indexed
-        // fallback may return a superset of the bounded query.
-        if (data.read === true || data.deleted === true) {
-          continue;
-        }
-        if (this.normalizeEmail(data.recipientId) !== viewer) {
-          continue;
-        }
-        count += 1;
-      }
-      return count;
+      return indexedCount;
     } catch (error) {
       logger.debug('Bounded unread recompute failed; retaining stored count', {
         conversationKey,
@@ -1979,30 +2223,104 @@ class ChatService {
       }
     });
 
+    const now = this.summaryNow();
     const result: Record<string, ConversationSummary> = {};
     await Promise.all(
       normalized.map(async (summary) => {
-        const partnerEmail = summary.partnerEmail;
-        const conversationKey = this.getConversationKey(viewer, partnerEmail);
-
-        if (
-          !conversationKey ||
-          this.isSelfConversationKey(conversationKey) ||
-          this.isSelfAddressed(viewer, partnerEmail)
-        ) {
-          result[partnerEmail] = { ...summary, unreadCount: 0 };
-          return;
-        }
-
-        const trueUnread = await this.computeTrueUnreadCount(tenantId, viewer, conversationKey);
-        result[partnerEmail] = {
-          ...summary,
-          unreadCount: trueUnread === null ? summary.unreadCount : trueUnread,
-        };
+        // One-shot derivation (getConversationSummaries): no persistent cache, so
+        // every non-self conversation is recomputed. This preserves the exact
+        // pre-Task-9 behavior for callers that read summaries once.
+        result[summary.partnerEmail] = await this.reconcileSummaryRecordCached(
+          tenantId,
+          viewer,
+          summary,
+          null,
+          now,
+          true
+        );
       })
     );
 
     return result;
+  }
+
+  // Reconcile a single summary record into its badge/list-ready form:
+  //   - self-conversations (identical key halves, OR sender == recipientId, OR
+  //     partnerEmail == viewer) are forced to unreadCount 0 so they can never
+  //     light the badge or contribute to the total; and
+  //   - non-self conversations have their stored unreadCount replaced with the
+  //     true-unread set so a desynced/stale counter converges to reality.
+  // When an `unreadCache` is supplied and the record did NOT change this pass
+  // (`forceRecompute === false`) a still-valid cached count is served WITHOUT a
+  // fresh indexed query — this is what lets a coalesced pass recompute only the
+  // conversation(s) that actually changed. A failed recompute retains the stored
+  // count and does not poison the cache.
+  private async reconcileSummaryRecordCached(
+    tenantId: string,
+    viewer: string,
+    summary: ConversationSummary,
+    unreadCache: Map<string, { count: number; expiresAt: number }> | null,
+    now: number,
+    forceRecompute: boolean
+  ): Promise<ConversationSummary> {
+    const partnerEmail = summary.partnerEmail;
+    const conversationKey = this.getConversationKey(viewer, partnerEmail);
+
+    if (
+      !conversationKey ||
+      this.isSelfConversationKey(conversationKey) ||
+      this.isSelfAddressed(viewer, partnerEmail)
+    ) {
+      return { ...summary, unreadCount: 0 };
+    }
+
+    if (!forceRecompute && unreadCache) {
+      const cached = unreadCache.get(conversationKey);
+      if (cached && cached.expiresAt > now) {
+        return { ...summary, unreadCount: cached.count };
+      }
+    }
+
+    // Pass the stored `unreadCount` as the hint so a missing-`read` under-count
+    // (P3-1) is caught by the bounded recipientId fallback when the stored
+    // counter claims more unread than the `read` index surfaced.
+    const trueUnread = await this.computeTrueUnreadCount(
+      tenantId,
+      viewer,
+      conversationKey,
+      summary.unreadCount
+    );
+    if (trueUnread === null) {
+      // Recompute failed (e.g. transient query error) — retain the stored count
+      // and leave any existing cache entry untouched so we retry next pass.
+      return { ...summary, unreadCount: summary.unreadCount };
+    }
+
+    if (unreadCache) {
+      unreadCache.set(conversationKey, {
+        count: trueUnread,
+        expiresAt: now + this.summaryUnreadCacheTtlMs,
+      });
+    }
+    return { ...summary, unreadCount: trueUnread };
+  }
+
+  // Compact, change-indicating signature for a normalized summary record. When a
+  // message arrives, is delivered, or is read, the stored `unreadCount`,
+  // `updatedAt`, and/or the last-message receipt flags change — so a change to a
+  // conversation's unread state always changes this signature, and unchanged
+  // conversations keep a stable signature (served from cache).
+  private buildSummarySignature(summary: ConversationSummary): string {
+    const last = summary.lastMessage;
+    return JSON.stringify([
+      summary.unreadCount,
+      summary.updatedAt,
+      summary.tenantId,
+      last?.messageId ?? null,
+      last?.timestamp ?? null,
+      last?.read ?? null,
+      last?.delivered ?? null,
+    ]);
   }
 
   // Durable, idempotent unread reconciliation for a user. Cleans up the confirmed
@@ -2016,13 +2334,111 @@ class ChatService {
   //     differs, so re-running is a no-op (no oscillation).
   // Safe to call on cheap triggers (conversation open, foreground/summary load,
   // after mark-as-read).
-  async reconcileUnreadForUser(userEmail: string, tenantId?: string | null): Promise<void> {
+  //
+  // chat-production-hardening (finding P0-1 — Model A: backend is the only chat
+  // writer): when the chat backend is configured, reconciliation runs through the
+  // authenticated `/chat/unread/reconcile` endpoint so the destructive self-node
+  // cleanup and counter rewrites happen server-side, bound to the caller's token
+  // (client chat write paths are locked to `.write:false`). The direct-write path
+  // is retained ONLY as the no-backend fallback.
+  async reconcileUnreadForUser(
+    userEmail: string,
+    tenantId?: string | null,
+    options?: { force?: boolean }
+  ): Promise<void> {
     const normalizedUser = this.normalizeEmail(userEmail);
     const userKey = this.sanitizeEmailKey(normalizedUser);
     if (!normalizedUser || !userKey) {
       return;
     }
 
+    const state = this.unreadReconcileState.get(userKey);
+
+    // In-flight guard: coalesce near-simultaneous triggers on this client into
+    // the single reconcile already running. Every caller awaits the same
+    // promise, so N triggers collapse to one network/direct call.
+    if (state?.inFlight) {
+      return state.inFlight;
+    }
+
+    // Throttle: suppress repeat calls inside the window unless explicitly forced
+    // (e.g. immediately after a state-changing mark-as-read). A genuinely-needed
+    // reconcile after the window still runs. `lastRunAt` starts at -Infinity so
+    // the first-ever call is never throttled.
+    const force = Boolean(options?.force);
+    const now = this.unreadReconcileNow();
+    const lastRunAt = state ? state.lastRunAt : Number.NEGATIVE_INFINITY;
+    if (!force && now - lastRunAt < this.unreadReconcileThrottleMs) {
+      return;
+    }
+
+    // Register the in-flight entry synchronously (before any await) so that
+    // sibling triggers arriving in the same tick observe it and coalesce.
+    const entry: { inFlight: Promise<void> | null; lastRunAt: number } = {
+      inFlight: null,
+      lastRunAt,
+    };
+    this.unreadReconcileState.set(userKey, entry);
+
+    const run = (async () => {
+      try {
+        await this.runReconcileUnreadForUser(normalizedUser, userKey, tenantId);
+      } finally {
+        entry.inFlight = null;
+        entry.lastRunAt = this.unreadReconcileNow();
+      }
+    })();
+    entry.inFlight = run;
+    return run;
+  }
+
+  // Actual dispatch: routes to the authenticated backend endpoint when the chat
+  // backend is configured, else the direct-RTDB fallback. Wrapped by
+  // `reconcileUnreadForUser`'s throttle + in-flight guard.
+  private async runReconcileUnreadForUser(
+    normalizedUser: string,
+    userKey: string,
+    tenantId?: string | null
+  ): Promise<void> {
+    if (this.getChatBackendBaseUrl()) {
+      try {
+        const resolvedTenantId = tenantId ? tenantId : await tenantService.getCachedSelectedTenant();
+        const tenantScopeId = this.requireTenantId(resolvedTenantId);
+        await this.performChatAction('POST', '/chat/unread/reconcile', {
+          tenantId: tenantScopeId,
+        });
+      } catch (error) {
+        logger.debug('Failed to reconcile unread state for user via backend', { error });
+      }
+      return;
+    }
+
+    await this.reconcileUnreadForUserDirect(normalizedUser, userKey, tenantId);
+  }
+
+  // Test-only hooks for the client unread-reconcile throttle (Task 7). Not part
+  // of the public API; used by unit tests to control the throttle window and
+  // clock and to reset coalescing state between cases.
+  /** @internal */
+  __setUnreadReconcileThrottleMs(ms: number): void {
+    this.unreadReconcileThrottleMs = Math.max(0, ms);
+  }
+  /** @internal */
+  __setUnreadReconcileClock(now: (() => number) | null): void {
+    this.unreadReconcileNow = now ?? (() => Date.now());
+  }
+  /** @internal */
+  __resetUnreadReconcileState(): void {
+    this.unreadReconcileState.clear();
+    this.unreadReconcileThrottleMs = ChatService.UNREAD_RECONCILE_THROTTLE_MS;
+    this.unreadReconcileNow = () => Date.now();
+  }
+
+  private async reconcileUnreadForUserDirect(
+    normalizedUser: string,
+    userKey: string,
+    tenantId?: string | null
+  ): Promise<void> {
     const resolvedTenantId = tenantId ? tenantId : await tenantService.getCachedSelectedTenant();
     const tenantScopeId = this.requireTenantId(resolvedTenantId);
 
@@ -2067,7 +2483,12 @@ class ChatService {
           continue;
         }
 
-        const trueUnread = await this.computeTrueUnreadCount(tenantScopeId, normalizedUser, conversationKey);
+        const trueUnread = await this.computeTrueUnreadCount(
+          tenantScopeId,
+          normalizedUser,
+          conversationKey,
+          summary.unreadCount
+        );
         if (trueUnread !== null && trueUnread !== summary.unreadCount) {
           writes.push(Promise.resolve(update(child(summariesRef, partnerKey), { unreadCount: trueUnread })));
           writes.push(
@@ -2165,77 +2586,33 @@ class ChatService {
       return () => {};
     }
 
-    let detached: (() => void) | null = null;
     let cancelled = false;
+    let sub: SharedSummarySubscription | null = null;
+    let subscriberId: number | null = null;
 
     const attach = async () => {
       const resolvedTenantId = tenantId ? tenantId : await tenantService.getCachedSelectedTenant();
       const tenantScopeId = this.requireTenantId(resolvedTenantId);
-      const userRef = this.tenantConversationSummariesRef(tenantScopeId, userKey);
+      // The unsubscribe may have fired while we were resolving the tenant.
+      if (cancelled) {
+        return;
+      }
 
-      const emitMetric = (raw: Record<string, unknown>) => {
-        let payloadBytes = 0;
+      const subscription = this.getOrCreateSummarySubscription(tenantScopeId, normalizedUser, userKey);
+      sub = subscription;
+      const id = subscription.nextSubscriberId++;
+      subscriberId = id;
+      subscription.subscribers.set(id, callback);
+
+      // A newly-attached consumer joining an already-live subscription gets the
+      // last broadcast immediately, so it doesn't wait for the next snapshot.
+      if (subscription.lastResult) {
         try {
-          payloadBytes = JSON.stringify(raw).length;
+          callback(subscription.lastResult);
         } catch (error) {
-          logger.debug('Failed to measure summary listener payload size', {
-            error,
-          });
+          logger.debug('Summary subscriber callback threw on replay', { error });
         }
-
-        logger.metric('chat.summary.listener_payload', {
-          bytes: payloadBytes,
-        });
-      };
-
-      // Synchronous, self-conversation-excluding fallback used if the bounded
-      // true-unread recompute cannot complete. Self summaries are still forced to
-      // 0 so a self-conversation can never light the badge.
-      const buildSelfExcludedFallback = (raw: Record<string, unknown>): Record<string, ConversationSummary> => {
-        const fallback: Record<string, ConversationSummary> = {};
-        this.collectSummaryRecordsFromNode(raw).forEach((value: any) => {
-          const summary = this.normalizeConversationSummaryRecord(value);
-          if (!summary) {
-            return;
-          }
-          const conversationKey = this.getConversationKey(normalizedUser, summary.partnerEmail);
-          const isSelf =
-            !conversationKey ||
-            this.isSelfConversationKey(conversationKey) ||
-            this.isSelfAddressed(normalizedUser, summary.partnerEmail);
-          fallback[summary.partnerEmail] = isSelf ? { ...summary, unreadCount: 0 } : summary;
-        });
-        return fallback;
-      };
-
-      const listener = (snapshot: any) => {
-        const raw = (snapshot?.val() || {}) as Record<string, unknown>;
-        void this.deriveReconciledSummaryMap(tenantScopeId, normalizedUser, raw)
-          .then((result) => {
-            if (cancelled) {
-              return;
-            }
-            callback(result);
-            emitMetric(raw);
-          })
-          .catch((error) => {
-            if (cancelled) {
-              return;
-            }
-            logger.debug('Failed to derive reconciled conversation summaries; emitting self-excluded fallback', {
-              error,
-            });
-            callback(buildSelfExcludedFallback(raw));
-            emitMetric(raw);
-          });
-      };
-
-      onValue(userRef, listener);
-      detached = () => {
-        try {
-          off(userRef, 'value', listener);
-        } catch {}
-      };
+      }
     };
 
     void attach().catch((error) => {
@@ -2246,8 +2623,288 @@ class ChatService {
 
     return () => {
       cancelled = true;
-      detached?.();
+      if (sub && subscriberId !== null) {
+        sub.subscribers.delete(subscriberId);
+        subscriberId = null;
+        if (sub.subscribers.size === 0) {
+          this.teardownSummarySubscription(sub);
+        }
+      }
     };
+  }
+
+  // Get-or-create the shared, ref-counted summaries subscription for a
+  // (user, tenant) pair. The underlying `onValue` listen is attached exactly once
+  // per subscription; concurrent consumers reuse it (finding P2-1, Task 9).
+  private getOrCreateSummarySubscription(
+    tenantScopeId: string,
+    normalizedUser: string,
+    userKey: string
+  ): SharedSummarySubscription {
+    const key = `${userKey}::${tenantScopeId}`;
+    const existing = this.summarySubscriptions.get(key);
+    if (existing && !existing.torndown) {
+      return existing;
+    }
+
+    const sub: SharedSummarySubscription = {
+      key,
+      tenantScopeId,
+      normalizedUser,
+      userKey,
+      subscribers: new Map(),
+      nextSubscriberId: 1,
+      detachFirebase: null,
+      torndown: false,
+      pendingRaw: null,
+      hasPending: false,
+      isRecomputing: false,
+      hasStartedFirstPass: false,
+      coalesceTimer: null,
+      lastResult: null,
+      lastSeenSignatures: new Map(),
+      unreadCache: new Map(),
+    };
+    this.summarySubscriptions.set(key, sub);
+
+    const userRef = this.tenantConversationSummariesRef(tenantScopeId, userKey);
+    const listener = (snapshot: any) => {
+      if (sub.torndown) {
+        return;
+      }
+      sub.pendingRaw = (snapshot?.val() || {}) as Record<string, unknown>;
+      sub.hasPending = true;
+      this.scheduleSummaryRecompute(sub);
+    };
+
+    onValue(userRef, listener);
+    sub.detachFirebase = () => {
+      try {
+        off(userRef, 'value', listener);
+      } catch {}
+    };
+
+    return sub;
+  }
+
+  // Coalesce a burst of summary-node changes into a single recompute pass. The
+  // FIRST pass runs on the leading edge (immediately) so the initial paint has no
+  // added latency; subsequent passes are trailing-debounced so a burst of
+  // near-simultaneous changes collapses into one pass.
+  private scheduleSummaryRecompute(sub: SharedSummarySubscription): void {
+    if (sub.torndown) {
+      return;
+    }
+    // A pass is already running or already scheduled — the latest `pendingRaw`
+    // will be picked up, so do not schedule another.
+    if (sub.isRecomputing || sub.coalesceTimer !== null) {
+      return;
+    }
+
+    if (!sub.hasStartedFirstPass) {
+      void this.runSummaryRecomputePass(sub);
+      return;
+    }
+
+    const windowMs = this.summaryCoalesceWindowMs;
+    if (windowMs <= 0) {
+      void this.runSummaryRecomputePass(sub);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      sub.coalesceTimer = null;
+      void this.runSummaryRecomputePass(sub);
+    }, windowMs);
+    // Never keep the event loop alive purely for a deferred recompute.
+    timer.unref?.();
+    sub.coalesceTimer = timer;
+  }
+
+  // A single coalesced recompute pass. Diffs the pending snapshot against the
+  // last-seen one and recomputes true-unread ONLY for changed conversations;
+  // unchanged conversations are served from the short-TTL cache. Broadcasts the
+  // reconciled map to every consumer.
+  private async runSummaryRecomputePass(sub: SharedSummarySubscription): Promise<void> {
+    if (sub.torndown) {
+      return;
+    }
+
+    const raw = (sub.pendingRaw || {}) as Record<string, unknown>;
+    sub.pendingRaw = null;
+    sub.hasPending = false;
+    sub.hasStartedFirstPass = true;
+    sub.isRecomputing = true;
+
+    const viewer = sub.normalizedUser;
+    const tenantId = sub.tenantScopeId;
+    const now = this.summaryNow();
+
+    try {
+      const normalized: ConversationSummary[] = [];
+      this.collectSummaryRecordsFromNode(raw).forEach((value: any) => {
+        const summary = this.normalizeConversationSummaryRecord(value);
+        if (summary) {
+          normalized.push(summary);
+        }
+      });
+
+      const nextSignatures = new Map<string, string>();
+      const seenPartners = new Set<string>();
+      const result: Record<string, ConversationSummary> = {};
+
+      await Promise.all(
+        normalized.map(async (summary) => {
+          const partnerEmail = summary.partnerEmail;
+          seenPartners.add(partnerEmail);
+          const signature = this.buildSummarySignature(summary);
+          nextSignatures.set(partnerEmail, signature);
+          // Recompute only when the record changed since the last pass; otherwise
+          // serve the still-valid cached true-unread (no fresh indexed query).
+          const changed = sub.lastSeenSignatures.get(partnerEmail) !== signature;
+          result[partnerEmail] = await this.reconcileSummaryRecordCached(
+            tenantId,
+            viewer,
+            summary,
+            sub.unreadCache,
+            now,
+            changed
+          );
+        })
+      );
+
+      // Drop cache/signature entries for conversations no longer present so the
+      // subscription's memory stays bounded to the live conversation set.
+      for (const partner of Array.from(sub.lastSeenSignatures.keys())) {
+        if (!seenPartners.has(partner)) {
+          const staleKey = this.getConversationKey(viewer, partner);
+          if (staleKey) {
+            sub.unreadCache.delete(staleKey);
+          }
+        }
+      }
+      sub.lastSeenSignatures = nextSignatures;
+
+      if (sub.torndown) {
+        return;
+      }
+      sub.lastResult = result;
+      this.broadcastSummaries(sub, result);
+      this.emitSummaryListenerMetric(raw);
+    } catch (error) {
+      if (!sub.torndown) {
+        logger.debug('Failed to derive reconciled conversation summaries; emitting self-excluded fallback', {
+          error,
+        });
+        const fallback = this.buildSelfExcludedFallbackMap(viewer, raw);
+        sub.lastResult = fallback;
+        this.broadcastSummaries(sub, fallback);
+        this.emitSummaryListenerMetric(raw);
+      }
+    } finally {
+      sub.isRecomputing = false;
+    }
+
+    // A snapshot may have arrived while we were recomputing — run once more so no
+    // change is dropped (the badge always converges to the true value).
+    if (!sub.torndown && sub.hasPending) {
+      this.scheduleSummaryRecompute(sub);
+    }
+  }
+
+  private broadcastSummaries(
+    sub: SharedSummarySubscription,
+    result: Record<string, ConversationSummary>
+  ): void {
+    for (const cb of Array.from(sub.subscribers.values())) {
+      try {
+        cb(result);
+      } catch (error) {
+        logger.debug('Summary subscriber callback threw', { error });
+      }
+    }
+  }
+
+  private emitSummaryListenerMetric(raw: Record<string, unknown>): void {
+    let payloadBytes = 0;
+    try {
+      payloadBytes = JSON.stringify(raw).length;
+    } catch (error) {
+      logger.debug('Failed to measure summary listener payload size', { error });
+    }
+    logger.metric('chat.summary.listener_payload', { bytes: payloadBytes });
+  }
+
+  // Synchronous, self-conversation-excluding fallback used if the bounded
+  // true-unread recompute cannot complete. Self summaries are still forced to 0 so
+  // a self-conversation can never light the badge.
+  private buildSelfExcludedFallbackMap(
+    normalizedUser: string,
+    raw: Record<string, unknown>
+  ): Record<string, ConversationSummary> {
+    const fallback: Record<string, ConversationSummary> = {};
+    this.collectSummaryRecordsFromNode(raw).forEach((value: any) => {
+      const summary = this.normalizeConversationSummaryRecord(value);
+      if (!summary) {
+        return;
+      }
+      const conversationKey = this.getConversationKey(normalizedUser, summary.partnerEmail);
+      const isSelf =
+        !conversationKey ||
+        this.isSelfConversationKey(conversationKey) ||
+        this.isSelfAddressed(normalizedUser, summary.partnerEmail);
+      fallback[summary.partnerEmail] = isSelf ? { ...summary, unreadCount: 0 } : summary;
+    });
+    return fallback;
+  }
+
+  private teardownSummarySubscription(sub: SharedSummarySubscription): void {
+    sub.torndown = true;
+    if (sub.coalesceTimer !== null) {
+      clearTimeout(sub.coalesceTimer);
+      sub.coalesceTimer = null;
+    }
+    try {
+      sub.detachFirebase?.();
+    } catch {}
+    sub.detachFirebase = null;
+    if (this.summarySubscriptions.get(sub.key) === sub) {
+      this.summarySubscriptions.delete(sub.key);
+    }
+  }
+
+  // Test-only hooks for the shared summaries subscription + coalesced recompute
+  // (Task 9). Not part of the public API; used by unit tests to drive coalescing,
+  // the per-conversation cache TTL, and to assert ref-counted sharing.
+  /** @internal */
+  __setSummaryCoalesceWindowMs(ms: number): void {
+    this.summaryCoalesceWindowMs = Math.max(0, ms);
+  }
+  /** @internal */
+  __setSummaryUnreadCacheTtlMs(ms: number): void {
+    this.summaryUnreadCacheTtlMs = Math.max(0, ms);
+  }
+  /** @internal */
+  __setSummaryClock(now: (() => number) | null): void {
+    this.summaryNow = now ?? (() => Date.now());
+  }
+  /** @internal */
+  __getSummarySubscriptionStats(): { activeSubscriptions: number; totalSubscribers: number } {
+    let totalSubscribers = 0;
+    for (const sub of this.summarySubscriptions.values()) {
+      totalSubscribers += sub.subscribers.size;
+    }
+    return { activeSubscriptions: this.summarySubscriptions.size, totalSubscribers };
+  }
+  /** @internal */
+  __resetSummarySubscriptionState(): void {
+    for (const sub of Array.from(this.summarySubscriptions.values())) {
+      this.teardownSummarySubscription(sub);
+    }
+    this.summarySubscriptions.clear();
+    this.summaryCoalesceWindowMs = ChatService.SUMMARY_RECOMPUTE_COALESCE_MS;
+    this.summaryUnreadCacheTtlMs = ChatService.SUMMARY_UNREAD_CACHE_TTL_MS;
+    this.summaryNow = () => Date.now();
   }
 
   // Typing indicators
@@ -2972,8 +3629,12 @@ class ChatService {
         conversationKey,
         tenantId,
         replyTo: normalizeChatReplyContext(message.replyTo),
-        delivered: Boolean(message.delivered),
-        read: Boolean(message.read),
+        // Receipt integrity (chat-production-hardening, P2-4): a brand-new message
+        // is never already delivered/read — force both false on the initial write
+        // so the direct-write path matches the backend write boundary and the
+        // recipient unread always INCREMENTS (never forged/decremented) on send.
+        delivered: false,
+        read: false,
         isSpecial: Boolean(message.isSpecial),
       };
 
@@ -3059,8 +3720,9 @@ class ChatService {
       replyTo: normalizeChatReplyContext(message.replyTo),
       sticker: message.sticker,
       gif: message.gif,
-      delivered: message.delivered,
-      read: message.read,
+      // delivered/read are intentionally NOT sent on the initial send: the backend
+      // write boundary forces both false and sets receipts only via the dedicated
+      // delivery/read endpoints (chat-production-hardening, P2-4).
     });
 
     const requestBody = JSON.stringify(payload);
@@ -3984,19 +4646,75 @@ class ChatService {
     }
   }
 
+  // Mark every unread incoming message in a conversation as read.
+  //
+  // chat-production-hardening (finding P0-1 — Model A: backend is the only chat
+  // writer): when the chat backend is configured, the read is performed through
+  // the authenticated `/chat/conversations/read` endpoint so the reader identity
+  // is bound to the token and the RTDB write happens server-side (client chat
+  // write paths are locked to `.write:false`). The direct-write path is retained
+  // ONLY as the no-backend fallback (parity with `sendMessage`/`sendMessageDirect`).
   async markConversationAsRead(currentUserEmail: string, otherUserEmail: string): Promise<number> {
-    try {
-      const me = this.normalizeEmail(currentUserEmail);
-      const them = this.normalizeEmail(otherUserEmail);
-      const conversationKey = this.getConversationKey(me, them);
-      if (!conversationKey || !me || !them) {
+    const me = this.normalizeEmail(currentUserEmail);
+    const them = this.normalizeEmail(otherUserEmail);
+    const conversationKey = this.getConversationKey(me, them);
+    if (!conversationKey || !me || !them) {
+      return 0;
+    }
+    // A self-conversation has no incoming messages to read; return gracefully
+    // without touching the backend (the endpoint rejects self-conversations).
+    if (this.isSelfConversationKey(conversationKey) || this.isSelfAddressed(me, them)) {
+      return 0;
+    }
+
+    if (this.getChatBackendBaseUrl()) {
+      try {
+        const tenantId = await this.ensureTenantChatScope(me, them);
+        const response = await this.performChatAction('POST', '/chat/conversations/read', {
+          tenantId,
+          body: { partnerEmail: them },
+        });
+        const updatedCount =
+          typeof response?.updatedCount === 'number'
+            ? response.updatedCount
+            : Array.isArray(response?.readMessageIds)
+              ? response.readMessageIds.length
+              : 0;
+        logger.metric('chat.conversation.read_all', {
+          conversationKey,
+          updatedCount,
+        });
+        return updatedCount;
+      } catch (error) {
+        logger.error('Error marking conversation as read via backend:', error);
         return 0;
       }
+    }
 
+    return this.markConversationAsReadDirect(me, them, conversationKey);
+  }
+
+  private async markConversationAsReadDirect(
+    me: string,
+    them: string,
+    conversationKey: string
+  ): Promise<number> {
+    try {
       const resolvedTenantId = await tenantService.getCachedSelectedTenant();
       const tenantScopeId = this.requireTenantId(resolvedTenantId);
       const conversationRef = this.tenantConversationMessagesRef(tenantScopeId, conversationKey);
-      const snapshot = await get(conversationRef);
+      // chat-production-hardening (Task 10, finding P2-2). Build the read-receipt
+      // patch from a BOUNDED indexed query over the `read == false` set so the
+      // read cost scales with the number of UNREAD messages, not the whole
+      // conversation history (O(unread), not O(all messages)). This mirrors the
+      // server-side writer `markChatConversationRead`
+      // (backend-runtime/src/chatMessageWriter.ts) — the primary hot path — which
+      // already uses the same bounded query. The remaining predicate
+      // (genuinely-incoming `partner → viewer`, not deleted) is re-applied to the
+      // bounded set because the index only narrows on `read` (a non-indexed
+      // fallback / mock store may return a superset).
+      const unreadQuery = query(conversationRef, orderByChild('read'), equalTo(false));
+      const snapshot = await get(unreadQuery);
       if (!snapshot.exists()) {
         return 0;
       }
@@ -4036,11 +4754,20 @@ class ChatService {
       }
 
       await update(conversationRef, patch);
-      await this.rebuildConversationSummariesForUser(me, tenantScopeId);
-      // After marking a conversation read, reconcile stored unread counts against
-      // the true-unread set and clean up any stuck self-conversation summary so
-      // the badge converges. Idempotent and bounded (O(unread)).
-      await this.reconcileUnreadForUser(me, tenantScopeId);
+      // Drive the summary refresh from the BOUNDED reconcile (recomputes the
+      // affected conversation's stored unreadCount from the true-unread set and
+      // writes back only on drift, O(unread)) rather than the full-history
+      // `rebuildConversationSummariesForUser`, which loops every conversation and
+      // reads each one's entire message node — negating the bounded-unread
+      // benefit on this hot path (finding P2-2). This mirrors the backend hot
+      // path (`reconcileOwnerConversationUnread`), which reconciles only the
+      // affected conversation's counter; the full rebuild is retained for
+      // explicit repair only. Reconcile also cleans up any stuck
+      // self-conversation summary so the badge converges. Idempotent and bounded
+      // (O(unread)). `force` bypasses the client throttle because we just mutated
+      // read state — this reconcile is genuinely needed and must not be
+      // suppressed by a recent read-path trigger.
+      await this.reconcileUnreadForUser(me, tenantScopeId, { force: true });
 
       logger.metric('chat.conversation.read_all', {
         conversationKey,

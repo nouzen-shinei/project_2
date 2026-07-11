@@ -139,7 +139,42 @@ function safeAttachListener(
   }
 }
 
-const MAX_SHARED_WATCH_CACHE_ENTRIES = 1200;
+/**
+ * Default upper bound on the number of per-message diff signatures a shared
+ * watch retains for change detection (finding P3-3). Diff signatures are compact
+ * (a few status flags + one content-signature string) rather than full message
+ * payloads, so the same memory budget holds many more ids than the old
+ * full-payload cache. That headroom is what stops a large (>cap) conversation
+ * from evicting the diff state of messages that are still receiving
+ * receipts/edits — the eviction that used to make a later `child_changed` look
+ * brand-new and re-broadcast phantom status/update/delete events. When the cap
+ * is exceeded the oldest entries are trimmed.
+ */
+export const DEFAULT_MAX_SHARED_WATCH_CACHE_ENTRIES = 5000;
+
+let sharedWatchCacheCap = DEFAULT_MAX_SHARED_WATCH_CACHE_ENTRIES;
+
+/**
+ * Test hook: override the per-watch diff-signature cap so tests can force
+ * eviction with a handful of messages instead of thousands. Mirrors
+ * `__setSharedWatchReleaseGraceMs`. Values `< 1` are ignored. Not part of the
+ * public runtime API.
+ */
+export function __setSharedWatchCacheCap(cap: number): void {
+  if (typeof cap === 'number' && Number.isFinite(cap) && cap >= 1) {
+    sharedWatchCacheCap = Math.trunc(cap);
+  }
+}
+
+/** Test hook: read the current per-watch diff-signature cap. */
+export function __getSharedWatchCacheCap(): number {
+  return sharedWatchCacheCap;
+}
+
+/** Test hook: reset the per-watch diff-signature cap to its default. */
+export function __resetSharedWatchCacheCap(): void {
+  sharedWatchCacheCap = DEFAULT_MAX_SHARED_WATCH_CACHE_ENTRIES;
+}
 
 const sharedConversationWatches = new Map<string, SharedConversationWatch>();
 
@@ -424,22 +459,52 @@ function deriveStatusPayload(snapshot: admin.database.DataSnapshot): ChatStatusP
   return payload;
 }
 
+/**
+ * Compact per-message state a shared watch retains purely to detect
+ * broadcastable transitions on `child_changed` (finding P3-3). Only the fields
+ * needed to diff status and content are kept — not the full payload — so the
+ * watch can retain diff state for many more messages within the same memory
+ * budget. This keeps receipts/edits on older messages in a large conversation
+ * diffed against real prior state instead of being mistaken for brand-new
+ * messages after a cache eviction.
+ */
+interface WatchMessageDiffState {
+  delivered?: boolean;
+  read?: boolean;
+  deliveredAt?: string;
+  readAt?: string;
+  deleted?: boolean;
+  contentSignature: string;
+}
+
+/** Build the compact diff signature retained for change detection. */
+function buildWatchMessageDiffState(payload: ChatMessagePayload): WatchMessageDiffState {
+  return {
+    delivered: payload.delivered,
+    read: payload.read,
+    deliveredAt: payload.deliveredAt,
+    readAt: payload.readAt,
+    deleted: payload.deleted,
+    contentSignature: buildChatRealtimeMessageContentSignature(payload),
+  };
+}
+
 function trimWatchCaches(
   knownMessageIds: Set<string>,
-  messageCache: Map<string, ChatMessagePayload>
+  messageDiffStates: Map<string, WatchMessageDiffState>
 ): void {
-  if (messageCache.size <= MAX_SHARED_WATCH_CACHE_ENTRIES) {
+  if (messageDiffStates.size <= sharedWatchCacheCap) {
     return;
   }
 
-  while (messageCache.size > MAX_SHARED_WATCH_CACHE_ENTRIES) {
-    const oldestEntry = messageCache.keys().next();
+  while (messageDiffStates.size > sharedWatchCacheCap) {
+    const oldestEntry = messageDiffStates.keys().next();
     if (oldestEntry.done || typeof oldestEntry.value !== 'string') {
       break;
     }
 
     const oldestMessageId = oldestEntry.value;
-    messageCache.delete(oldestMessageId);
+    messageDiffStates.delete(oldestMessageId);
     knownMessageIds.delete(oldestMessageId);
   }
 }
@@ -541,7 +606,7 @@ export async function watchConversationRealtime(
       .child(normalizedConversationKey);
 
     const knownMessageIds = new Set<string>();
-    const messageCache = new Map<string, ChatMessagePayload>();
+    const messageDiffStates = new Map<string, WatchMessageDiffState>();
 
     const listeners = {
       messageListener: (snapshot: admin.database.DataSnapshot) => {
@@ -556,8 +621,8 @@ export async function watchConversationRealtime(
         if (!payload) {
           return;
         }
-        messageCache.set(snapshot.key, payload);
-        trimWatchCaches(knownMessageIds, messageCache);
+        messageDiffStates.set(snapshot.key, buildWatchMessageDiffState(payload));
+        trimWatchCaches(knownMessageIds, messageDiffStates);
         broadcast(watchKey, (subscriber) => subscriber.onMessage?.(payload));
       },
       changeListener: (snapshot: admin.database.DataSnapshot) => {
@@ -570,16 +635,27 @@ export async function watchConversationRealtime(
           return;
         }
 
-        const previous = messageCache.get(snapshot.key);
-        messageCache.set(snapshot.key, payload);
-          trimWatchCaches(knownMessageIds, messageCache);
+        // Diff against the COMPACT prior signature. A missing prior signature
+        // means this id was either never seen OR its diff state was merely
+        // evicted from the bounded cache (finding P3-3). In BOTH cases we must
+        // NOT synthesize phantom status/update/delete events (an evicted receipt
+        // target would otherwise re-broadcast a fake delivered/read flip or a
+        // phantom delete to every subscriber). We only re-seed the signature so a
+        // subsequent genuine change is diffed against real prior state.
+        const previousState = messageDiffStates.get(snapshot.key);
+        const nextState = buildWatchMessageDiffState(payload);
+        messageDiffStates.set(snapshot.key, nextState);
+        trimWatchCaches(knownMessageIds, messageDiffStates);
+
+        if (!previousState) {
+          return;
+        }
 
         const statusChanged =
-          !previous ||
-          previous.delivered !== payload.delivered ||
-          previous.read !== payload.read ||
-          previous.deliveredAt !== payload.deliveredAt ||
-          previous.readAt !== payload.readAt;
+          previousState.delivered !== nextState.delivered ||
+          previousState.read !== nextState.read ||
+          previousState.deliveredAt !== nextState.deliveredAt ||
+          previousState.readAt !== nextState.readAt;
 
         if (statusChanged) {
           const statusPayload = deriveStatusPayload(snapshot);
@@ -588,11 +664,11 @@ export async function watchConversationRealtime(
           }
         }
 
-        if (didMessageContentChange(previous, payload)) {
+        if (previousState.contentSignature !== nextState.contentSignature) {
           broadcast(watchKey, (subscriber) => subscriber.onMessageUpdate?.(payload));
         }
 
-        if (payload.deleted && !previous?.deleted) {
+        if (nextState.deleted && !previousState.deleted) {
           broadcast(watchKey, (subscriber) => subscriber.onMessageDelete?.(payload));
         }
       },
@@ -614,8 +690,8 @@ export async function watchConversationRealtime(
           knownMessageIds.add(child.key);
           const payload = normalizeSnapshot(child, normalizedConversationKey);
           if (payload) {
-            messageCache.set(child.key, payload);
-            trimWatchCaches(knownMessageIds, messageCache);
+            messageDiffStates.set(child.key, buildWatchMessageDiffState(payload));
+            trimWatchCaches(knownMessageIds, messageDiffStates);
           }
         }
         return false;
@@ -691,16 +767,3 @@ function broadcast(watchKey: string, emit: (subscriber: ConversationWatcherHandl
   }
 }
 
-function didMessageContentChange(
-  previous: ChatMessagePayload | undefined,
-  next: ChatMessagePayload
-): boolean {
-  if (!previous) {
-    return true;
-  }
-
-  return (
-    buildChatRealtimeMessageContentSignature(previous) !==
-    buildChatRealtimeMessageContentSignature(next)
-  );
-}

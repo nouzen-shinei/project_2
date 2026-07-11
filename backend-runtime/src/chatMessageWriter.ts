@@ -292,6 +292,45 @@ export interface MarkPendingChatMessagesDeliveredResult {
   recipientHasOnlineDevice: boolean;
 }
 
+export interface MarkChatConversationReadInput {
+  tenantId: string;
+  // The signed-in user reading the conversation (bound to the auth token by the
+  // route — never client-supplied). Only their own incoming unread messages are
+  // marked read (chat-production-hardening, finding P0-1 — Model A: backend is
+  // the only writer).
+  actorEmail: string;
+  partnerEmail: string;
+}
+
+export interface MarkChatConversationReadResult {
+  readMessageIds: string[];
+  updatedCount: number;
+}
+
+export interface ReconcileChatUnreadForUserInput {
+  tenantId: string;
+  // The signed-in user whose stored unread counters are reconciled against the
+  // true-unread set. Bound to the auth token by the route.
+  actorEmail: string;
+}
+
+export interface ReconcileChatUnreadForUserResult {
+  reconciledConversations: number;
+  selfConversationsCleaned: number;
+}
+
+export interface RebuildChatSummariesForUserInput {
+  tenantId: string;
+  // The signed-in user whose conversation summaries are reconstructed. Bound to
+  // the auth token by the route — never client-supplied.
+  actorEmail: string;
+}
+
+export interface RebuildChatSummariesForUserResult {
+  rebuiltConversations: number;
+  prunedConversations: number;
+}
+
 interface ConversationSummary {
   partnerEmail: string;
   partnerId?: string | null;
@@ -748,21 +787,70 @@ function isFocusedChatTenantDevice(
   return nowMs - chatSeenMs <= ACTIVE_CHAT_STALE_MS;
 }
 
-async function resolveRecipientDeviceReceiptState(
-  tenantId: string,
-  recipientEmail: string,
-  partnerEmail: string
-): Promise<{
+// ─── Receipt-promotion resilience + performance hardening ────────────────────
+// (chat-production-hardening — receipt-promotion resilience + perf hardening.)
+//
+// The throttle (Part B) and the device receipt-state cache (Part C) trade a tiny
+// bounded window of staleness for a sharp reduction in redundant work on the
+// hottest receipt path (devices/ping fires promotion on EVERY ping). They only
+// ever REDUCE redundant work — a genuinely-needed receipt is never dropped
+// because the next ping after the window (or the next inbound message) still
+// promotes. Under the node:test / jest runners the default windows collapse to 0
+// so the pre-existing suites observe the exact prior (uncached, unthrottled)
+// behavior; each dedicated test opts back in via its `__set*` hook. Production
+// (neither env var set) keeps the conservative windows.
+const IS_TEST_RUNTIME = Boolean(process.env.NODE_TEST_CONTEXT || process.env.JEST_WORKER_ID);
+
+interface RecipientDeviceReceiptState {
   hasOnlineDevice: boolean;
   hasFocusedChatDevice: boolean;
   onlineDeviceCount: number;
   focusedChatDeviceCount: number;
-}> {
+}
+
+// Part C — short-TTL device receipt-state cache. Device presence does not change
+// sub-second, so within a small window it is safe to reuse the last-resolved
+// state instead of re-reading ALL of the recipient's Firestore device docs on
+// every receipt sync/promotion. Keyed by tenant + recipient + partner (the FOCUS
+// count is partner-scoped, so distinct partners must never share an entry;
+// the delivery-only path uses '' for partner and gets its own entry).
+export const DEFAULT_RECEIPT_STATE_CACHE_TTL_MS = 2500;
+let receiptStateCacheTtlMs = IS_TEST_RUNTIME ? 0 : DEFAULT_RECEIPT_STATE_CACHE_TTL_MS;
+const receiptStateCache = new Map<string, { expiresAt: number; value: RecipientDeviceReceiptState }>();
+
+/**
+ * Test hook: set the device receipt-state cache TTL (ms). `0` disables caching
+ * (every call re-reads Firestore). Not part of the public runtime API — exported
+ * only so tests can drive cache behavior deterministically.
+ */
+export function __setReceiptStateCacheTtlMs(ms: number): void {
+  if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+    receiptStateCacheTtlMs = ms;
+  }
+}
+
+/** Test hook: clear the cache and reset the TTL to its (runtime) default. */
+export function __resetReceiptStateCache(): void {
+  receiptStateCacheTtlMs = IS_TEST_RUNTIME ? 0 : DEFAULT_RECEIPT_STATE_CACHE_TTL_MS;
+  receiptStateCache.clear();
+}
+
+async function resolveRecipientDeviceReceiptState(
+  tenantId: string,
+  recipientEmail: string,
+  partnerEmail: string
+): Promise<RecipientDeviceReceiptState> {
   ensureFirebase();
-  const db = admin.firestore();
   const normalizedRecipient = normalizeEmail(recipientEmail);
   const normalizedPartner = normalizeEmail(partnerEmail);
-  if (!normalizedRecipient || !normalizedPartner) {
+  // Only the recipient identity is required to resolve ONLINE devices. A partner
+  // is needed solely for the per-conversation FOCUS check below, so the
+  // delivery-only caller (`markPendingChatMessagesDeliveredForRecipient`, which
+  // passes an empty partner) can still detect an online device and promote
+  // pending receipts. When no partner is supplied the focus count stays 0,
+  // exactly matching the prior all-false result for that case
+  // (chat-production-hardening, finding P2-3).
+  if (!normalizedRecipient) {
     return {
       hasOnlineDevice: false,
       hasFocusedChatDevice: false,
@@ -771,13 +859,25 @@ async function resolveRecipientDeviceReceiptState(
     };
   }
 
+  // Part C: short-TTL cache. The key includes the partner so a partner-scoped
+  // FOCUS count for one conversation is never served for a different partner
+  // (the delivery-only '' partner gets its own entry).
+  const cacheKey = `${tenantId}::${normalizedRecipient}::${normalizedPartner}`;
+  const nowMs = Date.now();
+  if (receiptStateCacheTtlMs > 0) {
+    const cached = receiptStateCache.get(cacheKey);
+    if (cached && cached.expiresAt > nowMs) {
+      return { ...cached.value };
+    }
+  }
+
+  const db = admin.firestore();
   const devicesSnap = await db
     .collection('user_devices')
     .doc(normalizedRecipient)
     .collection('devices')
     .get();
 
-  const nowMs = Date.now();
   let onlineDeviceCount = 0;
   let focusedChatDeviceCount = 0;
 
@@ -786,17 +886,24 @@ async function resolveRecipientDeviceReceiptState(
     if (isOnlineTenantDevice(data, tenantId, nowMs)) {
       onlineDeviceCount += 1;
     }
-    if (isFocusedChatTenantDevice(data, tenantId, normalizedPartner, nowMs)) {
+    // Focus is conversation-scoped: only meaningful when a partner is supplied.
+    if (normalizedPartner && isFocusedChatTenantDevice(data, tenantId, normalizedPartner, nowMs)) {
       focusedChatDeviceCount += 1;
     }
   }
 
-  return {
+  const resolved: RecipientDeviceReceiptState = {
     hasOnlineDevice: onlineDeviceCount > 0,
     hasFocusedChatDevice: focusedChatDeviceCount > 0,
     onlineDeviceCount,
     focusedChatDeviceCount,
   };
+
+  if (receiptStateCacheTtlMs > 0) {
+    receiptStateCache.set(cacheKey, { expiresAt: nowMs + receiptStateCacheTtlMs, value: { ...resolved } });
+  }
+
+  return resolved;
 }
 
 function computeMessagePreview(message: ChatMessageRecord): {
@@ -1345,34 +1452,16 @@ async function applyReceiptPatchToMessageContext(
   return nextMessage;
 }
 
-async function loadMessageContext(
-  db: admin.database.Database,
-  tenantId: string,
-  messageId: string
-): Promise<LoadedMessageContext | null> {
-  if (!messageId) {
-    return null;
-  }
-
-  const indexRef = tenantChatRootRef(db, tenantId).child('messageIndex').child(messageId);
-  const indexSnapshot = await indexRef.get();
-  if (!indexSnapshot.exists()) {
-    return null;
-  }
-
-  const indexValue = indexSnapshot.val() as Record<string, any> | null;
-  const conversationKey = typeof indexValue?.conversationKey === 'string' ? indexValue.conversationKey : null;
-  if (!conversationKey) {
-    return null;
-  }
-
-  const messageRef = tenantChatRootRef(db, tenantId).child('conversationMessages').child(conversationKey).child(messageId);
-  const messageSnapshot = await messageRef.get();
-  if (!messageSnapshot.exists()) {
-    return null;
-  }
-
-  const raw = (messageSnapshot.val() as Record<string, any>) || {};
+// Normalize a raw RTDB message value (from `conversationMessages`) into a typed
+// ChatMessageRecord. Extracted from `loadMessageContext` so a bounded query that
+// has ALREADY fetched the raw record (e.g. the delivered-scan bounded query) can
+// reuse it without paying for a second per-message read (chat-production-hardening,
+// finding P2-3 — eliminate the N+1 context load).
+function normalizeStoredMessageRecord(
+  messageId: string,
+  conversationKey: string,
+  raw: Record<string, any>
+): ChatMessageRecord {
   const normalizedSender = normalizeEmail(raw.sender);
   const normalizedRecipient = normalizeEmail(raw.recipientId);
 
@@ -1383,7 +1472,7 @@ async function loadMessageContext(
       ? null
       : undefined;
 
-  const message: ChatMessageRecord = {
+  return {
     id: messageId,
     text: typeof raw.text === 'string' ? raw.text : '',
     sender: normalizedSender,
@@ -1412,6 +1501,60 @@ async function loadMessageContext(
     deletedAt: typeof raw.deletedAt === 'string' ? raw.deletedAt : undefined,
     deletedBy: typeof raw.deletedBy === 'string' ? normalizeEmail(raw.deletedBy) : undefined,
   };
+}
+
+// Build a LoadedMessageContext from an ALREADY-NORMALIZED message record without
+// re-reading it (the message + index refs are derived purely from the ids). Used
+// by the bounded delivered-scan path so a batch of undelivered messages fetched
+// in a single indexed query can be receipt-patched without an extra read per item.
+function buildMessageContextFromRecord(
+  db: admin.database.Database,
+  tenantId: string,
+  conversationKey: string,
+  messageId: string,
+  message: ChatMessageRecord
+): LoadedMessageContext {
+  return {
+    messageId,
+    message,
+    conversationKey,
+    messageRef: tenantChatRootRef(db, tenantId)
+      .child('conversationMessages')
+      .child(conversationKey)
+      .child(messageId),
+    indexRef: tenantChatRootRef(db, tenantId).child('messageIndex').child(messageId),
+  };
+}
+
+async function loadMessageContext(
+  db: admin.database.Database,
+  tenantId: string,
+  messageId: string
+): Promise<LoadedMessageContext | null> {
+  if (!messageId) {
+    return null;
+  }
+
+  const indexRef = tenantChatRootRef(db, tenantId).child('messageIndex').child(messageId);
+  const indexSnapshot = await indexRef.get();
+  if (!indexSnapshot.exists()) {
+    return null;
+  }
+
+  const indexValue = indexSnapshot.val() as Record<string, any> | null;
+  const conversationKey = typeof indexValue?.conversationKey === 'string' ? indexValue.conversationKey : null;
+  if (!conversationKey) {
+    return null;
+  }
+
+  const messageRef = tenantChatRootRef(db, tenantId).child('conversationMessages').child(conversationKey).child(messageId);
+  const messageSnapshot = await messageRef.get();
+  if (!messageSnapshot.exists()) {
+    return null;
+  }
+
+  const raw = (messageSnapshot.val() as Record<string, any>) || {};
+  const message = normalizeStoredMessageRecord(messageId, conversationKey, raw);
 
   return {
     messageId,
@@ -1720,8 +1863,17 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
     replyTo: normalizeReplyContextPayload(input.replyTo),
     sticker: input.sticker,
     gif: input.gif,
-    delivered: Boolean(input.delivered),
-    read: Boolean(input.read),
+    // Receipt integrity (chat-production-hardening, finding P2-4): the INITIAL
+    // send NEVER trusts caller-supplied `delivered`/`read`. A brand-new message
+    // cannot already be delivered to or read by the recipient — receipts are set
+    // only later via the dedicated delivery/read endpoints
+    // (`markPendingChatMessagesDeliveredForRecipient` / `syncChatConversationReceipts`
+    // / `markConversationDelivered`). Forcing both `false` here prevents a sender
+    // from forging receipt ticks AND from decrementing the recipient's unread for
+    // a message they never saw (with `read` false, `applySummaryUpdatesForMessage`
+    // below correctly INCREMENTS recipient unread for a genuine new inbound message).
+    delivered: false,
+    read: false,
   });
 
   await newMessageRef.set(messageRecord);
@@ -1741,6 +1893,94 @@ export async function sendChatMessage(input: SendChatMessageInput): Promise<Chat
   );
 
   return messageRecord;
+}
+
+// Part A — Index-not-defined graceful fallback.
+// Module-level guard so the "deploy the .indexOn" advisory is logged AT MOST ONCE
+// per (field, conversation-path) instead of on every stale-index query — a burst
+// of pings must not spam the logs.
+const indexFallbackWarned = new Set<string>();
+
+/**
+ * Read the `field == value` subset of a conversation's messages, returning a
+ * plain `Record<messageId, rawMessage>` of the matching children (the shape the
+ * receipt callers iterate).
+ *
+ * FAST PATH: the bounded indexed query `conversationMessages/{conv}
+ * .orderByChild(field).equalTo(value)`. Identical semantics to today when the
+ * `.indexOn` for `field` is present in the DEPLOYED rules.
+ *
+ * RESILIENCE (receipt-promotion resilience + perf hardening): if the Admin SDK
+ * throws "Index not defined" — which happens when `database.rules.json` HAS the
+ * index but the rules have NOT been deployed yet — fall back to a SINGLE read of
+ * the whole conversation node and filter its children in memory to
+ * `child[field] === value`. RTDB's `equalTo(value)` matches only children whose
+ * `field` is STRICTLY equal to `value` (a child missing `field` is invisible to
+ * the index), so the in-memory filter uses the same strict `=== value` predicate
+ * — the returned subset is identical on both paths. The fallback is bounded by
+ * that one node read (no N+1, no cross-conversation scan) and self-heals to the
+ * fast indexed path the moment the rules deploy. Any NON-index error is
+ * re-thrown unchanged so callers keep their existing error handling.
+ */
+async function getConversationMessagesByIndexedField(
+  db: admin.database.Database,
+  tenantId: string,
+  conversationKey: string,
+  field: 'delivered' | 'read',
+  value: boolean
+): Promise<Record<string, any>> {
+  const conversationRef = tenantChatRootRef(db, tenantId)
+    .child('conversationMessages')
+    .child(conversationKey);
+
+  try {
+    const snapshot = await conversationRef.orderByChild(field).equalTo(value).get();
+    if (!snapshot.exists()) {
+      return {};
+    }
+    const node = snapshot.val();
+    return node && typeof node === 'object' ? (node as Record<string, any>) : {};
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Only the stale/missing-index case is recoverable here; everything else
+    // (permission, network, ...) must propagate so callers handle it as before.
+    if (!/Index not defined/i.test(message)) {
+      throw error;
+    }
+
+    const warnKey = `${field}:${tenantId}/${conversationKey}`;
+    if (!indexFallbackWarned.has(warnKey)) {
+      indexFallbackWarned.add(warnKey);
+      console.warn(
+        `[chatMessageWriter] ".indexOn": "${field}" not deployed for ` +
+          `tenantChat/${tenantId}/conversationMessages/${conversationKey}; using a bounded ` +
+          `in-memory fallback for this receipt read. Deploy database.rules.json ` +
+          `(firebase deploy --only database) to restore the fast indexed path.`
+      );
+    }
+
+    const snapshot = await conversationRef.get();
+    if (!snapshot.exists()) {
+      return {};
+    }
+    const node = (snapshot.val() || {}) as Record<string, any>;
+    const filtered: Record<string, any> = {};
+    for (const [childKey, childValue] of Object.entries(node)) {
+      if (
+        childValue &&
+        typeof childValue === 'object' &&
+        (childValue as Record<string, any>)[field] === value
+      ) {
+        filtered[childKey] = childValue;
+      }
+    }
+    return filtered;
+  }
+}
+
+/** Test hook: reset the one-time index-fallback warning guard. */
+export function __resetIndexFallbackWarnings(): void {
+  indexFallbackWarned.clear();
 }
 
 export async function markPendingChatMessagesDeliveredForRecipient(
@@ -1764,12 +2004,19 @@ export async function markPendingChatMessagesDeliveredForRecipient(
     };
   }
 
-  const indexQuery = tenantChatRootRef(db, tenantId)
-    .child('messageIndex')
-    .orderByChild('recipientId')
-    .equalTo(recipientEmail);
-  const indexSnapshot = await indexQuery.get();
-  if (!indexSnapshot.exists()) {
+  // chat-production-hardening, finding P2-3: the previous implementation queried
+  // the FLAT global `messageIndex` by `recipientId` — which returns EVERY message
+  // ever addressed to the recipient (delivered ones included) — and then did an
+  // N+1 `loadMessageContext` per undelivered item. Both scaled with the
+  // recipient's total history volume.
+  //
+  // Bounded replacement: enumerate ONLY the recipient's conversations (bounded by
+  // conversation count via `userConversations`), and for each run a `delivered ==
+  // false` indexed query so discovery is bounded to the UNDELIVERED subset. The
+  // raw records returned by that bounded query are reused directly to build the
+  // receipt-patch context (no extra per-message read), eliminating the N+1.
+  const recipientKey = sanitizeKey(recipientEmail);
+  if (!recipientKey) {
     return {
       deliveredMessageIds: [],
       deliveredCount: 0,
@@ -1777,23 +2024,77 @@ export async function markPendingChatMessagesDeliveredForRecipient(
     };
   }
 
-  const candidates = indexSnapshot.val() as Record<string, Record<string, any>>;
+  const conversationsSnapshot = await tenantChatRootRef(db, tenantId)
+    .child('userConversations')
+    .child(recipientKey)
+    .get();
+
+  const conversationKeys: string[] = [];
+  if (conversationsSnapshot.exists()) {
+    conversationsSnapshot.forEach((child) => {
+      const key = child.key;
+      if (key) {
+        conversationKeys.push(key);
+      }
+      return false;
+    });
+  }
+
+  const deliveredAt = new Date().toISOString();
+  const deliveryProvenance = buildPresenceDeliveryProvenance(receiptState, deliveredAt);
   const deliveredMessageIds: string[] = [];
 
-  for (const [messageId, record] of Object.entries(candidates)) {
-    if (record?.delivered === true) {
+  for (const conversationKey of conversationKeys) {
+    // A self-conversation is never a real inbox; skip it so we never touch self
+    // data (mirrors the send/read self-address guards).
+    if (isSelfConversationKey(conversationKey)) {
       continue;
     }
-    const context = await loadMessageContext(db, tenantId, messageId);
-    if (!context || context.message.deleted || normalizeEmail(context.message.recipientId) !== recipientEmail) {
-      continue;
+
+    // Bounded (`delivered == false`) discovery, routed through the index helper
+    // so a not-yet-deployed `.indexOn` degrades to a single bounded node read
+    // instead of hard-failing the whole promotion (Part A).
+    const undeliveredChildren = await getConversationMessagesByIndexedField(
+      db,
+      tenantId,
+      conversationKey,
+      'delivered',
+      false
+    );
+
+    // Collect the bounded (`delivered == false`) subset, re-applying the
+    // remaining predicate (genuinely-incoming to the recipient, not deleted,
+    // truly undelivered) because the index only narrows on `delivered`.
+    const pending: Array<{ messageId: string; record: ChatMessageRecord }> = [];
+    for (const [messageId, rawValue] of Object.entries(undeliveredChildren)) {
+      const raw = (rawValue || {}) as Record<string, any>;
+      if (!messageId) {
+        continue;
+      }
+      if (raw.delivered === true || raw.deleted === true) {
+        continue;
+      }
+      if (normalizeEmail(raw.recipientId) !== recipientEmail) {
+        continue;
+      }
+      // Genuinely-incoming: a self-addressed record (sender == recipient) is
+      // never legitimately deliverable.
+      if (normalizeEmail(raw.sender) === recipientEmail) {
+        continue;
+      }
+      pending.push({ messageId, record: normalizeStoredMessageRecord(messageId, conversationKey, raw) });
     }
-    const updated = await applyReceiptPatchToMessageContext(db, context, {
-      markDelivered: true,
-      deliveryProvenance: buildPresenceDeliveryProvenance(receiptState, new Date().toISOString()),
-    });
-    if (updated.delivered) {
-      deliveredMessageIds.push(messageId);
+
+    for (const { messageId, record } of pending) {
+      const context = buildMessageContextFromRecord(db, tenantId, conversationKey, messageId, record);
+      const updated = await applyReceiptPatchToMessageContext(db, context, {
+        markDelivered: true,
+        deliveredAt,
+        deliveryProvenance,
+      });
+      if (updated.delivered) {
+        deliveredMessageIds.push(messageId);
+      }
     }
   }
 
@@ -1802,6 +2103,77 @@ export async function markPendingChatMessagesDeliveredForRecipient(
     deliveredCount: deliveredMessageIds.length,
     recipientHasOnlineDevice: true,
   };
+}
+
+// Part B — throttle/coalesce receipt promotion on devices/ping.
+// `devices/ping` fires promotion on EVERY ping (fire-and-forget), and each
+// promotion enumerates ALL of the recipient's conversations. Pings are frequent
+// and bursty, so a per-(tenant, recipient) time-throttle coalesces a burst into
+// at most one promotion per short window. The raw
+// `markPendingChatMessagesDeliveredForRecipient` stays UNTHROTTLED for direct /
+// test callers; only the ping handler goes through the throttled wrapper.
+export const DEFAULT_RECEIPT_PROMOTION_THROTTLE_MS = 3000;
+let receiptPromotionThrottleMs = IS_TEST_RUNTIME ? 0 : DEFAULT_RECEIPT_PROMOTION_THROTTLE_MS;
+// Keyed by `${tenantId}::${recipientEmail}` → last-run start time (ms).
+const receiptPromotionLastRunAt = new Map<string, number>();
+
+/**
+ * Test hook: set the receipt-promotion throttle window (ms). `0` disables
+ * throttling (every call runs). Not part of the public runtime API — exported
+ * only so tests can drive coalescing deterministically.
+ */
+export function __setReceiptPromotionThrottleMs(ms: number): void {
+  if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+    receiptPromotionThrottleMs = ms;
+  }
+}
+
+/** Test hook: clear the throttle state and reset the window to its (runtime) default. */
+export function __resetReceiptPromotionThrottleMs(): void {
+  receiptPromotionThrottleMs = IS_TEST_RUNTIME ? 0 : DEFAULT_RECEIPT_PROMOTION_THROTTLE_MS;
+  receiptPromotionLastRunAt.clear();
+}
+
+/**
+ * Throttled/coalescing wrapper around `markPendingChatMessagesDeliveredForRecipient`
+ * for the devices/ping hot path. A burst of pings for the same
+ * (tenant, recipient) within the window runs the underlying promotion AT MOST
+ * once; a ping after the window promotes again. Distinct (tenant, recipient)
+ * keys are independent.
+ *
+ * Correctness is unaffected: a ping inside the window is SKIPPED (returns null),
+ * and the next ping after the window — or the next inbound message via the
+ * normal receipt path — still promotes, so no genuinely-needed receipt is ever
+ * dropped. The last-run time is recorded the moment a run STARTS (before the
+ * await) so a run in-flight/just-completed suppresses immediate repeats and a
+ * burst of concurrent pings all coalesce into the single in-flight run.
+ */
+export async function promotePendingDeliveryForRecipientThrottled(
+  input: MarkPendingChatMessagesDeliveredInput
+): Promise<MarkPendingChatMessagesDeliveredResult | null> {
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const recipientEmail = normalizeEmail(input.recipientEmail);
+  // Without a well-formed key we cannot throttle; defer to the raw function so it
+  // applies its own validation/behavior unchanged.
+  if (!tenantId || !recipientEmail) {
+    return markPendingChatMessagesDeliveredForRecipient(input);
+  }
+
+  const key = `${tenantId}::${recipientEmail}`;
+  const now = Date.now();
+
+  if (receiptPromotionThrottleMs > 0) {
+    const lastRun = receiptPromotionLastRunAt.get(key);
+    if (typeof lastRun === 'number' && now - lastRun < receiptPromotionThrottleMs) {
+      // Inside the coalescing window: skip this redundant promotion.
+      return null;
+    }
+    // Record the run start BEFORE awaiting so bursty/concurrent pings coalesce
+    // into this single run.
+    receiptPromotionLastRunAt.set(key, now);
+  }
+
+  return markPendingChatMessagesDeliveredForRecipient(input);
 }
 
 export async function syncChatConversationReceipts(
@@ -1835,29 +2207,35 @@ export async function syncChatConversationReceipts(
   );
 
   if (input.markConversationDelivered && receiptState.hasOnlineDevice) {
-    const conversationSnapshot = await tenantChatRootRef(db, tenantId)
-      .child('conversationMessages')
-      .child(conversationKey)
-      .get();
-    if (conversationSnapshot.exists()) {
-      conversationSnapshot.forEach((child) => {
-        const raw = (child.val() || {}) as Record<string, any>;
-        const messageId = child.key;
-        if (!messageId) {
-          return false;
-        }
-        if (normalizeEmail(raw.sender) !== partnerEmail) {
-          return false;
-        }
-        if (normalizeEmail(raw.recipientId) !== actorEmail) {
-          return false;
-        }
-        if (raw.deleted === true || raw.delivered === true) {
-          return false;
-        }
-        deliveredTargets.add(messageId);
-        return false;
-      });
+    // chat-production-hardening, finding P2-3: previously this did a full
+    // `get()` scan of the ENTIRE conversation (O(all messages)). Replace with a
+    // bounded `delivered == false` indexed query so the scan is O(undelivered),
+    // re-applying the remaining predicate (partner -> actor, not deleted) on the
+    // bounded subset because the index only narrows on `delivered`. Routed
+    // through the index helper so a not-yet-deployed `.indexOn` degrades to a
+    // bounded node read instead of hard-failing (Part A).
+    const undeliveredChildren = await getConversationMessagesByIndexedField(
+      db,
+      tenantId,
+      conversationKey,
+      'delivered',
+      false
+    );
+    for (const [messageId, rawValue] of Object.entries(undeliveredChildren)) {
+      const raw = (rawValue || {}) as Record<string, any>;
+      if (!messageId) {
+        continue;
+      }
+      if (raw.delivered === true || raw.deleted === true) {
+        continue;
+      }
+      if (normalizeEmail(raw.sender) !== partnerEmail) {
+        continue;
+      }
+      if (normalizeEmail(raw.recipientId) !== actorEmail) {
+        continue;
+      }
+      deliveredTargets.add(messageId);
     }
   }
 
@@ -1978,6 +2356,731 @@ export async function confirmOutboundChatDelivery(
     deliveredMessageIds,
     deliveredCount: deliveredMessageIds.length,
   };
+}
+
+// Count the unread-for-`viewer` messages inside a raw conversationMessages node.
+// A message counts as unread when it is NOT explicitly read (`read !== true`, so
+// a record MISSING the `read` field is treated as unread), is not `deleted`, and
+// is addressed to `viewer`. Applied to the (bounded) subset returned by either
+// indexed query, and to the full node returned by no-op query mocks.
+function countUnreadInConversationNode(raw: Record<string, any>, viewer: string): number {
+  let count = 0;
+  for (const value of Object.values(raw)) {
+    const data = value as Record<string, any> | null;
+    if (!data || typeof data !== 'object') {
+      continue;
+    }
+    // A missing `read` key is `undefined` (NOT `=== true`) → counted as unread.
+    if (data.read === true || data.deleted === true) {
+      continue;
+    }
+    if (normalizeEmail(data.recipientId) !== viewer) {
+      continue;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+// Bounded per-conversation true-unread recompute (server-side mirror of the
+// client `computeTrueUnreadCount`).
+//
+// Primary path: the indexed `read == false` set so the read cost scales with the
+// number of UNREAD messages, not the whole history (O(unread)). The remaining
+// predicate (`recipientId == viewer` and not `deleted`) is re-applied to that
+// bounded set because the index only narrows on `read`.
+//
+// Robustness (chat-production-hardening, finding P3-1): RTDB `equalTo(false)`
+// matches ONLY records whose `read` value is exactly `false`; a record lacking a
+// `read` key entirely is invisible to that index, so a legacy/foreign write
+// missing `read` would be UNDER-counted. All first-party writers now force
+// `read: false` on new messages (`sendChatMessage` here + client
+// `sendMessageDirect`), so in steady state the `read` index is exact. To cover
+// the residual legacy/foreign case WITHOUT regressing the hot path, a bounded
+// fallback fires ONLY when the caller's `storedUnreadHint` claims MORE unread
+// than the `read` index found (a suspected under-count/drift): it recounts over
+// the indexed `recipientId == viewer` set (also `.indexOn` → O(messages-to-viewer),
+// never a full-history scan) and treats a missing `read` as unread.
+//
+// Returns `null` when the primary read cannot complete so callers keep the
+// previously stored count rather than wiping a genuine unread value. A failure of
+// ONLY the fallback degrades to the primary `read`-index count, never null.
+async function computeTrueUnreadForConversation(
+  db: admin.database.Database,
+  tenantId: string,
+  viewerEmail: string,
+  conversationKey: string,
+  storedUnreadHint?: number | null
+): Promise<number | null> {
+  const viewer = normalizeEmail(viewerEmail);
+  if (!viewer || !conversationKey) {
+    return null;
+  }
+  const conversationRef = tenantChatRootRef(db, tenantId)
+    .child('conversationMessages')
+    .child(conversationKey);
+  try {
+    // Route the `read == false` primary read through the index helper so a
+    // not-yet-deployed `read` `.indexOn` degrades to a bounded node read instead
+    // of throwing "Index not defined" and wiping the counter to null (Part A,
+    // defensive — same failure class as the delivered index).
+    const unreadChildren = await getConversationMessagesByIndexedField(
+      db,
+      tenantId,
+      conversationKey,
+      'read',
+      false
+    );
+    const indexedCount = countUnreadInConversationNode(unreadChildren, viewer);
+
+    // Bounded missing-`read` fallback (P3-1): only when the stored counter
+    // suspects more unread than the `read` index surfaced. `recipCount` is always
+    // >= `indexedCount` (every `read == false` record for the viewer is also a
+    // `recipientId == viewer` record), so this never under-counts.
+    if (
+      typeof storedUnreadHint === 'number' &&
+      Number.isFinite(storedUnreadHint) &&
+      storedUnreadHint > indexedCount
+    ) {
+      try {
+        const recipientSnapshot = await conversationRef.orderByChild('recipientId').equalTo(viewer).get();
+        return recipientSnapshot.exists()
+          ? countUnreadInConversationNode((recipientSnapshot.val() || {}) as Record<string, any>, viewer)
+          : 0;
+      } catch {
+        return indexedCount;
+      }
+    }
+
+    return indexedCount;
+  } catch {
+    return null;
+  }
+}
+
+// Reconcile ONE owner conversation's stored unread counter to the true-unread
+// value without creating a partial summary node. Only mutates when the record
+// already exists AND the stored value drifts, so the operation is idempotent and
+// never resurrects a deleted summary.
+async function reconcileOwnerConversationUnread(
+  db: admin.database.Database,
+  tenantId: string,
+  ownerEmail: string,
+  partnerEmail: string,
+  conversationKey: string
+): Promise<boolean> {
+  const ownerKey = sanitizeKey(normalizeEmail(ownerEmail));
+  const partnerKey = sanitizeKey(normalizeEmail(partnerEmail));
+  if (!ownerKey || !partnerKey) {
+    return false;
+  }
+
+  const summaryRef = tenantChatRootRef(db, tenantId)
+    .child('conversationSummaries')
+    .child(`${ownerKey}/${partnerKey}`);
+
+  // Read the stored counter first so the recompute can detect a missing-`read`
+  // under-count (P3-1) and fall back to the bounded recipientId index when the
+  // stored value claims more unread than the `read` index surfaced. A single
+  // summary-object read (not a scan); best-effort — a failure just leaves the
+  // hint unset and the primary `read`-index path is used.
+  let storedUnreadHint: number | null = null;
+  try {
+    const summarySnapshot = await summaryRef.get();
+    const storedSummary = summarySnapshot.val() as ConversationSummary | null;
+    if (storedSummary && typeof storedSummary === 'object' && typeof storedSummary.unreadCount === 'number') {
+      storedUnreadHint = storedSummary.unreadCount;
+    }
+  } catch {
+    storedUnreadHint = null;
+  }
+
+  const trueUnread = await computeTrueUnreadForConversation(
+    db,
+    tenantId,
+    ownerEmail,
+    conversationKey,
+    storedUnreadHint
+  );
+  if (trueUnread === null) {
+    return false;
+  }
+
+  let changed = false;
+  await summaryRef.transaction((current) => {
+    if (!current || typeof current !== 'object') {
+      return current;
+    }
+    if ((current as ConversationSummary).unreadCount === trueUnread) {
+      return current;
+    }
+    changed = true;
+    return { ...(current as ConversationSummary), unreadCount: trueUnread };
+  });
+
+  const userConversationRef = tenantChatRootRef(db, tenantId)
+    .child('userConversations')
+    .child(`${ownerKey}/${conversationKey}`);
+  await userConversationRef.transaction((current) => {
+    if (!current || typeof current !== 'object') {
+      return current;
+    }
+    if ((current as Record<string, unknown>).unreadCount === trueUnread) {
+      return current;
+    }
+    return { ...(current as Record<string, unknown>), unreadCount: trueUnread };
+  });
+
+  return changed;
+}
+
+// Mark every UNREAD incoming message (partner → actor) in a conversation as read
+// (and delivered) on behalf of the authenticated reader. This is the server-side
+// replacement for the client's direct-write `markConversationAsRead`
+// (chat-production-hardening, finding P0-1 — Model A: backend is the only
+// writer). Identity is bound to the auth token by the route, so a caller can
+// only ever mark THEIR OWN incoming messages read. Idempotent: re-running after
+// everything is read is a no-op. Bounded (O(unread)) via the `read == false`
+// index. After marking, the actor's stored unread for the conversation is
+// reconciled to the true value so the badge converges exactly.
+export async function markChatConversationRead(
+  input: MarkChatConversationReadInput
+): Promise<MarkChatConversationReadResult> {
+  ensureFirebase();
+  const db = admin.database();
+
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const actorEmail = normalizeEmail(input.actorEmail);
+  const partnerEmail = normalizeEmail(input.partnerEmail);
+  if (!tenantId || !actorEmail || !partnerEmail) {
+    throw new ChatMessageActionError('Actor, partner, and tenant are required', 'invalid_payload');
+  }
+
+  const conversationKey = getConversationKey(actorEmail, partnerEmail);
+  if (!conversationKey) {
+    throw new ChatMessageActionError('Unable to resolve conversation', 'invalid_payload');
+  }
+  // A self-conversation is never a real inbox and cannot be "read"; reject at the
+  // boundary so no self-conversation node is ever touched (mirrors send guard).
+  if (actorEmail === partnerEmail || isSelfConversationKey(conversationKey)) {
+    throw new ChatMessageActionError(
+      'Self-addressed conversations cannot be marked read',
+      'not_allowed',
+      { actorEmail, partnerEmail, conversationKey }
+    );
+  }
+
+  // Bounded (`read == false`) discovery routed through the index helper so a
+  // not-yet-deployed `read` `.indexOn` degrades to a bounded node read instead of
+  // hard-failing the read-marking (Part A, defensive).
+  const unreadChildren = await getConversationMessagesByIndexedField(
+    db,
+    tenantId,
+    conversationKey,
+    'read',
+    false
+  );
+
+  const candidateIds: string[] = [];
+  for (const [messageId, rawValue] of Object.entries(unreadChildren)) {
+    const raw = (rawValue || {}) as Record<string, any>;
+    if (!messageId) {
+      continue;
+    }
+    // Re-apply predicate: only UNREAD, non-deleted, genuinely-incoming
+    // (partner → actor) messages qualify. The index only narrows on `read`.
+    if (raw.read === true || raw.deleted === true) {
+      continue;
+    }
+    if (normalizeEmail(raw.sender) !== partnerEmail) {
+      continue;
+    }
+    if (normalizeEmail(raw.recipientId) !== actorEmail) {
+      continue;
+    }
+    candidateIds.push(messageId);
+  }
+
+  const readMessageIds: string[] = [];
+  const readAt = new Date().toISOString();
+
+  for (const messageId of candidateIds) {
+    const context = await loadMessageContext(db, tenantId, messageId);
+    if (!context) {
+      continue;
+    }
+    // Defense-in-depth: re-verify identity against the durable record.
+    if (normalizeEmail(context.message.sender) !== partnerEmail) {
+      continue;
+    }
+    if (normalizeEmail(context.message.recipientId) !== actorEmail) {
+      continue;
+    }
+    if (context.message.deleted) {
+      continue;
+    }
+    const beforeRead = Boolean(context.message.read);
+    const updated = await applyReceiptPatchToMessageContext(db, context, {
+      markRead: true,
+      readAt,
+    });
+    if (!beforeRead && updated.read) {
+      readMessageIds.push(messageId);
+    }
+  }
+
+  // Converge the stored counter to the true-unread value (belt-and-suspenders in
+  // case the stored count had drifted before this read).
+  await reconcileOwnerConversationUnread(db, tenantId, actorEmail, partnerEmail, conversationKey);
+
+  return {
+    readMessageIds,
+    updatedCount: readMessageIds.length,
+  };
+}
+
+// Durable, idempotent unread reconciliation for a user — the server-side
+// replacement for the client's direct-write `reconcileUnreadForUser`
+// (chat-production-hardening, finding P0-1 — Model A). Identity is bound to the
+// auth token by the route. For the authenticated actor it:
+//   - removes any stuck self-conversation summary, its userConversations mirror,
+//     and the self conversationMessages node (self-messaging is unsupported and
+//     this orphaned data can never be opened/read); and
+//   - recomputes every non-self conversation's stored unreadCount from the
+//     true-unread set (bounded, O(unread)) and writes it back ONLY when it drifts
+//     so re-running is a no-op (no oscillation).
+export async function reconcileChatUnreadForUser(
+  input: ReconcileChatUnreadForUserInput
+): Promise<ReconcileChatUnreadForUserResult> {
+  ensureFirebase();
+  const db = admin.database();
+
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const actorEmail = normalizeEmail(input.actorEmail);
+  const userKey = sanitizeKey(actorEmail);
+  if (!tenantId || !actorEmail || !userKey) {
+    throw new ChatMessageActionError('Actor and tenant are required', 'invalid_payload');
+  }
+
+  const summariesRef = tenantChatRootRef(db, tenantId).child('conversationSummaries').child(userKey);
+  const snapshot = await summariesRef.get();
+  if (!snapshot.exists()) {
+    return { reconciledConversations: 0, selfConversationsCleaned: 0 };
+  }
+
+  const raw = (snapshot.val() || {}) as Record<string, any>;
+  let reconciledConversations = 0;
+  let selfConversationsCleaned = 0;
+
+  for (const [partnerKey, value] of Object.entries(raw)) {
+    const record = (value || {}) as Record<string, any>;
+    const partnerEmail = normalizeEmail(record.partnerEmail);
+    if (!partnerEmail) {
+      continue;
+    }
+
+    const conversationKey = getConversationKey(actorEmail, partnerEmail);
+    const isSelf = !conversationKey || isSelfConversationKey(conversationKey) || actorEmail === partnerEmail;
+
+    if (isSelf) {
+      await summariesRef.child(partnerKey).set(null);
+      if (conversationKey) {
+        await tenantChatRootRef(db, tenantId)
+          .child('userConversations')
+          .child(`${userKey}/${conversationKey}`)
+          .set(null);
+        await tenantChatRootRef(db, tenantId)
+          .child('conversationMessages')
+          .child(conversationKey)
+          .set(null);
+      }
+      selfConversationsCleaned += 1;
+      continue;
+    }
+
+    const storedUnread = typeof record.unreadCount === 'number' ? record.unreadCount : 0;
+    // Pass the stored counter as the hint so a missing-`read` under-count (P3-1)
+    // is caught by the bounded recipientId fallback when the stored value claims
+    // more unread than the `read` index surfaced.
+    const trueUnread = await computeTrueUnreadForConversation(
+      db,
+      tenantId,
+      actorEmail,
+      conversationKey,
+      storedUnread
+    );
+    if (trueUnread !== null && trueUnread !== storedUnread) {
+      await summariesRef.child(partnerKey).update({ unreadCount: trueUnread });
+      await tenantChatRootRef(db, tenantId)
+        .child('userConversations')
+        .child(`${userKey}/${conversationKey}`)
+        .update({ unreadCount: trueUnread });
+      reconciledConversations += 1;
+    }
+  }
+
+  return { reconciledConversations, selfConversationsCleaned };
+}
+
+// Given the user's own sanitized key and a sorted `keyA__keyB` conversation key,
+// return the OTHER half (the partner's sanitized key). Mirrors the client
+// `getPartnerKeyFromConversationKey` used by the direct rebuild path.
+function getPartnerKeyFromConversationKey(userKey: string, conversationKey: string): string | null {
+  if (!userKey) {
+    return null;
+  }
+  const parts = conversationKey.split('__').filter(Boolean);
+  if (parts.length !== 2) {
+    return null;
+  }
+  if (parts[0] === userKey) {
+    return parts[1];
+  }
+  if (parts[1] === userKey) {
+    return parts[0];
+  }
+  return null;
+}
+
+// Read + normalize the maintained `conversationLatest/{conv}` pointer into a
+// `ConversationLatestRecord`. This is the PREFERRED source for the latest-message
+// summary during a rebuild because it avoids a full-history scan of the
+// conversation node. Returns null when the pointer is missing/legacy/malformed so
+// the caller can fall back to a single bounded node read.
+async function readConversationLatestRecord(
+  db: admin.database.Database,
+  tenantId: string,
+  conversationKey: string
+): Promise<ConversationLatestRecord | null> {
+  try {
+    const snapshot = await tenantChatRootRef(db, tenantId)
+      .child('conversationLatest')
+      .child(conversationKey)
+      .get();
+    if (!snapshot.exists()) {
+      return null;
+    }
+    const raw = snapshot.val() as Record<string, any> | null;
+    if (!raw || typeof raw !== 'object' || !raw.messageId || !raw.timestamp) {
+      return null;
+    }
+    const record: ConversationLatestRecord = {
+      messageId: String(raw.messageId),
+      timestamp: String(raw.timestamp),
+      sender: normalizeEmail(raw.sender),
+      recipientId: normalizeEmail(raw.recipientId) || null,
+      tenantId: typeof raw.tenantId === 'string' ? raw.tenantId : null,
+      delivered: Boolean(raw.delivered),
+      read: Boolean(raw.read),
+      isSpecial: Boolean(raw.isSpecial),
+      preview: {
+        text: typeof raw.preview?.text === 'string' ? raw.preview.text : '',
+        type: (raw.preview?.type as LastMessageType) || 'text',
+      },
+    };
+    const provenance = normalizeChatDeliveryProvenance(raw.deliveryProvenance);
+    if (provenance) {
+      record.deliveryProvenance = provenance;
+    }
+    if (raw.deleted === true) {
+      record.deleted = true;
+    }
+    if (typeof raw.editedAt === 'string') {
+      record.editedAt = raw.editedAt;
+    }
+    if (typeof raw.preview?.attachmentCount === 'number') {
+      record.preview.attachmentCount = raw.preview.attachmentCount;
+    }
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+// Build a conversation summary `lastMessage` from a maintained latest-pointer
+// record (server-side mirror of the client `buildSummaryFromLatestRecord`).
+function buildLastMessageSummaryFromLatestRecord(
+  ownerEmail: string,
+  record: ConversationLatestRecord
+): ConversationSummary['lastMessage'] {
+  const normalizedOwner = normalizeEmail(ownerEmail);
+  const summary: NonNullable<ConversationSummary['lastMessage']> = {
+    messageId: record.messageId,
+    text: record.preview.text,
+    timestamp: record.timestamp,
+    sender: record.sender,
+    isOwnMessage: record.sender === normalizedOwner,
+    delivered: record.delivered,
+    read: record.read,
+    type: record.preview.type,
+    isSpecial: record.isSpecial,
+  };
+  if (typeof record.preview.attachmentCount === 'number') {
+    summary.attachmentCount = record.preview.attachmentCount;
+  }
+  if (record.editedAt) {
+    summary.editedAt = record.editedAt;
+  }
+  if (record.deleted) {
+    summary.deleted = true;
+    summary.text = 'Message deleted';
+    summary.type = 'deleted';
+  }
+  return summary;
+}
+
+// Legacy fallback for a conversation whose `conversationLatest` pointer is
+// missing: read the conversation node ONCE and return the highest-timestamp
+// message (plus a partner-email hint derived from the participants). Used only
+// when the maintained pointer is absent so the common path stays bounded.
+async function resolveLatestFromConversationNode(
+  db: admin.database.Database,
+  tenantId: string,
+  conversationKey: string,
+  viewerEmail: string
+): Promise<{ record: ConversationLatestRecord | null; partnerEmail: string | null }> {
+  let record: ConversationLatestRecord | null = null;
+  let latestMs = -1;
+  let partnerEmail: string | null = null;
+  try {
+    const snapshot = await tenantChatRootRef(db, tenantId)
+      .child('conversationMessages')
+      .child(conversationKey)
+      .get();
+    if (!snapshot.exists()) {
+      return { record: null, partnerEmail: null };
+    }
+    const node = (snapshot.val() || {}) as Record<string, any>;
+    for (const [messageId, rawValue] of Object.entries(node)) {
+      const data = (rawValue || {}) as Record<string, any>;
+      if (!messageId || typeof data !== 'object') {
+        continue;
+      }
+      const sender = normalizeEmail(data.sender);
+      const recipient = normalizeEmail(data.recipientId);
+      if (!partnerEmail) {
+        if (sender === viewerEmail && recipient) {
+          partnerEmail = recipient;
+        } else if (recipient === viewerEmail && sender) {
+          partnerEmail = sender;
+        }
+      }
+      const ts = getTimestampMs(data.timestamp);
+      if (ts > latestMs) {
+        latestMs = ts;
+        const message: ChatMessageRecord = {
+          ...(data as ChatMessageRecord),
+          id: messageId,
+          sender,
+          recipientId: recipient || undefined,
+          timestamp: typeof data.timestamp === 'string' ? data.timestamp : new Date().toISOString(),
+          conversationKey,
+          tenantId: typeof data.tenantId === 'string' ? data.tenantId : (tenantId ?? null),
+          deleted: Boolean(data.deleted),
+          delivered: Boolean(data.delivered),
+          read: Boolean(data.read),
+          isSpecial: Boolean(data.isSpecial),
+        } as ChatMessageRecord;
+        record = buildConversationLatestRecord(messageId, message);
+      }
+    }
+  } catch {
+    return { record, partnerEmail };
+  }
+  return { record, partnerEmail };
+}
+
+// Server-side reconstruction of the authenticated user's conversation summaries —
+// the Admin-SDK replacement for the client's direct-write
+// `rebuildConversationSummariesForUser` (chat-production-hardening, finding P0-1 —
+// Model A: backend is the only writer; client chat write paths are locked to
+// `.write:false`). Identity is bound to the auth token by the route.
+//
+// Semantics mirror the client rebuild:
+//   - enumerate the user's conversations from `userConversations/{userKey}`;
+//   - SKIP self-conversations (never (re)create a self summary) so any pre-existing
+//     self summary is pruned below and cannot regenerate;
+//   - for each conversation resolve the partner (from the userConversations entry,
+//     the conversation-key halves, or an existing summary), derive the latest
+//     message PREFERRING the maintained `conversationLatest/{conv}` pointer (only
+//     falling back to a single bounded conversation-node read when the pointer is
+//     missing/legacy), and recompute unread via the BOUNDED true-unread path
+//     (`computeTrueUnreadForConversation`, O(unread));
+//   - write the reconstructed `conversationSummaries/{userKey}/{partnerKey}` and
+//     mirror `userConversations/{userKey}/{conv}`; and
+//   - PRUNE `conversationSummaries` entries whose partner is no longer present.
+// Idempotent: a re-run over converged data writes the same records and prunes
+// nothing new.
+export async function rebuildChatSummariesForUser(
+  input: RebuildChatSummariesForUserInput
+): Promise<RebuildChatSummariesForUserResult> {
+  ensureFirebase();
+  const db = admin.database();
+
+  const tenantId = typeof input.tenantId === 'string' ? input.tenantId.trim() : '';
+  const actorEmail = normalizeEmail(input.actorEmail);
+  const userKey = sanitizeKey(actorEmail);
+  if (!tenantId || !actorEmail || !userKey) {
+    throw new ChatMessageActionError('Actor and tenant are required', 'invalid_payload');
+  }
+
+  const userConversationsRef = tenantChatRootRef(db, tenantId).child('userConversations').child(userKey);
+  const summariesRef = tenantChatRootRef(db, tenantId).child('conversationSummaries').child(userKey);
+
+  const [conversationIndexSnap, existingSummariesSnap] = await Promise.all([
+    userConversationsRef.get(),
+    summariesRef.get(),
+  ]);
+
+  const conversationIndex = (conversationIndexSnap.val() || {}) as Record<string, any>;
+  const existingSummaries = (existingSummariesSnap.val() || {}) as Record<string, ConversationSummary>;
+
+  // partnerKey → partnerEmail hints from any existing summaries (used to resolve a
+  // conversation whose userConversations entry lacks a partnerEmail).
+  const knownPartnerEmails = new Map<string, string>();
+  for (const [partnerKey, summary] of Object.entries(existingSummaries)) {
+    const email = normalizeEmail((summary as any)?.partnerEmail);
+    if (email) {
+      knownPartnerEmails.set(partnerKey, email);
+    }
+  }
+
+  const partnerEmails = new Set<string>();
+  // Partner keys written in THIS pass — never pruned below even if the pre-read
+  // existing-summaries snapshot held a stale/empty entry at the same key.
+  const rebuiltPartnerKeys = new Set<string>();
+  let rebuiltConversations = 0;
+
+  for (const [conversationKey, entryRaw] of Object.entries(conversationIndex)) {
+    // Never (re)build a self-conversation summary. Skipping means its partnerEmail
+    // is never added to `partnerEmails`, so any pre-existing self summary is pruned
+    // below and cannot regenerate.
+    if (isSelfConversationKey(conversationKey)) {
+      continue;
+    }
+    const entry = (entryRaw || {}) as Record<string, any>;
+
+    let partnerEmail = normalizeEmail(entry.partnerEmail);
+    const existingPartnerKey =
+      typeof entry.partnerKey === 'string' && entry.partnerKey.trim() ? entry.partnerKey.trim().toLowerCase() : null;
+    const partnerKeyFromConversation = getPartnerKeyFromConversationKey(userKey, conversationKey);
+
+    for (const candidate of [existingPartnerKey, partnerKeyFromConversation]) {
+      if (!partnerEmail && candidate) {
+        const known = knownPartnerEmails.get(candidate);
+        if (known) {
+          partnerEmail = known;
+        }
+      }
+    }
+
+    // PREFER the maintained latest pointer (bounded — no full-history scan).
+    let latestRecord = await readConversationLatestRecord(db, tenantId, conversationKey);
+
+    // Legacy fallback: read the conversation node ONCE only when the pointer is
+    // missing. This also supplies a partner hint when none was resolved above.
+    if (!latestRecord) {
+      const fallback = await resolveLatestFromConversationNode(db, tenantId, conversationKey, actorEmail);
+      latestRecord = fallback.record;
+      if (!partnerEmail && fallback.partnerEmail) {
+        partnerEmail = fallback.partnerEmail;
+      }
+    }
+
+    if (!partnerEmail && latestRecord) {
+      if (latestRecord.sender === actorEmail && latestRecord.recipientId) {
+        partnerEmail = latestRecord.recipientId;
+      } else if (latestRecord.recipientId === actorEmail && latestRecord.sender) {
+        partnerEmail = latestRecord.sender;
+      }
+    }
+
+    if (!partnerEmail) {
+      continue;
+    }
+    // Resolved partner is the user themselves — a self-conversation. Skip so it is
+    // neither written nor kept (it is pruned below).
+    if (partnerEmail === actorEmail) {
+      continue;
+    }
+
+    const sanitizedPartnerKey = existingPartnerKey || partnerKeyFromConversation || sanitizeKey(partnerEmail);
+    if (!sanitizedPartnerKey) {
+      continue;
+    }
+
+    // A conversation with no resolvable latest message cannot produce a summary.
+    if (!latestRecord) {
+      continue;
+    }
+
+    // BOUNDED true-unread recompute (O(unread)). Pass the stored counter as the
+    // hint so a missing-`read` under-count is caught by the bounded recipientId
+    // fallback. A null result (read failed) preserves the stored value.
+    const storedHint =
+      typeof entry.unreadCount === 'number'
+        ? entry.unreadCount
+        : typeof existingSummaries[sanitizedPartnerKey]?.unreadCount === 'number'
+          ? existingSummaries[sanitizedPartnerKey].unreadCount
+          : 0;
+    const trueUnread = await computeTrueUnreadForConversation(
+      db,
+      tenantId,
+      actorEmail,
+      conversationKey,
+      storedHint
+    );
+    const unreadCount = trueUnread === null ? storedHint : trueUnread;
+
+    partnerEmails.add(partnerEmail);
+    rebuiltPartnerKeys.add(sanitizedPartnerKey);
+    knownPartnerEmails.set(sanitizedPartnerKey, partnerEmail);
+
+    const existingSummary = (existingSummaries[sanitizedPartnerKey] || {}) as ConversationSummary;
+    const summaryLastMessage = buildLastMessageSummaryFromLatestRecord(actorEmail, latestRecord);
+    const updatedAt = latestRecord.timestamp || new Date().toISOString();
+
+    const summaryRecord: ConversationSummary = {
+      partnerEmail,
+      partnerId: existingSummary?.partnerId ?? null,
+      partnerName: existingSummary?.partnerName ?? null,
+      tenantId,
+      lastMessage: summaryLastMessage ?? null,
+      unreadCount,
+      updatedAt,
+    };
+
+    await summariesRef.child(sanitizedPartnerKey).set(summaryRecord);
+    await userConversationsRef.child(conversationKey).update({
+      partnerEmail,
+      partnerKey: sanitizedPartnerKey,
+      lastMessageId: latestRecord.messageId,
+      updatedAt,
+      unreadCount,
+      tenantId,
+    });
+
+    rebuiltConversations += 1;
+  }
+
+  // Prune stale summaries: any existing summary whose partner is no longer present
+  // (including a self summary, whose partnerEmail == actorEmail and is therefore
+  // never in `partnerEmails`, and any record missing a partnerEmail).
+  let prunedConversations = 0;
+  for (const [partnerKey, value] of Object.entries(existingSummaries)) {
+    // Never prune a partner we just (re)built this pass.
+    if (rebuiltPartnerKeys.has(partnerKey)) {
+      continue;
+    }
+    const email = normalizeEmail((value as any)?.partnerEmail);
+    if (email && partnerEmails.has(email)) {
+      continue;
+    }
+    await summariesRef.child(partnerKey).set(null);
+    prunedConversations += 1;
+  }
+
+  return { rebuiltConversations, prunedConversations };
 }
 
 export async function editChatMessage(input: EditChatMessageInput): Promise<ChatMessageRecord> {

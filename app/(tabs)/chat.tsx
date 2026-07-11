@@ -327,6 +327,18 @@ import {
   resolveChatPendingTextMessageReconciledIds,
 } from '@/lib/chatPendingReconciliationState';
 import {
+  resolveConfirmedDeliveredIds,
+  resolveExhaustedOutboxAction,
+} from '@/lib/chatSendConfirmationState';
+import {
+  OUTBOX_MAX_REDRIVE_ATTEMPTS,
+  OUTBOX_MIN_STALE_MS,
+  OUTBOX_BASE_BACKOFF_MS,
+  OUTBOX_DRIVER_TICK_MS,
+  resolveOutboxBackoffMs,
+  claimOutboxConversation,
+} from '@/lib/outboxSelfHeal';
+import {
   resolveChatPendingServerMatchVisibility,
   resolveChatPendingTextVisibilityState,
 } from '@/lib/chatPendingVisibilityState';
@@ -418,21 +430,17 @@ const CHAT_MESSAGE_MAX_CHARS = 500;
 const CHAT_MESSAGE_MAX_WORDS = 100;
 const CHAT_REPLY_PREVIEW_MAX_CHARS = 120;
 const MESSAGE_INFO_COPIED_RESET_DELAY_MS = 1400;
-// Outbox self-heal driver (stuck-message-delivery-fix, tasks 10.5/10.6).
+// Outbox self-heal driver policy (stuck-message-delivery-fix, tasks 10.5/10.6).
 // A send that was accepted locally but is not yet confirmed as durably persisted
 // for the intended recipient is automatically re-driven with bounded exponential
 // backoff (reusing its clientMsgId so the server upsert is idempotent). After the
 // attempt cap is exhausted without confirmation, the item is dead-lettered to an
 // explicit, actionable `failed` state — never left as a misleading "Sent".
-const OUTBOX_MAX_REDRIVE_ATTEMPTS = 5;
-// Grace period before the first re-drive so we never race the initial in-flight
-// send that is still awaiting its own promise.
-const OUTBOX_MIN_STALE_MS = 8000;
-const OUTBOX_BASE_BACKOFF_MS = 8000;
-const OUTBOX_MAX_BACKOFF_MS = 5 * 60 * 1000;
-const OUTBOX_DRIVER_TICK_MS = 5000;
-const resolveOutboxBackoffMs = (attempts: number): number =>
-  Math.min(OUTBOX_MAX_BACKOFF_MS, OUTBOX_BASE_BACKOFF_MS * Math.pow(2, Math.max(0, attempts)));
+//
+// The constants + backoff live in `lib/outboxSelfHeal.ts` so the chat screen
+// driver (this file, for the OPEN conversation) and the app-level self-heal hook
+// (`hooks/useOutboxSelfHeal.ts`, for ALL OTHER conversations) share a single
+// source of truth and identical timing (chat-production-hardening, P1-1).
 const CONVERSATION_SEARCH_SCOPE_LABELS: Record<ChatConversationSearchScope, string> = {
   all: 'All',
   text: 'Text',
@@ -1341,6 +1349,27 @@ export default function Chat() {
   const normalizeMessageId = useCallback((id: any): string => {
     return resolveChatNormalizedMessageId(id);
   }, []);
+
+  // Authoritative send-confirmation set (chat-production-hardening, P1-2).
+  // Every send/retry/re-drive that RESOLVES with a serverMessageId adds the
+  // normalized id here. Because self-addressed sends are rejected at the client
+  // and server write boundary, a resolved serverMessageId is proof that a durable
+  // record exists for the intended (non-self) recipient — independent of whether
+  // that message is on the currently loaded page. Folding this into the delivered
+  // signal means a successfully-sent message is treated as confirmed and is never
+  // re-driven or dead-lettered, even during a listener/pagination gap. Kept in a
+  // ref (so adds never re-render on their own) with a version counter that the
+  // delivered-id memo depends on to re-evaluate when a new id is confirmed.
+  const confirmedServerMessageIdsRef = useRef<Set<string>>(new Set());
+  const [confirmedServerMessageIdsVersion, setConfirmedServerMessageIdsVersion] = useState(0);
+  const markServerMessageConfirmed = useCallback((serverMessageId: unknown) => {
+    const normalized = normalizeMessageId(serverMessageId);
+    if (!normalized || confirmedServerMessageIdsRef.current.has(normalized)) {
+      return;
+    }
+    confirmedServerMessageIdsRef.current.add(normalized);
+    setConfirmedServerMessageIdsVersion((version) => version + 1);
+  }, [normalizeMessageId]);
 
   const normalizeParticipantEmail = useCallback((value: unknown): string => {
     return resolveChatNormalizedParticipantEmail(value);
@@ -7528,6 +7557,13 @@ export default function Chat() {
         clientMsgId: tempId,
       });
 
+      // A resolved serverMessageId is authoritative proof of a durable record for
+      // the intended (non-self) recipient (self-addressed sends are rejected at
+      // the write boundary). Record it so the delivered signal confirms this send
+      // even if its server bubble is not on the loaded page — it is never re-driven
+      // or dead-lettered (chat-production-hardening, P1-2).
+      markServerMessageConfirmed(serverMessageId);
+
       if (optimisticTempId) {
         const idToUpdate = optimisticTempId;
         // Do NOT promote to terminal "Sent" just because the send promise
@@ -7674,6 +7710,7 @@ export default function Chat() {
     sendMessageNotification,
     setShowScrollToBottomSafely,
     hasEditedMessageChanged,
+    markServerMessageConfirmed,
   ]);
 
   const handleComposerBlur = useCallback(() => {
@@ -10673,12 +10710,20 @@ export default function Chat() {
   }, [teamMembersWithChatInfoById, selectedTeamMember]);
 
   const deliveredMessageIds = useMemo(() => {
-    return new Set(
-      displayedMessages
-        .map((msg: any) => normalizeMessageId(msg?.id))
-        .filter((id: string) => Boolean(id))
-    );
-  }, [displayedMessages, normalizeMessageId]);
+    // The authoritative delivered/confirmed signal is the UNION of ids on the
+    // currently loaded page and ids independently confirmed by a resolved send
+    // (chat-production-hardening, P1-2). Both the delivered-reconciliation effect
+    // and the outbox self-heal driver consume this set, so a successfully-sent
+    // message that is not (yet) on the loaded page is still treated as confirmed
+    // and is never re-driven or dead-lettered.
+    const displayedIds = displayedMessages
+      .map((msg: any) => normalizeMessageId(msg?.id))
+      .filter((id: string) => Boolean(id));
+    return resolveConfirmedDeliveredIds(displayedIds, confirmedServerMessageIdsRef.current);
+    // confirmedServerMessageIdsVersion is intentionally in the dep list so the
+    // union re-evaluates whenever a newly confirmed id is added to the ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayedMessages, normalizeMessageId, confirmedServerMessageIdsVersion]);
 
   const buildPendingTextMatchKey = useCallback((
     sender: string,
@@ -11246,6 +11291,10 @@ export default function Chat() {
           { replyTo: pendingMsg.replyTo, clientMsgId: pendingMsg.clientMsgId || tempId }
         );
 
+        // Authoritative confirmation: a resolved serverMessageId proves a durable
+        // record for the intended recipient exists (chat-production-hardening, P1-2).
+        markServerMessageConfirmed(serverMessageId);
+
         // Keep the item in the confirmed-pending state ("Sending…") rather than
         // promoting straight to terminal "Sent" — a resolved promise is not proof
         // of a durable record for the intended recipient (stuck-message-delivery-fix,
@@ -11327,7 +11376,7 @@ export default function Chat() {
         });
       }
     },
-    [isOffline, pendingMessages, selectedTeamMember, sendMessage, resolvePendingMessageStatus]
+    [isOffline, pendingMessages, selectedTeamMember, sendMessage, resolvePendingMessageStatus, markServerMessageConfirmed]
   );
 
   // ---- Outbox self-heal driver (stuck-message-delivery-fix, tasks 10.5/10.6) ----
@@ -11388,6 +11437,40 @@ export default function Chat() {
       // surface an explicit, actionable `failed` state rather than a phantom Sent.
       if (attempts > OUTBOX_MAX_REDRIVE_ATTEMPTS) {
         outboxRedriveStateRef.current.delete(tempId);
+        // Authoritative safety net BEFORE dead-lettering (chat-production-hardening,
+        // P1-2): the message may be durably persisted for the intended recipient
+        // yet absent from the loaded page (listener gap, pagination trim, race).
+        // Confirm delivery from a cheap keyed existence check — not loaded-page
+        // presence alone — and mark it confirmed instead of flipping to a
+        // misleading `failed`. Genuine failures (no server id, no durable record)
+        // still dead-letter.
+        let recordExists = false;
+        if (serverId) {
+          const senderEmail =
+            pendingMsg.sender || effectiveUser?.email || user?.email || '';
+          try {
+            recordExists = await chatService.messageExistsById(
+              senderEmail,
+              pendingMsg.recipientId,
+              serverId
+            );
+          } catch (error) {
+            logger.debug('Outbox dead-letter existence check failed; falling back', {
+              tempId,
+              error,
+            });
+            recordExists = false;
+          }
+        }
+        const action = resolveExhaustedOutboxAction({
+          serverMessageId: serverId,
+          confirmedDeliveredIds: deliveredMessageIds,
+          recordExists,
+        });
+        if (action === 'confirm') {
+          markServerMessageConfirmed(serverId);
+          return;
+        }
         deadLetterPendingMessage(tempId);
         return;
       }
@@ -11406,6 +11489,9 @@ export default function Chat() {
           pendingMsg.recipientId,
           { replyTo: pendingMsg.replyTo, clientMsgId: pendingMsg.clientMsgId || tempId }
         );
+        // Authoritative confirmation of the re-driven send (chat-production-hardening,
+        // P1-2): the returned id proves a durable record for the intended recipient.
+        markServerMessageConfirmed(serverMessageId);
         const redrivenPending: PendingMessage = {
           ...pendingMsg,
           status: 'sending',
@@ -11436,6 +11522,9 @@ export default function Chat() {
       deliveredMessageIds,
       sendMessage,
       deadLetterPendingMessage,
+      markServerMessageConfirmed,
+      effectiveUser?.email,
+      user?.email,
     ]
   );
 
@@ -11504,6 +11593,21 @@ export default function Chat() {
     }, OUTBOX_DRIVER_TICK_MS);
     return () => clearInterval(interval);
   }, [isOffline, driveUnconfirmedOutbox]);
+
+  // Claim the open conversation for THIS screen's driver so the app-level
+  // outbox self-heal hook (`hooks/useOutboxSelfHeal.ts`) never re-drives the same
+  // pending items in parallel (chat-production-hardening, P1-1). The chat screen
+  // only ever loads/drives the selected conversation's pending items, so it owns
+  // exactly this recipient while mounted; the app-level driver owns every other
+  // conversation. The claim is released on unmount / selection change.
+  useEffect(() => {
+    const recipientId = selectedTeamMember?.id;
+    if (!recipientId) {
+      return;
+    }
+    const release = claimOutboxConversation(recipientId);
+    return release;
+  }, [selectedTeamMember?.id]);
 
   // Prune driver bookkeeping for items that are no longer pending (delivered,
   // reconciled, canceled, or dead-lettered) so the map does not grow unbounded.

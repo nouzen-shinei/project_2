@@ -46,6 +46,7 @@ import ModalAlertProvider from '../components/ModalAlertProvider';
 import * as Updates from 'expo-updates';
 import { installErrorFilter } from '../globalErrorFilter';
 import { TenantProvider, useTenant } from '../hooks/useTenantContext';
+import { useOutboxSelfHeal } from '../hooks/useOutboxSelfHeal';
 import { VideoSeekProvider } from '../hooks/useVideoSeekConfig';
 import TenantAccessScreen from '../components/TenantAccessScreen';
 import { useTheme } from '../hooks/useTheme';
@@ -699,6 +700,16 @@ const TenantAwareShell = ({ colorScheme, isOffline, roleChangeNotice, router, on
       (segments[0] === '(tabs)' && (segments[1] === 'plan' || segments[1] === 'billing-history')));
   const isInviteFlow = segments[0] === 'invite';
   const { activeMembership, memberships, loading, pendingMemberships } = useTenant();
+
+  // App-level outbox self-heal (chat-production-hardening, P1-1): re-drive
+  // not-yet-confirmed sends in EVERY conversation (not just the open chat
+  // screen's) with bounded backoff, dead-lettering, and authoritative
+  // confirmation. Mounted here — high in the tree and inside the tenant scope —
+  // so it runs regardless of which tab/screen is active. It internally gates on
+  // auth + tenant + connectivity and skips any conversation the chat screen is
+  // actively driving, so the two drivers never compete for the same items.
+  useOutboxSelfHeal();
+
   const [tenantModalVisible, setTenantModalVisible] = useState(true);
   const [tenantModalBlocked, setTenantModalBlocked] = useState(false);
   const [hintDismissed, setHintDismissed] = useState(false);
