@@ -115,6 +115,74 @@ const useStallDetector = (active: boolean, currentTime: number, stallThresholdMs
   return isStalled;
 };
 
+/**
+ * Tracks whether the playhead is genuinely advancing.
+ *
+ * Returns `true` while `currentTime` keeps moving forward (the video is truly
+ * rendering frames) and flips to `false` after `timeoutMs` with no forward
+ * progress — i.e. the video has actually frozen.
+ *
+ * This is the reliable way to tell a spurious `waiting` event during smooth
+ * playback (playhead keeps moving) apart from a real buffer underrun (playhead
+ * frozen). The underlying element is unreliable here: browsers fire `waiting`,
+ * not `pause`, during a stall, so `isPlaying` stays true; and `currentTime > 0`
+ * stays true forever once playback has started. Only the delta of `currentTime`
+ * over time reveals whether the picture is actually moving.
+ */
+export const usePlayheadAdvancing = (
+  currentTime: number,
+  active: boolean,
+  timeoutMs = 400
+): boolean => {
+  const [advancing, setAdvancing] = useState(false);
+  const lastTimeRef = useRef(currentTime);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!active) {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      lastTimeRef.current = currentTime;
+      setAdvancing(false);
+      return;
+    }
+
+    const delta = currentTime - lastTimeRef.current;
+    if (delta > 0.02) {
+      // Forward progress beyond a small epsilon => the video is truly playing.
+      lastTimeRef.current = currentTime;
+      setAdvancing(true);
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+      }
+      // If no further progress arrives within the window, treat the playhead as
+      // frozen so the buffering overlay is allowed to surface.
+      timerRef.current = setTimeout(() => {
+        setAdvancing(false);
+        timerRef.current = null;
+      }, timeoutMs);
+    } else if (delta < 0) {
+      // Backward jump (seek or replay) — resync the baseline so subsequent
+      // forward progress is measured from the new position.
+      lastTimeRef.current = currentTime;
+    }
+  }, [active, currentTime, timeoutMs]);
+
+  useEffect(
+    () => () => {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    },
+    []
+  );
+
+  return advancing;
+};
+
 export const useVideoPlaybackUxState = ({
   status = 'idle',
   isLoading,

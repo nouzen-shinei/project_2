@@ -61,7 +61,7 @@ import { ShareModal } from './ShareModal';
 import { chatCacheService } from '../services/chatCacheService';
 import * as Haptics from 'expo-haptics';
 import { DEFAULT_SEEK_STEP_SECONDS, useVideoSeekConfig } from '../hooks/useVideoSeekConfig';
-import { useVideoPlaybackUxState } from '@/hooks/useVideoPlaybackUxState';
+import { useVideoPlaybackUxState, usePlayheadAdvancing } from '@/hooks/useVideoPlaybackUxState';
 import { VideoBufferingOverlay } from './VideoBufferingOverlay';
 import { useWebVideoState } from '@/hooks/useWebVideoSetup';
 import { useVideoProgressBar } from '@/hooks/useVideoProgressBar';
@@ -3651,6 +3651,13 @@ function VideoPlayerLoaded({
     bufferGapSeconds: Platform.OS === 'web' ? 0.3 : 0.3,
   });
 
+  // True only while the playhead is genuinely moving. Unlike `isPlaying` (which
+  // stays true during a buffer underrun because the browser fires `waiting`, not
+  // `pause`) or `currentTime > 0` (which stays true forever once playback has
+  // begun), this flips to false the moment the video actually freezes — letting
+  // the buffering overlay appear exactly when the video is stuck.
+  const playheadAdvancing = usePlayheadAdvancing(currentTime, Platform.OS === 'web' && isPlaying);
+
   const progressPercentage =
     effectiveDuration > 0 && Number.isFinite(currentTime)
       ? Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100))
@@ -4155,17 +4162,20 @@ function VideoPlayerLoaded({
     const showPoster =
       !!posterUri && (playbackUxState.isInitialLoading || playbackUxState.isBuffering || playbackUxState.isStalled);
 
-    // On web: suppress the loading/buffering overlay once the video has actually started.
-    // The UX state machine can lag behind the real video state, keeping the overlay visible
-    // even while video is playing. Trust the actual playback state instead.
+    // `videoActuallyPlaying` gates the poster only: once real frames exist
+    // (currentTime > 0) we must not cover them with a blurred thumbnail.
     const videoActuallyPlaying = Platform.OS === 'web' && (isPlaying || currentTime > 0);
-    // Suppress overlays when video is visibly playing. Mobile Chrome fires the
-    // 'waiting' event frequently during normal playback of large files, causing
-    // false-positive buffering overlays on top of running video.
-    const suppressOverlay = videoActuallyPlaying && (
+    // Suppress the loading/buffering overlay ONLY while the playhead is genuinely
+    // advancing. Mobile Chrome fires spurious 'waiting' events during smooth
+    // playback of large files, so `isBuffering` alone can't be trusted — but if
+    // frames keep rendering (currentTime keeps moving) it's a false positive and
+    // the spinner should stay hidden. When the video truly freezes to buffer,
+    // `playheadAdvancing` becomes false and the overlay is allowed to show, which
+    // is exactly when the buffering indicator needs to appear.
+    const suppressOverlay = Platform.OS === 'web' && playheadAdvancing && (
       playbackUxState.phase === 'loading' ||
       playbackUxState.isInitialLoading ||
-      (playbackUxState.isBuffering && isPlaying)
+      playbackUxState.isBuffering
     );
 
     // Custom messaging for unsupported video codec (e.g. HEVC on Android browsers).
@@ -5795,6 +5805,11 @@ function WebFullscreenModal({
     bufferGapSeconds: 0.5,
   });
 
+  // Genuine playhead motion — the reliable signal for "video is truly playing"
+  // vs "frozen while a spurious `waiting` event is in flight". See the inline
+  // player for the full rationale.
+  const playheadAdvancing = usePlayheadAdvancing(currentTime, isPlaying);
+
   const bufferedPercent = playbackUxState.bufferedPercent ?? 0;
   // Don't hide controls on error — user needs close button and retry is in the overlay.
   const shouldLockControls = playbackUxState.isInitialLoading;
@@ -6186,14 +6201,15 @@ function WebFullscreenModal({
         ? 'loading'
         : playbackUxState.phase;
 
-    // Suppress the loading/buffering overlay when the video is visibly playing.
-    // The browser 'waiting' event fires constantly during normal playback of large files
-    // on mobile Chrome — don't show the spinner over a running video.
-    const videoActuallyPlaying = isPlaying || currentTime > 0;
-    const suppressOverlay = videoActuallyPlaying && (
+    // Suppress the loading/buffering overlay only while the playhead is genuinely
+    // advancing. The browser 'waiting' event fires constantly during normal
+    // playback of large files on mobile Chrome, but if frames keep rendering it's
+    // a false positive. When playback actually freezes, `playheadAdvancing` flips
+    // to false and the spinner is allowed to appear.
+    const suppressOverlay = playheadAdvancing && (
       playbackUxState.phase === 'loading' ||
       playbackUxState.isInitialLoading ||
-      (playbackUxState.isBuffering && isPlaying)
+      playbackUxState.isBuffering
     );
 
     return (

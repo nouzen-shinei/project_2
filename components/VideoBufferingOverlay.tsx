@@ -52,10 +52,12 @@ export function VideoBufferingOverlay({
 
   const backgroundColor = useMemo(() => {
     switch (phase) {
+      case 'loading':
       case 'buffering':
-        return 'rgba(8,12,24,0.4)';
       case 'stalled':
-        return 'rgba(8,12,24,0.55)';
+        // Minimal, streaming-app style: keep the frozen frame visible under a
+        // light scrim and let the centered spinner carry the state — no text box.
+        return 'rgba(0,0,0,0.28)';
       case 'ended':
         return 'rgba(8,12,24,0.5)';
       case 'error':
@@ -66,6 +68,9 @@ export function VideoBufferingOverlay({
   }, [phase]);
 
   const isFullscreen = variant === 'fullscreen';
+  // Transient loading states show ONLY a spinner (like YouTube/Netflix). Text and
+  // action buttons are reserved for states that truly need them (error/ended).
+  const isTransientLoading = phase === 'loading' || phase === 'buffering' || phase === 'stalled';
   const showPercentText =
     showPercent && typeof bufferedPercent === 'number' && Number.isFinite(bufferedPercent);
   const actionHandler = onRetry ?? onReplay;
@@ -82,42 +87,56 @@ export function VideoBufferingOverlay({
         overlayStyle,
       ]}
       pointerEvents={shouldHandleTouches ? 'auto' : 'none'}
+      accessible={isTransientLoading}
+      accessibilityLabel={isTransientLoading ? 'Buffering video' : undefined}
     >
-      <View style={[styles.badge, isFullscreen ? styles.badgeFullscreen : null]}>
-        <View style={styles.badgeRow}>
-          {showSpinner ? (
-            <ActivityIndicator size={isFullscreen ? 'large' : 'small'} color={accentColor} />
-          ) : null}
-          <View style={styles.textGroup}>
-            {title ? (
-              <Text style={[styles.title, isFullscreen ? styles.titleFullscreen : null]}>{title}</Text>
+      {isTransientLoading ? (
+        // Single clean centered spinner — the pattern used by major video apps.
+        // No status text, no percentage, no card; the frozen frame stays visible.
+        showSpinner ? (
+          <ActivityIndicator
+            size="large"
+            color={accentColor}
+            style={isFullscreen ? styles.spinnerFullscreen : undefined}
+          />
+        ) : null
+      ) : (
+        <View style={[styles.badge, isFullscreen ? styles.badgeFullscreen : null]}>
+          <View style={styles.badgeRow}>
+            {showSpinner ? (
+              <ActivityIndicator size={isFullscreen ? 'large' : 'small'} color={accentColor} />
             ) : null}
-            {subtitle ? (
-              <Text style={[styles.subtitle, isFullscreen ? styles.subtitleFullscreen : null]}>
-                {subtitle}
+            <View style={styles.textGroup}>
+              {title ? (
+                <Text style={[styles.title, isFullscreen ? styles.titleFullscreen : null]}>{title}</Text>
+              ) : null}
+              {subtitle ? (
+                <Text style={[styles.subtitle, isFullscreen ? styles.subtitleFullscreen : null]}>
+                  {subtitle}
+                </Text>
+              ) : null}
+            </View>
+            {showPercentText ? (
+              <Text style={[styles.percent, isFullscreen ? styles.percentFullscreen : null]}>
+                {Math.round(bufferedPercent)}%
               </Text>
             ) : null}
           </View>
-          {showPercentText ? (
-            <Text style={[styles.percent, isFullscreen ? styles.percentFullscreen : null]}>
-              {Math.round(bufferedPercent)}%
-            </Text>
+          {actionHandler && actionLabel ? (
+            <Pressable
+              onPress={actionHandler}
+              style={({ pressed }) => [
+                styles.actionButton,
+                isFullscreen ? styles.actionButtonFullscreen : null,
+                pressed ? styles.actionButtonPressed : null,
+              ]}
+            >
+              {ActionIcon ? <ActionIcon size={18} color="white" /> : null}
+              <Text style={styles.actionText}>{actionLabel}</Text>
+            </Pressable>
           ) : null}
         </View>
-        {actionHandler && actionLabel ? (
-          <Pressable
-            onPress={actionHandler}
-            style={({ pressed }) => [
-              styles.actionButton,
-              isFullscreen ? styles.actionButtonFullscreen : null,
-              pressed ? styles.actionButtonPressed : null,
-            ]}
-          >
-            {ActionIcon ? <ActionIcon size={18} color="white" /> : null}
-            <Text style={styles.actionText}>{actionLabel}</Text>
-          </Pressable>
-        ) : null}
-      </View>
+      )}
     </Reanimated.View>
   );
 }
@@ -134,6 +153,9 @@ const styles = StyleSheet.create({
   },
   overlayFullscreen: {
     paddingHorizontal: 24,
+  },
+  spinnerFullscreen: {
+    transform: [{ scale: 1.4 }],
   },
   badge: {
     minWidth: 180,
