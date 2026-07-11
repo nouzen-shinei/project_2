@@ -107,8 +107,8 @@ function deriveConversationState(selectedRecipientId: string, items: Map<string,
   return resolveChatPendingConversationDerivedState<PendingTextItem, never, never>({
     selectedRecipientId,
     pendingMessages: items,
-    pendingMedia: new Map(),
-    pendingAttachments: new Map(),
+    pendingMedia: new Map<string, never>(),
+    pendingAttachments: new Map<string, never>(),
     resolvePendingMessageStatus: resolveStatus,
   });
 }

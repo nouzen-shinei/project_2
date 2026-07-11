@@ -23,10 +23,12 @@ import { startPlayBillingReconcileScheduler, getPlayBillingReconcileSchedulerSta
 import {
   decodeInternalToken,
   getConversationWatchStats,
+  getInboxWatchStats,
   getConversationKey,
   normalizeEmail,
   verifyInternalToken,
   watchConversationRealtime,
+  watchUserInboxRealtime,
 } from './chatRealtime';
 import { checkChatRateLimit } from './chatRateLimiter';
 import {
@@ -5905,6 +5907,7 @@ export function createApp(options: CreateAppOptions = {}){
     /^\/billing\/play\/notifications$/,
     /^\/billing\/appstore\/notifications$/,
     /^\/chat\/stream$/,
+    /^\/chat\/inbox-stream$/,
     /^\/admin\/notifications\/history$/,
     /^\/admin\/notifications\/stats$/,
     /^\/admin\/settings\/runtime-endpoints$/,
@@ -6155,7 +6158,7 @@ export function createApp(options: CreateAppOptions = {}){
     const p=req.path; if(p==='/health'||p==='/ready'||p.startsWith('/webhooks/whatsapp')||p==='/auth/bridge'||p.startsWith('/shared-files/public/')) return next();
     if(p==='/billing/stripe/webhook'||p==='/billing/razorpay/webhook'||p==='/billing/play/notifications'||p==='/billing/appstore/notifications') return next();
     if(p==='/billing/checkout/session-public') return next();
-    if(p==='/chat/stream'){
+    if(p==='/chat/stream'||p==='/chat/inbox-stream'){
       const token = typeof req.query.token === 'string' ? req.query.token : undefined;
       if(token && verifyInternalToken(token)) return next();
       return res.sendStatus(401);
@@ -17678,6 +17681,114 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  // Per-user inbound-message stream (SSE). Replaces the client's direct read of
+  // the RTDB `messageIndex` node (which drove in-app chat notifications) so that
+  // node's `.read` rule can be locked to `false`. The backend watches the
+  // CALLER'S OWN inbound index records via the Admin SDK (which bypasses RTDB
+  // rules) and streams a compact inbound event per newly-arrived message.
+  //
+  // Auth mirrors `/chat/stream`: an internal token is required, the actor is
+  // taken from the TOKEN (its `email` claim must match the `user` query param —
+  // a client cannot stream another user's inbox by spoofing the query), and the
+  // user must be an active member of the tenant.
+  app.get('/chat/inbox-stream', async (req, res) => {
+    const master = process.env.INTERNAL_API_KEY;
+    if (!master) {
+      return res.status(501).json({ error: 'not_enabled' });
+    }
+
+    const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+    const tokenPayload = decodeInternalToken(token);
+    if (!token || !tokenPayload) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : '';
+    if (!tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+
+    const userEmail = typeof req.query.user === 'string' ? req.query.user : '';
+    const normalizedUser = normalizeEmail(userEmail);
+    if (!normalizedUser) {
+      return res.status(400).json({ error: 'invalid_user' });
+    }
+
+    // Actor is derived from the TOKEN, never trusted from the query param.
+    if (typeof tokenPayload.email === 'string' && normalizeEmail(tokenPayload.email) !== normalizedUser) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const userIsMember = await isTenantEmailActiveMemberImpl(tenantId, normalizedUser);
+    if (!userIsMember) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    try {
+      ensureFirebase();
+    } catch (error) {
+      console.error('[chat-inbox-stream] firebase init failed', error);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+
+    req.socket.setTimeout(0);
+    req.socket.setNoDelay(true);
+    req.socket.setKeepAlive(true);
+
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    (res as any).flushHeaders?.();
+
+    let closed = false;
+    const send = (payload: unknown) => {
+      if (closed || res.writableEnded) {
+        return;
+      }
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    send({ type: 'ready', payload: { tenantId, user: normalizedUser } });
+
+    let cleanup: (() => void) | null = null;
+    const heartbeat = setInterval(() => {
+      send({ type: 'ping', timestamp: Date.now() });
+    }, 25000);
+
+    const closeStream = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      clearInterval(heartbeat);
+      cleanup?.();
+      if (!res.writableEnded) {
+        res.end();
+      }
+    };
+
+    req.on('close', closeStream);
+    req.on('aborted', closeStream);
+
+    try {
+      cleanup = await watchUserInboxRealtime(tenantId, normalizedUser, {
+        onInbound: (payload) => send({ type: 'inbound', payload }),
+      });
+
+      if (closed) {
+        cleanup();
+        cleanup = null;
+        return;
+      }
+    } catch (error) {
+      console.error('[chat-inbox-stream] watch failed', error);
+      send({ type: 'status', payload: { error: 'internal_error' } });
+      closeStream();
+      return;
+    }
+  });
+
   app.post('/chat/delta', requireMemberTenantAccess, async (req, res) => {
     const authContext = req.authContext;
     if (!authContext) {
@@ -18007,6 +18118,10 @@ export function createApp(options: CreateAppOptions = {}){
     const chatWatchStats = getConversationWatchStats();
     lines.push(`wa_chat_realtime_watches_active ${chatWatchStats.activeWatches}`);
     lines.push(`wa_chat_realtime_watch_subscribers ${chatWatchStats.totalSubscribers}`);
+
+    const chatInboxWatchStats = getInboxWatchStats();
+    lines.push(`wa_chat_inbox_watches_active ${chatInboxWatchStats.activeWatches}`);
+    lines.push(`wa_chat_inbox_watch_subscribers ${chatInboxWatchStats.totalSubscribers}`);
 
     const chatWatchThreshold = readOptionalNumberEnv('ALERT_CHAT_REALTIME_WATCHES_ACTIVE');
     if (chatWatchThreshold !== null) {

@@ -18,6 +18,7 @@ import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 import { maybeShowStorageLimitReachedAlert } from './storageLimitAlert';
 import { tryPresentModalAlert } from './modalAlertService';
 import { chatRealtimeStream, type ChatRealtimeCallbacks } from './chatRealtimeStream';
+import { chatInboxStream } from './chatInboxStream';
 import { tenantService } from './tenantService';
 import { runtimeEndpoints } from './runtimeEndpoints';
 type AuthServiceType = typeof import('../hooks/useAuthUnified').authService;
@@ -174,6 +175,21 @@ interface MessageIndexRecord {
   isSpecial?: boolean;
   hasAttachments?: boolean;
   lastUpdated?: string;
+}
+
+// Compact inbound event streamed by the backend per-user inbox stream
+// (`/chat/inbox-stream`). Mirrors the fields the old client `messageIndex`
+// reader mapped into a lightweight ChatMessage for notifications.
+interface InboxInboundPayload {
+  id: string;
+  sender: string;
+  recipientId?: string;
+  timestamp: string;
+  conversationKey?: string;
+  delivered?: boolean;
+  read?: boolean;
+  isSpecial?: boolean;
+  tenantId?: string;
 }
 
 export interface ConversationLatestRecord {
@@ -1047,119 +1063,6 @@ class ChatService {
       return;
     }
     await set(child(this.tenantMessageIndexRootRef(tenantId), messageId), indexRecord);
-  }
-
-  private async updateMessageIndexRecord(
-    tenantId: string,
-    messageId: string,
-    patch: Partial<MessageIndexRecord>
-  ): Promise<void> {
-    if (!patch || Object.keys(patch).length === 0) {
-      return;
-    }
-    await update(child(this.tenantMessageIndexRootRef(tenantId), messageId), {
-      ...patch,
-      lastUpdated: new Date().toISOString(),
-    });
-  }
-
-  private async getMessageIndexRecord(tenantId: string, messageId: string): Promise<MessageIndexRecord | null> {
-    const snapshot = await get(child(this.tenantMessageIndexRootRef(tenantId), messageId));
-    if (!snapshot.exists()) {
-      return null;
-    }
-    return snapshot.val() as MessageIndexRecord;
-  }
-
-  private async loadMessageById(
-    messageId: string,
-    tenantId: string
-  ): Promise<{ message: ChatMessage; index: MessageIndexRecord } | null> {
-    const indexRecord = await this.getMessageIndexRecord(tenantId, messageId);
-    if (!indexRecord || !indexRecord.conversationKey) {
-      logger.debug('🔍 Missing message index record while loading message', { messageId });
-      return null;
-    }
-
-    const conversationRef = child(this.tenantConversationMessagesRef(tenantId, indexRecord.conversationKey), messageId);
-    const convoSnapshot = await get(conversationRef);
-    if (!convoSnapshot.exists()) {
-      logger.warn('⚠️ Message index present but conversation record missing', {
-        messageId,
-        conversationKey: indexRecord.conversationKey,
-      });
-      return null;
-    }
-
-    const message = convoSnapshot.val() as ChatMessage;
-    const hydrated: ChatMessage = {
-      ...message,
-      id: messageId,
-      sender: this.normalizeEmail(message?.sender),
-      recipientId: this.normalizeEmail(message?.recipientId) || undefined,
-      conversationKey: indexRecord.conversationKey,
-      tenantId: indexRecord.tenantId ?? message.tenantId,
-      replyTo: normalizeChatReplyContext((message as any)?.replyTo),
-      deliveryProvenance: normalizeChatDeliveryProvenance(message?.deliveryProvenance ?? indexRecord.deliveryProvenance),
-    };
-
-    return { message: hydrated, index: indexRecord };
-  }
-
-  private async applyConversationMessagePatch(
-    messageId: string,
-    message: ChatMessage,
-    patch: Partial<ChatMessage>
-  ): Promise<void> {
-    const tenantId = typeof message.tenantId === 'string' ? message.tenantId : null;
-    if (!tenantId) {
-      throw new Error('Missing tenantId for chat patch write');
-    }
-
-    const normalizedSender = this.normalizeEmail(message.sender);
-    const normalizedRecipient = this.normalizeEmail(message.recipientId);
-    const conversationKey = message.conversationKey || this.getConversationKey(normalizedSender, normalizedRecipient);
-    if (!conversationKey) {
-      return;
-    }
-
-    await update(child(this.tenantConversationMessagesRef(tenantId, conversationKey), messageId), patch);
-
-    const indexPatch: Partial<MessageIndexRecord> = {};
-    if (patch.timestamp) {
-      indexPatch.timestamp = patch.timestamp;
-    }
-    if (patch.delivered !== undefined) {
-      indexPatch.delivered = patch.delivered;
-    }
-    if (patch.read !== undefined) {
-      indexPatch.read = patch.read;
-    }
-    if (patch.deliveryProvenance !== undefined) {
-      indexPatch.deliveryProvenance = normalizeChatDeliveryProvenance(patch.deliveryProvenance);
-    }
-    if (patch.isSpecial !== undefined) {
-      indexPatch.isSpecial = patch.isSpecial;
-    }
-    if (patch.attachments || patch.fileUrl !== undefined) {
-      indexPatch.hasAttachments = Boolean(
-        (patch.attachments && patch.attachments.length > 0) ||
-          patch.fileUrl !== undefined ||
-          message.attachments?.length ||
-          message.fileUrl
-      );
-    }
-    if (Object.keys(indexPatch).length) {
-      await this.updateMessageIndexRecord(tenantId, messageId, indexPatch);
-    }
-
-    await this.registerConversationForUsers(
-      normalizedSender,
-      normalizedRecipient,
-      messageId,
-      patch.timestamp ?? message.timestamp,
-      tenantId
-    );
   }
 
   private async fetchChatPageViaBackend(
@@ -2716,8 +2619,9 @@ class ChatService {
       sub.coalesceTimer = null;
       void this.runSummaryRecomputePass(sub);
     }, windowMs);
-    // Never keep the event loop alive purely for a deferred recompute.
-    timer.unref?.();
+    // Node timers expose unref() to avoid holding the event loop open; RN/web
+    // timers are numbers with no such method — guard by feature-detection.
+    (timer as unknown as { unref?: () => void }).unref?.();
     sub.coalesceTimer = timer;
   }
 
@@ -4091,34 +3995,48 @@ class ChatService {
     return normalized;
   }
 
-  async getAllMessages(): Promise<ChatMessage[]> {
-    try {
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const snapshot = await get(this.tenantMessageIndexRootRef(tenantScopeId));
-      if (!snapshot.exists()) {
-        return [];
-      }
-
-      const indexEntries = snapshot.val() as Record<string, MessageIndexRecord>;
-      const resolvedMessages = await Promise.all(
-        Object.keys(indexEntries).map(async (messageId) => {
-          const record = await this.loadMessageById(messageId, tenantScopeId);
-          return record?.message ?? null;
-        })
-      );
-
-      const messages = resolvedMessages.filter((msg): msg is ChatMessage => Boolean(msg));
-      messages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-      logger.metric('chat.fetchAllMessages', { count: messages.length });
-      return messages;
-    } catch (error) {
-      logger.error('Error getting messages:', error);
-      throw error;
+  // Map a compact server inbound event to the lightweight ChatMessage shape the
+  // notification hook expects (identical to the record shape the prior RTDB
+  // `messageIndex` reader produced: no message body, just routing + status).
+  private mapInboxPayloadToMessage(
+    payload: InboxInboundPayload,
+    tenantScopeId: string
+  ): ChatMessage | null {
+    if (!payload || typeof payload !== 'object') {
+      return null;
     }
+    const id = typeof payload.id === 'string' && payload.id.trim().length > 0 ? payload.id : null;
+    const sender = this.normalizeEmail(payload.sender);
+    if (!id || !sender || !payload.timestamp) {
+      return null;
+    }
+    return {
+      id,
+      sender,
+      recipientId: this.normalizeEmail(payload.recipientId) || undefined,
+      text: '',
+      timestamp: payload.timestamp,
+      isSpecial: Boolean(payload.isSpecial),
+      delivered: Boolean(payload.delivered),
+      read: Boolean(payload.read),
+      conversationKey: payload.conversationKey,
+      tenantId: payload.tenantId ?? tenantScopeId,
+    } as ChatMessage;
   }
 
+  // Global per-user "a new inbound message arrived for me" signal that powers
+  // in-app chat notifications (hooks/useNotifications.ts).
+  //
+  // chat-production-hardening (messageIndex read lockdown): this NO LONGER reads
+  // the RTDB `tenantChat/{tenantId}/messageIndex` node from the client. Instead
+  // it subscribes to the authenticated backend per-user inbound stream
+  // (`chatInboxStream` -> `/chat/inbox-stream`), where the server watches the
+  // caller's own inbound index records via the Admin SDK (which bypasses rules).
+  // The callback contract is preserved: it is invoked with lightweight
+  // ChatMessage records (empty `text`, routing + status only), so the hook's
+  // filtering/dedup/notification logic is unchanged. Each stream event carries a
+  // single newly-arrived inbound message; the hook already filters by recency
+  // and dedups by id.
   onMessagesChange(recipientEmail: string, callback: (messages: ChatMessage[]) => void): () => void {
     if (typeof callback !== 'function') {
       logger.warn('onMessagesChange invoked without a valid callback', {
@@ -4134,65 +4052,58 @@ class ChatService {
       return () => {};
     }
 
-    let detached: (() => void) | null = null;
+    const baseUrl = this.getChatBackendBaseUrl();
+    if (!baseUrl || !this.realtimeStreamEnabled) {
+      // No server-side inbox stream available. Emit an empty set (parity with the
+      // prior no-data path) and read nothing from RTDB.
+      callback([]);
+      return () => {};
+    }
+
+    let close: (() => void) | null = null;
     let cancelled = false;
 
     const attach = async () => {
       const resolvedTenantId = await tenantService.getCachedSelectedTenant();
       const tenantScopeId = this.requireTenantId(resolvedTenantId);
+      if (cancelled) {
+        return;
+      }
 
-      const recipientQuery = query(
-        this.tenantMessageIndexRootRef(tenantScopeId),
-        orderByChild('recipientId'),
-        equalTo(normalizedRecipient)
-      );
+      const subscriptionClose = await chatInboxStream.subscribe<InboxInboundPayload>({
+        baseUrl,
+        tenantId: tenantScopeId,
+        userEmail: normalizedRecipient,
+        onInbound: (payload) => {
+          const message = this.mapInboxPayloadToMessage(payload, tenantScopeId);
+          if (!message) {
+            return;
+          }
+          logger.metric('chat.listener.userInbox', {
+            recipient: normalizedRecipient,
+            count: 1,
+          });
+          callback([message]);
+        },
+      });
 
-      const listener = async (snapshot: any) => {
-        if (!snapshot.exists()) {
-          callback([]);
-          return;
-        }
-
-        const indexEntries = snapshot.val() as Record<string, MessageIndexRecord>;
-        const messages = Object.entries(indexEntries).map(([messageId, record]) => ({
-          id: messageId,
-          sender: record.sender,
-          recipientId: record.recipientId || undefined,
-          text: '',
-          timestamp: record.timestamp,
-          isSpecial: Boolean(record.isSpecial),
-          delivered: Boolean(record.delivered),
-          read: Boolean(record.read),
-          conversationKey: record.conversationKey,
-          tenantId: record.tenantId ?? tenantScopeId,
-        })) as ChatMessage[];
-
-        logger.metric('chat.listener.userIndex', {
-          recipient: normalizedRecipient,
-          count: messages.length,
-        });
-
-        callback(messages);
-      };
-
-      onValue(recipientQuery, listener);
-      detached = () => {
-        try {
-          off(recipientQuery, 'value', listener);
-        } catch {}
-      };
+      if (cancelled) {
+        subscriptionClose?.();
+        return;
+      }
+      close = subscriptionClose;
     };
 
     void attach().catch((error) => {
       if (!cancelled) {
-        logger.warn('Failed to subscribe to message index', { error });
+        logger.warn('Failed to subscribe to inbound message stream', { error });
       }
-      callback([]);
     });
 
     return () => {
       cancelled = true;
-      detached?.();
+      close?.();
+      close = null;
     };
   }
 
@@ -4461,191 +4372,6 @@ class ChatService {
     };
   }
 
-  // Mark message as delivered (double tick)
-  async markMessageAsDelivered(messageId: string): Promise<void> {
-    try {
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const record = await this.loadMessageById(messageId, tenantScopeId);
-      if (!record) {
-        return;
-      }
-
-      const { message } = record;
-      if (message.delivered) {
-        return;
-      }
-
-      const deliveredAt = new Date().toISOString();
-      await this.applyConversationMessagePatch(messageId, message, {
-        delivered: true,
-        deliveredAt,
-      });
-
-      await this.applySummaryUpdatesForMessage(
-        messageId,
-        { ...message, delivered: true, deliveredAt },
-        { updateIfSameMessageId: true }
-      );
-
-      logger.metric('chat.message.delivered', {
-        conversationKey: message.conversationKey,
-      });
-    } catch (error) {
-      logger.error('Error marking message as delivered:', error);
-      throw error;
-    }
-  }
-
-  // Mark message as read (blue tick)
-  async markMessageAsRead(messageId: string): Promise<void> {
-    try {
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const record = await this.loadMessageById(messageId, tenantScopeId);
-      if (!record) {
-        return;
-      }
-
-      const { message } = record;
-      if (message.read) {
-        return;
-      }
-
-      const readAt = new Date().toISOString();
-      const deliveredAt = message.deliveredAt ?? readAt;
-
-      await this.applyConversationMessagePatch(messageId, message, {
-        read: true,
-        readAt,
-        delivered: true,
-        deliveredAt,
-      });
-
-      await this.applySummaryUpdatesForMessage(
-        messageId,
-        { ...message, read: true, readAt, delivered: true, deliveredAt },
-        {
-          recipientUnreadStrategy: 'decrement',
-          recipientUnreadAmount: 1,
-          updateIfSameMessageId: true,
-        }
-      );
-      logger.metric('chat.message.read', {
-        conversationKey: message.conversationKey,
-      });
-    } catch (error) {
-      logger.error('Error marking message as read:', error);
-      throw error;
-    }
-  }
-
-  // Mark multiple messages as delivered
-  async markMessagesAsDelivered(messageIds: string[]): Promise<void> {
-    try {
-      if (!messageIds.length) {
-        return;
-      }
-
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const records = await Promise.all(messageIds.map((id) => this.loadMessageById(id, tenantScopeId)));
-      const pending = records
-        .map((record, index) => (record ? { id: messageIds[index], message: record.message } : null))
-        .filter((entry): entry is { id: string; message: ChatMessage } => Boolean(entry && !entry.message.delivered));
-      if (!pending.length) {
-        return;
-      }
-
-      const deliveredAt = new Date().toISOString();
-
-      await Promise.all(
-        pending.map(({ id, message }) =>
-          this.applyConversationMessagePatch(id, message, {
-            delivered: true,
-            deliveredAt,
-          })
-        )
-      );
-
-      await Promise.all(
-        pending.map(({ id, message }) =>
-          this.applySummaryUpdatesForMessage(
-            id,
-            { ...message, delivered: true, deliveredAt },
-            { updateIfSameMessageId: true }
-          )
-        )
-      );
-
-      logger.debug('✓✓ Batch delivered:', pending.length, 'messages');
-    } catch (error) {
-      logger.error('Error marking messages as delivered:', error);
-      throw error;
-    }
-  }
-
-  // Mark multiple messages as read
-  async markMessagesAsRead(messageIds: string[]): Promise<void> {
-    try {
-      if (!messageIds.length) {
-        return;
-      }
-
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const records = await Promise.all(messageIds.map((id) => this.loadMessageById(id, tenantScopeId)));
-      const pending = records
-        .map((record, index) => (record ? { id: messageIds[index], message: record.message } : null))
-        .filter((entry): entry is { id: string; message: ChatMessage } => Boolean(entry && !entry.message.read));
-      if (!pending.length) {
-        return;
-      }
-
-      const readAt = new Date().toISOString();
-
-      await Promise.all(
-        pending.map(({ id, message }) =>
-          this.applyConversationMessagePatch(id, message, {
-            read: true,
-            readAt,
-            delivered: true,
-            deliveredAt: message.deliveredAt ?? readAt,
-          })
-        )
-      );
-
-      await Promise.all(
-        pending.map(({ id, message }) =>
-          this.applySummaryUpdatesForMessage(
-            id,
-            {
-              ...message,
-              read: true,
-              readAt,
-              delivered: true,
-              deliveredAt: message.deliveredAt ?? readAt,
-            },
-            {
-              recipientUnreadStrategy: 'decrement',
-              recipientUnreadAmount: 1,
-              updateIfSameMessageId: true,
-            }
-          )
-        )
-      );
-
-      logger.debug('👁️ Batch read:', pending.length, 'messages');
-    } catch (error) {
-      logger.error('Error marking messages as read:', error);
-      throw error;
-    }
-  }
-
   // Mark every unread incoming message in a conversation as read.
   //
   // chat-production-hardening (finding P0-1 — Model A: backend is the only chat
@@ -4781,125 +4507,6 @@ class ChatService {
     }
   }
 
-  // Get undelivered messages for a user
-  async getUndeliveredMessages(recipientEmail: string): Promise<ChatMessage[]> {
-    try {
-      const normalizedRecipient = this.normalizeEmail(recipientEmail);
-      if (!normalizedRecipient) {
-        return [];
-      }
-
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const recipientQuery = query(
-        this.tenantMessageIndexRootRef(tenantScopeId),
-        orderByChild('recipientId'),
-        equalTo(normalizedRecipient)
-      );
-      const snapshot = await get(recipientQuery);
-      if (!snapshot.exists()) {
-        return [];
-      }
-
-      const indexEntries = snapshot.val() as Record<string, MessageIndexRecord>;
-      const pendingIds = Object.entries(indexEntries)
-        .filter(([, record]) => !record.delivered)
-        .map(([messageId]) => messageId);
-
-      const resolved = await Promise.all(pendingIds.map((id) => this.loadMessageById(id, tenantScopeId)));
-      const messages = resolved
-        .map((record) => record?.message ?? null)
-        .filter((msg): msg is ChatMessage => Boolean(msg));
-
-      return messages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-    } catch (error) {
-      logger.error('Error getting undelivered messages:', error);
-      return [];
-    }
-  }
-
-  // Get unread messages for a user
-  async getUnreadMessages(recipientEmail: string): Promise<ChatMessage[]> {
-    try {
-      const normalizedRecipient = this.normalizeEmail(recipientEmail);
-      if (!normalizedRecipient) {
-        return [];
-      }
-
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const recipientQuery = query(
-        this.tenantMessageIndexRootRef(tenantScopeId),
-        orderByChild('recipientId'),
-        equalTo(normalizedRecipient)
-      );
-      const snapshot = await get(recipientQuery);
-      if (!snapshot.exists()) {
-        return [];
-      }
-
-      const indexEntries = snapshot.val() as Record<string, MessageIndexRecord>;
-      const pendingIds = Object.entries(indexEntries)
-        .filter(([, record]) => !record.read)
-        .map(([messageId]) => messageId);
-
-      const resolved = await Promise.all(pendingIds.map((id) => this.loadMessageById(id, tenantScopeId)));
-      const messages = resolved
-        .map((record) => record?.message ?? null)
-        .filter((msg): msg is ChatMessage => Boolean(msg));
-
-      return messages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-    } catch (error) {
-      logger.error('Error getting unread messages:', error);
-      return [];
-    }
-  }
-
-  // Mark messages as delivered when recipient comes online
-  async markPendingMessagesAsDelivered(recipientEmail: string): Promise<number> {
-    try {
-      const normalizedRecipient = this.normalizeEmail(recipientEmail);
-      if (!normalizedRecipient) {
-        return 0;
-      }
-
-      const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-      const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-      const recipientQuery = query(
-        this.tenantMessageIndexRootRef(tenantScopeId),
-        orderByChild('recipientId'),
-        equalTo(normalizedRecipient)
-      );
-      const snapshot = await get(recipientQuery);
-      if (!snapshot.exists()) {
-        return 0;
-      }
-
-      const indexEntries = snapshot.val() as Record<string, MessageIndexRecord>;
-      const messagesToDeliver = Object.entries(indexEntries)
-        .filter(([, record]) => !record.delivered && record.timestamp)
-        .map(([messageId]) => messageId);
-
-      if (messagesToDeliver.length > 0) {
-        logger.debug('📨 Marking pending messages as delivered for online user:', {
-          recipient: recipientEmail,
-          messageCount: messagesToDeliver.length
-        });
-        
-        await this.markMessagesAsDelivered(messagesToDeliver);
-        return messagesToDeliver.length;
-      }
-
-      return 0;
-    } catch (error) {
-      logger.error('Error marking pending messages as delivered:', error);
-      return 0;
-    }
-  }
-
   // Get unread message count for a specific conversation between two users
   async getUnreadMessageCount(currentUserEmail: string, otherUserEmail: string): Promise<number> {
     try {
@@ -4972,82 +4579,6 @@ class ChatService {
     } catch (error) {
       logger.error('Error getting last message:', error);
       return null;
-    }
-  }
-
-  // Listen for message status changes for real-time updates
-  onMessageStatusChange(userEmail: string, callback: () => void): () => void {
-    try {
-      logger.debug('🔄 Setting up message status listener for user:', userEmail);
-      
-      // Use a more targeted approach - listen for changes to messages
-      // We'll throttle the callback to avoid too many refreshes
-      let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
-      const normalizedUser = this.normalizeEmail(userEmail);
-      if (!normalizedUser) {
-        return () => {};
-      }
-
-      let detached: (() => void) | null = null;
-      let cancelled = false;
-
-      const attach = async () => {
-        const resolvedTenantId = await tenantService.getCachedSelectedTenant();
-        const tenantScopeId = this.requireTenantId(resolvedTenantId);
-
-        const queries = [
-          query(this.tenantMessageIndexRootRef(tenantScopeId), orderByChild('recipientId'), equalTo(normalizedUser)),
-          query(this.tenantMessageIndexRootRef(tenantScopeId), orderByChild('sender'), equalTo(normalizedUser)),
-        ];
-
-        const listeners = queries.map((q) =>
-          onValue(q, (snapshot) => {
-            if (!snapshot.exists()) {
-              return;
-            }
-            if (timeoutId) {
-              clearTimeout(timeoutId);
-            }
-            timeoutId = setTimeout(() => {
-              logger.metric('chat.listener.statusTick', {
-                user: normalizedUser,
-                buckets: queries.length,
-              });
-              callback();
-              timeoutId = null;
-            }, 2000);
-          })
-        );
-
-        detached = () => {
-          logger.debug('🔄 Cleaning up message status listener');
-          if (timeoutId) {
-            clearTimeout(timeoutId);
-          }
-          listeners.forEach((listener, index) => {
-            try {
-              off(queries[index], 'value', listener);
-            } catch (error) {
-              logger.debug('Failed to remove status listener', { error });
-            }
-          });
-        };
-      };
-
-      void attach().catch((error) => {
-        if (!cancelled) {
-          logger.warn('Failed to subscribe to message status changes', { error });
-        }
-      });
-
-      return () => {
-        cancelled = true;
-        detached?.();
-      };
-    } catch (error) {
-      logger.error('Error setting up message status listener:', error);
-      return () => {}; // Return empty cleanup function
     }
   }
 

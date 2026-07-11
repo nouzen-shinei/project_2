@@ -107,7 +107,7 @@ function isListenCalledTwiceError(error: unknown): boolean {
  * rethrown unchanged.
  */
 function safeAttachListener(
-  ref: admin.database.Reference,
+  ref: admin.database.Query,
   eventType: 'child_added' | 'child_changed',
   callback: (snapshot: admin.database.DataSnapshot) => void
 ): void {
@@ -767,3 +767,313 @@ function broadcast(watchKey: string, emit: (subscriber: ConversationWatcherHandl
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Per-user inbox realtime watch (chat-production-hardening — messageIndex
+// read lockdown).
+//
+// WHY: the client used to read the RTDB `tenantChat/{tenantId}/messageIndex`
+// node directly (a `orderByChild('recipientId').equalTo(me)` query) purely to
+// drive the global "a new inbound message arrived for me" signal that powers
+// in-app chat notifications (`hooks/useNotifications.ts`). That client read is
+// the last thing forcing `messageIndex .read` open. This server-side watcher
+// replaces it: the backend (Admin SDK, which bypasses RTDB rules) watches the
+// caller's OWN inbound index records and streams a compact inbound event to the
+// authenticated client, so `messageIndex .read` can be locked to `false`.
+//
+// It mirrors `watchConversationRealtime`: one shared Firebase listen per
+// (tenant, recipient) multiplexed across subscribers, a `.once('value')` seed
+// that suppresses the initial burst (only genuinely NEW inbound records are
+// emitted), `safeAttachListener` recovery for the "listen() called twice"
+// assert, a grace-window deferred release, and idempotent teardown. Only
+// `child_added` is watched — status flips (delivered/read) on existing messages
+// never produce a NEW inbound notification, so they are intentionally ignored.
+// ---------------------------------------------------------------------------
+
+/** Compact inbound event streamed to a client for notification purposes. */
+export interface InboxInboundPayload {
+  id: string;
+  sender: string;
+  recipientId?: string;
+  timestamp: string;
+  conversationKey?: string;
+  delivered?: boolean;
+  read?: boolean;
+  isSpecial?: boolean;
+  tenantId?: string;
+}
+
+export interface InboxWatcherHandlers {
+  onInbound?: (payload: InboxInboundPayload) => void;
+}
+
+interface SharedInboxWatch {
+  subscribers: Map<number, InboxWatcherHandlers>;
+  nextSubscriberId: number;
+  cleanupFirebase: (() => void) | null;
+  initPromise: Promise<void>;
+  torndown: boolean;
+  pendingReleaseTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const sharedInboxWatches = new Map<string, SharedInboxWatch>();
+
+export interface InboxWatchStats {
+  activeWatches: number;
+  totalSubscribers: number;
+}
+
+export function getInboxWatchStats(): InboxWatchStats {
+  let totalSubscribers = 0;
+  for (const watch of sharedInboxWatches.values()) {
+    totalSubscribers += watch.subscribers.size;
+  }
+  return {
+    activeWatches: sharedInboxWatches.size,
+    totalSubscribers,
+  };
+}
+
+function inboxWatchKey(tenantId: string, recipientEmail: string): string {
+  return [
+    typeof tenantId === 'string' ? tenantId.trim() : '',
+    normalizeEmail(recipientEmail),
+  ].join('::');
+}
+
+/** Test hook: is a deferred release pending for this user's inbox watch? */
+export function __hasPendingInboxRelease(tenantId: string, recipientEmail: string): boolean {
+  const watch = sharedInboxWatches.get(inboxWatchKey(tenantId, recipientEmail));
+  return !!watch && watch.pendingReleaseTimer !== null;
+}
+
+/** Test hook: number of inbox watches with a deferred release pending. */
+export function __getInboxPendingReleaseCount(): number {
+  let count = 0;
+  for (const watch of sharedInboxWatches.values()) {
+    if (watch.pendingReleaseTimer !== null) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Minimal shape shared by every shared-watch so the release helpers below can be
+ * generic over both conversation and inbox watches without touching the
+ * conversation code path.
+ */
+interface ReleasableSharedWatch {
+  subscribers: Map<number, unknown>;
+  cleanupFirebase: (() => void) | null;
+  torndown: boolean;
+  pendingReleaseTimer: ReturnType<typeof setTimeout> | null;
+}
+
+function cancelGenericPendingRelease(watch: ReleasableSharedWatch): void {
+  if (watch.pendingReleaseTimer !== null) {
+    clearTimeout(watch.pendingReleaseTimer);
+    watch.pendingReleaseTimer = null;
+  }
+}
+
+function releaseGenericSharedWatch<W extends ReleasableSharedWatch>(
+  watches: Map<string, W>,
+  watchKey: string,
+  watch: W
+): void {
+  if (watch.subscribers.size > 0) {
+    return;
+  }
+  cancelGenericPendingRelease(watch);
+  if (watches.get(watchKey) === watch) {
+    watches.delete(watchKey);
+  }
+  watch.cleanupFirebase?.();
+}
+
+function scheduleGenericSharedWatchRelease<W extends ReleasableSharedWatch>(
+  watches: Map<string, W>,
+  watchKey: string,
+  watch: W
+): void {
+  if (watch.torndown || watch.pendingReleaseTimer !== null) {
+    return;
+  }
+  const graceMs = sharedWatchReleaseGraceMs;
+  if (graceMs <= 0) {
+    releaseGenericSharedWatch(watches, watchKey, watch);
+    return;
+  }
+  const timer = setTimeout(() => {
+    watch.pendingReleaseTimer = null;
+    releaseGenericSharedWatch(watches, watchKey, watch);
+  }, graceMs);
+  timer.unref?.();
+  watch.pendingReleaseTimer = timer;
+}
+
+function normalizeInboxSnapshot(
+  snapshot: admin.database.DataSnapshot,
+  tenantId: string
+): InboxInboundPayload | null {
+  if (!snapshot.key) {
+    return null;
+  }
+  const raw = snapshot.val() as Record<string, any> | null;
+  if (!raw) {
+    return null;
+  }
+  const sender = normalizeEmail(raw.sender);
+  const timestamp = normalizeTimestampField(raw.timestamp);
+  if (!sender || !timestamp) {
+    return null;
+  }
+  const recipientId = normalizeEmail(raw.recipientId);
+  return {
+    id: snapshot.key,
+    sender,
+    recipientId: recipientId || undefined,
+    timestamp,
+    conversationKey: normalizeStringField(raw.conversationKey),
+    delivered: normalizeBooleanFlag(raw.delivered),
+    read: normalizeBooleanFlag(raw.read),
+    isSpecial: raw.isSpecial === true ? true : undefined,
+    tenantId: normalizeStringField(raw.tenantId) ?? tenantId,
+  };
+}
+
+function broadcastInbox(watchKey: string, emit: (subscriber: InboxWatcherHandlers) => void): void {
+  const watch = sharedInboxWatches.get(watchKey);
+  if (!watch || watch.subscribers.size === 0) {
+    return;
+  }
+  for (const subscriber of watch.subscribers.values()) {
+    try {
+      emit(subscriber);
+    } catch (error) {
+      console.warn('[chat-inbox] subscriber callback failed', error);
+    }
+  }
+}
+
+/**
+ * Watch a single user's inbound messages (server-side, Admin SDK) and invoke
+ * `handlers.onInbound` for each NEW inbound `messageIndex` record addressed to
+ * `recipientEmail`. Returns an unsubscribe function. Shared + ref-counted per
+ * (tenant, recipient); the underlying Firebase listen is released a grace window
+ * after the last subscriber leaves.
+ */
+export async function watchUserInboxRealtime(
+  tenantId: string,
+  recipientEmail: string,
+  handlers: InboxWatcherHandlers
+): Promise<() => void> {
+  ensureFirebase();
+  const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+  const normalizedRecipient = normalizeEmail(recipientEmail);
+  if (!normalizedTenantId) {
+    throw new Error('Missing tenantId for watchUserInboxRealtime');
+  }
+  if (!normalizedRecipient) {
+    throw new Error('Missing recipient for watchUserInboxRealtime');
+  }
+
+  const watchKey = [normalizedTenantId, normalizedRecipient].join('::');
+  let watch = sharedInboxWatches.get(watchKey);
+
+  if (watch) {
+    // Reuse a live watch inside its grace-window release: cancel the pending
+    // teardown and reuse the still-attached Firebase listener (no re-attach).
+    cancelGenericPendingRelease(watch);
+  }
+
+  if (!watch) {
+    const db = admin.database();
+    const indexQuery = db
+      .ref('tenantChat')
+      .child(normalizedTenantId)
+      .child('messageIndex')
+      .orderByChild('recipientId')
+      .equalTo(normalizedRecipient);
+
+    const knownMessageIds = new Set<string>();
+
+    const inboundListener = (snapshot: admin.database.DataSnapshot) => {
+      if (!snapshot.key) {
+        return;
+      }
+      if (knownMessageIds.has(snapshot.key)) {
+        return;
+      }
+      knownMessageIds.add(snapshot.key);
+      const payload = normalizeInboxSnapshot(snapshot, normalizedTenantId);
+      if (!payload) {
+        return;
+      }
+      broadcastInbox(watchKey, (subscriber) => subscriber.onInbound?.(payload));
+    };
+
+    watch = {
+      subscribers: new Map<number, InboxWatcherHandlers>(),
+      nextSubscriberId: 1,
+      cleanupFirebase: null,
+      initPromise: Promise.resolve(),
+      torndown: false,
+      pendingReleaseTimer: null,
+    };
+
+    watch.initPromise = (async () => {
+      // Seed known ids so the child_added burst for pre-existing inbound records
+      // is suppressed — only messages that arrive AFTER the watch starts are
+      // streamed (matching the "new inbound message" notification signal).
+      const initialSnapshot = await indexQuery.once('value');
+      initialSnapshot.forEach((child) => {
+        if (child.key) {
+          knownMessageIds.add(child.key);
+        }
+        return false;
+      });
+
+      safeAttachListener(indexQuery, 'child_added', inboundListener);
+
+      watch!.cleanupFirebase = () => {
+        if (watch!.torndown) {
+          return;
+        }
+        watch!.torndown = true;
+        indexQuery.off('child_added', inboundListener);
+      };
+    })();
+
+    sharedInboxWatches.set(watchKey, watch);
+  }
+
+  const subscriberId = watch.nextSubscriberId++;
+  watch.subscribers.set(subscriberId, handlers);
+
+  try {
+    await watch.initPromise;
+  } catch (error) {
+    watch.subscribers.delete(subscriberId);
+    if (watch.subscribers.size === 0) {
+      cancelGenericPendingRelease(watch);
+      if (sharedInboxWatches.get(watchKey) === watch) {
+        sharedInboxWatches.delete(watchKey);
+      }
+      watch.cleanupFirebase?.();
+    }
+    throw error;
+  }
+
+  return () => {
+    const current = sharedInboxWatches.get(watchKey);
+    if (!current) {
+      return;
+    }
+    current.subscribers.delete(subscriberId);
+    if (current.subscribers.size === 0) {
+      scheduleGenericSharedWatchRelease(sharedInboxWatches, watchKey, current);
+    }
+  };
+}

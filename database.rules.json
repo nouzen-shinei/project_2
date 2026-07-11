@@ -21,7 +21,7 @@
           }
         },
         "messageIndex": {
-          ".read": "auth != null",
+          ".read": false,
           ".indexOn": ["timestamp", "conversationKey", "recipientId", "sender"]
         },
         "conversationClientMsgIndex": {

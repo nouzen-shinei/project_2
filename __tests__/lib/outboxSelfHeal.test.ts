@@ -469,7 +469,7 @@ describe('outboxSelfHeal — property: claimed conversations never receive a re-
         ),
         fc.array(fc.constantFrom('a', 'b', 'c', 'd'), { maxLength: 4 }),
         async (items, claimedArr) => {
-          const claimed = new Set(claimedArr);
+          const claimed = new Set<string>(claimedArr);
           const initial: [string, OutboxPendingMessageLike][] = items.map((it, i) => [
             `t${i}`,
             item({

@@ -258,7 +258,7 @@ export function createOutboxSelfHealState(): OutboxSelfHealRuntimeState {
   };
 }
 
-const EMPTY_MAP: ReadonlyMap<string, never> = new Map();
+const EMPTY_MAP: ReadonlyMap<string, never> = new Map<string, never>();
 
 /**
  * Run one pass of the app-level outbox self-heal driver across ALL persisted
