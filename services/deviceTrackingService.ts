@@ -33,7 +33,6 @@ import {
   getDoc, 
   updateDoc, 
   deleteField,
-  deleteDoc,
   serverTimestamp, 
   onSnapshot, 
   collection,
@@ -2639,30 +2638,6 @@ class DeviceTrackingService {
   }
 
   /**
-   * Remove device completely from database
-   */
-  async removeDevice(userEmail: string, deviceId: string): Promise<void> {
-    try {
-      // Delete the device document from subcollection
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      await deleteDoc(deviceDoc);
-      
-      // Update user's device count
-      const totalDevices = await this.getTotalDevicesCount(userEmail);
-      const userDoc = doc(firestore, 'user_devices', userEmail);
-      await updateDoc(userDoc, {
-        totalDevices: totalDevices,
-        lastActivity: this.createResolvedTimestamp()
-      });
-      
-      logger.debug('Device removed:', deviceId);
-    } catch (error) {
-      logger.error('Failed to remove device:', error);
-      throw error;
-    }
-  }
-
-  /**
    * Get all devices for a user
    */
   async getUserDevices(userEmail: string, options?: DeviceTenantFilterOptions): Promise<UserDevice[]> {
@@ -3669,119 +3644,6 @@ class DeviceTrackingService {
         staleWebPushSubscriptionsCleaned: 0,
         deduplicatedWebPushSubscriptionsCleaned: 0,
       };
-    }
-  }
-
-  /**
-   * Cleanup offline devices (remove devices offline for more than 14 days)
-   */
-  async cleanupOfflineDevices(): Promise<void> {
-    try {
-      const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
-      
-      // Query all user documents to get all users
-      const usersQuery = query(collection(firestore, 'user_devices'));
-      const usersSnapshot = await getDocs(usersQuery);
-      
-      for (const userDoc of usersSnapshot.docs) {
-        const userEmail = userDoc.id;
-        
-        // Get all devices for this user from subcollection
-        const devicesCollection = collection(firestore, 'user_devices', userEmail, 'devices');
-        const devicesSnapshot = await getDocs(devicesCollection);
-        
-        let cleanedCount = 0;
-        
-        for (const deviceDoc of devicesSnapshot.docs) {
-          const device = deviceDoc.data() as UserDevice;
-          const lastSeenDate = device.lastSeen instanceof Timestamp 
-            ? device.lastSeen.toDate() 
-            : new Date(device.lastSeen);
-          
-          if (!device.isOnline && lastSeenDate < fourteenDaysAgo) {
-            // Delete the device document from subcollection
-            await deleteDoc(deviceDoc.ref);
-            cleanedCount++;
-            logger.debug('Cleaned up old device:', deviceDoc.id);
-          }
-        }
-        
-        if (cleanedCount > 0) {
-          // Update user's device count
-          const remainingDevices = await this.getTotalDevicesCount(userEmail);
-          const userDocRef = doc(firestore, 'user_devices', userEmail);
-          await updateDoc(userDocRef, {
-            totalDevices: remainingDevices,
-            lastActivity: this.createResolvedTimestamp()
-          });
-        }
-      }
-    } catch (error) {
-      logger.error('Error cleaning up offline devices:', error);
-    }
-  }
-
-  /**
-   * Cleanup expired device bans (remove bans that have expired)
-   */
-  async cleanupExpiredDeviceBans(): Promise<void> {
-    try {
-      logger.debug('🧹 Starting cleanup of expired device bans...');
-      
-      // Query for all active bans that have an expiration date
-      const expiredBansQuery = query(
-        collection(firestore, 'device_bans'),
-        where('isActive', '==', true),
-        where('expiresAt', '!=', null)
-      );
-
-      const expiredBansSnapshot = await getDocs(expiredBansQuery);
-      let cleanedCount = 0;
-      
-      for (const banDoc of expiredBansSnapshot.docs) {
-        const banData = banDoc.data();
-        
-        if (banData.expiresAt) {
-          const expirationDate = banData.expiresAt instanceof Timestamp 
-            ? banData.expiresAt.toDate() 
-            : new Date(banData.expiresAt);
-          
-          // Check if ban has expired
-          if (new Date() > expirationDate) {
-            // Deactivate expired ban
-            await updateDoc(banDoc.ref, { 
-              isActive: false,
-              expiredAt: this.createResolvedTimestamp(),
-              expiredBy: 'system',
-              expiredReason: 'Automatic cleanup - ban expired'
-            });
-            
-            cleanedCount++;
-            logger.debug(`🧹 Deactivated expired ban: ${banDoc.id} (expired: ${expirationDate.toISOString()})`);
-          }
-        }
-      }
-      
-      logger.debug(`✅ Cleanup completed: ${cleanedCount} expired bans deactivated`);
-    } catch (error) {
-      logger.error('❌ Error cleaning up expired device bans:', error);
-    }
-  }
-
-  /**
-   * Comprehensive cleanup - runs all cleanup operations
-   */
-  async performComprehensiveCleanup(): Promise<void> {
-    try {
-      logger.debug('🧹 Starting comprehensive cleanup...');
-      
-      // Run all cleanup operations
-      await this.cleanupOfflineDevices();
-      await this.cleanupExpiredDeviceBans();
-      
-      logger.debug('✅ Comprehensive cleanup completed');
-    } catch (error) {
-      logger.error('❌ Error during comprehensive cleanup:', error);
     }
   }
 
@@ -4830,166 +4692,6 @@ class DeviceTrackingService {
   // ===== DEVICE MANAGEMENT METHODS =====
 
   /**
-   * Mark device as deleted by admin (soft delete) - also performs force logout
-   */
-  async markDeviceAsDeleted(
-    userEmail: string, 
-    deviceId: string, 
-    adminEmail: string, 
-    adminName: string, 
-    reason: string
-  ): Promise<void> {
-    try {
-      // Get device from subcollection
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      const deviceSnap = await getDoc(deviceDoc);
-      
-      if (!deviceSnap.exists()) {
-        throw new Error('Device not found');
-      }
-
-      const device = deviceSnap.data() as UserDevice;
-
-      // First force logout the device if it's online
-      if (device.isOnline) {
-        logger.debug(`Force logging out device ${deviceId} before deletion`);
-        await this.forceLogoutDevice(userEmail, deviceId, adminEmail, adminName, `Device deletion: ${reason}`);
-      }
-
-      // Update device status in subcollection
-      const updates = {
-        isDeleted: true,
-        deletedAt: this.createResolvedTimestamp(),
-        deletedBy: adminEmail,
-        deletedByName: adminName,
-        deletionReason: reason,
-        updatedAt: this.createResolvedTimestamp(),
-        isOnline: false,
-        logoutSignal: true, // Ensure logout signal is set
-      };
-
-      const cleanUpdates = this.cleanUndefinedValues(updates);
-      await updateDoc(deviceDoc, cleanUpdates);
-
-      // Create logout signal for real-time detection (in case device comes online later)
-      await this.createLogoutSignal(userEmail, deviceId, adminEmail, adminName, `Device deletion: ${reason}`);
-
-      // Log the action
-      await this.logDeviceAction({
-        actionType: 'deleted',
-        deviceId,
-        userId: userEmail,
-        adminEmail,
-        adminName,
-        reason,
-        timestamp: this.createResolvedTimestamp(),
-        deviceData: device
-      });
-
-      logger.debug(`Device ${deviceId} marked as deleted and logged out by admin ${adminName}`);
-    } catch (error) {
-      logger.error('Failed to mark device as deleted:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Permanently delete a device and clean up related records
-   */
-  async deleteDevicePermanently(
-    userEmail: string,
-    deviceId: string,
-    adminEmail: string,
-    adminName: string,
-    reason: string
-  ): Promise<void> {
-    try {
-      // Fetch device to decide if we should force logout first
-      const deviceDocRef = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      const deviceSnap = await getDoc(deviceDocRef);
-      if (!deviceSnap.exists()) {
-        throw new Error('Device not found');
-      }
-
-      const device = deviceSnap.data() as UserDevice;
-
-      // If online, try to force logout before deletion
-      if (device.isOnline) {
-        try {
-          await this.forceLogoutDevice(
-            userEmail,
-            deviceId,
-            adminEmail,
-            adminName,
-            `Permanent deletion: ${reason || 'No reason provided'}`
-          );
-        } catch (e) {
-          logger.warn('Force logout before permanent delete failed, continuing with delete:', e);
-        }
-      }
-
-      // Ensure a persistent logout signal exists with a TTL so returning devices are forced to logout
-      try {
-        const signalRef = doc(firestore, 'logout_signals', `${userEmail}_${deviceId}`);
-        const nowPlus30Days = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        const expiresAt = Timestamp.fromDate(nowPlus30Days);
-        // Create or update the logout signal with persistent metadata
-        await setDoc(
-          signalRef,
-          {
-            userEmail,
-            deviceId,
-            adminEmail,
-            adminName,
-            reason: `Permanent deletion: ${reason || 'No reason provided'}`,
-            createdAt: this.createResolvedTimestamp(),
-            consumed: false,
-            type: 'permanent_delete',
-            persistent: true,
-            expiresAt
-          },
-          { merge: true }
-        );
-      } catch (e) {
-        logger.warn('Failed to set persistent logout signal during permanent delete:', e);
-      }
-
-      // Delete the device document
-      await deleteDoc(deviceDocRef);
-
-      // Delete related device actions for this device+user (best-effort)
-      try {
-        const actionsQ = query(
-          collection(firestore, 'device_actions'),
-          where('userId', '==', userEmail),
-          where('deviceId', '==', deviceId)
-        );
-        const actionsSnap = await getDocs(actionsQ);
-        const deletions: Promise<any>[] = [];
-        actionsSnap.forEach((docSnap) => {
-          deletions.push(deleteDoc(doc(firestore, 'device_actions', docSnap.id)));
-        });
-        if (deletions.length) await Promise.allSettled(deletions);
-      } catch (e) {
-        logger.warn('Best-effort cleanup of device_actions failed:', e);
-      }
-
-      // Update user's device count and last activity
-      const totalDevices = await this.getTotalDevicesCount(userEmail);
-      const userDocRef = doc(firestore, 'user_devices', userEmail);
-      await updateDoc(userDocRef, {
-        totalDevices,
-        lastActivity: this.createResolvedTimestamp()
-      });
-
-      logger.debug(`Device ${deviceId} permanently deleted by ${adminName}`);
-    } catch (error) {
-      logger.error('Failed to permanently delete device:', error);
-      throw error;
-    }
-  }
-
-  /**
    * Get a specific device by ID
    */
   async getDeviceById(userEmail: string, deviceId: string): Promise<UserDevice | null> {
@@ -5047,163 +4749,6 @@ class DeviceTrackingService {
       logger.debug(`Device ${deviceId} automatically restored: ${reason}`);
     } catch (error) {
       logger.error('Failed to restore deleted device:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Restore a deleted device (admin action)
-   * This method now automatically detects hard banned devices and calls the appropriate restoration method
-   */
-  async restoreDevice(
-    userEmail: string, 
-    deviceId: string, 
-    adminEmail: string, 
-    adminName: string
-  ): Promise<void> {
-    try {
-      // First check if this device is hard banned
-      const deviceForCheck = await this.getDeviceById(userEmail, deviceId);
-      if (!deviceForCheck) {
-        throw new Error('Device not found');
-      }
-
-      // Check if device is hard banned
-      const banCheck = await this.isDeviceBannedForUser(deviceForCheck, userEmail);
-      if (banCheck) {
-        // If device is hard banned, call the hard ban restoration method instead
-        await this.restoreHardBannedDevice(userEmail, deviceId, adminEmail, adminName);
-        return;
-      }
-
-      // If not hard banned, proceed with regular device restoration
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      const updates = {
-        isDeleted: false,
-        isRestored: true,
-        restoredAt: this.createResolvedTimestamp(),
-        updatedAt: this.createResolvedTimestamp(),
-        // Clear deletion fields
-        deletedAt: deleteField(),
-        deletedBy: deleteField(),
-        deletedByName: deleteField(),
-        deletionReason: deleteField()
-      };
-
-      const cleanUpdates = this.cleanUndefinedValues(updates);
-      await updateDoc(deviceDoc, cleanUpdates);
-
-      // Update user's last activity
-      const userDoc = doc(firestore, 'user_devices', userEmail);
-      await updateDoc(userDoc, { lastActivity: this.createResolvedTimestamp() });
-
-      // Log the action
-      await this.logDeviceAction({
-        actionType: 'restored',
-        deviceId,
-        userId: userEmail,
-        adminEmail,
-        adminName,
-        timestamp: this.createResolvedTimestamp()
-      });
-
-      logger.debug(`Device ${deviceId} restored by admin ${adminName}`);
-    } catch (error) {
-      logger.error('Failed to restore device:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Restore a hard banned device by deactivating its ban
-   */
-  async restoreHardBannedDevice(
-    userEmail: string, 
-    deviceId: string, 
-    adminEmail: string, 
-    adminName: string
-  ): Promise<void> {
-    try {
-      // Get the device to find its fingerprint
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      const deviceSnapshot = await getDoc(deviceDoc);
-      
-      if (!deviceSnapshot.exists()) {
-        throw new Error('Device not found');
-      }
-
-      const device = deviceSnapshot.data() as UserDevice;
-      const deviceFingerprint = await this.generateDeviceFingerprint(device);
-
-      // Find and delete active bans for this user+device combination
-      const bansQuery = query(
-        collection(firestore, 'device_bans'),
-        where('deviceFingerprint', '==', deviceFingerprint),
-        where('targetUserEmail', '==', userEmail),
-        where('isActive', '==', true)
-      );
-
-      const bansSnapshot = await getDocs(bansQuery);
-      
-      if (bansSnapshot.empty) {
-        throw new Error('No active ban found for this device');
-      }
-
-      // Delete all matching ban documents completely
-      const deletionPromises = [];
-      for (const banDoc of bansSnapshot.docs) {
-        const banData = banDoc.data();
-        
-        // Log the restoration before deleting the document
-        await this.logDeviceAction({
-          actionType: 'restored',
-          deviceId,
-          userId: userEmail,
-          adminEmail,
-          adminName,
-          reason: `Hard ban restored and removed - Original reason: ${banData.reason || 'Unknown'}`,
-          timestamp: this.createResolvedTimestamp()
-        });
-        
-        deletionPromises.push(deleteDoc(banDoc.ref));
-      }
-
-      await Promise.all(deletionPromises);
-
-      // Also restore the device if it was deleted during the ban process
-      const updates = {
-        isDeleted: false,
-        isRestored: true,
-        restoredAt: this.createResolvedTimestamp(),
-        updatedAt: this.createResolvedTimestamp(),
-        // Clear deletion fields if they exist
-        deletedAt: deleteField(),
-        deletedBy: deleteField(),
-        deletedByName: deleteField(),
-        deletionReason: deleteField()
-      };
-
-      const cleanUpdates = this.cleanUndefinedValues(updates);
-      await updateDoc(deviceDoc, cleanUpdates);
-
-      // Update user's last activity
-      const userDoc = doc(firestore, 'user_devices', userEmail);
-      await updateDoc(userDoc, { lastActivity: this.createResolvedTimestamp() });
-
-      // Log the action
-      await this.logDeviceAction({
-        actionType: 'restored',
-        deviceId,
-        userId: userEmail,
-        adminEmail,
-        adminName,
-        reason: 'Hard ban restored and ban document deleted',
-        timestamp: this.createResolvedTimestamp()
-      });
-
-      logger.debug(`Hard banned device ${deviceId} restored and ban document deleted by admin ${adminName}`);
-    } catch (error) {
-      logger.error('Failed to restore hard banned device:', error);
       throw error;
     }
   }
@@ -5267,156 +4812,86 @@ class DeviceTrackingService {
   }
 
   /**
-   * Force logout all devices for a specific user
+   * Force logout all devices for a specific user via the backend Device Admin API.
+   *
+   * This used to write directly to Firestore (`logout_signals` / `user_devices`)
+   * from the device, but those collections are now locked to backend-only writes,
+   * so the privileged force-logout is delegated to the server. The app client
+   * authenticates with a per-user internal token (Firebase ID token ->
+   * `/auth/bridge`) and proves tenant-admin access, then POSTs to the
+   * tenant-admin-authorized `POST /tenants/{tenantId}/members/force-logout`
+   * endpoint (which reuses the same server-side force-logout-all orchestrator as
+   * the Device Console). No Firestore write happens here anymore.
+   *
+   * Requires a `tenantId` (the endpoint is tenant-scoped) and a resolvable
+   * backend base URL + internal token. When the base URL or token is unavailable
+   * (offline / not signed in) this throws a clear error so the caller's existing
+   * try/catch can log and continue — the caller must not depend on this
+   * succeeding to complete an email removal (graceful degradation).
    */
   async forceLogoutAllUserDevices(
     userEmail: string,
+    tenantId: string,
     reason?: string
   ): Promise<void> {
-    try {
-      logger.debug(`🚨 Force logging out all devices for user: ${userEmail}`);
-      
-      // Get all devices from subcollection
-      const devices = await this.getUserDevices(userEmail);
-      
-      if (devices.length === 0) {
-        logger.debug(`No devices found for user: ${userEmail}`);
-        return;
+    const normalizedTenantId = typeof tenantId === 'string' ? tenantId.trim() : '';
+    if (!normalizedTenantId) {
+      throw new Error('forceLogoutAllUserDevices requires a tenantId');
+    }
+
+    logger.debug(`🚨 Requesting backend force-logout for all devices of user: ${userEmail}`, {
+      tenantId: normalizedTenantId,
+      reason,
+    });
+
+    const baseUrl = runtimeEndpoints.getPreferredBackendBaseUrl()?.replace(/\/+$/, '');
+    if (!baseUrl) {
+      throw new Error('Backend base URL unavailable; cannot force logout user devices.');
+    }
+
+    const token = await internalTokenManager.getToken(baseUrl);
+    if (!token) {
+      throw new Error('Authentication token unavailable; cannot force logout user devices.');
+    }
+
+    const endpoint = `${baseUrl}/tenants/${normalizedTenantId}/members/force-logout`;
+    const buildInit = (bearer: string): RequestInit => ({
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${bearer}`,
+      },
+      body: JSON.stringify({ email: userEmail }),
+    });
+
+    let response = await fetch(endpoint, buildInit(token));
+
+    // On a 401 the internal token may have just expired; re-mint once and retry.
+    if (response.status === 401) {
+      const refreshed = await internalTokenManager.forceRefresh(baseUrl);
+      if (!refreshed) {
+        throw new Error('Authentication token expired; cannot force logout user devices.');
       }
-      
-      let loggedOutCount = 0;
-      
-      // Force logout each device
-      for (const device of devices) {
-        if (!device.isDeleted && device.isOnline) {
-          try {
-            await this.forceLogoutDevice(userEmail, device.deviceId, 'system', 'System Administrator', reason || 'User authorization removed');
-            loggedOutCount++;
-          } catch (error) {
-            logger.error(`Failed to logout device ${device.deviceId}:`, error);
-          }
-        } else if (!device.isDeleted) {
-          // For offline devices, just set logout signal for when they come online
-          try {
-            await this.createLogoutSignal(userEmail, device.deviceId, 'system', 'System Administrator', reason || 'User authorization removed');
-          } catch (error) {
-            logger.error(`Failed to create logout signal for device ${device.deviceId}:`, error);
-          }
-        }
-      }
-      
-      logger.debug(`✅ Force logout completed for ${userEmail}: ${loggedOutCount} devices logged out, logout signals set for offline devices`);
-    } catch (error) {
-      logger.error('Failed to force logout all user devices:', error);
-      throw error;
+      response = await fetch(endpoint, buildInit(refreshed));
     }
-  }
 
-  /**
-   * Force logout a device
-   */
-  async forceLogoutDevice(
-    userEmail: string, 
-    deviceId: string, 
-    adminEmail: string, 
-    adminName: string,
-    reason?: string
-  ): Promise<void> {
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      maybeShowMaintenanceAlertFromRaw(response.status, text);
+      throw new Error(`Force logout request failed (${response.status}): ${text || 'unknown error'}`);
+    }
+
+    let affected: number | undefined;
     try {
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      const updates = {
-        lastSeen: this.createResolvedTimestamp(),
-        updatedAt: this.createResolvedTimestamp(),
-        lastActivityType: 'forced_logout',
-        forcedLogoutBy: adminEmail,
-        forcedLogoutByName: adminName,
-        forcedLogoutAt: this.createResolvedTimestamp(),
-        forcedLogoutReason: reason || 'Administrative action',
-        logoutType: 'forced',
-        logoutSignal: true, // Signal for client to logout
-        isOnline: false, // Mark device as offline
-        sessionActive: false,
-        expoPushToken: deleteField(),
-        pushTokenStatus: 'missing',
-        needsExpoPushTokenRefresh: true,
-        lastPushTokenErrorAt: this.createResolvedTimestamp(),
-        lastPushTokenErrorCode: 'forced_logout',
-        webPushSubscription: deleteField(),
-        webPushStatus: 'unsubscribed',
-        webPushVapidPublicKey: deleteField(),
-        webPushSubscribedAt: deleteField(),
-        webPushLastSyncedAt: deleteField(),
-        webPushLastErrorAt: deleteField(),
-        webPushLastErrorCode: deleteField(),
-        webPushClientLastSubscriptionSyncAt: deleteField(),
-        webPushClientLastSubscriptionContext: deleteField(),
-        webPushClientLastSubscriptionPermission: deleteField(),
-        webPushClientLastReceiptAt: deleteField(),
-        webPushClientLastReceiptType: deleteField(),
-        webPushClientLastReceiptNotificationId: deleteField(),
-        webPushClientLastReceiptTag: deleteField(),
-        webPushClientLastReceiptTitle: deleteField(),
-        activeChatPartner: deleteField(),
-        activeChatPartnerId: deleteField(),
-        activeChatPartnerName: deleteField(),
-        activeChatIsFocused: deleteField(),
-        activeChatLastSeenAt: deleteField(),
-        activeChatLastMessageId: deleteField(),
-        activeChatLastMessageTimestamp: deleteField(),
-      };
-
-      const cleanUpdates = this.cleanUndefinedValues(updates);
-      await updateDoc(deviceDoc, cleanUpdates);
-
-      // Update user's last activity
-      const userDoc = doc(firestore, 'user_devices', userEmail);
-      await updateDoc(userDoc, { lastActivity: this.createResolvedTimestamp() });
-
-      // Create a logout signal document for real-time detection
-      await this.createLogoutSignal(userEmail, deviceId, adminEmail, adminName, reason);
-
-      // Log the action
-      await this.logDeviceAction({
-        actionType: 'forced_logout',
-        deviceId,
-        userId: userEmail,
-        adminEmail,
-        adminName,
-        reason: reason || 'Administrative force logout',
-        timestamp: this.createResolvedTimestamp()
-      });
-
-      logger.debug(`Device ${deviceId} force logged out by admin ${adminName}`);
-    } catch (error) {
-      logger.error('Failed to force logout device:', error);
-      throw error;
+      const data = (await response.json()) as { affected?: number };
+      affected = typeof data?.affected === 'number' ? data.affected : undefined;
+    } catch {
+      // A non-JSON 2xx body is unusual but non-fatal; the action still succeeded.
     }
-  }
-
-  /**
-   * Create a logout signal for real-time detection by the target device
-   */
-  private async createLogoutSignal(
-    userEmail: string, 
-    deviceId: string, 
-    adminEmail: string, 
-    adminName: string,
-    reason?: string
-  ): Promise<void> {
-    try {
-      const signalDoc = doc(firestore, 'logout_signals', `${userEmail}_${deviceId}`);
-      await setDoc(signalDoc, {
-        userEmail,
-        deviceId,
-        adminEmail,
-        adminName,
-        reason: reason || 'Administrative action',
-        createdAt: this.createResolvedTimestamp(),
-        consumed: false
-      });
-    } catch (error) {
-      logger.error('Failed to create logout signal:', error);
-    }
+    logger.debug(`✅ Backend force-logout completed for ${userEmail}`, {
+      tenantId: normalizedTenantId,
+      affected,
+    });
   }
 
   /**
@@ -5780,71 +5255,6 @@ class DeviceTrackingService {
   }
 
   /**
-   * Create a hard ban for a device based on its unchanging characteristics
-   */
-  async createDeviceBan(
-    device: UserDevice,
-    userEmail: string,
-    reason: string,
-    adminEmail: string,
-    adminName: string,
-    expiresAt?: Date
-  ): Promise<void> {
-    try {
-      const deviceFingerprint = await this.generateDeviceFingerprint(device);
-      
-      const banData = {
-        banType: 'hard' as const,
-        deviceFingerprint,
-        bannedFields: {
-          userAgent: device.userAgent,
-          manufacturer: device.manufacturer,
-          modelName: device.modelName,
-          modelId: device.modelId,
-          hardwareConcurrency: device.hardwareConcurrency,
-          totalMemory: device.totalMemory,
-          screenWidth: device.screenWidth,
-          screenHeight: device.screenHeight,
-          supportedCpuArchitectures: device.supportedCpuArchitectures,
-          jsHeapSizeLimit: device.jsHeapSizeLimit,
-          platform: device.platform,
-          vendor: device.vendor
-        },
-        reason,
-        adminEmail,
-        adminName,
-        targetDeviceId: device.deviceId,
-        targetUserEmail: userEmail,
-        isActive: true,
-        createdAt: this.createResolvedTimestamp(),
-        expiresAt: expiresAt ? Timestamp.fromDate(expiresAt) : undefined,
-        lastChecked: this.createResolvedTimestamp()
-      };
-
-      // First force logout the device if it's online
-      if (device.isOnline) {
-        logger.debug(`Force logging out device ${device.deviceId} before hard ban`);
-        await this.forceLogoutDevice(userEmail, device.deviceId, adminEmail, adminName, `Hard ban: ${reason}`);
-      }
-
-      // Clean undefined values before sending to Firestore
-      const cleanBanData = this.cleanUndefinedValues(banData);
-
-      // Add ban to Firestore
-      const banRef = doc(collection(firestore, 'device_bans'));
-      await setDoc(banRef, cleanBanData);
-
-      // Also soft delete the current device instance
-      await this.markDeviceAsDeleted(userEmail, device.deviceId, adminEmail, adminName, `Hard banned: ${reason}`);
-
-      logger.debug(`🚫 Hard banned device: ${deviceFingerprint} for user: ${userEmail}`);
-    } catch (error) {
-      logger.error('❌ Failed to create device ban:', error);
-      throw error;
-    }
-  }
-
-  /**
    * Check if a device is banned based on its fingerprint
    */
   async isDeviceBanned(device: UserDevice): Promise<DeviceBan | null> {
@@ -5999,26 +5409,6 @@ class DeviceTrackingService {
     } catch (error) {
       logger.error('❌ Failed to get device bans:', error);
       return [];
-    }
-  }
-
-  /**
-   * Remove/deactivate a device ban
-   */
-  async removeDeviceBan(banId: string, adminEmail: string, adminName: string): Promise<void> {
-    try {
-      const banRef = doc(firestore, 'device_bans', banId);
-      await updateDoc(banRef, {
-        isActive: false,
-        removedAt: this.createResolvedTimestamp(),
-        removedBy: adminEmail,
-        removedByName: adminName
-      });
-
-      logger.debug(`✅ Device ban removed: ${banId} by ${adminEmail}`);
-    } catch (error) {
-      logger.error('❌ Failed to remove device ban:', error);
-      throw error;
     }
   }
 

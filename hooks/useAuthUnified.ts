@@ -49,7 +49,7 @@ interface IDeviceTrackingServiceContract {
   getCurrentDeviceId(): string | null;
   logUserLogout(userEmail: string, deviceId: string): Promise<void>;
   updateLastLogin(userEmail: string): Promise<void>;
-  forceLogoutAllUserDevices(userEmail: string, reason: string): Promise<void>;
+  forceLogoutAllUserDevices(userEmail: string, tenantId: string, reason?: string): Promise<void>;
 }
 let __deviceTrackingService: (DeviceTrackingServiceType & IDeviceTrackingServiceContract) | null = null;
 function getDeviceTrackingService(): DeviceTrackingServiceType & IDeviceTrackingServiceContract {
@@ -3022,15 +3022,36 @@ async function removeAuthorizedEmail(email: string): Promise<void> {
     `🚫 Removing user ${normalizedEmail} from authorized list (cached=${hadCachedEntry}) and forcing logout`
   );
 
-  // Always attempt to force logout devices, even if the cache entry is missing
+  // Resolve the tenant scope up front: the backend force-logout endpoint is
+  // tenant-scoped, and the tenant-native store revocation below reuses the same
+  // tenant id.
+  let tenantId: string | null = null;
   try {
-    await getDeviceTrackingService().forceLogoutAllUserDevices(
-      normalizedEmail,
-      'User removed from authorized list'
-    );
+    tenantId = await resolveTenantScopeForMembershipNotifications();
   } catch (error) {
-    logger.error('Failed to force logout user devices during authorization removal:', error);
-    // Continue with removal even if logout fails
+    logger.warn('Failed to resolve tenant scope during authorization removal:', error);
+  }
+
+  // Force logout all of the user's devices via the backend Device Admin API.
+  // This requires a tenant; when none is available we skip it (with a warning)
+  // rather than throw, so the removal itself still proceeds. Any backend failure
+  // is logged and swallowed to preserve graceful degradation — the email removal
+  // must still succeed even if the force-logout side effect no-ops.
+  if (tenantId) {
+    try {
+      await getDeviceTrackingService().forceLogoutAllUserDevices(
+        normalizedEmail,
+        tenantId,
+        'User removed from authorized list'
+      );
+    } catch (error) {
+      logger.error('Failed to force logout user devices during authorization removal:', error);
+      // Continue with removal even if logout fails
+    }
+  } else {
+    logger.warn(
+      'No tenant scope available; skipping backend force-logout during authorization removal.'
+    );
   }
 
   if (hadCachedEntry) {
@@ -3039,7 +3060,6 @@ async function removeAuthorizedEmail(email: string): Promise<void> {
 
   // Revoke from tenant-native stores
   try {
-    const tenantId = await resolveTenantScopeForMembershipNotifications();
     if (!tenantId) {
       throw new Error('No tenant selected for member removal');
     }

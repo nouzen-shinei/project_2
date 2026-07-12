@@ -1521,3 +1521,445 @@ export async function startBillingCheckout(payload: BillingCheckoutPayload) {
     throw error;
   }
 }
+// ---------------------------------------------------------------------------
+// Device Console — Device Admin API client wrappers
+// ---------------------------------------------------------------------------
+//
+// Typed wrappers over the 13 `POST /admin/tenants/devices/...` endpoints
+// registered in `backend-runtime/src/app.ts` and orchestrated by
+// `backend-runtime/src/deviceAdminService.ts`. All calls use `auth: 'master'`
+// (mirroring `fetchTenantUserDevices`) and are POSTs with a JSON body.
+//
+// The record/result interfaces below are LOCAL MIRRORS of the backend's
+// `DeviceAdminRecord`, `DeviceCounts`, `DeviceActionOutcome`, `AuditEntryRecord`,
+// `FetchHistoryResult`, and `FetchTimelineResult` types. The admin console is a
+// separate package, so they are re-declared here (not imported from
+// `backend-runtime/src`) and kept field-for-field aligned with that service.
+//
+// Errors surface as `ApiError` (thrown by `apiRequest`), which carries the HTTP
+// `status` and parsed `data` so callers can branch on the backend error codes
+// (e.g. `not_authorized`, `validation_failed`, `device_not_found`,
+// `already_deleted`, `not_deleted`, `active_ban_exists`, `no_active_ban`,
+// `tenant_scope_violation`, `too_many_targets`, `invalid_reason`,
+// `invalid_expiration`, `invalid_title`, `invalid_message`, `empty_recipients`,
+// `signal_write_failed`, `delete_rolled_back`, `history_failed`).
+
+/** Device form factor (mirrors `DeviceAdminRecord.deviceType`). */
+export type DeviceType = 'mobile' | 'web' | 'tablet';
+
+/** Logout classification (mirrors `DeviceAdminRecord.logoutType`). */
+export type DeviceLogoutType = 'manual' | 'forced' | 'auto';
+
+/** Expo push token sync status (mirrors `DeviceAdminRecord.pushTokenStatus`). */
+export type DevicePushTokenStatus = 'synced' | 'missing' | 'requested' | 'unknown';
+
+/** Web push subscription status (mirrors `DeviceAdminRecord.webPushStatus`). */
+export type DeviceWebPushStatus =
+  | 'subscribed'
+  | 'unsubscribed'
+  | 'unsupported'
+  | 'permission_denied'
+  | 'sync_required'
+  | 'error';
+
+/** The ten device filters surfaced by the Device Console (Requirement 5.1). */
+export type DeviceFilter =
+  | 'all'
+  | 'online'
+  | 'offline'
+  | 'web'
+  | 'mobile'
+  | 'tablet'
+  | 'deleted'
+  | 'logged_out'
+  | 'force_logged_out'
+  | 'hard_banned';
+
+/** The sort options offered by the Device Console (Requirement 5.3). */
+export type DeviceSort = 'name' | 'lastSeen' | 'deviceType' | 'status';
+
+/** Notification priority accepted by the notify endpoint. */
+export type DeviceNotifyPriority = 'high' | 'normal' | 'low';
+
+/** Tenant membership summary as stored on a device document. */
+export interface DeviceTenantMembership {
+  tenantId: string;
+  role?: string;
+  status?: string;
+}
+
+/** Web push subscription shape (mirrors `DeviceAdminRecord.webPushSubscription`). */
+export interface DeviceWebPushSubscription {
+  endpoint: string;
+  expirationTime?: number | null;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+}
+
+/**
+ * Projected device record surfaced by the Device Admin API. Local mirror of the
+ * backend `DeviceAdminRecord`: timestamp fields are ISO 8601 strings, with
+ * `*Ms` epoch-ms companions where deterministic ordering/classification matters.
+ */
+export interface DeviceAdminRecord {
+  // Identity
+  deviceId: string;
+  deviceType?: DeviceType;
+
+  // Hardware / model metadata
+  deviceName?: string;
+  modelName?: string;
+  manufacturer?: string;
+  brand?: string;
+
+  // Platform / OS metadata
+  platformOS?: string;
+  osName?: string;
+  osVersion?: string;
+
+  // Browser metadata (web only)
+  browserName?: string;
+  browserVersion?: string;
+  userAgent?: string;
+
+  // Network metadata
+  ipAddress?: string;
+  networkType?: string;
+  carrierName?: string;
+  countryCode?: string;
+
+  // Presence / activity
+  lastSeen?: string | null;
+  lastSeenMs?: number | null;
+  isOnline?: boolean;
+  sessionActive?: boolean;
+  lastActivityType?: string;
+  logoutType?: DeviceLogoutType;
+
+  // Soft-delete provenance
+  isDeleted?: boolean;
+  deletedAt?: string | null;
+  deletedBy?: string;
+  deletedByName?: string;
+  deletionReason?: string;
+  isRestored?: boolean;
+  restoredAt?: string | null;
+
+  // Force-logout provenance
+  forcedLogoutBy?: string;
+  forcedLogoutByName?: string;
+  forcedLogoutAt?: string | null;
+  forcedLogoutReason?: string;
+  logoutSignal?: boolean;
+
+  // Ban state
+  isHardBanned?: boolean;
+
+  // Tenant scoping
+  tenantIds?: string[];
+  activeTenantId?: string | null;
+  lastTenantId?: string | null;
+  tenantMemberships?: DeviceTenantMembership[];
+
+  // Owner attribution (derived from the parent `user_devices/{email}` doc)
+  ownerEmail?: string | null;
+  ownerDisplayName?: string | null;
+
+  // Push targeting
+  expoPushToken?: string;
+  webPushSubscription?: DeviceWebPushSubscription;
+  pushTokenStatus?: DevicePushTokenStatus;
+  webPushStatus?: DeviceWebPushStatus;
+}
+
+/** Total / online / offline device counts for a tenant (mirrors `DeviceCounts`). */
+export interface DeviceCounts {
+  total: number;
+  online: number;
+  offline: number;
+}
+
+/** A single notification / bulk-action recipient. */
+export interface DeviceTarget {
+  email: string;
+  deviceId: string;
+}
+
+/**
+ * Per-target outcome for a bulk/notify action (mirrors `DeviceActionOutcome`).
+ * `ok` marks a successful delivery (notify) or force-logout (bulk); `error`
+ * carries a stable code or message when `ok` is false.
+ */
+export interface DeviceActionOutcome {
+  email: string;
+  deviceId: string;
+  ok: boolean;
+  error?: string;
+}
+
+/** Audit outcome classification (mirrors backend `DeviceAuditOutcome`). */
+export type DeviceAuditOutcome = 'success' | 'partial' | 'failure';
+
+/**
+ * A single audit entry surfaced by the history/timeline reads (local mirror of
+ * the backend `AuditEntryRecord`). `id` doubles as the stable tie-break key for
+ * equal `actionTimeMs`; `actionTimeMs` is the primary sort key and `createdAt`
+ * is an ISO 8601 timestamp with timezone.
+ */
+export interface AuditEntryRecord {
+  id: string;
+  tenantId: string;
+  action: string;
+  actorId?: string;
+  actorEmail?: string;
+  actorName?: string;
+  targetDeviceId?: string;
+  targetUserEmail?: string;
+  reason?: string;
+  affectedCount?: number;
+  outcome?: DeviceAuditOutcome;
+  metadata?: Record<string, unknown>;
+  actionTimeMs: number;
+  createdAt: string;
+}
+
+/** Request body for {@link fetchTenantDevices} (#1 list/search/filter/sort). */
+export interface DeviceListRequest {
+  tenantId: string;
+  search?: string;
+  filter?: DeviceFilter;
+  sort?: DeviceSort;
+  hideInactive?: boolean;
+  limit?: number;
+  cursor?: string;
+}
+
+/** Success response for {@link fetchTenantDevices} (flat devices + counts). */
+export interface DeviceListResponse {
+  ok: true;
+  tenantId: string;
+  counts: DeviceCounts;
+  devices: DeviceAdminRecord[];
+}
+
+/** Success response for {@link fetchDeviceDetail} (#2). */
+export interface DeviceDetailResponse {
+  ok: true;
+  device: DeviceAdminRecord;
+}
+
+/** Success response for {@link forceLogoutAllUserDevices} (#4). */
+export interface ForceLogoutAllResponse {
+  ok: true;
+  affected: number;
+}
+
+/** Success response for {@link bulkForceLogoutDevices} (#5). */
+export interface BulkForceLogoutResponse {
+  ok: true;
+  succeeded: number;
+  failed: number;
+  results: DeviceActionOutcome[];
+}
+
+/** Success response for {@link banDevice} (#6). */
+export interface BanDeviceResponse {
+  ok: true;
+  banId: string;
+}
+
+/** Success response for {@link notifyDevices} (#11). */
+export interface NotifyDevicesResponse {
+  ok: true;
+  successful: number;
+  failed: number;
+  results: DeviceActionOutcome[];
+}
+
+/** Success response for {@link fetchDeviceHistory} (#12). */
+export interface DeviceHistoryResponse {
+  ok: true;
+  entries: AuditEntryRecord[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+/** Success response for {@link fetchDeviceTimeline} (#13). */
+export interface DeviceTimelineResponse {
+  ok: true;
+  entries: AuditEntryRecord[];
+}
+
+/** Generic `{ ok: true }` acknowledgement returned by the action endpoints. */
+export interface DeviceActionAck {
+  ok: true;
+}
+
+/** #1 — List/search/filter/sort a tenant's devices with online/offline counts. */
+export function fetchTenantDevices(payload: DeviceListRequest) {
+  return apiRequest<DeviceListResponse>('/admin/tenants/devices', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #2 — Full device detail + provenance for one device. */
+export function fetchDeviceDetail(payload: { tenantId: string; email: string; deviceId: string }) {
+  return apiRequest<DeviceDetailResponse>('/admin/tenants/devices/detail', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #3 — Force logout a single device. */
+export function forceLogoutDevice(payload: {
+  tenantId: string;
+  email: string;
+  deviceId: string;
+  reason?: string;
+}) {
+  return apiRequest<DeviceActionAck>('/admin/tenants/devices/force-logout', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #4 — Force logout all active in-tenant devices of a user. */
+export function forceLogoutAllUserDevices(payload: {
+  tenantId: string;
+  email: string;
+  reason?: string;
+}) {
+  return apiRequest<ForceLogoutAllResponse>('/admin/tenants/devices/force-logout-all', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #5 — Bulk force-logout up to 500 selected devices. */
+export function bulkForceLogoutDevices(payload: {
+  tenantId: string;
+  targets: DeviceTarget[];
+  reason?: string;
+}) {
+  return apiRequest<BulkForceLogoutResponse>('/admin/tenants/devices/bulk/force-logout', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #6 — Create a hard ban for a single device by fingerprint. */
+export function banDevice(payload: {
+  tenantId: string;
+  email: string;
+  deviceId: string;
+  reason: string;
+  expiresAt?: string | number | null;
+}) {
+  return apiRequest<BanDeviceResponse>('/admin/tenants/devices/ban', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #7 — Remove an active ban and restore access for a single device. */
+export function unbanDevice(payload: {
+  tenantId: string;
+  email: string;
+  deviceId: string;
+  reason?: string;
+}) {
+  return apiRequest<DeviceActionAck>('/admin/tenants/devices/unban', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #8 — Soft-delete a single device (records a force-logout signal). */
+export function deleteDevice(payload: {
+  tenantId: string;
+  email: string;
+  deviceId: string;
+  reason: string;
+}) {
+  return apiRequest<DeviceActionAck>('/admin/tenants/devices/delete', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #9 — Restore a soft-deleted device. */
+export function restoreDevice(payload: {
+  tenantId: string;
+  email: string;
+  deviceId: string;
+  reason?: string;
+}) {
+  return apiRequest<DeviceActionAck>('/admin/tenants/devices/restore', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #10 — Permanently delete a device + related tracking records (atomic). */
+export function permanentlyDeleteDevice(payload: {
+  tenantId: string;
+  email: string;
+  deviceId: string;
+  reason: string;
+}) {
+  return apiRequest<DeviceActionAck>('/admin/tenants/devices/permanent-delete', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #11 — Compose + send a notification to selected devices. */
+export function notifyDevices(payload: {
+  tenantId: string;
+  title: string;
+  body: string;
+  targets: DeviceTarget[];
+  priority?: DeviceNotifyPriority;
+}) {
+  return apiRequest<NotifyDevicesResponse>('/admin/tenants/devices/notify', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #12 — Tenant-scoped action + notification history (most-recent-first). */
+export function fetchDeviceHistory(payload: {
+  tenantId: string;
+  limit?: number;
+  cursor?: string;
+  action?: string;
+}) {
+  return apiRequest<DeviceHistoryResponse>('/admin/tenants/devices/history', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}
+
+/** #13 — Per-device activity timeline (oldest-first, stable tie-break). */
+export function fetchDeviceTimeline(payload: { tenantId: string; email: string; deviceId: string }) {
+  return apiRequest<DeviceTimelineResponse>('/admin/tenants/devices/timeline', {
+    method: 'POST',
+    body: payload,
+    auth: 'master',
+  });
+}

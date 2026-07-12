@@ -20,12 +20,6 @@ export { default as TenantJoinCodeManager } from './TenantJoinCodeManager';
 export { default as TenantOnboardingChecklist } from './TenantOnboardingChecklist';
 export { default as TenantUsageSummary } from './TenantUsageSummary';
 
-// Admin and device management components
-export { default as DeviceActionModal } from './DeviceActionModal';
-export { default as DeviceDetailsModal } from './DeviceDetailsModal';
-export { default as BrowserDeviceModal } from './BrowserDeviceModal';
-export { default as AdminNotificationCenter } from './AdminNotificationCenter';
-
 // UI Modal components
 export { default as ConfirmationModal } from './ConfirmationModal';
 export { default as OptionModal } from './OptionModal';

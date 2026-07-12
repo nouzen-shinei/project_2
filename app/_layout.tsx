@@ -15,7 +15,6 @@ import { useFonts } from 'expo-font';
 import { useAuth, authService } from '../hooks/useAuthUnified';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useNotifications } from '../hooks/useNotifications';
-import { deviceManagementService } from '../services/deviceManagementService';
 import Toast from 'react-native-toast-message';
 import {
   Inter_400Regular,
@@ -392,19 +391,6 @@ export default function RootLayout() {
 
     return unsubscribe;
   }, [router]);
-
-  // Initialize device management service only when user is authorized
-  useEffect(() => {
-    if (user?.isAuthorized) {
-      deviceManagementService.start();
-      return () => {
-        deviceManagementService.stop();
-      };
-    }
-    // If not authorized, ensure service is stopped
-    deviceManagementService.stop();
-    return undefined;
-  }, [user?.isAuthorized]);
 
   // Remove auto-initialization since admin is already set up in Firestore
 

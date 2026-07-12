@@ -137,6 +137,7 @@
   },
   "devDependencies": {
     "@babel/core": "^7.28.4",
+    "@firebase/rules-unit-testing": "5.0.1",
     "@types/crypto-js": "^4.2.2",
     "@types/jest": "^29.5.14",
     "@types/react": "~19.0.10",

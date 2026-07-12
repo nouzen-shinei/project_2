@@ -1,6 +1,6 @@
 import { Suspense, lazy, useState, type ComponentType } from 'react';
 import clsx from 'clsx';
-import { BarChart3, Building2, CreditCard, GaugeCircle, MessageCircle, MessageSquareDashed, Megaphone, PhoneCall, Server, Settings2, type LucideIcon } from 'lucide-react';
+import { BarChart3, Building2, CreditCard, GaugeCircle, MessageCircle, MessageSquareDashed, Megaphone, PhoneCall, Server, Settings2, Smartphone, type LucideIcon } from 'lucide-react';
 import { AuthConfigPanel } from './features/settings/AuthConfigPanel';
 import { RuntimeEndpointsPanel } from './features/settings/RuntimeEndpointsPanel';
 import { MaintenanceModePanel } from './features/settings/MaintenanceModePanel';
@@ -18,6 +18,7 @@ import { LoadingScreen } from './components/LoadingScreen';
 import { useConfigHydration } from './hooks/useStoreHydration';
 import { useConfigStore, type ConfigState } from './store/configStore';
 import { TenantDirectoryPanel } from './features/tenants/TenantDirectoryPanel';
+import { DeviceConsolePanel } from './features/devices/DeviceConsolePanel';
 import { UsageAnalyticsPanel } from './features/tenants/UsageAnalyticsPanel';
 import { BillingCatalogPanel } from './features/billing/BillingCatalogPanel';
 import { BillingOpsPanel } from './features/billing/BillingOpsPanel';
@@ -28,7 +29,7 @@ const RuntimeMetricsPanel = lazy(async () => {
 });
 
 type PanelComponent = ComponentType;
-type TabId = 'overview' | 'metrics' | 'queue' | 'broadcasts' | 'telephony' | 'chat' | 'tenants' | 'usage' | 'billing' | 'settings';
+type TabId = 'overview' | 'metrics' | 'queue' | 'broadcasts' | 'telephony' | 'chat' | 'tenants' | 'devices' | 'usage' | 'billing' | 'settings';
 
 interface TabDefinition {
   id: TabId;
@@ -89,6 +90,13 @@ const TAB_CONFIG: TabDefinition[] = [
     panels: [TenantDirectoryPanel],
   },
   {
+    id: 'devices',
+    label: 'Device Console',
+    description: 'Inspect and manage tenant devices.',
+    icon: Smartphone,
+    panels: [DeviceConsolePanel],
+  },
+  {
     id: 'usage',
     label: 'Usage analytics',
     description: 'Usage summaries, trends, headroom, and CSV exports.',
@@ -123,6 +131,17 @@ export default function App() {
     return (view || '').trim().toLowerCase() === 'membership-inspector';
   })();
 
+  const isDeviceInspectorView = (() => {
+    if (typeof window === 'undefined') return false;
+    const view = new URLSearchParams(window.location.search).get('view');
+    return (view || '').trim().toLowerCase() === 'device-inspector';
+  })();
+
+  const deviceInspectorTenantId = (() => {
+    if (typeof window === 'undefined') return undefined;
+    return new URLSearchParams(window.location.search).get('tenantId')?.trim() || undefined;
+  })();
+
   const [activeTab, setActiveTab] = useState<TabId>(() => {
     if (typeof window === 'undefined') return 'overview';
     const raw = new URLSearchParams(window.location.search).get('tab');
@@ -135,6 +154,7 @@ export default function App() {
       normalized === 'telephony' ||
       normalized === 'chat' ||
       normalized === 'tenants' ||
+      normalized === 'devices' ||
       normalized === 'usage' ||
       normalized === 'billing' ||
       normalized === 'settings'
@@ -160,6 +180,18 @@ export default function App() {
         <main className="main">
           <div className="page-grid page-grid--single">
             <TenantDirectoryPanel />
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  if (isDeviceInspectorView) {
+    return (
+      <div className="app-shell">
+        <main className="main">
+          <div className="page-grid page-grid--single">
+            <DeviceConsolePanel tenantId={deviceInspectorTenantId} />
           </div>
         </main>
       </div>

@@ -13,17 +13,17 @@ import {
   Modal,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
-import { Plus, Trash2, RefreshCw, Shield, User, Bell, Settings, Search, X, PieChart, KeyRound } from 'lucide-react-native';
-import { useRouter } from 'expo-router';
+import { Plus, Trash2, RefreshCw, Shield, User, Settings, Search, X, PieChart, KeyRound } from 'lucide-react-native';
+import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth } from '../../hooks/useAuthUnified';
 import { useNetworkStatus } from '../../hooks/useNetworkStatus';
-import AdminNotificationCenter from '../../components/AdminNotificationCenter';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useTenant } from '@/hooks/useTenantContext';
+import { isRetiredAdminRouteTarget } from '@/lib/retiredAdminRoute';
 import { tenantService } from '@/services/tenantService';
 import { usageAnalyticsService } from '@/services/usageAnalyticsService';
 import type { TenantInvite, TenantMembership, TenantMembershipRole, TenantJoinRequestStatus } from '@/types';
@@ -49,11 +49,17 @@ const MEMBER_ROLE_FILTERS: { label: string; value: 'all' | TenantMembershipRole 
 
 const ROLE_OPTIONS: TenantMembershipRole[] = ['owner', 'admin', 'staff', 'member'];
 const USAGE_HISTORY_MONTHS = 6;
-const NOTIFICATIONS_TAB_ALLOWED_EMAIL = 'krvikrantsingh51@gmail.com';
+
+// The retired client-side device-management admin surface (formerly the "Notifications"
+// tab) is recognised via the pure `isRetiredAdminRouteTarget` predicate in
+// `@/lib/retiredAdminRoute`. Requests whose stored deep link / saved route targets that
+// removed surface render an "interface unavailable" view so the removed UI cannot be
+// resurrected (Requirement 18.1, 18.5).
 
 
 export default function AdminPanel() {
   const router = useRouter();
+  const retiredRouteParams = useLocalSearchParams<{ tab?: string; view?: string }>();
   const insets = useSafeAreaInsets();
   const sharedTopPadding = useSharedTopPadding();
   const { theme } = useTheme();
@@ -85,7 +91,6 @@ export default function AdminPanel() {
   useEffect(() => {
     tenantIdRef.current = tenantId;
   }, [tenantId]);
-  const tenantMemberEmails = useMemo(() => tenantMembers.map((member) => member.email), [tenantMembers]);
   const tenantSeatMembersCount = useMemo(
     () => tenantMembers.filter((member) => member.role === 'owner' || member.role === 'admin' || member.role === 'staff').length,
     [tenantMembers],
@@ -107,7 +112,7 @@ export default function AdminPanel() {
   }, [memberships]);
   const [loadingAction, setLoadingAction] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
-  const [activeTab, setActiveTab] = useState<'users' | 'team' | 'notifications'>('users'); // New tab state
+  const [activeTab, setActiveTab] = useState<'users' | 'team'>('users'); // New tab state
   // Role change confirmation modal state
   const [showRoleChangeModal, setShowRoleChangeModal] = useState(false);
   const [roleChangeEmail, setRoleChangeEmail] = useState<string>('');
@@ -115,8 +120,13 @@ export default function AdminPanel() {
   const [roleChangeSelectedRole, setRoleChangeSelectedRole] = useState<TenantMembershipRole>('member');
   const [roleChangeMembership, setRoleChangeMembership] = useState<TenantMembership | null>(null);
   const [memberToDelete, setMemberToDelete] = useState<TenantMembership | null>(null);
-  const canAccessNotificationsTab =
-    (user?.email || '').trim().toLowerCase() === NOTIFICATIONS_TAB_ALLOWED_EMAIL;
+  // Guard: a stored deep link / persisted route / query that still targets the retired
+  // client-side device-management surface (the former "Notifications" tab) must render an
+  // "interface unavailable" view instead of the removed UI (Requirement 18.5).
+  const isRetiredAdminRoute = useMemo(
+    () => isRetiredAdminRouteTarget(retiredRouteParams),
+    [retiredRouteParams.tab, retiredRouteParams.view],
+  );
   const inviteButtonVisible = activeTab === 'users' || activeTab === 'team';
   const needsInvitePortal = inviteButtonVisible && activeTab !== 'users';
   // Users search state
@@ -239,12 +249,6 @@ export default function AdminPanel() {
   const canManageMembers = Boolean(user?.isAuthorized) && (hasTenantAdminAccess || isLegacyAdmin);
   const initiatedFrom = Platform.OS === 'web' ? 'web' : 'mobile';
   const canAssignOwnerRole = activeMembership?.role === 'owner';
-
-  useEffect(() => {
-    if (!canAccessNotificationsTab && activeTab === 'notifications') {
-      setActiveTab('users');
-    }
-  }, [canAccessNotificationsTab, activeTab]);
 
   useEffect(() => {
     if (!tenantId || !canManageMembers) {
@@ -665,6 +669,26 @@ export default function AdminPanel() {
         <Text style={[styles.debugText, { color: theme.textSecondary }]}> 
           • Tenant Role: {activeMembership?.role || 'unknown'}
         </Text>
+      </View>
+    );
+  }
+
+  // Retired surface guard: a stored deep link / saved route that still points at the removed
+  // device-management admin UI renders a clear "interface unavailable" view rather than the old
+  // UI or a crash (Requirement 18.5). The on-device runtime tracking is unaffected.
+  if (isRetiredAdminRoute) {
+    return (
+      <View style={[styles.container, styles.centered, { backgroundColor: theme.background }]}>
+        <Text style={[styles.message, { color: theme.text }]}>This interface is no longer available</Text>
+        <Text style={[styles.loadingSubtext, { color: theme.textSecondary, marginTop: 8, textAlign: 'center' }]}>
+          Device management has moved to the admin console and is no longer part of the app.
+        </Text>
+        <TouchableOpacity
+          style={[styles.addButton, { backgroundColor: theme.primary, marginTop: 20 }]}
+          onPress={() => router.replace('/(tabs)/admin')}
+        >
+          <Text style={styles.addButtonText}>Back to Admin Panel</Text>
+        </TouchableOpacity>
       </View>
     );
   }
@@ -1714,53 +1738,24 @@ export default function AdminPanel() {
             Members
           </Text>
         </TouchableOpacity>
-
-        {canAccessNotificationsTab && (
-          <TouchableOpacity
-            style={[
-              styles.tabButton,
-              activeTab === 'notifications' && [styles.activeTab, { borderBottomColor: theme.primary }]
-            ]}
-            onPress={() => setActiveTab('notifications')}
-          >
-            <Bell size={20} color={activeTab === 'notifications' ? theme.primary : theme.textSecondary} />
-            <Text
-              allowFontScaling={false}
-              style={[
-                styles.tabText,
-                { color: activeTab === 'notifications' ? theme.primary : theme.textSecondary }
-              ]}
-            >
-              Notifications
-            </Text>
-          </TouchableOpacity>
-        )}
       </View>
 
       {/* Tab Content */}
-      {canAccessNotificationsTab && activeTab === 'notifications' ? (
-        <AdminNotificationCenter 
-          adminEmail={user?.email || ''} 
-          adminName={user?.displayName || user?.email || 'Admin'}
-          tenantMemberEmails={tenantMemberEmails}
-        />
-      ) : (
-        <ScrollView
-          style={styles.content}
-          contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 24 }}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={handlePanelRefresh}
-              tintColor={theme.primary}
-              colors={[theme.primary]}
-            />
-          }
-        >
-          {activeTab === 'users' ? renderUserManagementSection() : renderTeamMembersSection()}
-        </ScrollView>
-      )}
+      <ScrollView
+        style={styles.content}
+        contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 24 }}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handlePanelRefresh}
+            tintColor={theme.primary}
+            colors={[theme.primary]}
+          />
+        }
+      >
+        {activeTab === 'users' ? renderUserManagementSection() : renderTeamMembersSection()}
+      </ScrollView>
 
       {needsInvitePortal && (
         <View style={[styles.hiddenInviteManagerHost, { pointerEvents: 'none' }]}>

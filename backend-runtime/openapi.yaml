@@ -388,6 +388,75 @@ paths:
         '403': { description: Tenant mismatch, insufficient role, owner_role_required, or self_removal_forbidden }
         '404': { description: Membership not found }
         '500': { description: Status update failed }
+  /tenants/{tenantId}/members/force-logout:
+    post:
+      summary: Force logout all active in-tenant devices of a member (tenant-admin)
+      description: >-
+        Tenant-admin-authorized counterpart to
+        /admin/tenants/devices/force-logout-all, reachable by the app client
+        (which authenticates with a per-user internal token, not a master
+        token). Authorized via the shared tenant-access guard (owner/admin
+        only) and reuses the same force-logout-all orchestrator, so the signal
+        writes and audit entry are identical to the console path. Signals every
+        active-session device of the member within the scoped tenant and returns
+        the affected count (0 when none). On a partial signal-write failure,
+        returns 500 identifying the affected/failed device ids (failed sessions
+        retained).
+      parameters:
+        - in: path
+          name: tenantId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, maxLength: 200 }
+      responses:
+        '200':
+          description: Active in-tenant devices force-logged-out
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, affected]
+                properties:
+                  ok: { type: boolean }
+                  affected: { type: integer, description: Number of devices signaled }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: >-
+            Not authorized: missing/insufficient tenant access
+            (tenant_role_insufficient, tenant_membership_required) or
+            admin_role_required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: >-
+            Partial/complete signal write failure (signal_write_failed) or
+            force_logout_all_failed. The signal_write_failed body additionally
+            carries affected (count signaled) and failedDeviceIds (sessions
+            retained).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - type: object
+                    properties:
+                      affected: { type: integer }
+                      failedDeviceIds:
+                        type: array
+                        items: { type: string }
   /tenants/{tenantId}/invites:
     post:
       summary: Create a tenant invite
@@ -504,3 +573,887 @@ paths:
         '404': { description: Join request not found }
         '409': { description: Request already reviewed }
         '500': { description: Rejection failed }
+
+  # -------------------------------------------------------------------------
+  # Device Admin API (Device Console)
+  # -------------------------------------------------------------------------
+  # All 13 endpoints are POST, live under /admin/tenants/devices/..., and are
+  # gated by the shared admin middleware: they require a master token or a
+  # Global_Admin claim, returning 403 { error: not_authorized } when a caller is
+  # present but unauthorized (the middleware may pre-empt wholly missing/invalid
+  # bearer tokens with 401). Bodies are validated with zod; a failed parse
+  # returns 400 { error: validation_failed, issues: [...] } and mutates nothing.
+  # Every action asserts the target device is associated with the scoped tenant
+  # and rejects cross-tenant/unscoped targets with 403 tenant_scope_violation.
+  /admin/tenants/devices:
+    post:
+      summary: List / search / filter / sort tenant devices with online-offline counts
+      description: >-
+        Returns the Selected_Tenant's devices (grouped by owner email A→Z with a
+        distinct no-owner group last, sorted within each group) plus tenant-wide
+        total/online/offline counts (online uses the 300s window). Requires
+        master token or Global_Admin. Pure read; never mutates device state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                search:
+                  type: string
+                  maxLength: 256
+                  description: Case-insensitive substring match; empty/omitted matches all devices
+                filter:
+                  type: string
+                  enum: [all, online, offline, web, mobile, tablet, deleted, logged_out, force_logged_out, hard_banned]
+                  description: Defaults to all when omitted
+                sort:
+                  type: string
+                  enum: [name, lastSeen, deviceType, status]
+                  description: Defaults to lastSeen (most-recent-first) when omitted
+                hideInactive:
+                  type: boolean
+                  description: When true, excludes deleted / hard-banned / logged-out devices
+                limit: { type: integer, minimum: 1, maximum: 1000, description: Optional cap on the returned list }
+                cursor: { type: string, minLength: 1, maxLength: 400 }
+      responses:
+        '200':
+          description: Tenant device list with counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, tenantId, counts, devices]
+                properties:
+                  ok: { type: boolean }
+                  tenantId: { type: string }
+                  counts: { $ref: '#/components/schemas/DeviceCounts' }
+                  devices:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeviceAdminRecord' }
+        '400':
+          description: Validation failed (validation_failed with issues)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: List load failed (device_list_failed); Console retains previously displayed data
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/detail:
+    post:
+      summary: Full device detail and provenance for one device
+      description: >-
+        Returns the projected device record (metadata plus deletion / ban /
+        force-logout provenance) for one device in the scoped tenant. Requires
+        master token or Global_Admin. Pure read.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Device detail resolved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, device]
+                properties:
+                  ok: { type: boolean }
+                  device: { $ref: '#/components/schemas/DeviceAdminRecord' }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Detail load failed (device_detail_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/force-logout:
+    post:
+      summary: Force logout a single device
+      description: >-
+        Writes an unconsumed Force_Logout_Signal for {email, deviceId}, updates
+        device force-logout provenance, and records one audit entry. Rejects an
+        already-deleted target with no state change. Requires master token or
+        Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+                reason: { type: string, description: Optional human-readable reason }
+      responses:
+        '200':
+          description: Device force-logged-out
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Device already deleted (already_deleted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Signal write failed (signal_write_failed) or force_logout_failed; device left unchanged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/force-logout-all:
+    post:
+      summary: Force logout all active in-tenant devices of a user
+      description: >-
+        Signals every active-session device of the user within the scoped
+        tenant and returns the affected count (0 when none). On a partial
+        signal-write failure, returns 500 identifying the affected/failed device
+        ids (failed sessions retained). Requires master token or Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                reason: { type: string, description: Optional human-readable reason }
+      responses:
+        '200':
+          description: Active in-tenant devices force-logged-out
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, affected]
+                properties:
+                  ok: { type: boolean }
+                  affected: { type: integer, description: Number of devices signaled }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: >-
+            Partial/complete signal write failure (signal_write_failed) or
+            force_logout_all_failed. The signal_write_failed body additionally
+            carries affected (count signaled) and failedDeviceIds (sessions
+            retained).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - type: object
+                    properties:
+                      affected: { type: integer }
+                      failedDeviceIds:
+                        type: array
+                        items: { type: string }
+  /admin/tenants/devices/bulk/force-logout:
+    post:
+      summary: Bulk force-logout up to 500 selected devices
+      description: >-
+        Fans out force-logout across the selected targets; a per-target failure
+        never blocks the others. succeeded + failed equals the number of
+        targets, with exactly one outcome per target. Requires master token or
+        Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, targets]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                targets:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/DeviceTarget' }
+                reason: { type: string, description: Optional human-readable reason }
+      responses:
+        '200':
+          description: Bulk force-logout completed (per-target outcomes)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, succeeded, failed, results]
+                properties:
+                  ok: { type: boolean }
+                  succeeded: { type: integer }
+                  failed: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeviceActionOutcome' }
+        '400':
+          description: Validation failed (validation_failed) or too many targets over 500 (too_many_targets)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Bulk force-logout failed (bulk_force_logout_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/ban:
+    post:
+      summary: Create a hard ban for a single device
+      description: >-
+        Creates exactly one active Device_Ban for the device fingerprint
+        (storing the optional expiration when provided) and records one audit
+        entry. Reason is required (1–500 chars after trimming); optional
+        expiration must be strictly later than now. At most one active ban may
+        exist per fingerprint. Requires master token or Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId, reason]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+                reason: { type: string, minLength: 1, maxLength: 500, description: Required; 1–500 chars after trimming }
+                expiresAt:
+                  nullable: true
+                  description: >-
+                    Optional expiration as an ISO 8601 datetime string or epoch
+                    milliseconds; must be strictly later than the creation time.
+                  oneOf:
+                    - { type: string, format: date-time }
+                    - { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Device banned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, banId]
+                properties:
+                  ok: { type: boolean }
+                  banId: { type: string, description: Id of the created device_bans document }
+        '400':
+          description: >-
+            Validation failed (validation_failed with issues), or invalid_email,
+            invalid_reason, invalid_expiration
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: An active ban already exists for the fingerprint (active_ban_exists)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Ban failed (ban_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/unban:
+    post:
+      summary: Remove an active ban and restore device access
+      description: >-
+        Deactivates the device's active Device_Ban and records one audit entry.
+        Unbanning a device with no active ban is rejected and changes nothing.
+        Requires master token or Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+                reason: { type: string, description: Optional human-readable reason }
+      responses:
+        '200':
+          description: Device unbanned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: No active ban to remove (no_active_ban)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Unban failed (unban_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/delete:
+    post:
+      summary: Soft-delete a single device
+      description: >-
+        Marks the device deleted (with deletion provenance), records a
+        Force_Logout_Signal, and writes one audit entry. Reason is required
+        (1–500 chars after trimming). Deleting an already-deleted device is
+        rejected with no state change. Requires master token or Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId, reason]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+                reason: { type: string, minLength: 1, maxLength: 500, description: Required; 1–500 chars after trimming }
+      responses:
+        '200':
+          description: Device soft-deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email, invalid_reason)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Device already deleted (already_deleted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Delete failed (delete_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/restore:
+    post:
+      summary: Restore a soft-deleted device
+      description: >-
+        Returns a soft-deleted device to the active state and records one audit
+        entry. Restoring a device that is not deleted is rejected. Requires
+        master token or Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+                reason: { type: string, description: Optional human-readable reason }
+      responses:
+        '200':
+          description: Device restored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Device is not deleted (not_deleted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Restore failed (restore_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/permanent-delete:
+    post:
+      summary: Permanently delete a device and its related tracking records
+      description: >-
+        Atomically removes the device document and related tracking records
+        (all-or-nothing) and updates the parent counters, then writes one audit
+        entry. Reason is required (1–500 chars after trimming). A mid-operation
+        datastore failure rolls back completely. Requires master token or
+        Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId, reason]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+                reason: { type: string, minLength: 1, maxLength: 500, description: Required; 1–500 chars after trimming }
+      responses:
+        '200':
+          description: Device permanently deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email, invalid_reason)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized) or tenant scope violation (tenant_scope_violation)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: Device not found (device_not_found)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Atomic removal rolled back (delete_rolled_back) or permanent_delete_failed; nothing removed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/notify:
+    post:
+      summary: Compose and send a notification to selected devices
+      description: >-
+        Sends one notification (title 1–100, body 1–500) to up to 500 selected
+        targets via the Push_Delivery_Service, records one audit entry with
+        delivery counts, and returns per-target outcomes. successful + failed
+        equals the number of targets; when the push service is unavailable every
+        delivery is counted as failed. Requires master token or Global_Admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, title, body, targets]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                title: { type: string, minLength: 1, maxLength: 100, description: 1–100 chars after trimming }
+                body: { type: string, minLength: 1, maxLength: 500, description: 1–500 chars after trimming }
+                targets:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/DeviceTarget' }
+                priority:
+                  type: string
+                  enum: [high, normal, low]
+      responses:
+        '200':
+          description: Notification dispatched (per-target outcomes)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, successful, failed, results]
+                properties:
+                  ok: { type: boolean }
+                  successful: { type: integer }
+                  failed: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeviceActionOutcome' }
+        '400':
+          description: >-
+            Validation failed (validation_failed with issues), or invalid_title,
+            invalid_message, empty_recipients, too_many_targets
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Notify failed (notify_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/history:
+    post:
+      summary: Tenant-scoped device action and notification history
+      description: >-
+        Returns the Selected_Tenant's deviceAuditLogs entries most-recent-first
+        with cursor pagination. All-or-nothing on retrieval failure (no partial
+        entries). Requires master token or Global_Admin. Pure read.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                limit: { type: integer, minimum: 1, maximum: 1000, description: Page size }
+                cursor: { type: string, minLength: 1, maxLength: 400, description: Opaque cursor (id of the last entry of the prior page) }
+                action: { type: string, minLength: 1, maxLength: 64, description: Optional action equality filter }
+      responses:
+        '200':
+          description: History page (most-recent-first)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, entries, hasMore]
+                properties:
+                  ok: { type: boolean }
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntryRecord' }
+                  hasMore: { type: boolean }
+                  nextCursor: { type: string, description: Present only when hasMore is true }
+        '400':
+          description: Validation failed (validation_failed with issues)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: History retrieval failed (history_failed); no partial entries returned
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /admin/tenants/devices/timeline:
+    post:
+      summary: Per-device activity timeline (ascending, stable order)
+      description: >-
+        Returns a single device's deviceAuditLogs entries oldest-first with a
+        stable secondary sort by audit-entry id, so the order is identical
+        across repeated openings. Requires master token or Global_Admin. Pure
+        read.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, email, deviceId]
+              properties:
+                tenantId: { type: string, minLength: 1, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 200 }
+                deviceId: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Device timeline (oldest-first)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, entries]
+                properties:
+                  ok: { type: boolean }
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntryRecord' }
+        '400':
+          description: Validation failed (validation_failed with issues, or invalid_email)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Not authorized (not_authorized)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          description: Timeline retrieval failed (timeline_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      description: Standard Device Admin API error body.
+      required: [error]
+      properties:
+        error: { type: string, description: Machine-readable error code (e.g. not_authorized, validation_failed, device_not_found) }
+        message: { type: string, description: Optional human-readable detail }
+        issues:
+          type: array
+          description: Present on validation_failed; the zod validation issues
+          items:
+            type: object
+            additionalProperties: true
+    DeviceCounts:
+      type: object
+      description: Total / online / offline device counts for a tenant (online + offline === total).
+      required: [total, online, offline]
+      properties:
+        total: { type: integer }
+        online: { type: integer }
+        offline: { type: integer }
+    DeviceTarget:
+      type: object
+      description: A single notification / bulk-action recipient.
+      required: [email, deviceId]
+      properties:
+        email: { type: string, format: email, maxLength: 200 }
+        deviceId: { type: string, minLength: 1, maxLength: 200 }
+    DeviceActionOutcome:
+      type: object
+      description: Per-target outcome for a bulk / notify action; exactly one per target.
+      required: [email, deviceId, ok]
+      properties:
+        email: { type: string, format: email }
+        deviceId: { type: string }
+        ok: { type: boolean }
+        error: { type: string, description: Stable error code / message when ok is false }
+    DeviceTenantMembership:
+      type: object
+      description: Tenant membership summary as stored on a device document.
+      required: [tenantId]
+      properties:
+        tenantId: { type: string }
+        role: { type: string }
+        status: { type: string }
+    DeviceWebPushSubscription:
+      type: object
+      description: Web push subscription stored on a device document.
+      required: [endpoint, keys]
+      properties:
+        endpoint: { type: string }
+        expirationTime: { type: integer, format: int64, nullable: true }
+        keys:
+          type: object
+          required: [p256dh, auth]
+          properties:
+            p256dh: { type: string }
+            auth: { type: string }
+    AuditEntryRecord:
+      type: object
+      description: >-
+        A single durable deviceAuditLogs entry surfaced by history / timeline.
+        actionTimeMs is the primary sort key and createdAt is ISO 8601 with
+        timezone; id is the stable tie-break key.
+      required: [id, tenantId, action, actionTimeMs, createdAt]
+      properties:
+        id: { type: string, description: Firestore auto-id; stable tie-break key }
+        tenantId: { type: string }
+        action:
+          type: string
+          description: Surfaced as stored; one of the recorded device actions
+          enum: [force_logout, force_logout_all, ban, unban, delete, restore, permanent_delete, notify]
+        actorId: { type: string }
+        actorEmail: { type: string }
+        actorName: { type: string }
+        targetDeviceId: { type: string }
+        targetUserEmail: { type: string }
+        reason: { type: string }
+        affectedCount: { type: integer, description: Affected device count for force-logout-all / bulk actions }
+        outcome:
+          type: string
+          enum: [success, partial, failure]
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Free-form details, e.g. per-device results or delivery counts
+        actionTimeMs: { type: integer, format: int64, description: Epoch ms; primary sort key }
+        createdAt: { type: string, format: date-time, description: ISO 8601 with timezone }
+    DeviceAdminRecord:
+      type: object
+      description: >-
+        Projected, console-facing subset of the on-device UserDevice document.
+        Timestamp fields are ISO 8601 strings with *Ms epoch-ms companions where
+        deterministic ordering matters. Attributes that are not applicable /
+        available are absent and rendered with an explicit placeholder by the UI.
+      required: [deviceId]
+      properties:
+        deviceId: { type: string, description: Doc id / stable device id }
+        deviceType:
+          type: string
+          enum: [mobile, web, tablet]
+        deviceName: { type: string }
+        modelName: { type: string }
+        manufacturer: { type: string }
+        brand: { type: string }
+        platformOS: { type: string }
+        osName: { type: string }
+        osVersion: { type: string }
+        browserName: { type: string }
+        browserVersion: { type: string }
+        userAgent: { type: string }
+        ipAddress: { type: string }
+        networkType: { type: string }
+        carrierName: { type: string }
+        countryCode: { type: string }
+        lastSeen: { type: string, format: date-time, nullable: true, description: ISO 8601 (serialized from Firestore Timestamp) }
+        lastSeenMs: { type: integer, format: int64, nullable: true, description: Epoch-ms companion for deterministic ordering }
+        isOnline: { type: boolean, description: Client-reported; the Console recomputes via the 300s window }
+        sessionActive: { type: boolean }
+        lastActivityType: { type: string }
+        logoutType:
+          type: string
+          enum: [manual, forced, auto]
+        isDeleted: { type: boolean }
+        deletedAt: { type: string, format: date-time, nullable: true }
+        deletedBy: { type: string }
+        deletedByName: { type: string }
+        deletionReason: { type: string }
+        isRestored: { type: boolean }
+        restoredAt: { type: string, format: date-time, nullable: true }
+        forcedLogoutBy: { type: string }
+        forcedLogoutByName: { type: string }
+        forcedLogoutAt: { type: string, format: date-time, nullable: true }
+        forcedLogoutReason: { type: string }
+        logoutSignal: { type: boolean, description: Set true on force-logout / delete }
+        isHardBanned: { type: boolean, description: Whether the device currently has an active hard Device_Ban }
+        tenantIds:
+          type: array
+          items: { type: string }
+        activeTenantId: { type: string, nullable: true }
+        lastTenantId: { type: string, nullable: true }
+        tenantMemberships:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceTenantMembership' }
+        ownerEmail: { type: string, nullable: true, description: Derived from the parent user_devices doc keyed by owner email }
+        ownerDisplayName: { type: string, nullable: true }
+        expoPushToken: { type: string }
+        webPushSubscription: { $ref: '#/components/schemas/DeviceWebPushSubscription' }
+        pushTokenStatus:
+          type: string
+          enum: [synced, missing, requested, unknown]
+        webPushStatus:
+          type: string
+          enum: [subscribed, unsubscribed, unsupported, permission_denied, sync_required, error]

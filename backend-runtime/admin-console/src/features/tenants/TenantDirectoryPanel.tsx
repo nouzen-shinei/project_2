@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Building2, Copy, Download, RefreshCcw, Search, X } from 'lucide-react';
+import { Building2, Copy, Download, RefreshCcw, Search, Smartphone, X } from 'lucide-react';
 import { SectionCard } from '../../components/SectionCard';
 import {
   ApiError,
@@ -236,6 +236,7 @@ export function TenantDirectoryPanel() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [copiedValue, setCopiedValue] = useState<string | null>(null);
+  const [deviceInspectorErrorByTenant, setDeviceInspectorErrorByTenant] = useState<Record<string, string>>({});
   const [inspectorTenant, setInspectorTenant] = useState<TenantAdminSummary | null>(null);
   const [membershipRows, setMembershipRows] = useState<TenantMembershipAdminRecord[]>([]);
   const [membershipMeta, setMembershipMeta] = useState<TenantMembershipInspectorResponse | null>(null);
@@ -888,6 +889,30 @@ export function TenantDirectoryPanel() {
     url.searchParams.set('view', 'membership-inspector');
     url.searchParams.set('tenantId', tenantId);
     window.open(url.toString(), '_blank', 'noopener,noreferrer');
+  }, []);
+
+  const handleOpenDeviceInspectorInNewTab = useCallback((tenantId: string) => {
+    if (typeof window === 'undefined') return;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('tab', 'devices');
+      url.searchParams.set('view', 'device-inspector');
+      url.searchParams.set('tenantId', tenantId);
+      const opened = window.open(url.toString(), '_blank', 'noopener,noreferrer');
+      if (!opened) {
+        throw new Error('Unable to open the Device Console (the browser may have blocked the new tab).');
+      }
+      setDeviceInspectorErrorByTenant((prev) => {
+        if (!prev[tenantId]) return prev;
+        const next = { ...prev };
+        delete next[tenantId];
+        return next;
+      });
+    } catch (err) {
+      console.warn('[TenantDirectoryPanel] device inspector open failed', err);
+      const message = err instanceof Error ? err.message : 'Unable to open the Device Console.';
+      setDeviceInspectorErrorByTenant((prev) => ({ ...prev, [tenantId]: message }));
+    }
   }, []);
 
   const handleInspect = useCallback(
@@ -2052,7 +2077,19 @@ export function TenantDirectoryPanel() {
                                 : 'Inspecting'
                               : 'Inspect members'}
                           </button>
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={() => handleOpenDeviceInspectorInNewTab(tenant.id)}
+                          >
+                            <Smartphone size={14} /> Inspect devices
+                          </button>
                         </div>
+                        {deviceInspectorErrorByTenant[tenant.id] && (
+                          <div className="tenant-error" role="alert">
+                            <strong>Device Console:</strong> {deviceInspectorErrorByTenant[tenant.id]}
+                          </div>
+                        )}
                       </div>
                     </td>
                     <td>

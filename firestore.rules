@@ -43,6 +43,31 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.admin == true;
     }
 
+    // Device-tracking ownership: true when the signed-in caller owns the
+    // user_devices/{ownerEmail} document tree (their own device records).
+    // Device docs are keyed by the account's email, which matches the
+    // authenticated identity used elsewhere in these rules.
+    function isDeviceOwner(ownerEmail) {
+      return isSignedIn() && ownerEmail == request.auth.token.email;
+    }
+
+    // Client SDK writers may never create or modify the denormalized `tenantIndex`
+    // field on device docs. `tenantIndex` is a backend-derived per-device tenant
+    // index maintained exclusively through the Admin SDK (Device_Admin_API
+    // /devices/ping + the backfill job), which bypasses these rules. See the
+    // device-tenant-index spec (Requirements 5.2, 5.3, 5.4).
+    //   - delete (request.resource == null): allowed — the whole doc, including
+    //     the index, is removed by the owner.
+    //   - create (resource == null): the new doc must NOT carry `tenantIndex`.
+    //   - update: the `tenantIndex` key must be untouched by the write.
+    // Owner presence/registration self-writes of every OTHER field stay allowed
+    // because they never include `tenantIndex`.
+    function doesNotWriteTenantIndex() {
+      return request.resource == null
+        || (resource == null && !('tenantIndex' in request.resource.data))
+        || (resource != null && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['tenantIndex']));
+    }
+
     match /tenantUsage/{tenantId}/months/{monthId} {
       allow read: if hasTenantStaffAccess(tenantId) || isAdmin();
       allow create: if false;
@@ -153,9 +178,97 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // Default fallback: keep existing permissive behavior for other collections
-    match /{document=**} {
-      allow read, write: if isSignedIn();
+    // ─────────────────────────────────────────────────────────────────────────
+    // Device-tracking collections (locked down).
+    //
+    // These four collections are managed by the backend Device Admin API through
+    // the Firebase Admin SDK, which bypasses these rules. Privileged / admin /
+    // cross-user mutations via the client SDK are DENIED here. Only the on-device
+    // Device_Tracking_Runtime's own presence/signal/ban reads and self-writes are
+    // permitted. See the device-console-migration spec (Requirements 16 and 18).
+    //
+    // NOTE: these collections are explicitly excluded from the trailing
+    // "default fallback" match below so this lockdown is not defeated by the
+    // permissive `allow read, write: if isSignedIn()` rule (Firestore grants
+    // access when ANY matching rule allows it).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Per-user device presence/heartbeat + push registration.
+    //   Reads: open to signed-in users. The runtime reads its own device state,
+    //     and the client notification fan-out enumerates a recipient's devices to
+    //     resolve push targets; both relied on the previous permissive read, so we
+    //     preserve read access unchanged.
+    //   Writes: owner-only. A signed-in user may only write documents under their
+    //     own user_devices/{ownerEmail} tree (self-registration, heartbeat/presence,
+    //     push-token and web-push subscription sync, self-logout). No client can
+    //     mutate another user's device docs; all admin mutations (delete, restore,
+    //     force-logout provenance, ban flags) are backend-only.
+    match /user_devices/{ownerEmail} {
+      allow read: if isSignedIn();
+      allow write: if isDeviceOwner(ownerEmail) && doesNotWriteTenantIndex();
+
+      match /{devicePath=**} {
+        allow read: if isSignedIn();
+        allow write: if isDeviceOwner(ownerEmail) && doesNotWriteTenantIndex();
+      }
+    }
+
+    // Device bans (hard-ban records keyed by device fingerprint).
+    //   Reads: open to signed-in users so the runtime's isDeviceBannedForUser
+    //     query keeps enforcing active bans (enforcement is a read).
+    //   Create/Delete: backend-only (ban creation happens via the Admin SDK).
+    //   Update: restricted to the runtime's own enforcement bookkeeping only:
+    //     (a) refreshing `lastChecked` on an active ban (this write must succeed,
+    //         otherwise ban enforcement would fail), and
+    //     (b) deactivating a ban that has genuinely expired — server-verified via
+    //         request.time so a client cannot self-unban an active ban.
+    //   Any other mutation (admin unban, changing reason/target/provenance) is denied.
+    match /device_bans/{banId} {
+      allow read: if isSignedIn();
+      allow create, delete: if false;
+      allow update: if isSignedIn() && (
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastChecked']) ||
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isActive', 'expiredAt']) &&
+          request.resource.data.isActive == false &&
+          ('expiresAt' in resource.data) &&
+          resource.data.expiresAt < request.time
+        )
+      );
+    }
+
+    // Force-logout signals (doc id scheme: `{email}_{deviceId}`).
+    //   Signals are created by the backend only.
+    //   Reads: a signed-in user may read only their own signal doc (matched on the
+    //     stored `userEmail`, which equals the email component of the doc id).
+    //     Reads of a non-existent doc are allowed so the runtime's frequent
+    //     checkLogoutSignal polling does not error when no signal is present.
+    //   Create/Delete: denied for clients.
+    //   Update: a user may only mark THEIR OWN signal consumed (consumed/consumedAt);
+    //     no other fields may change and no other user's signal may be touched.
+    match /logout_signals/{signalId} {
+      allow read: if isSignedIn() && (
+        resource == null || resource.data.userEmail == request.auth.token.email
+      );
+      allow create, delete: if false;
+      allow update: if isSignedIn() &&
+        resource.data.userEmail == request.auth.token.email &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['consumed', 'consumedAt']);
+    }
+
+    // Device audit log: append-only audit written and read exclusively by the
+    // backend (Admin SDK). No client access of any kind.
+    match /deviceAuditLogs/{document=**} {
+      allow read, write: if false;
+    }
+
+    // Default fallback: keep existing permissive behavior for other collections.
+    // The four device-tracking collections above are excluded here so their
+    // tighter rules are authoritative (Firestore allows access if ANY matching
+    // rule grants it, so leaving them in scope would re-open client writes).
+    match /{collection}/{document=**} {
+      allow read, write: if isSignedIn()
+        && !(collection in ['user_devices', 'device_bans', 'logout_signals', 'deviceAuditLogs']);
     }
   }
 }

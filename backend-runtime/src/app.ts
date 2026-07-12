@@ -13,6 +13,39 @@ import { findJobByMessageId } from './storage';
 import { z } from 'zod';
 import { cspMiddleware } from './csp';
 import { ensureFirebase } from './firebaseAdmin';
+import {
+  listTenantDevices,
+  deriveTenantIndex,
+  buildResultingTenantScopeForAddedTenant,
+  fetchDeviceDetail,
+  fetchHistory as fetchDeviceHistory,
+  fetchTimeline as fetchDeviceTimeline,
+  matchesSearch,
+  matchesFilter,
+  isInactiveDevice,
+  sortAndGroup,
+  computeCounts,
+  forceLogout,
+  ban,
+  unban,
+  softDelete,
+  restore,
+  permanentDelete,
+  validateReason,
+  validateExpiration,
+  validateTitle,
+  validateMessage,
+  validateTargets,
+  DEFAULT_MAX_TARGETS,
+  forceLogoutAll,
+  bulkForceLogout,
+  notify,
+  DeviceAdminError,
+  ForceLogoutAllError,
+  type DeviceAdminRecord,
+  type DeviceFilter,
+  type DeviceSort,
+} from './deviceAdminService';
 import { getEmailBackendBaseUrl, getWebAppBaseUrl } from './runtimeEndpoints';
 import { getMaintenanceMode } from './maintenanceMode';
 import { finalizeReminderQuotaFromHistory } from './lib/reminderQuota';
@@ -745,6 +778,119 @@ const tenantSearchSchema = z.object({
 const tenantUserDevicesSchema = z.object({
   tenantId: z.string().trim().min(1).max(120),
   email: z.string().trim().email().max(200),
+});
+
+// Device Console (Device Admin API) read-endpoint schemas. Mirror the existing
+// admin-route conventions: trimmed/bounded strings, `.safeParse(req.body || {})`,
+// and a 400 `validation_failed` (with `issues`) on failure without mutating state.
+const deviceFilterValues = [
+  'all',
+  'online',
+  'offline',
+  'web',
+  'mobile',
+  'tablet',
+  'deleted',
+  'logged_out',
+  'force_logged_out',
+  'hard_banned',
+] as const;
+
+const deviceSortValues = ['name', 'lastSeen', 'deviceType', 'status'] as const;
+
+const tenantDeviceListSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  // Search term is optional; 1–256 chars (Req 4.1). An empty/omitted term
+  // matches all devices, so only the upper bound is enforced here.
+  search: z.string().trim().max(256).optional(),
+  filter: z.enum(deviceFilterValues).optional(),
+  sort: z.enum(deviceSortValues).optional(),
+  hideInactive: z.boolean().optional(),
+  limit: z.number().int().positive().max(1000).optional(),
+  cursor: z.string().trim().min(1).max(400).optional(),
+});
+
+const tenantDeviceDetailSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(200),
+  deviceId: z.string().trim().min(1).max(200),
+});
+
+const tenantDeviceHistorySchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  limit: z.number().int().positive().max(1000).optional(),
+  cursor: z.string().trim().min(1).max(400).optional(),
+  action: z.string().trim().min(1).max(64).optional(),
+});
+
+const tenantDeviceTimelineSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(200),
+  deviceId: z.string().trim().min(1).max(200),
+});
+
+// Single-device destructive-action bodies. `tenantId` is a required non-empty
+// string (Req 3.6) so an unscoped request is rejected with 400 before any
+// service call; the orchestrators additionally reject cross-tenant targets with
+// `tenant_scope_violation`→403 (Req 3.2/3.3). Reason is accepted loosely here
+// (optional/unbounded) for the endpoints that gate it through `validateReason`
+// so a bad reason surfaces as the specific `invalid_reason`/`invalid_expiration`
+// code rather than a generic `validation_failed`.
+const tenantDeviceActionSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(200),
+  deviceId: z.string().trim().min(1).max(200),
+  reason: z.string().optional(),
+});
+
+const tenantDeviceBanSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(200),
+  deviceId: z.string().trim().min(1).max(200),
+  reason: z.string().optional(),
+  expiresAt: z.union([z.string(), z.number(), z.null()]).optional(),
+});
+
+// User-scoped force-logout-all body (#4). No `deviceId` — the orchestrator
+// signals every active in-tenant device of `email`. Reason is accepted loosely
+// (the orchestrator falls back to a default when omitted).
+const tenantDeviceForceLogoutAllSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().max(200),
+  reason: z.string().optional(),
+});
+
+// Bulk force-logout body (#5). `targets` is validated STRUCTURALLY here (array
+// of `{ email, deviceId }`); the non-empty / ≤500 bounds are enforced by
+// `validateTargets` in the handler so they surface as the specific
+// `too_many_targets` code (Req 14.2/14.4).
+const tenantDeviceBulkForceLogoutSchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  targets: z.array(
+    z.object({
+      email: z.string().trim().email().max(200),
+      deviceId: z.string().trim().min(1).max(200),
+    })
+  ),
+  reason: z.string().optional(),
+});
+
+// Notify body (#11). `title`/`body`/`targets` are accepted loosely here so the
+// length + count bounds surface as the specific `invalid_title` /
+// `invalid_message` / `empty_recipients` / `too_many_targets` codes via
+// `validateTitle`/`validateMessage`/`validateTargets` in the handler
+// (Req 12.1, 12.4, 12.6, 14.4).
+const tenantDeviceNotifySchema = z.object({
+  tenantId: z.string().trim().min(1).max(120),
+  title: z.string(),
+  body: z.string(),
+  targets: z.array(
+    z.object({
+      email: z.string().trim().email().max(200),
+      deviceId: z.string().trim().min(1).max(200),
+    })
+  ),
+  priority: z.enum(['high', 'normal', 'low']).optional(),
 });
 
 const tenantJoinCodeClaimSchema = tenantJoinCodeLookupSchema.extend({
@@ -6921,6 +7067,585 @@ export function createApp(options: CreateAppOptions = {}){
     } catch (error) {
       console.error('[admin_user_devices] lookup failed', error);
       return res.status(500).json({ error: 'device_lookup_failed' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Device Console — read/listing endpoints (Device Admin API)
+  // -------------------------------------------------------------------------
+  //
+  // All four routes sit behind the SAME master-token / global-admin gate as the
+  // other `/admin/tenants/...` routes (Requirements 16.1, 16.2; Property 16):
+  // no auth context or a non-admin caller is rejected with 403 `not_authorized`
+  // and no state is read. Bodies are validated with `zod` (400 `validation_failed`
+  // with `issues`). These are pure reads — they never mutate device/ban/signal
+  // state — and delegate to `deviceAdminService`.
+
+  // #1 List/search/filter/sort devices for a tenant, with online/offline counts.
+  app.post('/admin/tenants/devices', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceListSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const search = parsed.data.search ?? '';
+    const filter: DeviceFilter = parsed.data.filter ?? 'all';
+    const sort: DeviceSort = parsed.data.sort ?? 'lastSeen';
+    const hideInactive = parsed.data.hideInactive === true;
+    const limit = parsed.data.limit;
+
+    try {
+      const nowMs = Date.now();
+
+      // Tenant-scoped devices (design Property 3 — scoping done in the service
+      // via `filterDevicesForTenant`).
+      const tenantDevices = await listTenantDevices(tenantId);
+
+      // Counts reflect the Selected_Tenant's devices (Req 1.3, 1.8) independent
+      // of the active search/filter; `computeCounts` guarantees
+      // `online + offline === total` (Property 2).
+      const counts = computeCounts(tenantDevices, nowMs);
+
+      // Narrow to the displayed set: search (Req 4) + filter (Req 5.1) +
+      // optional hide-inactive (Req 5.5).
+      let visible = tenantDevices.filter(
+        (device) => matchesSearch(device, search) && matchesFilter(device, filter, nowMs)
+      );
+      if (hideInactive) {
+        visible = visible.filter((device) => !isInactiveDevice(device));
+      }
+
+      // Group by owner email (A→Z, no-owner group last) and sort in-group
+      // (Req 5.2, 5.3, 5.6, 5.7), then flatten preserving that order. Each
+      // record still carries `ownerEmail`, so grouping is losslessly derivable.
+      const grouped = sortAndGroup(visible, sort, nowMs);
+      let devices: DeviceAdminRecord[] = grouped.flatMap((group) => group.devices);
+
+      // Optional defensive cap on the returned list.
+      if (typeof limit === 'number' && devices.length > limit) {
+        devices = devices.slice(0, limit);
+      }
+
+      return res.json({ ok: true, tenantId, counts, devices });
+    } catch (error) {
+      console.error('[admin_devices_list] load failed', error);
+      // The Device Console retains previously displayed data (Req 1.7); the
+      // server just reports the failure.
+      return res.status(500).json({ error: 'device_list_failed' });
+    }
+  });
+
+  // #2 Full device detail + provenance for one device.
+  app.post('/admin/tenants/devices/detail', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceDetailSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    try {
+      const device = await fetchDeviceDetail({ tenantId, email: normalizedEmail, deviceId });
+      return res.json({ ok: true, device });
+    } catch (error) {
+      // Typed service errors carry the status + code the route should return:
+      // 404 `device_not_found`, 403 `tenant_scope_violation` (Req 6.6, 3.2, 3.3).
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_detail] load failed', error);
+      return res.status(500).json({ error: 'device_detail_failed' });
+    }
+  });
+
+  // #12 Tenant-scoped action + notification history (most-recent-first).
+  app.post('/admin/tenants/devices/history', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceHistorySchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+
+    try {
+      const result = await fetchDeviceHistory({
+        tenantId,
+        limit: parsed.data.limit,
+        cursor: parsed.data.cursor,
+        action: parsed.data.action,
+      });
+      const response: {
+        ok: true;
+        entries: typeof result.entries;
+        hasMore: boolean;
+        nextCursor?: string;
+      } = { ok: true, entries: result.entries, hasMore: result.hasMore };
+      if (result.nextCursor) {
+        response.nextCursor = result.nextCursor;
+      }
+      return res.json(response);
+    } catch (error) {
+      // All-or-nothing: on failure return no partial entries (Req 13.4, 13.5).
+      console.error('[admin_devices_history] load failed', error);
+      return res.status(500).json({ error: 'history_failed' });
+    }
+  });
+
+  // #13 Per-device activity timeline (oldest-first, stable tie-break).
+  app.post('/admin/tenants/devices/timeline', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceTimelineSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    try {
+      const result = await fetchDeviceTimeline({ tenantId, email: normalizedEmail, deviceId });
+      return res.json({ ok: true, entries: result.entries });
+    } catch (error) {
+      console.error('[admin_devices_timeline] load failed', error);
+      return res.status(500).json({ error: 'timeline_failed' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Device Console — single-device destructive endpoints (Device Admin API)
+  // -------------------------------------------------------------------------
+  //
+  // Same master-token / global-admin gate as the read endpoints above
+  // (Req 16.1, 16.2): no auth context or a non-admin caller → 403 `not_authorized`
+  // with no state change. Bodies are `zod`-validated (400 `validation_failed`).
+  // Each resolves the acting admin identity the same way the other admin routes
+  // do — `resolveAuthenticatedEmail(authContext)` for `actor.email` and
+  // `authContext.uid` for `actor.id` — and threads it onto provenance + audit.
+  // Tenant scoping (Req 3.2/3.3/3.6) is enforced inside the orchestrators, which
+  // throw `tenant_scope_violation`→403. All thrown `DeviceAdminError`s carry the
+  // exact `status` + `code` the route should return, so a single mapping covers
+  // every lifecycle/conflict/scope case; unknown errors → 500.
+
+  // #3 Force logout a single device (Req 7.1, 7.3, 7.5, 7.7).
+  app.post('/admin/tenants/devices/force-logout', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceActionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      await forceLogout({ tenantId, email: normalizedEmail, deviceId, actor, reason: parsed.data.reason });
+      return res.json({ ok: true });
+    } catch (error) {
+      // Maps already_deleted→409, device_not_found→404, tenant_scope_violation→403,
+      // signal_write_failed→500 via the carried status + code.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_force_logout] failed', error);
+      return res.status(500).json({ error: 'force_logout_failed' });
+    }
+  });
+
+  // #6 Ban a single device by fingerprint (Req 8.1, 8.4, 8.6, 8.8).
+  app.post('/admin/tenants/devices/ban', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceBanSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    // Reason is required (1–500 after trimming) — Req 8.1/8.4.
+    const reasonResult = validateReason(parsed.data.reason);
+    if (!reasonResult.ok) {
+      return res.status(400).json({ error: 'invalid_reason' });
+    }
+    // Optional expiration must be strictly later than now — Req 8.8.
+    const expirationResult = validateExpiration(parsed.data.expiresAt, Date.now());
+    if (!expirationResult.ok) {
+      return res.status(400).json({ error: 'invalid_expiration' });
+    }
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      const result = await ban({
+        tenantId,
+        email: normalizedEmail,
+        deviceId,
+        actor,
+        reason: reasonResult.value,
+        expiresAt: parsed.data.expiresAt ?? null,
+      });
+      return res.json({ ok: true, banId: result.banId });
+    } catch (error) {
+      // Maps active_ban_exists→409, device_not_found→404, tenant_scope_violation→403.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_ban] failed', error);
+      return res.status(500).json({ error: 'ban_failed' });
+    }
+  });
+
+  // #7 Remove an active ban and restore access (Req 8.7).
+  app.post('/admin/tenants/devices/unban', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceActionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      await unban({ tenantId, email: normalizedEmail, deviceId, actor, reason: parsed.data.reason });
+      return res.json({ ok: true });
+    } catch (error) {
+      // Maps no_active_ban→409, device_not_found→404, tenant_scope_violation→403.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_unban] failed', error);
+      return res.status(500).json({ error: 'unban_failed' });
+    }
+  });
+
+  // #8 Soft-delete a single device (Req 9.1, 9.2, 9.5, 9.7).
+  app.post('/admin/tenants/devices/delete', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceActionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    // Reason is required (1–500 after trimming) — Req 9.2.
+    const reasonResult = validateReason(parsed.data.reason);
+    if (!reasonResult.ok) {
+      return res.status(400).json({ error: 'invalid_reason' });
+    }
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      await softDelete({ tenantId, email: normalizedEmail, deviceId, actor, reason: reasonResult.value });
+      return res.json({ ok: true });
+    } catch (error) {
+      // Maps already_deleted→409, device_not_found→404, tenant_scope_violation→403.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_delete] failed', error);
+      return res.status(500).json({ error: 'delete_failed' });
+    }
+  });
+
+  // #9 Restore a soft-deleted device (Req 9.3, 9.6).
+  app.post('/admin/tenants/devices/restore', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceActionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      await restore({ tenantId, email: normalizedEmail, deviceId, actor, reason: parsed.data.reason });
+      return res.json({ ok: true });
+    } catch (error) {
+      // Maps not_deleted→409, device_not_found→404, tenant_scope_violation→403.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_restore] failed', error);
+      return res.status(500).json({ error: 'restore_failed' });
+    }
+  });
+
+  // #10 Permanently delete a device + related tracking records (Req 10.1, 10.2, 10.4, 10.6).
+  app.post('/admin/tenants/devices/permanent-delete', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceActionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const deviceId = parsed.data.deviceId.trim();
+
+    // Reason is required (1–500 after trimming) — Req 10.2.
+    const reasonResult = validateReason(parsed.data.reason);
+    if (!reasonResult.ok) {
+      return res.status(400).json({ error: 'invalid_reason' });
+    }
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      await permanentDelete({ tenantId, email: normalizedEmail, deviceId, actor, reason: reasonResult.value });
+      return res.json({ ok: true });
+    } catch (error) {
+      // Maps device_not_found→404, delete_rolled_back→500, tenant_scope_violation→403.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_permanent_delete] failed', error);
+      return res.status(500).json({ error: 'permanent_delete_failed' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Device Console — user-scoped + bulk endpoints (Device Admin API)
+  // -------------------------------------------------------------------------
+  //
+  // Same master-token / global-admin gate as the single-device routes above
+  // (Req 15.4, 16.1, 16.2): no auth context or a non-admin caller → 403
+  // `not_authorized` with no state change. Bodies are `zod`-validated (400
+  // `validation_failed`); notify/bulk additionally run the pure
+  // `validateTitle`/`validateMessage`/`validateTargets` helpers so out-of-bounds
+  // titles/messages and empty/over-limit selections surface as the specific
+  // codes (`invalid_title`, `invalid_message`, `empty_recipients`,
+  // `too_many_targets`) before any fan-out. Each resolves the acting admin
+  // identity the same way the single-device routes do —
+  // `resolveAuthenticatedEmail(authContext)` for `actor.email`/`actor.name` and
+  // `authContext.uid` for `actor.id`.
+
+  // #4 Force logout ALL active in-tenant devices of a user (Req 11.1, 11.4).
+  app.post('/admin/tenants/devices/force-logout-all', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceForceLogoutAllSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      const result = await forceLogoutAll({ tenantId, email: normalizedEmail, actor, reason: parsed.data.reason });
+      return res.json({ ok: true, affected: result.affected });
+    } catch (error) {
+      // Partial signal-write failure: some devices were signaled, others retained
+      // their sessions — return 500 identifying the affected devices (Req 11.4).
+      // Checked BEFORE the generic mapping because ForceLogoutAllError extends
+      // DeviceAdminError.
+      if (error instanceof ForceLogoutAllError) {
+        return res.status(500).json({
+          error: 'signal_write_failed',
+          affected: error.affected,
+          failedDeviceIds: error.failedDeviceIds,
+        });
+      }
+      // Maps tenant_scope_violation→403 and any other typed lifecycle error via
+      // the carried status + code (Req 11.1).
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_force_logout_all] failed', error);
+      return res.status(500).json({ error: 'force_logout_all_failed' });
+    }
+  });
+
+  // #5 Bulk force-logout up to 500 selected devices (Req 14.2, 14.4, 14.7).
+  app.post('/admin/tenants/devices/bulk/force-logout', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceBulkForceLogoutSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+
+    // Non-empty + ≤500 bounds → specific `too_many_targets` over the limit,
+    // otherwise `validation_failed` (empty/other) — Req 14.2/14.4.
+    const targetsResult = validateTargets(parsed.data.targets);
+    if (!targetsResult.ok) {
+      const code = parsed.data.targets.length > DEFAULT_MAX_TARGETS ? 'too_many_targets' : 'validation_failed';
+      return res.status(400).json({ error: code });
+    }
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      const result = await bulkForceLogout({
+        tenantId,
+        targets: targetsResult.value,
+        actor,
+        reason: parsed.data.reason,
+      });
+      // Bulk completeness: succeeded + failed === targets, one outcome each,
+      // failures never block successes (Req 14.7; design Property 18).
+      return res.json({ ok: true, succeeded: result.succeeded, failed: result.failed, results: result.results });
+    } catch (error) {
+      // Maps too_many_targets→400, tenant_scope_violation→403 via status + code.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_bulk_force_logout] failed', error);
+      return res.status(500).json({ error: 'bulk_force_logout_failed' });
+    }
+  });
+
+  // #11 Compose + send a notification to selected devices (Req 12.1, 12.4, 12.6, 14.4).
+  app.post('/admin/tenants/devices/notify', async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
+      return res.status(403).json({ error: 'not_authorized' });
+    }
+
+    const parsed = tenantDeviceNotifySchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = parsed.data.tenantId.trim();
+
+    // Title 1–100 (Req 12.1) and message 1–500 (Req 12.4) after trimming.
+    const titleResult = validateTitle(parsed.data.title);
+    if (!titleResult.ok) {
+      return res.status(400).json({ error: 'invalid_title' });
+    }
+    const messageResult = validateMessage(parsed.data.body);
+    if (!messageResult.ok) {
+      return res.status(400).json({ error: 'invalid_message' });
+    }
+    // Non-empty recipients (Req 12.6) capped at 500 (Req 14.4): empty →
+    // `empty_recipients`, over the limit → `too_many_targets`.
+    const targetsResult = validateTargets(parsed.data.targets);
+    if (!targetsResult.ok) {
+      const code = parsed.data.targets.length > DEFAULT_MAX_TARGETS ? 'too_many_targets' : 'empty_recipients';
+      return res.status(400).json({ error: code });
+    }
+
+    try {
+      const actorEmail = await resolveAuthenticatedEmail(authContext);
+      const actor = { id: authContext.uid, email: actorEmail ?? undefined, name: actorEmail ?? undefined };
+      const result = await notify({
+        tenantId,
+        title: titleResult.value,
+        body: messageResult.value,
+        targets: targetsResult.value,
+        actor,
+        priority: parsed.data.priority,
+      });
+      // Aggregate completeness: successful + failed === targets, one outcome each
+      // (Req 12.5/12.7; design Property 18).
+      return res.json({ ok: true, successful: result.successful, failed: result.failed, results: result.results });
+    } catch (error) {
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[admin_devices_notify] failed', error);
+      return res.status(500).json({ error: 'notify_failed' });
     }
   });
 
@@ -17288,6 +18013,83 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  // Force logout every active in-tenant device of a member (tenant-admin authorized).
+  //
+  // This is the app-client-reachable counterpart to the master-gated
+  // `/admin/tenants/devices/force-logout-all` Device Console endpoint. The app
+  // client authenticates with a per-user INTERNAL token (Firebase ID token ->
+  // `/auth/bridge`), not a master token, so it cannot call the master-gated
+  // console route. Instead it proves tenant-admin access through the shared
+  // tenant-access guard (`requireParamsAdminTenantAccess`, owner/admin only) and
+  // reuses the exact same `deviceAdminService.forceLogoutAll` orchestrator, so
+  // the signal writes + audit entry are identical to the console path.
+  //
+  // The client calls this when an authorized email is removed from a tenant:
+  // Stage 4 locked `logout_signals` / `user_devices` to backend-only writes, so
+  // the former direct-Firestore force-logout can no longer run on the device.
+  app.post('/tenants/:tenantId/members/force-logout', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    // Defense-in-depth: the guard already enforced minRole 'admin', but mirror
+    // the membership routes' explicit owner/admin gate so a low-role caller is
+    // rejected here too (Req 16.1/16.2).
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+
+    // Body is just the target member email (tenantId comes from the resolved,
+    // authorized route param). Trim + validate as an email, max 200 chars.
+    const parsed = z
+      .object({ email: z.string().trim().email().max(200) })
+      .safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const normalizedEmail = normalizeEmail(parsed.data.email);
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+
+    try {
+      // Resolve the acting admin identity the same way the other device/admin
+      // routes do so provenance + audit attribute the action (Req 16.3).
+      const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+      const actor = {
+        id: req.authContext?.uid,
+        email: actorEmail ?? undefined,
+        name: actorEmail ?? undefined,
+      };
+      const result = await forceLogoutAll({
+        tenantId: tenantAccess.tenantId,
+        email: normalizedEmail,
+        actor,
+      });
+      return res.json({ ok: true, affected: result.affected });
+    } catch (error) {
+      // Partial signal-write failure: some devices were signaled, others kept
+      // their sessions — return 500 identifying the affected devices (Req 11.4).
+      // Checked before the generic mapping because ForceLogoutAllError extends
+      // DeviceAdminError.
+      if (error instanceof ForceLogoutAllError) {
+        return res.status(500).json({
+          error: 'signal_write_failed',
+          affected: error.affected,
+          failedDeviceIds: error.failedDeviceIds,
+        });
+      }
+      // Any other typed lifecycle/scope error maps via its carried status + code.
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      console.error('[tenant_members_force_logout] failed', error);
+      return res.status(500).json({ error: 'force_logout_all_failed' });
+    }
+  });
+
   app.get('/notifications/daily-quotes/status', optionalQueryStaffTenantAccess, async (req, res) => {
     const authContext = req.authContext;
     if (!authContext) {
@@ -17539,7 +18341,45 @@ export function createApp(options: CreateAppOptions = {}){
         baseUpdate.ownerUid = req.authContext.uid;
       }
 
-      await deviceRef.set(baseUpdate, { merge: true });
+      // Device_Tenant_Index write-path maintenance (device-tenant-index feature).
+      // This endpoint is the single backend writer of the Tenant_Scoping_Source
+      // (`tenantIds`/`activeTenantId`), so it also keeps the denormalized derived
+      // `tenantIndex` consistent IN THE SAME atomic write per the
+      // "recompute-and-persist-in-the-same-write" contract documented in
+      // deviceAdminService. `tenantId` is already trimmed + non-empty (schema
+      // `.trim().min(1)` and the tenant guard above), so no empty id is ever
+      // written into the index (Requirement 1.4).
+      if (pingType === 'register') {
+        // FULL RECOMPUTE. Registration is the only moment scope can SHRINK or
+        // `tenantMemberships` can change: the client's preceding setDoc(merge)
+        // may have replaced/removed `tenantIds`/`tenantMemberships`/
+        // `activeTenantId` wholesale. We therefore read the CURRENT (post
+        // client-merge) source inside a transaction, apply this ping's
+        // contribution (add + activate the pinged tenant), recompute the whole
+        // index via `deriveTenantIndex`, and write scope + index together
+        // atomically (Requirements 2.1, 2.2, 2.4, 2.5, 3.2). On transaction
+        // failure nothing changes and the outer catch surfaces 500
+        // internal_error (Requirement 2.6) — the failure is not swallowed.
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(deviceRef);
+          const current = (snap.data() ?? {}) as Record<string, unknown>;
+          const resultingSource = buildResultingTenantScopeForAddedTenant(current, tenantId);
+          const tenantIndex = deriveTenantIndex(resultingSource);
+          tx.set(deviceRef, { ...baseUpdate, tenantIndex }, { merge: true });
+        });
+      } else {
+        // ADDITIVE. `heartbeat`/`full` pings only ever ADD the pinged tenant to
+        // scope (`arrayUnion` on `tenantIds`, `activeTenantId = tenantId`); they
+        // never remove a tenant and never touch `tenantMemberships`. So the only
+        // effect on the derived index is "ensure `tenantId` is present" — a
+        // matching `arrayUnion` on `tenantIndex` in the SAME set(merge) keeps the
+        // scope change and index change in ONE atomic write with NO extra read,
+        // preserving the hot heartbeat path's cost (Requirements 2.3, 2.5, 3.1,
+        // 3.3). A presence-only heartbeat still (idempotently) reasserts the
+        // pinged tenant and never drops existing tenants.
+        baseUpdate.tenantIndex = admin.firestore.FieldValue.arrayUnion(tenantId);
+        await deviceRef.set(baseUpdate, { merge: true });
+      }
 
       const parentUpdate: admin.firestore.UpdateData<admin.firestore.DocumentData> = {
         email: normalizedEmail,
