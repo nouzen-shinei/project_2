@@ -22,7 +22,8 @@ import * as admin from 'firebase-admin';
 import { createHash } from 'crypto';
 import { matchesTenantDevice, type TenantTaggedDocument } from './tenantDeviceFilter';
 import { getFirestore } from './firebaseAdmin';
-import { sendExpoMessages, type ExpoPushMessage } from './pushUtils';
+import { toEpochMs, resolveDeviceLastSeenMs } from './lib/deviceLastSeen';
+import { sendExpoMessages, type ExpoPushMessage, type SendExpoMessagesResult } from './pushUtils';
 import {
   sendWebPushNotification,
   sanitizeWebPushSubscription,
@@ -198,37 +199,46 @@ export function classifyOnline(
 
 /**
  * Resolve a device's last-seen epoch-ms, preferring the numeric `lastSeenMs`
- * companion and falling back to parsing the ISO `lastSeen` string. Returns
- * `NaN` when neither yields a valid time (so callers treat it as offline).
+ * companion and falling back to parsing the `lastSeen` field. Returns `NaN`
+ * when neither yields a valid time (so callers treat it as offline).
+ *
+ * Delegates to the shared {@link resolveDeviceLastSeenMs} (the single source of
+ * truth also used by the offline-device prune job) and normalizes its `null`
+ * "unknown" result to `NaN` for the pure `classifyOnline` window comparison.
  */
 function resolveLastSeenMs(device: Pick<DeviceAdminRecord, 'lastSeen' | 'lastSeenMs'>): number {
-  if (typeof device.lastSeenMs === 'number' && Number.isFinite(device.lastSeenMs)) {
-    return device.lastSeenMs;
-  }
-  if (typeof device.lastSeen === 'string' && device.lastSeen.trim().length > 0) {
-    const parsed = Date.parse(device.lastSeen);
-    if (!Number.isNaN(parsed)) {
-      return parsed;
-    }
-  }
-  return Number.NaN;
+  const ms = resolveDeviceLastSeenMs(device);
+  return ms === null ? Number.NaN : ms;
 }
 
 /**
  * Compute total/online/offline counts for a set of devices at reference time
  * `nowMs`, using the 300-second online window (Requirement 1.6).
  *
+ * A soft-deleted (`isDeleted === true`) or hard-banned (`isHardBanned === true`)
+ * device is NEVER counted online — such a device cannot hold a live session, so
+ * counting a stale-but-recent `lastSeen` as "online" would be misleading. It
+ * instead counts toward `offline` (and `total`). The pure `classifyOnline`
+ * helper is left untouched (lastSeen-only, Requirement 1.6); the deleted/banned
+ * exclusion is applied here, where the full device records are available.
+ *
  * Guarantees the partition invariant `online + offline === total` for any input
  * (Requirements 1.3, 1.8), and returns `{ total: 0, online: 0, offline: 0 }`
  * for an empty input. Pure: no I/O, deterministic in its inputs.
  */
 export function computeCounts(
-  devices: ReadonlyArray<Pick<DeviceAdminRecord, 'lastSeen' | 'lastSeenMs'>>,
+  devices: ReadonlyArray<
+    Pick<DeviceAdminRecord, 'lastSeen' | 'lastSeenMs' | 'isDeleted' | 'isHardBanned'>
+  >,
   nowMs: number
 ): DeviceCounts {
   const total = devices.length;
   let online = 0;
   for (const device of devices) {
+    // A deleted or hard-banned device can have no live session — never online.
+    if (device.isDeleted === true || device.isHardBanned === true) {
+      continue;
+    }
     if (classifyOnline(resolveLastSeenMs(device), nowMs)) {
       online += 1;
     }
@@ -390,11 +400,12 @@ export function isInactiveDevice(device: DeviceAdminRecord): boolean {
 /**
  * Decide whether a device matches the selected filter at reference time
  * `nowMs` (Requirement 5.1). Online/offline use the 300-second console window
- * via `classifyOnline` so they agree with `computeCounts`; `web`/`mobile`/
- * `tablet` match `deviceType`; `deleted`/`hard_banned` read the lifecycle
- * flags; `logged_out` is a manual/auto logout and `force_logged_out` is a
- * forced logout (see the predicates above). Pure: no I/O, deterministic in its
- * inputs.
+ * via `classifyOnline` AND exclude deleted/hard-banned devices from `online`
+ * (they match `offline`) so the filter agrees with the online/offline split
+ * produced by `computeCounts`; `web`/`mobile`/`tablet` match `deviceType`;
+ * `deleted`/`hard_banned` read the lifecycle flags; `logged_out` is a
+ * manual/auto logout and `force_logged_out` is a forced logout (see the
+ * predicates above). Pure: no I/O, deterministic in its inputs.
  */
 export function matchesFilter(
   device: DeviceAdminRecord,
@@ -405,9 +416,20 @@ export function matchesFilter(
     case 'all':
       return true;
     case 'online':
-      return classifyOnline(resolveLastSeenMs(device), nowMs);
+      // A deleted / hard-banned device can hold no live session, so it never
+      // matches `online` (it matches `offline`) — keeping this filter consistent
+      // with the online/offline split produced by `computeCounts`.
+      return (
+        device.isDeleted !== true &&
+        device.isHardBanned !== true &&
+        classifyOnline(resolveLastSeenMs(device), nowMs)
+      );
     case 'offline':
-      return !classifyOnline(resolveLastSeenMs(device), nowMs);
+      return !(
+        device.isDeleted !== true &&
+        device.isHardBanned !== true &&
+        classifyOnline(resolveLastSeenMs(device), nowMs)
+      );
     case 'web':
       return device.deviceType === 'web';
     case 'mobile':
@@ -570,6 +592,115 @@ export function sortAndGroup(
 
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Result-set pagination (pure helpers)
+// ---------------------------------------------------------------------------
+//
+// Recommendation #2 — real device-list pagination.
+//
+// The list endpoint computes EXACT total/online/offline counts (Req 1.3, 1.8),
+// an 8-field substring search (Req 4), and owner-grouping sort (Req 5.2, 5.3,
+// 5.6, 5.7). Each of those inherently needs the FULL tenant device set in
+// memory, so a true datastore cursor — which would truncate the scan to a page
+// — is incompatible with them. We therefore paginate the RETURNED, already
+// deterministically-ordered result array with an opaque cursor while leaving
+// counts/search/filter/sort computed over the full set exactly as before.
+//
+// TRADEOFF: every page still scans the whole tenant device set, so the read
+// cost is O(tenant devices) per page rather than O(limit). This is acceptable
+// for an admin console (bounded tenants, infrequent calls) and keeps counts
+// exact. The future path to genuinely read-bounded pagination is an external
+// search index (Algolia / Typesense) plus precomputed aggregate counters, which
+// would let a page and the counts be served without loading the full set.
+//
+// KNOWN CAVEAT: the cursor is an offset into a freshly-recomputed ordered
+// result, so a concurrent mutation (a device added/removed between two page
+// requests) can shift rows by one and cause a row to be skipped or repeated
+// across pages. This is acceptable for an admin console — the counts are
+// recomputed on every call and the operator can refresh — and it is more robust
+// than a keyset boundary, which would not survive re-sorting under a different
+// sort option.
+
+/** Default device-list page size applied when a caller omits `limit`. */
+export const DEFAULT_DEVICE_LIST_LIMIT = 100;
+
+/** Hard upper bound on a single device-list page (request-validation cap). */
+export const MAX_DEVICE_LIST_LIMIT = 500;
+
+/**
+ * Encode a non-negative integer offset into an opaque, URL-safe cursor. The
+ * offset is serialized to its decimal string then base64url-encoded so the
+ * token carries no meaning to the client (they only ever echo it back).
+ */
+function encodeDeviceCursor(offset: number): string {
+  return Buffer.from(String(offset), 'utf8').toString('base64url');
+}
+
+/**
+ * Decode an opaque device-list cursor back into a non-negative integer offset.
+ * Anything invalid — absent, blank, not base64url, or not a canonical
+ * non-negative integer — decodes to 0 (the first page), so a garbage cursor
+ * degrades gracefully rather than throwing. Pure: no I/O.
+ */
+function decodeDeviceCursor(cursor: string | undefined): number {
+  if (typeof cursor !== 'string') {
+    return 0;
+  }
+  const trimmed = cursor.trim();
+  if (trimmed.length === 0) {
+    return 0;
+  }
+  // `Buffer.from(_, 'base64url')` never throws — it ignores non-alphabet chars —
+  // so we validate the DECODED payload is a canonical non-negative integer.
+  const decoded = Buffer.from(trimmed, 'base64url').toString('utf8');
+  if (!/^\d+$/.test(decoded)) {
+    return 0;
+  }
+  const parsed = Number(decoded);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    return 0;
+  }
+  return parsed;
+}
+
+/**
+ * Paginate an already-ordered device result with an opaque offset cursor
+ * (Recommendation #2).
+ *
+ * `cursor` decodes to a non-negative integer offset (absent/blank/invalid => 0),
+ * clamped into `[0, ordered.length]`. `limit` is clamped to
+ * `[1, MAX_DEVICE_LIST_LIMIT]`; a non-positive / non-finite limit falls back to
+ * `DEFAULT_DEVICE_LIST_LIMIT` so a single page is always well-bounded. Returns
+ * the `page` slice `[offset, offset + limit)`, `hasMore` (whether any rows
+ * remain past this page), and `nextCursor` — the opaque cursor for the next
+ * page, present iff `hasMore`.
+ *
+ * Pure: no I/O, deterministic in its inputs. This helper ONLY slices the
+ * ordered result; the caller is responsible for computing counts/search/filter/
+ * sort over the FULL set (see the module comment for the read-cost tradeoff).
+ */
+export function paginateDevices(
+  ordered: ReadonlyArray<DeviceAdminRecord>,
+  cursor: string | undefined,
+  limit: number
+): { page: DeviceAdminRecord[]; hasMore: boolean; nextCursor?: string } {
+  const flooredLimit = Number.isFinite(limit) ? Math.floor(limit) : Number.NaN;
+  const safeLimit =
+    Number.isInteger(flooredLimit) && flooredLimit > 0
+      ? Math.min(flooredLimit, MAX_DEVICE_LIST_LIMIT)
+      : DEFAULT_DEVICE_LIST_LIMIT;
+
+  const rawOffset = decodeDeviceCursor(cursor);
+  const offset = Math.min(Math.max(rawOffset, 0), ordered.length);
+
+  const page = ordered.slice(offset, offset + safeLimit);
+  const hasMore = offset + safeLimit < ordered.length;
+  const nextCursor = hasMore ? encodeDeviceCursor(offset + safeLimit) : undefined;
+
+  return { page, hasMore, nextCursor };
+}
+
 // ---------------------------------------------------------------------------
 // Input validation (pure helpers)
 // ---------------------------------------------------------------------------
@@ -2458,13 +2589,23 @@ export async function permanentDelete(
 // `notify` reuses the EXISTING delivery primitives — `pushUtils.sendExpoMessages`
 // for Expo-token targets and `webPush.sendWebPushNotification` for web-push
 // targets (design's Push_Delivery_Service reuse; Requirements 12.2, 12.3) — and
-// never builds a new delivery path. Each per-target delivery is wrapped in a 30s
-// timeout via `Promise.race` so a stuck delivery is counted as failed rather than
-// hanging the whole send (Requirement 12.5); the per-target deliveries run
-// concurrently so the call settles once every delivery has completed or timed
-// out. Exactly ONE `notify` audit entry is written per call, carrying the
-// delivery counts and an aggregate outcome (design's "every notify call writes
-// one deviceAuditLogs entry with delivery counts").
+// never builds a new delivery path. Expo-token targets are BATCHED: all of a
+// single notify call's Expo messages go out in ONE `sendExpoMessages(...)` call
+// (which internally chunks to ≤100 messages per Expo HTTP request), instead of
+// one Expo HTTP request per device, cutting the fan-out from up to 500 requests
+// to ceil(N/100). Web-push targets stay per-target (Expo's batch endpoint has no
+// web-push equivalent) and run concurrently with a bounded fan-out.
+//
+// TIMEOUT-GRANULARITY TRADEOFF (Requirement 12.5): the single batched Expo call
+// is wrapped in ONE 30s `withTimeout`, so up to 100 Expo messages now SHARE a
+// single 30s budget rather than each getting its own 30s timer. If that batched
+// call times out or the push service is unavailable/throws, EVERY Expo target in
+// the batch is counted as failed (Requirement 12.7). Web-push deliveries keep
+// their per-target 30s timeout. This is an intentional cost of batching: it
+// trades per-message timeout isolation for far fewer outbound HTTP requests.
+// Exactly ONE `notify` audit entry is written per call, carrying the delivery
+// counts and an aggregate outcome (design's "every notify call writes one
+// deviceAuditLogs entry with delivery counts").
 //
 // AUDIT APPROACH for `bulkForceLogout` (documented per task 7.1): each per-target
 // force-logout delegates to the single-device `forceLogout`, which already writes
@@ -2478,7 +2619,13 @@ export async function permanentDelete(
 // conflict/signal-write failures — write no audit entry, consistent with the
 // per-device orchestrator, so there is never a partial/duplicate audit.)
 
-/** Per-target delivery/action timeout for notify deliveries (Requirement 12.5). */
+/**
+ * Delivery/action timeout for notify deliveries (Requirement 12.5). Applied
+ * per web-push target and ONCE around the single batched Expo call — so a batch
+ * of up to 100 Expo messages shares one 30s budget (see the batching/timeout
+ * tradeoff note above and on {@link notify}). A timeout counts the affected
+ * delivery(ies) as failed rather than hanging the send.
+ */
 export const NOTIFY_DELIVERY_TIMEOUT_MS = 30_000;
 
 /**
@@ -2560,8 +2707,12 @@ function toServiceErrorCode(err: unknown): string {
  * `delivery_timeout` error if the timer wins (Requirement 12.5). The timer is
  * `unref`'d so it never keeps the process alive, and cleared as soon as the
  * delivery settles.
+ *
+ * Exported so the Server_Fanout orchestrator (`deviceFanoutService.fanout`) can
+ * reuse the SAME delivery-timeout primitive as `notify` rather than forking a
+ * divergent one (device-push-fanout-migration Req 1.5).
  */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error('delivery_timeout'));
@@ -2594,8 +2745,9 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
  *
  * This helper NEVER rejects as long as `fn` never rejects — it is used only
  * with mappers that catch their own errors and resolve to an outcome value
- * (see {@link deliverNotification} and the per-target bulk mapper), so the
- * bounded fan-out is a pure performance concern with no behavioral change. An
+ * (see the notify target-resolution / web-push mappers and the per-target bulk
+ * mapper), so the bounded fan-out is a pure performance concern with no
+ * behavioral change. An
  * empty `items` list resolves immediately to `[]` without invoking `fn`. A
  * `limit <= 0` is clamped to `1`.
  *
@@ -2660,27 +2812,36 @@ function toWebPushUrgency(priority?: NotifyPriority): 'very-low' | 'low' | 'norm
 }
 
 /**
- * Deliver one notification to a single target, returning its {@link DeviceActionOutcome}.
+ * Classification of a single notify target after its device doc is read.
  *
- * Loads `user_devices/{email}/devices/{deviceId}` and, WITHOUT throwing, records
- * a FAILED outcome for a missing device (`device_not_found`) or a device outside
- * the scoped tenant (`tenant_scope_violation`) — so tenant isolation holds for
- * the bulk send without aborting the rest (Requirement 3.2; design Property 18).
- * It then resolves the device's push channel — preferring a non-empty
- * `expoPushToken` (via {@link sendExpoMessages}), else a valid `webPushSubscription`
- * (via {@link sendWebPushNotification}) — and wraps the delivery in a 30s timeout
- * (Requirement 12.5). Any delivery failure, timeout, thrown error, or
- * push-service-unavailable condition, and a target with no push channel, all map
- * to a FAILED outcome (Requirements 12.5, 12.7). This function never throws.
+ * `notify` resolves every target into exactly one of these WITHOUT throwing, so
+ * a missing/out-of-scope/channel-less device is captured as a failure rather
+ * than aborting the rest (Requirement 3.2; design Property 18). `expo`/`web`
+ * carry the resolved push address; `failure` carries the stable error code that
+ * becomes the target's {@link DeviceActionOutcome} error verbatim.
  */
-async function deliverNotification(
+type ResolvedNotifyTarget =
+  | { kind: 'failure'; email: string; deviceId: string; error: string }
+  | { kind: 'expo'; email: string; deviceId: string; token: string }
+  | { kind: 'web'; email: string; deviceId: string; subscription: WebPushSubscriptionShape };
+
+/**
+ * Resolve one notify target's push channel from its device doc, NEVER throwing.
+ *
+ * Loads `user_devices/{email}/devices/{deviceId}` and classifies the target:
+ * `device_not_found` for a missing doc, a read-error message on a failed read,
+ * `tenant_scope_violation` for an out-of-tenant device (Requirement 3.2), an
+ * `expo` target when a non-empty `expoPushToken` is present (PREFERRED over
+ * web-push), a `web` target for a valid `webPushSubscription`, or a
+ * `no_push_target` failure when the device has no usable channel. This is the
+ * read/classification half of delivery; the actual send happens in the batched
+ * Expo phase / per-target web-push phase of {@link notify}.
+ */
+async function resolveNotifyTarget(
   db: admin.firestore.Firestore,
   tenantId: string,
-  target: DeviceTarget,
-  title: string,
-  body: string,
-  priority?: NotifyPriority
-): Promise<DeviceActionOutcome> {
+  target: DeviceTarget
+): Promise<ResolvedNotifyTarget> {
   const { email, deviceId } = target;
 
   let data: Record<string, unknown>;
@@ -2692,67 +2853,71 @@ async function deliverNotification(
       .doc(deviceId);
     const snapshot = await deviceRef.get();
     if (!snapshot.exists) {
-      return { email, deviceId, ok: false, error: 'device_not_found' };
+      return { kind: 'failure', email, deviceId, error: 'device_not_found' };
     }
     data = (snapshot.data() ?? {}) as Record<string, unknown>;
   } catch (err) {
-    return { email, deviceId, ok: false, error: toErrorMessage(err) };
+    return { kind: 'failure', email, deviceId, error: toErrorMessage(err) };
   }
 
   // Tenant isolation for bulk: an out-of-scope target is a FAILED result, not a
   // throw, so the remaining targets are still processed (Requirement 3.2).
   if (!assertTenantScope(data, tenantId)) {
-    return { email, deviceId, ok: false, error: 'tenant_scope_violation' };
+    return { kind: 'failure', email, deviceId, error: 'tenant_scope_violation' };
   }
 
   const expoToken =
     typeof data.expoPushToken === 'string' && data.expoPushToken.trim().length > 0
       ? data.expoPushToken.trim()
       : undefined;
+  if (expoToken) {
+    // Expo token is PREFERRED over web-push (unchanged precedence).
+    return { kind: 'expo', email, deviceId, token: expoToken };
+  }
+
   const subscription: WebPushSubscriptionShape | null = sanitizeWebPushSubscription(
     data.webPushSubscription
   );
+  if (subscription) {
+    return { kind: 'web', email, deviceId, subscription };
+  }
 
+  // No usable push channel on this device.
+  return { kind: 'failure', email, deviceId, error: 'no_push_target' };
+}
+
+/**
+ * Deliver one notification to a single WEB-PUSH target, returning its
+ * {@link DeviceActionOutcome}. Wraps the `sendWebPushNotification` call in a 30s
+ * timeout (Requirement 12.5) and NEVER throws — a delivery failure, timeout, or
+ * push-service-unavailable condition maps to a FAILED outcome (Requirements
+ * 12.5, 12.7, 14.7). Expo targets are NOT delivered here; they go through the
+ * batched Expo phase in {@link notify}.
+ */
+async function deliverWebPushNotification(
+  target: { email: string; deviceId: string; subscription: WebPushSubscriptionShape },
+  title: string,
+  body: string,
+  priority?: NotifyPriority
+): Promise<DeviceActionOutcome> {
+  const { email, deviceId, subscription } = target;
   try {
-    if (expoToken) {
-      const message: ExpoPushMessage = {
-        to: expoToken,
-        title,
-        body,
-        priority: toExpoPriority(priority),
-        data: { type: 'device_console_notification' },
-      };
-      const result = await withTimeout(
-        sendExpoMessages([message], { context: 'device_notify' }),
-        NOTIFY_DELIVERY_TIMEOUT_MS
-      );
-      const ok = result.sent >= 1;
-      return { email, deviceId, ok, error: ok ? undefined : 'expo_delivery_failed' };
-    }
-
-    if (subscription) {
-      const result = await withTimeout(
-        sendWebPushNotification({
-          subscription,
-          payload: { title, body, data: { type: 'device_console_notification' } },
-          urgency: toWebPushUrgency(priority),
-        }),
-        NOTIFY_DELIVERY_TIMEOUT_MS
-      );
-      const ok = result.ok === true;
-      return {
-        email,
-        deviceId,
-        ok,
-        error: ok ? undefined : result.errorCode ?? 'web_push_delivery_failed',
-      };
-    }
-
-    // No usable push channel on this device.
-    return { email, deviceId, ok: false, error: 'no_push_target' };
+    const result = await withTimeout(
+      sendWebPushNotification({
+        subscription,
+        payload: { title, body, data: { type: 'device_console_notification' } },
+        urgency: toWebPushUrgency(priority),
+      }),
+      NOTIFY_DELIVERY_TIMEOUT_MS
+    );
+    const ok = result.ok === true;
+    return {
+      email,
+      deviceId,
+      ok,
+      error: ok ? undefined : result.errorCode ?? 'web_push_delivery_failed',
+    };
   } catch (err) {
-    // Per-target delivery failure / 30s timeout / push-service-unavailable —
-    // counted as failed without aborting the rest (Requirements 12.5, 12.7, 14.7).
     return { email, deviceId, ok: false, error: toErrorMessage(err) };
   }
 }
@@ -2762,13 +2927,31 @@ async function deliverNotification(
  * Push_Delivery_Service (Requirements 12.2, 12.3, 12.5, 12.7, 14.7, 14.8; design
  * Property 18).
  *
- * Each target's delivery runs concurrently and is wrapped in a 30s timeout, so
- * the call settles once every delivery has completed or timed out
- * (Requirement 12.5). A per-target failure, timeout, or push-service-unavailable
- * condition is captured as a failed outcome and never aborts the remaining
- * targets (Requirements 12.7, 14.7). The returned `successful + failed` equals
- * the number of targets and every target appears exactly once in `results`
- * (design Property 18). Exactly one `notify` audit entry is written recording the
+ * Runs in three phases so the completeness invariants hold regardless of channel
+ * mix:
+ *   1. RESOLUTION — read each device doc concurrently (bounded fan-out) and
+ *      classify it into a failure outcome (`device_not_found` /
+ *      `tenant_scope_violation` / read error / `no_push_target`), an Expo target,
+ *      or a web-push target (Expo token preferred). Never throws.
+ *   2. EXPO BATCH — all Expo targets go out in ONE `sendExpoMessages(...)` call
+ *      (internally chunked to ≤100 per HTTP request) wrapped in a SINGLE 30s
+ *      timeout. Each target's outcome is read from the index-aligned per-message
+ *      `results`. If the batched call times out or the push service is
+ *      unavailable/throws, EVERY Expo target in the batch is failed
+ *      (Requirement 12.7).
+ *   3. WEB-PUSH — each web-push target is delivered individually with its own 30s
+ *      timeout, concurrently with a bounded fan-out.
+ * Outcomes are reassembled into INPUT ORDER so `results[i]` corresponds to
+ * `targets[i]`.
+ *
+ * TIMEOUT-GRANULARITY TRADEOFF (Requirement 12.5): batching means up to 100 Expo
+ * messages now SHARE one 30s timeout instead of each getting its own. This is an
+ * intentional cost of collapsing up to 500 Expo HTTP requests into ceil(N/100).
+ * A per-target failure, timeout, or push-service-unavailable condition is still
+ * captured as a failed outcome and never aborts the remaining targets
+ * (Requirements 12.7, 14.7). The returned `successful + failed` equals the number
+ * of targets and every target appears exactly once in `results` (design
+ * Property 18). Exactly one `notify` audit entry is written recording the
  * delivery counts and the aggregate outcome (`success` when none failed,
  * `failure` when none succeeded, otherwise `partial`); an audit-write failure
  * propagates so the route reports the action as not recorded (Requirement 17.4).
@@ -2794,15 +2977,97 @@ export async function notify(params: NotifyParams): Promise<NotifyResult> {
 
   const db = getFirestore();
 
-  // Deliveries run concurrently with a bounded fan-out; `deliverNotification`
-  // never throws, so this resolves once every delivery has completed or timed
-  // out (Requirement 12.5). `mapWithConcurrency` preserves input order and
-  // returns exactly one outcome per target, so the succeeded/failed counts and
-  // the completeness property (design Property 18) are unchanged — only the
-  // number of simultaneous deliveries is capped.
-  const results = await mapWithConcurrency(targets, DEVICE_ACTION_CONCURRENCY, (target) =>
-    deliverNotification(db, tenantId, target, title, body, priority)
+  // Phase 1 — RESOLUTION. Read + classify every target concurrently (bounded
+  // fan-out). `resolveNotifyTarget` never throws, and `mapWithConcurrency`
+  // preserves input order, so `resolved[i]` corresponds to `targets[i]`.
+  const resolved = await mapWithConcurrency(targets, DEVICE_ACTION_CONCURRENCY, (target) =>
+    resolveNotifyTarget(db, tenantId, target)
   );
+
+  // Outcomes are written back at each target's ORIGINAL index so the returned
+  // `results` are in INPUT ORDER and every target appears exactly once
+  // (design Property 18).
+  const results: DeviceActionOutcome[] = new Array(targets.length);
+  const expoEntries: Array<{ index: number; email: string; deviceId: string; message: ExpoPushMessage }> = [];
+  const webEntries: Array<{ index: number; email: string; deviceId: string; subscription: WebPushSubscriptionShape }> = [];
+
+  resolved.forEach((entry, index) => {
+    if (entry.kind === 'failure') {
+      results[index] = { email: entry.email, deviceId: entry.deviceId, ok: false, error: entry.error };
+    } else if (entry.kind === 'expo') {
+      expoEntries.push({
+        index,
+        email: entry.email,
+        deviceId: entry.deviceId,
+        message: {
+          to: entry.token,
+          title,
+          body,
+          priority: toExpoPriority(priority),
+          data: { type: 'device_console_notification' },
+        },
+      });
+    } else {
+      webEntries.push({
+        index,
+        email: entry.email,
+        deviceId: entry.deviceId,
+        subscription: entry.subscription,
+      });
+    }
+  });
+
+  // Phase 2 — EXPO BATCH. All Expo targets go out in ONE `sendExpoMessages` call
+  // (internally chunked ≤100/request) under a SINGLE shared 30s timeout. On a
+  // batch timeout / thrown / push-service-unavailable condition, EVERY Expo
+  // target in the batch is failed (Requirement 12.7); otherwise each target's
+  // outcome comes from the index-aligned per-message `results`.
+  if (expoEntries.length > 0) {
+    let batchResult: SendExpoMessagesResult | null = null;
+    let batchError: string | null = null;
+    try {
+      batchResult = await withTimeout(
+        sendExpoMessages(
+          expoEntries.map((e) => e.message),
+          { context: 'device_notify' }
+        ),
+        NOTIFY_DELIVERY_TIMEOUT_MS
+      );
+    } catch (err) {
+      batchError = toErrorMessage(err);
+    }
+
+    expoEntries.forEach((entry, k) => {
+      if (!batchResult) {
+        results[entry.index] = {
+          email: entry.email,
+          deviceId: entry.deviceId,
+          ok: false,
+          error: batchError ?? 'expo_delivery_failed',
+        };
+        return;
+      }
+      const perMessage = batchResult.results[k];
+      const ok = perMessage?.ok === true;
+      results[entry.index] = {
+        email: entry.email,
+        deviceId: entry.deviceId,
+        ok,
+        error: ok ? undefined : perMessage?.error ?? 'expo_delivery_failed',
+      };
+    });
+  }
+
+  // Phase 3 — WEB-PUSH. Each web-push target keeps its own per-target 30s
+  // timeout, delivered concurrently with a bounded fan-out.
+  if (webEntries.length > 0) {
+    const webOutcomes = await mapWithConcurrency(webEntries, DEVICE_ACTION_CONCURRENCY, (entry) =>
+      deliverWebPushNotification(entry, title, body, priority)
+    );
+    webEntries.forEach((entry, k) => {
+      results[entry.index] = webOutcomes[k];
+    });
+  }
 
   const successful = results.reduce((count, r) => (r.ok ? count + 1 : count), 0);
   const failed = results.length - successful;
@@ -2922,6 +3187,11 @@ export async function bulkForceLogout(
 //     applies a STABLE secondary sort by audit-entry `id` for equal
 //     `actionTimeMs` (Req 19.4). Entries are keyed by `targetDeviceId`, matching
 //     the `(tenantId, targetDeviceId, actionTimeMs)` composite index (task 3.3).
+//     It first asserts the target device exists and is tenant-scoped (mirroring
+//     `fetchDeviceDetail`: 404 `device_not_found` / 403 `tenant_scope_violation`)
+//     and paginates with the SAME `limit + 1` opaque doc-id cursor as
+//     `fetchHistory`, taking the cursor boundary from the Firestore-ordered page
+//     (before the in-memory id re-sort) so pages join without gaps/overlaps.
 
 /** Default page size for {@link fetchHistory} when the caller omits `limit`. */
 export const DEFAULT_HISTORY_LIMIT = 100;
@@ -2991,10 +3261,14 @@ export interface FetchHistoryResult {
 export interface FetchTimelineParams {
   /** The Selected_Tenant that scopes the timeline (Req 19.1). */
   tenantId: string;
-  /** Owning user email (API-shape parity; entries are keyed by device id). */
+  /** Owning user email; used to locate the device doc for the existence check. */
   email: string;
   /** The device whose timeline is returned (keyed on `targetDeviceId`). */
   deviceId: string;
+  /** Page size; defaults to {@link DEFAULT_HISTORY_LIMIT} when omitted. */
+  limit?: number;
+  /** Opaque pagination cursor: the `id` of the last entry of the prior page. */
+  cursor?: string;
 }
 
 /** Result of {@link fetchTimeline}. */
@@ -3002,6 +3276,10 @@ export interface FetchTimelineResult {
   ok: true;
   /** The device's entries, oldest-first with a stable id tie-break (Req 19.4). */
   entries: AuditEntryRecord[];
+  /** True when at least one more entry exists beyond this page. */
+  hasMore: boolean;
+  /** Cursor to pass as `cursor` for the next page; present iff `hasMore`. */
+  nextCursor?: string;
 }
 
 /**
@@ -3127,28 +3405,82 @@ export async function fetchHistory(params: FetchHistoryParams): Promise<FetchHis
 
 /**
  * Read a single device's activity timeline, oldest-first (Requirements 19.1,
- * 19.4; design Property 22).
+ * 19.4, 6.6, 3.2; design Property 22).
+ *
+ * BEFORE returning any entries this reads `user_devices/{email}/devices/
+ * {deviceId}` and rejects a device that does not exist ({@link
+ * DeviceNotFoundError} → 404) or one outside the scoped tenant ({@link
+ * TenantScopeError} → 403), mirroring {@link fetchDeviceDetail} so the timeline
+ * agrees with the design's error table. A device that EXISTS and is in-scope but
+ * has no audit rows still returns an empty `entries` array (200).
  *
  * Queries `deviceAuditLogs` where `tenantId == params.tenantId` AND
- * `targetDeviceId == params.deviceId`, ordered by `actionTimeMs` ASC, then
- * applies a STABLE in-memory secondary sort by audit-entry `id` so equal
- * `actionTimeMs` values are broken deterministically (Requirement 19.4). Entries
- * are keyed by `targetDeviceId` (the `email` field is accepted for API-shape
- * parity but not part of the query). ALL-OR-NOTHING: the read is not wrapped in
- * a try/catch, so a query failure propagates with no partial entries.
+ * `targetDeviceId == params.deviceId`, ordered by `actionTimeMs` ASC, and
+ * paginates with the same opaque doc-id cursor pattern as {@link fetchHistory}
+ * (fetch `limit + 1` for look-ahead; `startAfter` on the re-read cursor
+ * snapshot). A STABLE in-memory secondary sort by audit-entry `id` breaks equal
+ * `actionTimeMs` values deterministically (Requirement 19.4); the cursor
+ * boundary is taken from the Firestore-ordered page (before that re-sort) so
+ * `startAfter` advances without skipping or duplicating entries. ALL-OR-NOTHING:
+ * the reads are not wrapped in a try/catch, so a query failure propagates with
+ * no partial entries.
  */
 export async function fetchTimeline(params: FetchTimelineParams): Promise<FetchTimelineResult> {
-  const { tenantId, deviceId } = params;
+  const { tenantId, email, deviceId, limit, cursor } = params;
   const db = getFirestore();
+  const pageSize = resolveHistoryLimit(limit);
 
-  const snapshot = await db
+  // Existence + tenant-scope check BEFORE any read of the audit log, mirroring
+  // `fetchDeviceDetail`: an unknown device → 404 `device_not_found`, an
+  // out-of-scope device → 403 `tenant_scope_violation` (Req 6.6, 3.2, 3.3).
+  const deviceRef = db
+    .collection('user_devices')
+    .doc(email)
+    .collection('devices')
+    .doc(deviceId);
+  const deviceSnap = await deviceRef.get();
+  if (!deviceSnap.exists) {
+    throw new DeviceNotFoundError();
+  }
+  const deviceData = (deviceSnap.data() ?? {}) as Record<string, unknown>;
+  if (!assertTenantScope(deviceData, tenantId)) {
+    throw new TenantScopeError();
+  }
+
+  let query: admin.firestore.Query<admin.firestore.DocumentData> = db
     .collection(DEVICE_AUDIT_LOG_COLLECTION)
     .where('tenantId', '==', tenantId)
     .where('targetDeviceId', '==', deviceId)
-    .orderBy('actionTimeMs', 'asc')
-    .get();
+    // Oldest-first (Req 19.1).
+    .orderBy('actionTimeMs', 'asc');
 
-  const entries = snapshot.docs.map((doc) => toAuditEntryRecord(doc.id, doc.data()));
+  // Cursor = id of the last entry of the previous page. Re-read it and hand the
+  // snapshot to `startAfter` for a deterministic position; ignore an
+  // unknown/blank cursor (append-only ⇒ a handed-out cursor stays valid).
+  if (typeof cursor === 'string' && cursor.trim().length > 0) {
+    const cursorSnap = await db
+      .collection(DEVICE_AUDIT_LOG_COLLECTION)
+      .doc(cursor.trim())
+      .get();
+    if (cursorSnap.exists) {
+      query = query.startAfter(cursorSnap);
+    }
+  }
+
+  // One extra doc beyond the page reveals whether more entries exist.
+  const snapshot = await query.limit(pageSize + 1).get();
+  const docs = snapshot.docs;
+
+  const hasMore = docs.length > pageSize;
+  const pageDocs = hasMore ? docs.slice(0, pageSize) : docs;
+
+  // Cursor boundary follows Firestore's ordering (BEFORE the in-memory re-sort
+  // below) so `startAfter` continues from exactly where this page ends without
+  // skipping or duplicating entries across pages.
+  const nextCursor =
+    pageDocs.length > 0 ? pageDocs[pageDocs.length - 1].id : undefined;
+
+  const entries = pageDocs.map((doc) => toAuditEntryRecord(doc.id, doc.data()));
 
   // Stable secondary sort by id for equal actionTimeMs (Req 19.4). The primary
   // ordering already comes from Firestore; this makes the tie-break explicit and
@@ -3160,7 +3492,11 @@ export async function fetchTimeline(params: FetchTimelineParams): Promise<FetchT
     return a.id.localeCompare(b.id);
   });
 
-  return { ok: true, entries };
+  const result: FetchTimelineResult = { ok: true, entries, hasMore };
+  if (hasMore && nextCursor !== undefined) {
+    result.nextCursor = nextCursor;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -3210,42 +3546,10 @@ function toIsoString(value: unknown): string | null {
   return null;
 }
 
-/** Resolve a Firestore `Timestamp`/`Date`/number/ISO string to epoch ms. */
-function toEpochMs(value: unknown): number | null {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null;
-  }
-  if (typeof value === 'string') {
-    const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? null : parsed;
-  }
-  if (value instanceof Date) {
-    const ms = value.getTime();
-    return Number.isNaN(ms) ? null : ms;
-  }
-  const maybeToMillis = (value as { toMillis?: () => number }).toMillis;
-  if (typeof maybeToMillis === 'function') {
-    try {
-      const ms = maybeToMillis.call(value);
-      return Number.isFinite(ms) ? ms : null;
-    } catch {
-      return null;
-    }
-  }
-  const maybeToDate = (value as { toDate?: () => Date }).toDate;
-  if (typeof maybeToDate === 'function') {
-    try {
-      const ms = maybeToDate.call(value).getTime();
-      return Number.isNaN(ms) ? null : ms;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
+// `toEpochMs` (the raw Firestore Timestamp/Date/number/ISO → epoch-ms resolver)
+// now lives in `./lib/deviceLastSeen` so the Device Console read path and the
+// offline-device prune job share ONE conversion. It is imported at the top of
+// this module.
 
 /** Narrow an unknown value to `deviceType`, or `undefined`. */
 function toDeviceType(value: unknown): DeviceType | undefined {

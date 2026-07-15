@@ -129,9 +129,19 @@ function matchesFilterOracle(
     case 'all':
       return true;
     case 'online':
-      return classifyOnlineOracle(device, nowMs);
+      // Deleted / hard-banned devices are never online (they match offline),
+      // keeping the filter consistent with `computeCounts`.
+      return (
+        device.isDeleted !== true &&
+        device.isHardBanned !== true &&
+        classifyOnlineOracle(device, nowMs)
+      );
     case 'offline':
-      return !classifyOnlineOracle(device, nowMs);
+      return !(
+        device.isDeleted !== true &&
+        device.isHardBanned !== true &&
+        classifyOnlineOracle(device, nowMs)
+      );
     case 'web':
       return device.deviceType === 'web';
     case 'mobile':
@@ -277,11 +287,15 @@ describe('Property 6 — filter membership correctness (including hide-inactive)
           ),
           (device, delta) => {
             const nowMs = BASE_MS + delta;
-            // Force a finite, known last-seen so the boundary is deterministic.
+            // Force a finite, known last-seen so the boundary is deterministic,
+            // and clear the deleted/banned flags so this case isolates the 300s
+            // window split (the deleted/banned exclusion is covered separately).
             const boundaryDevice: DeviceAdminRecord = {
               ...device,
               lastSeenMs: BASE_MS,
               lastSeen: undefined,
+              isDeleted: false,
+              isHardBanned: false,
             };
             const expectedOnline = delta <= WINDOW_MS;
             expect(matchesFilter(boundaryDevice, 'online', nowMs)).toBe(expectedOnline);
@@ -360,6 +374,37 @@ describe('Property 6 — filter membership correctness (including hide-inactive)
           }
         }),
         { numRuns: 200, verbose: false }
+      );
+    },
+    30_000
+  );
+
+  it(
+    'a deleted or hard-banned device with a fresh lastSeen matches offline, not online (property)',
+    () => {
+      fc.assert(
+        fc.property(
+          deviceArb,
+          // A delta inside the window so, absent the deleted/banned exclusion,
+          // the device would classify as online purely on lastSeen.
+          fc.integer({ min: 0, max: WINDOW_MS }),
+          fc.constantFrom('deleted', 'hardBanned', 'both' as const),
+          (device, delta, mode) => {
+            const nowMs = BASE_MS + delta;
+            const fresh: DeviceAdminRecord = {
+              ...device,
+              lastSeenMs: BASE_MS,
+              lastSeen: undefined,
+              isDeleted: mode === 'deleted' || mode === 'both',
+              isHardBanned: mode === 'hardBanned' || mode === 'both',
+            };
+            // Deleted/banned ⇒ never online (matches offline), even though the
+            // 300s window alone would say online — consistent with computeCounts.
+            expect(matchesFilter(fresh, 'online', nowMs)).toBe(false);
+            expect(matchesFilter(fresh, 'offline', nowMs)).toBe(true);
+          }
+        ),
+        { numRuns: 150, verbose: false }
       );
     },
     30_000

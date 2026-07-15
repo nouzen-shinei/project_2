@@ -1736,12 +1736,21 @@ export interface DeviceListRequest {
   cursor?: string;
 }
 
-/** Success response for {@link fetchTenantDevices} (flat devices + counts). */
+/**
+ * Success response for {@link fetchTenantDevices} (flat devices + counts).
+ *
+ * `counts` always reflect the full tenant set; `devices` is a single page of
+ * the ordered result. `hasMore` / `nextCursor` implement result-set pagination
+ * (Recommendation #2): pass `nextCursor` back as {@link DeviceListRequest.cursor}
+ * to load the following page.
+ */
 export interface DeviceListResponse {
   ok: true;
   tenantId: string;
   counts: DeviceCounts;
   devices: DeviceAdminRecord[];
+  hasMore?: boolean;
+  nextCursor?: string;
 }
 
 /** Success response for {@link fetchDeviceDetail} (#2). */

@@ -194,21 +194,23 @@ service cloud.firestore {
     // ─────────────────────────────────────────────────────────────────────────
 
     // Per-user device presence/heartbeat + push registration.
-    //   Reads: open to signed-in users. The runtime reads its own device state,
-    //     and the client notification fan-out enumerates a recipient's devices to
-    //     resolve push targets; both relied on the previous permissive read, so we
-    //     preserve read access unchanged.
+    //   Reads: owner-only. A signed-in user may read only documents under their
+    //     own user_devices/{ownerEmail} tree; no client may enumerate another
+    //     user's devices. The client notification fan-out no longer resolves a
+    //     recipient's device/push targets — that resolution moved server-side to
+    //     the Admin-SDK-backed /notifications/fanout (Stages 1–3), which bypasses
+    //     these rules.
     //   Writes: owner-only. A signed-in user may only write documents under their
     //     own user_devices/{ownerEmail} tree (self-registration, heartbeat/presence,
     //     push-token and web-push subscription sync, self-logout). No client can
     //     mutate another user's device docs; all admin mutations (delete, restore,
     //     force-logout provenance, ban flags) are backend-only.
     match /user_devices/{ownerEmail} {
-      allow read: if isSignedIn();
+      allow read: if isDeviceOwner(ownerEmail);
       allow write: if isDeviceOwner(ownerEmail) && doesNotWriteTenantIndex();
 
       match /{devicePath=**} {
-        allow read: if isSignedIn();
+        allow read: if isDeviceOwner(ownerEmail);
         allow write: if isDeviceOwner(ownerEmail) && doesNotWriteTenantIndex();
       }
     }

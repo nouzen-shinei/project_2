@@ -18,7 +18,7 @@
 
 import * as fc from 'fast-check';
 
-import { computeCounts, type DeviceAdminRecord } from '../deviceAdminService';
+import { computeCounts, classifyOnline, type DeviceAdminRecord } from '../deviceAdminService';
 
 // ---------------------------------------------------------------------------
 // Generators
@@ -54,16 +54,25 @@ const lastSeenArb = fc.oneof(
   fc.constant(null)
 );
 
+/** Optional boolean lifecycle flag: true / false / omitted. */
+const optionalBoolArb = fc.option(fc.boolean(), { nil: undefined });
+
 /**
- * A device-like record carrying only the fields `computeCounts` reads. Both
- * keys are optional (`requiredKeys: []`) so some generated devices omit
- * last-seen data entirely, in addition to the explicit null/undefined/invalid
- * values inside the field generators above.
+ * A device-like record carrying the fields `computeCounts` reads. All keys are
+ * optional (`requiredKeys: []`) so some generated devices omit last-seen and
+ * lifecycle data entirely, in addition to the explicit null/undefined/invalid
+ * values inside the field generators above. `isDeleted` / `isHardBanned` are
+ * included so the property exercises the exclusion of deleted/banned devices
+ * from the online count.
  */
-const deviceArb: fc.Arbitrary<Pick<DeviceAdminRecord, 'lastSeen' | 'lastSeenMs'>> = fc.record(
+const deviceArb: fc.Arbitrary<
+  Pick<DeviceAdminRecord, 'lastSeen' | 'lastSeenMs' | 'isDeleted' | 'isHardBanned'>
+> = fc.record(
   {
     lastSeen: lastSeenArb,
     lastSeenMs: lastSeenMsArb,
+    isDeleted: optionalBoolArb,
+    isHardBanned: optionalBoolArb,
   },
   { requiredKeys: [] }
 );
@@ -100,6 +109,24 @@ describe('Property 2 — count integrity (online + offline = total)', () => {
           expect(counts.offline).toBeGreaterThanOrEqual(0);
           expect(counts.online).toBeLessThanOrEqual(counts.total);
           expect(counts.offline).toBeLessThanOrEqual(counts.total);
+
+          // A deleted / hard-banned device is never counted online: the online
+          // count equals the number of non-deleted, non-banned devices that are
+          // within the 300s window (an independent recomputation).
+          const expectedOnline = devices.filter(
+            (d) =>
+              d.isDeleted !== true &&
+              d.isHardBanned !== true &&
+              classifyOnline(
+                typeof d.lastSeenMs === 'number' && Number.isFinite(d.lastSeenMs)
+                  ? d.lastSeenMs
+                  : typeof d.lastSeen === 'string'
+                    ? Date.parse(d.lastSeen)
+                    : Number.NaN,
+                nowMs
+              )
+          ).length;
+          expect(counts.online).toBe(expectedOnline);
         }),
         { numRuns: 200, verbose: false }
       );
@@ -119,4 +146,33 @@ describe('Property 2 — count integrity (online + offline = total)', () => {
     },
     20_000
   );
+
+  it('a soft-deleted device with a fresh lastSeen is counted offline, not online', () => {
+    const nowMs = 1_700_000_000_000;
+    const counts = computeCounts(
+      [{ lastSeenMs: nowMs, isDeleted: true }], // last-seen "now" but deleted
+      nowMs
+    );
+    expect(counts).toEqual({ total: 1, online: 0, offline: 1 });
+  });
+
+  it('a hard-banned device with a fresh lastSeen is counted offline, not online', () => {
+    const nowMs = 1_700_000_000_000;
+    const counts = computeCounts([{ lastSeenMs: nowMs, isHardBanned: true }], nowMs);
+    expect(counts).toEqual({ total: 1, online: 0, offline: 1 });
+  });
+
+  it('mixes online, deleted-but-fresh, banned-but-fresh, and stale devices correctly', () => {
+    const nowMs = 1_700_000_000_000;
+    const counts = computeCounts(
+      [
+        { lastSeenMs: nowMs }, // online
+        { lastSeenMs: nowMs, isDeleted: true }, // fresh but deleted -> offline
+        { lastSeenMs: nowMs, isHardBanned: true }, // fresh but banned -> offline
+        { lastSeenMs: nowMs - 10 * 60_000 }, // stale -> offline
+      ],
+      nowMs
+    );
+    expect(counts).toEqual({ total: 4, online: 1, offline: 3 });
+  });
 });

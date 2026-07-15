@@ -117,6 +117,91 @@ test('Requirement 1.7: a list-load failure retains prior data and shows an error
   }
 });
 
+test('Recommendation #2: a hasMore response renders "Load more"; clicking it pages with the cursor and appends', async () => {
+  // First page (no cursor) reports another page; the second page (sent with the
+  // stored cursor) completes the list. The panel should APPEND the second page.
+  const fetchMock = installFetch((path, init) => {
+    assert.equal(path, DEVICES_PATH, 'panel should only call the device list endpoint');
+    const body = JSON.parse(init?.body || '{}');
+    if (!body.cursor) {
+      return {
+        status: 200,
+        data: {
+          ok: true,
+          tenantId: 't-1',
+          counts: { total: 2, online: 2, offline: 0 },
+          devices: [sampleDevice({ deviceId: 'dev-1', deviceName: 'Ada Laptop' })],
+          hasMore: true,
+          nextCursor: 'cursor-1',
+        },
+      };
+    }
+    // Load-more must echo the stored cursor from the first response.
+    assert.equal(body.cursor, 'cursor-1', 'load more should send the stored nextCursor');
+    return {
+      status: 200,
+      data: {
+        ok: true,
+        tenantId: 't-1',
+        counts: { total: 2, online: 2, offline: 0 },
+        devices: [
+          sampleDevice({
+            deviceId: 'dev-2',
+            deviceName: 'Grace Phone',
+            deviceType: 'mobile',
+            ownerEmail: 'grace@example.com',
+          }),
+        ],
+        hasMore: false,
+      },
+    };
+  });
+  try {
+    const view = await render();
+    assert.equal(fetchMock.calls.length, 1, 'one list fetch on mount');
+    assert.match(view.text(), /Ada Laptop/, 'first page device should be shown');
+
+    const loadMore = view.findButton(/Load more/);
+    assert.ok(loadMore, 'a "Load more" control should render when hasMore is true');
+
+    await view.click(loadMore);
+
+    assert.equal(fetchMock.calls.length, 2, 'clicking "Load more" should trigger a second fetch');
+    const text = view.text();
+    assert.match(text, /Ada Laptop/, 'the first-page device should be retained after appending');
+    assert.match(text, /Grace Phone/, 'the second-page device should be appended');
+    assert.match(text, /Showing 2 devices/, 'the count line should reflect the combined loaded list');
+
+    // The last page reports hasMore=false, so the control disappears.
+    assert.equal(view.findButton(/Load more/), null, '"Load more" should be gone once hasMore is false');
+
+    view.unmount();
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('Recommendation #2: no "Load more" control when the first page reports hasMore false', async () => {
+  const fetchMock = installFetch(() => ({
+    status: 200,
+    data: {
+      ok: true,
+      tenantId: 't-1',
+      counts: { total: 1, online: 1, offline: 0 },
+      devices: [sampleDevice()],
+      hasMore: false,
+    },
+  }));
+  try {
+    const view = await render();
+    assert.match(view.text(), /Ada’s Laptop/, 'the single device should be shown');
+    assert.equal(view.findButton(/Load more/), null, '"Load more" should not render when hasMore is false');
+    view.unmount();
+  } finally {
+    fetchMock.restore();
+  }
+});
+
 test('Requirement 1.8: an empty tenant shows an empty state with 0/0/0 counts', async () => {
   const fetchMock = installFetch(() => ({
     status: 200,

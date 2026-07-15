@@ -24,6 +24,9 @@ import {
   matchesFilter,
   isInactiveDevice,
   sortAndGroup,
+  paginateDevices,
+  DEFAULT_DEVICE_LIST_LIMIT,
+  MAX_DEVICE_LIST_LIMIT,
   computeCounts,
   forceLogout,
   ban,
@@ -125,6 +128,17 @@ import {
   sanitizeWebPushSubscription,
   sendWebPushNotification,
 } from './webPush';
+import {
+  fanout as deviceFanoutDefault,
+  serializeFanoutResponse,
+  resolveRecipientOnlineStatus as resolveRecipientOnlineStatusDefault,
+  listRecipientsWithDevices as listRecipientsWithDevicesDefault,
+  type FanoutParams as DeviceFanoutParams,
+  type DeviceNotificationFanoutResult as DeviceFanoutResult,
+  type OnlineStatusParams as DeviceOnlineStatusParams,
+  type DeviceListingParams,
+  type ObservableUserDevices,
+} from './deviceFanoutService';
 
 type TenantMembershipRole = 'owner' | 'admin' | 'staff' | 'member';
 
@@ -412,6 +426,45 @@ const expoPushPayloadSchema = z.union([
 const tenantScopedPushPayloadSchema = expoPushPayloadSchema.and(
   z.object({ tenantId: z.string().min(1) })
 );
+
+// Server_Fanout request body (device-push-fanout-migration, design "Components
+// §1 Fanout_Endpoint"). A recipient identifier plus a notification payload
+// carrying a title, body, and `data.type` (the Notification_Type) — Req 1.4.
+const fanoutPayloadSchema = z.object({
+  tenantId: z.string().min(1),
+  recipientEmail: z.string().min(1),
+  notification: z.object({
+    title: z.string(),
+    body: z.string(),
+    data: z.record(z.unknown()).optional(),
+  }),
+  onlineOnly: z.boolean().optional(),
+  // Optional single-device target (device-push-fanout-migration, task 12.1 Part
+  // B). When present, the fan-out restricts its candidate devices to the ONE
+  // device whose `deviceId` matches, so the client single-device push path
+  // (`sendNotificationToDeviceDetailed`) can route through the server without
+  // reading another user's device documents. Passed through as `targetDeviceId`.
+  deviceId: z.string().min(1).optional(),
+});
+
+// Server-side online-status resolution body (device-push-fanout-migration Stage
+// 3, design "Cross_User_Reader migration inventory"). Replaces the client
+// `checkUserOnlineStatus` cross-user read — Req 7.3, 7.5.
+const onlineStatusPayloadSchema = z.object({
+  tenantId: z.string().min(1),
+  recipientEmail: z.string().min(1),
+});
+
+// Server-side multi-user device-listing body (device-push-fanout-migration
+// Stage 3). Replaces the client `getAllUsersWithDevices` cross-user reads —
+// Req 7.3, 7.5. `recipientEmails` is bounded to mirror the client's batched
+// listing and cap the Admin-SDK fan-out.
+const deviceListingPayloadSchema = z.object({
+  tenantId: z.string().min(1),
+  recipientEmails: z.array(z.string().min(1)).min(1).max(500),
+  currentUserEmail: z.string().optional(),
+  includeCurrentUser: z.boolean().optional(),
+});
 
 const dailyQuoteTriggerSchema = z.object({
   timeOfDay: z.enum(['morning', 'evening', 'immediate', 'auto']).optional(),
@@ -806,7 +859,11 @@ const tenantDeviceListSchema = z.object({
   filter: z.enum(deviceFilterValues).optional(),
   sort: z.enum(deviceSortValues).optional(),
   hideInactive: z.boolean().optional(),
-  limit: z.number().int().positive().max(1000).optional(),
+  // Page size cap for result-set pagination (Recommendation #2). Omitted =>
+  // DEFAULT_DEVICE_LIST_LIMIT applied in the route.
+  limit: z.number().int().positive().max(MAX_DEVICE_LIST_LIMIT).optional(),
+  // Opaque page cursor (base64url offset into the deterministic ordered
+  // result); blank/absent/invalid resolves to the first page.
   cursor: z.string().trim().min(1).max(400).optional(),
 });
 
@@ -827,6 +884,8 @@ const tenantDeviceTimelineSchema = z.object({
   tenantId: z.string().trim().min(1).max(120),
   email: z.string().trim().email().max(200),
   deviceId: z.string().trim().min(1).max(200),
+  limit: z.number().int().positive().max(1000).optional(),
+  cursor: z.string().trim().min(1).max(400).optional(),
 });
 
 // Single-device destructive-action bodies. `tenantId` is a required non-empty
@@ -5729,6 +5788,9 @@ export interface CreateAppOptions {
     recordTenantInviteSend?: TenantInviteSendRecorder;
     sendTenantInviteEmail?: typeof sendTenantInviteEmail;
     executeExpoPushProxyRequest?: ExpoPushProxyExecutor;
+    deviceFanout?: (params: DeviceFanoutParams) => Promise<DeviceFanoutResult>;
+    resolveRecipientOnlineStatus?: (params: DeviceOnlineStatusParams) => Promise<boolean>;
+    listRecipientsWithDevices?: (params: DeviceListingParams) => Promise<ObservableUserDevices[]>;
     checkChatRateLimit?: typeof checkChatRateLimit;
     loadTenantNotificationPreferencesRecord?: typeof loadTenantNotificationPreferencesRecord;
     loadUsageMonthSnapshot?: UsageSnapshotLoader;
@@ -5929,6 +5991,11 @@ export function createApp(options: CreateAppOptions = {}){
   const sendTenantInviteEmailImpl = options.overrides?.sendTenantInviteEmail ?? sendTenantInviteEmail;
   const executeExpoPushProxyRequestImpl =
     options.overrides?.executeExpoPushProxyRequest ?? executeExpoPushProxyRequestDefault;
+  const deviceFanoutImpl = options.overrides?.deviceFanout ?? deviceFanoutDefault;
+  const resolveRecipientOnlineStatusImpl =
+    options.overrides?.resolveRecipientOnlineStatus ?? resolveRecipientOnlineStatusDefault;
+  const listRecipientsWithDevicesImpl =
+    options.overrides?.listRecipientsWithDevices ?? listRecipientsWithDevicesDefault;
   const loadTenantNotificationPreferencesRecordImpl =
     options.overrides?.loadTenantNotificationPreferencesRecord ?? loadTenantNotificationPreferencesRecord;
   const cancelRazorpaySubscriptionImpl = options.overrides?.cancelRazorpaySubscription ?? cancelRazorpaySubscription;
@@ -7082,6 +7149,16 @@ export function createApp(options: CreateAppOptions = {}){
   // state — and delegate to `deviceAdminService`.
 
   // #1 List/search/filter/sort devices for a tenant, with online/offline counts.
+  //
+  // Pagination (Recommendation #2 — result-set pagination): the tenant-wide
+  // counts and the search/filter/sort/hide-inactive pipeline are computed over
+  // the FULL tenant device set (so counts stay exact), then the deterministic
+  // ordered result is sliced into a page via `paginateDevices` using a real
+  // opaque `cursor` (base64url offset). The response carries `hasMore` and an
+  // optional `nextCursor` for the next page. TRADEOFF: each page still scans the
+  // full tenant set (read cost O(tenant devices), not O(limit)); the future path
+  // to read-bounded pagination is an external search index + precomputed
+  // aggregate counters. See `deviceAdminService.paginateDevices` for details.
   app.post('/admin/tenants/devices', async (req, res) => {
     const authContext = req.authContext;
     if (!authContext || (authContext.tokenType !== 'master' && authContext.isGlobalAdmin !== true)) {
@@ -7125,14 +7202,26 @@ export function createApp(options: CreateAppOptions = {}){
       // (Req 5.2, 5.3, 5.6, 5.7), then flatten preserving that order. Each
       // record still carries `ownerEmail`, so grouping is losslessly derivable.
       const grouped = sortAndGroup(visible, sort, nowMs);
-      let devices: DeviceAdminRecord[] = grouped.flatMap((group) => group.devices);
+      const orderedDevices: DeviceAdminRecord[] = grouped.flatMap((group) => group.devices);
 
-      // Optional defensive cap on the returned list.
-      if (typeof limit === 'number' && devices.length > limit) {
-        devices = devices.slice(0, limit);
-      }
+      // Result-set pagination (Recommendation #2): counts (above) are exact over
+      // the full tenant set; here we slice the deterministic ordered result with
+      // a real opaque cursor so matches beyond `limit` are reachable via
+      // `nextCursor` instead of being silently dropped.
+      const { page, hasMore, nextCursor } = paginateDevices(
+        orderedDevices,
+        parsed.data.cursor,
+        limit ?? DEFAULT_DEVICE_LIST_LIMIT
+      );
 
-      return res.json({ ok: true, tenantId, counts, devices });
+      return res.json({
+        ok: true,
+        tenantId,
+        counts,
+        devices: page,
+        hasMore,
+        ...(nextCursor ? { nextCursor } : {}),
+      });
     } catch (error) {
       console.error('[admin_devices_list] load failed', error);
       // The Device Console retains previously displayed data (Req 1.7); the
@@ -7232,9 +7321,30 @@ export function createApp(options: CreateAppOptions = {}){
     const deviceId = parsed.data.deviceId.trim();
 
     try {
-      const result = await fetchDeviceTimeline({ tenantId, email: normalizedEmail, deviceId });
-      return res.json({ ok: true, entries: result.entries });
+      const result = await fetchDeviceTimeline({
+        tenantId,
+        email: normalizedEmail,
+        deviceId,
+        limit: parsed.data.limit,
+        cursor: parsed.data.cursor,
+      });
+      const response: {
+        ok: true;
+        entries: typeof result.entries;
+        hasMore: boolean;
+        nextCursor?: string;
+      } = { ok: true, entries: result.entries, hasMore: result.hasMore };
+      if (result.nextCursor) {
+        response.nextCursor = result.nextCursor;
+      }
+      return res.json(response);
     } catch (error) {
+      // Typed service errors carry the status + code the route should return:
+      // 404 `device_not_found`, 403 `tenant_scope_violation` (Req 6.6, 3.2, 3.3).
+      if (error instanceof DeviceAdminError) {
+        return res.status(error.status).json({ error: error.code });
+      }
+      // All-or-nothing: on any other failure return no partial entries.
       console.error('[admin_devices_timeline] load failed', error);
       return res.status(500).json({ error: 'timeline_failed' });
     }
@@ -17624,6 +17734,147 @@ export function createApp(options: CreateAppOptions = {}){
       console.warn('[push_proxy] error', message);
       return res.status(502).json({ error: 'expo_push_failed', message });
     }
+  });
+
+  // Fanout_Endpoint — POST /notifications/fanout (device-push-fanout-migration,
+  // design "Components §1 Fanout_Endpoint" + "§3 Fanout_Authorization").
+  //
+  // The Server_Fanout entry point: the client delegates push-target resolution
+  // and push delivery here so it never reads a recipient's device documents
+  // (Req 1.3). The middleware chain mirrors `/notifications/push`:
+  //   pushProxyRL → requireMemberTenantAccess (Fanout_Authorization, min role
+  //   `member` — Req 5.1, 5.3, 5.5).
+  // The global auth middleware has already authenticated the sender's per-user
+  // internal token (Req 5.1); an unauthenticated request never reaches here.
+  app.post('/notifications/fanout', pushProxyRL, requireMemberTenantAccess, async (req, res) => {
+    const parsed = fanoutPayloadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      // Req 1.4: reject a malformed payload before any device resolution.
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+
+    // Confirm the body's tenant matches the authorized tenant scope, mirroring
+    // `/notifications/push` (defence-in-depth against a caller acting outside the
+    // tenant it authenticated against).
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    // Elevated-type authorization (Req 5.5): a `team_membership_change`
+    // notification requires the caller to hold at least the `staff` role in the
+    // tenant. `member` is the default for chat/notice types. The role comparison
+    // reuses the shared `tenantRolePriority` ladder (member 1 < staff 2 < admin 3
+    // < owner 4) — no hand-rolled role logic. Rejecting here happens BEFORE any
+    // device resolution, so an under-privileged caller never resolves the
+    // recipient's Push_Targets (Req 5.2).
+    const notificationType =
+      typeof parsed.data.notification.data?.type === 'string'
+        ? parsed.data.notification.data.type
+        : undefined;
+    if (notificationType === 'team_membership_change') {
+      const currentRank = tenantRolePriority[tenantAccess.role] ?? 0;
+      const requiredRank = tenantRolePriority.staff;
+      if (currentRank < requiredRank) {
+        return res.status(403).json({ error: 'insufficient_role' });
+      }
+    }
+
+    // Resolve the acting sender's identity for the fan-out audit/observability,
+    // exactly as the device-admin `notify` route builds its `actor`.
+    const actorEmail = await resolveAuthenticatedEmail(req.authContext);
+    const actor = {
+      id: req.authContext?.uid,
+      email: actorEmail ?? undefined,
+      name: actorEmail ?? undefined,
+    };
+
+    // Delegate to the Server_Fanout. It resolves the recipient's devices through
+    // the Admin SDK, applies the Delivery_Filter, delivers push, performs the
+    // cross-user writes, and returns the counts-only Fanout_Result — it never
+    // throws to the endpoint (Req 6.5).
+    const result = await deviceFanoutImpl({
+      tenantId: tenantAccess.tenantId,
+      recipientEmail: parsed.data.recipientEmail.trim().toLowerCase(),
+      notification: parsed.data.notification,
+      onlineOnly: parsed.data.onlineOnly ?? true,
+      // Single-device targeting (Part B): route the optional `deviceId` through
+      // as the fan-out's `targetDeviceId`. Absent → recipient-wide fan-out.
+      targetDeviceId: parsed.data.deviceId,
+      actor,
+    });
+
+    // Respond with ONLY the ten DeviceNotificationFanoutResult counts — never a
+    // recipient's push tokens, web-push endpoints, or device network metadata
+    // (Req 5.4). `serializeFanoutResponse` guarantees the counts-only shape.
+    return res.json(serializeFanoutResponse(result));
+  });
+
+  // Online-status resolution — POST /notifications/online-status
+  // (device-push-fanout-migration Stage 3; design "Cross_User_Reader migration
+  // inventory"). The server-side replacement for the client
+  // `checkUserOnlineStatus` cross-user read: it resolves the recipient's devices
+  // through the Admin SDK (Req 7.3) and returns ONLY the boolean "any device
+  // online" result (Req 7.5) — no per-device detail, no tokens, no endpoints, no
+  // network metadata (Req 5.4). Middleware mirrors `/notifications/fanout`:
+  //   pushProxyRL → requireMemberTenantAccess (min role `member`).
+  app.post('/notifications/online-status', pushProxyRL, requireMemberTenantAccess, async (req, res) => {
+    const parsed = onlineStatusPayloadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    // Tenant-scoped Admin-SDK resolution. Returns only the boolean.
+    const online = await resolveRecipientOnlineStatusImpl({
+      tenantId: tenantAccess.tenantId,
+      recipientEmail: parsed.data.recipientEmail.trim().toLowerCase(),
+    });
+
+    return res.json({ online });
+  });
+
+  // Multi-user device listing — POST /notifications/device-listing
+  // (device-push-fanout-migration Stage 3). The server-side replacement for the
+  // client `getAllUsersWithDevices` cross-user reads: it resolves each
+  // recipient's devices through the Admin SDK (Req 7.3) and returns the same
+  // observable listing the client produced (Req 7.5), with every device's raw
+  // push tokens, web-push subscription endpoints, and device network metadata
+  // stripped (Req 5.4). Middleware mirrors `/notifications/fanout`.
+  app.post('/notifications/device-listing', pushProxyRL, requireMemberTenantAccess, async (req, res) => {
+    const parsed = deviceListingPayloadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (parsed.data.tenantId.trim() !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+
+    // Tenant-scoped Admin-SDK resolution. Each returned device is secret-free.
+    const users = await listRecipientsWithDevicesImpl({
+      tenantId: tenantAccess.tenantId,
+      recipientEmails: parsed.data.recipientEmails,
+      currentUserEmail: parsed.data.currentUserEmail,
+      includeCurrentUser: parsed.data.includeCurrentUser,
+    });
+
+    return res.json({ users });
   });
 
   app.get('/notifications/web-push/config', requireMemberTenantAccessFromQuery, async (req, res) => {

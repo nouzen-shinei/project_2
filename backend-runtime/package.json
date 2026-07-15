@@ -15,6 +15,7 @@
     "usage:refresh-worker": "node dist/jobs/processUsageRefreshRequests.js",
     "billing:backfill": "node dist/jobs/runBillingBackfill.js",
     "device:tenant-index-backfill": "node dist/jobs/runDeviceTenantIndexBackfill.js",
+    "device:offline-prune": "node dist/jobs/runOfflineDevicePrune.js",
     "billing:play-reconcile": "node dist/jobs/runPlayBillingReconcile.js",
     "billing:stale-pending": "node dist/jobs/runBillingAutoCancelStalePending.js",
     "auth:set-global-admin": "node scripts/set-global-admin-claim.cjs"

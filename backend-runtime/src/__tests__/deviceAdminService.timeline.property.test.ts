@@ -83,18 +83,49 @@ interface FakeQuerySnapshot {
   size: number;
 }
 
+/** Snapshot returned by a direct `docRef.get()` (existence check). */
+interface FakeDocSnapshot {
+  exists: boolean;
+  data: () => Record<string, unknown> | undefined;
+}
+
+/**
+ * A direct document reference addressed by full path (e.g.
+ * `user_devices/{email}/devices/{deviceId}`). Supports `.collection()` for
+ * nesting and `.get()` for the existence + tenant-scope check `fetchTimeline`
+ * now performs before reading the audit log.
+ */
+class FakeDocRef {
+  constructor(
+    private readonly store: FakeFirestore,
+    private readonly path: string
+  ) {}
+
+  collection(name: string): FakeQuery {
+    return new FakeQuery(this.store, `${this.path}/${name}`, [], null, null);
+  }
+
+  async get(): Promise<FakeDocSnapshot> {
+    const data = this.store.getDoc(this.path);
+    return { exists: data !== undefined, data: () => (data ? { ...data } : undefined) };
+  }
+}
+
 /**
  * A chainable query over one collection. `where(field,'==',value)` accumulates
- * an equality filter; `orderBy(field,'asc')` records the primary sort. `.get()`
- * filters, then shuffles (via the store's advancing PRNG) and stable-sorts by
- * the ordered field — leaving equal-key docs in a randomized order.
+ * an equality filter; `orderBy(field,'asc')` records the primary sort;
+ * `limit(n)` caps the returned docs; `doc(id)` addresses a single document.
+ * `.get()` filters, then shuffles (via the store's advancing PRNG) and
+ * stable-sorts by the ordered field — leaving equal-key docs in a randomized
+ * order — before applying any `limit`.
  */
 class FakeQuery {
   constructor(
     private readonly store: FakeFirestore,
     private readonly collectionName: string,
     private readonly filters: EqualityFilter[],
-    private readonly orderField: string | null
+    private readonly orderField: string | null,
+    private readonly limitN: number | null
   ) {}
 
   where(field: string, op: string, value: unknown): FakeQuery {
@@ -105,7 +136,8 @@ class FakeQuery {
       this.store,
       this.collectionName,
       [...this.filters, { field, value }],
-      this.orderField
+      this.orderField,
+      this.limitN
     );
   }
 
@@ -113,7 +145,15 @@ class FakeQuery {
     if (direction !== 'asc') {
       throw new Error(`FakeQuery only exercises ascending orderBy, got '${direction}'`);
     }
-    return new FakeQuery(this.store, this.collectionName, this.filters, field);
+    return new FakeQuery(this.store, this.collectionName, this.filters, field, this.limitN);
+  }
+
+  limit(n: number): FakeQuery {
+    return new FakeQuery(this.store, this.collectionName, this.filters, this.orderField, n);
+  }
+
+  doc(id: string): FakeDocRef {
+    return new FakeDocRef(this.store, `${this.collectionName}/${id}`);
   }
 
   async get(): Promise<FakeQuerySnapshot> {
@@ -135,16 +175,19 @@ class FakeQuery {
       });
     }
 
+    const limited = this.limitN !== null ? shuffled.slice(0, this.limitN) : shuffled;
+
     return {
-      docs: shuffled.map((doc) => ({ id: doc.id, data: () => ({ ...doc.data }) })),
-      empty: shuffled.length === 0,
-      size: shuffled.length,
+      docs: limited.map((doc) => ({ id: doc.id, data: () => ({ ...doc.data }) })),
+      empty: limited.length === 0,
+      size: limited.length,
     };
   }
 }
 
 class FakeFirestore {
   private readonly collections = new Map<string, SeededDoc[]>();
+  private readonly docs = new Map<string, Record<string, unknown>>();
   private readonly rng: () => number;
 
   constructor(shuffleSeed: number) {
@@ -156,6 +199,16 @@ class FakeFirestore {
     const list = this.collections.get(collectionName) ?? [];
     list.push({ id: doc.id, data: { ...doc.data } });
     this.collections.set(collectionName, list);
+  }
+
+  /** Seed a single document addressed by full path (test setup only). */
+  seedDoc(path: string, data: Record<string, unknown>): void {
+    this.docs.set(path, { ...data });
+  }
+
+  /** Read a single document by full path, or `undefined` when absent. */
+  getDoc(path: string): Record<string, unknown> | undefined {
+    return this.docs.get(path);
   }
 
   collectionDocs(collectionName: string): SeededDoc[] {
@@ -173,7 +226,7 @@ class FakeFirestore {
   }
 
   collection(name: string): FakeQuery {
-    return new FakeQuery(this, name, [], null);
+    return new FakeQuery(this, name, [], null, null);
   }
 }
 
@@ -253,6 +306,14 @@ describe('Property 22 — timeline ascending order with stable id tie-break', ()
           async (docs: GeneratedAuditDoc[], shuffleSeed, email) => {
             const db = new FakeFirestore(shuffleSeed);
             mockedGetFirestore.mockReturnValue(db as never);
+
+            // `fetchTimeline` now asserts the device exists and is tenant-scoped
+            // before reading the audit log, so seed a target device doc scoped
+            // to TARGET_TENANT (this property covers ordering, not the 404/403
+            // paths — those are exercised by the fetchTimeline unit suite).
+            db.seedDoc(`user_devices/${email}/devices/${TARGET_DEVICE}`, {
+              tenantIds: [TARGET_TENANT],
+            });
 
             for (const doc of docs) {
               const data: Record<string, unknown> = {

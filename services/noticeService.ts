@@ -1,8 +1,8 @@
 import { logger } from '@/lib/logger';
 import { authService } from '../hooks/useAuthUnified';
 import { Notice } from '../types/notice';
-import { deviceTrackingService, UserDevice } from './deviceTrackingService';
-import type { DeviceTenantFilterOptions } from './deviceTrackingService';
+import { deviceTrackingService, isServerFanoutEnabled, UserDevice } from './deviceTrackingService';
+import type { DeviceNotificationFanoutResult, DeviceTenantFilterOptions } from './deviceTrackingService';
 import { tenantService } from './tenantService';
 import type { TenantMembershipRole } from '../types/tenant';
 
@@ -70,8 +70,28 @@ class NoticeService {
         failed: 0,
       };
 
+      // Fanout_Feature_Flag (Stage 3, Req 7.1/7.3/7.5): when the Server_Fanout is
+      // enabled, per-recipient push delivery is delegated to the backend
+      // Fanout_Endpoint (`POST /notifications/fanout`) via the shipped
+      // `deviceTrackingService.sendNotificationToUser` bridge — which resolves the
+      // recipient's devices SERVER-SIDE. This removes the cross-user
+      // `getUserDevices` read (the exact read this migration eliminates). When the
+      // flag is off, the legacy client path below runs UNCHANGED (Req 9.2).
+      const useServerFanout = isServerFanoutEnabled();
+
       for (const email of recipients) {
         try {
+          if (useServerFanout) {
+            const dispatch = await this.dispatchNoticeViaServerFanout(email, notice, tenantFilterOptions);
+            if (dispatch.deliverableDeviceCount > 0) {
+              summary.recipients++;
+            }
+            summary.devices += dispatch.deliverableDeviceCount;
+            summary.success += dispatch.success;
+            summary.failed += dispatch.failed;
+            continue;
+          }
+
           const devices = await deviceTrackingService.getUserDevices(email, tenantFilterOptions);
           const evaluatedDevices = devices.map((device) => ({
             device,
@@ -371,6 +391,95 @@ class NoticeService {
     }
 
     return { success, failed };
+  }
+
+  /**
+   * Server_Fanout delivery for a single notice recipient (Stage 3; Req 7.1, 7.3,
+   * 7.5). Delegates push-target resolution and delivery to the backend
+   * Fanout_Endpoint via {@link deviceTrackingService.sendNotificationToUser},
+   * which — under the flag — resolves the recipient's devices server-side and
+   * NEVER reads the recipient's `user_devices` tree from the client.
+   *
+   * PARITY WITH THE RETIRED CLIENT READER (Req 7.5):
+   *  - `onlineOnly: false` so BOTH online and offline eligible devices are
+   *    reached, matching the legacy path which delivered to both the online and
+   *    offline partitions.
+   *  - The payload carries the `notice_created` Notification_Type, so the server
+   *    Delivery_Filter applies the `noticeNotificationsEnabled` Per_Type_Toggle
+   *    (and the master `notificationsEnabled` toggle), exactly as the legacy
+   *    `sendNotificationToDeviceDetailed` did.
+   *  - The server Delivery_Filter additionally honors the notice-specific
+   *    hard-ban + manual/forced-logout exclusions (its `excludeBannedOrLoggedOut`
+   *    path, enabled for `notice_created`), reproducing the client
+   *    `evaluateDeviceEligibility` + `canAttemptRemoteNotificationDelivery`
+   *    exclusions so notices reach the SAME devices as before.
+   *  - Deleted devices, and mobile-token duplicates, are excluded server-side.
+   *
+   * DOCUMENTED RESIDUAL DEVIATIONS (the server cannot reproduce these two purely
+   * client-local behaviors, and neither changes which OTHER users' devices are
+   * notified):
+   *  1. SENDER'S OWN CURRENT DEVICE. The legacy path suppressed delivery to the
+   *     notice author's *current* device (it knew `getCurrentDeviceId()`). The
+   *     server cannot know the caller's current device id, so when the author is
+   *     also a recipient their current device is handled by
+   *     `sendNotificationToUser`'s local Presence_Delivery (an in-app
+   *     notification on web) rather than being fully suppressed. This only ever
+   *     affects the author's OWN device, never another user's.
+   *  2. PER-DEVICE PAYLOAD FIELDS. The legacy per-device payload embedded
+   *     `data.deviceId` and `data.deliveryScope` ('online'/'offline'); with
+   *     server-side resolution the fan-out is per-recipient, so those per-device
+   *     fields are omitted from the notice `data`. All notice-identifying fields
+   *     (`noticeId`, `priority`, audio, etc.) are preserved.
+   */
+  private async dispatchNoticeViaServerFanout(
+    email: string,
+    notice: Notice,
+    tenantFilterOptions?: DeviceTenantFilterOptions
+  ): Promise<{ success: number; failed: number; deliverableDeviceCount: number }> {
+    const payload = this.buildRecipientNoticePayload(notice);
+    const result: DeviceNotificationFanoutResult = await deviceTrackingService.sendNotificationToUser(
+      email,
+      payload,
+      false, // onlineOnly=false → reach BOTH online and offline eligible devices
+      tenantFilterOptions
+    );
+    return {
+      success: result.success,
+      failed: result.failed,
+      deliverableDeviceCount: result.deliverableDeviceCount,
+    };
+  }
+
+  /**
+   * Build the recipient-level notice payload delegated to the Fanout_Endpoint.
+   * Mirrors {@link buildNotificationPayload} but WITHOUT the per-device
+   * `deviceId`/`deliveryScope` fields (resolution is server-side and
+   * per-recipient — see {@link dispatchNoticeViaServerFanout}). The
+   * `data.type = 'notice_created'` drives the server's notice Per_Type_Toggle +
+   * ban/logout exclusion.
+   */
+  private buildRecipientNoticePayload(notice: Notice) {
+    const data: any = {
+      type: 'notice_created',
+      noticeId: notice.id,
+      priority: notice.priority,
+      targetAudience: notice.targetAudience || ['all'],
+      createdBy: notice.createdByName,
+      createdByEmail: notice.createdByEmail,
+      createdAt: notice.createdAt || new Date().toISOString(),
+      hasAudio: Boolean(notice.audioUrl),
+    };
+
+    // Only include audioDurationMs if it's defined to prevent Firebase push errors
+    if (notice.audioDurationMs !== undefined) {
+      data.audioDurationMs = notice.audioDurationMs;
+    }
+
+    return {
+      title: this.buildTitle(notice),
+      body: this.buildBody(notice),
+      data,
+    };
   }
 
   private dedupeDevices(devices: UserDevice[]): UserDevice[] {

@@ -119,10 +119,14 @@ describe('POST /admin/tenants/devices — response envelope shape (Req 6.5)', ()
     const res = await post('/admin/tenants/devices', { tenantId: TENANT });
 
     expect(res.status).toBe(200);
-    // Exactly these four top-level keys — no more, no less.
-    expect(Object.keys(res.body).sort()).toEqual(['counts', 'devices', 'ok', 'tenantId']);
+    // Exactly these five top-level keys — `hasMore` joins the envelope for
+    // result-set pagination (Recommendation #2); `nextCursor` is omitted when
+    // there is no further page (both devices fit under the default page size).
+    expect(Object.keys(res.body).sort()).toEqual(['counts', 'devices', 'hasMore', 'ok', 'tenantId']);
     expect(res.body.ok).toBe(true);
     expect(res.body.tenantId).toBe(TENANT);
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body).not.toHaveProperty('nextCursor');
 
     // Counts envelope is unchanged.
     expect(Object.keys(res.body.counts).sort()).toEqual(['offline', 'online', 'total']);
@@ -143,8 +147,10 @@ describe('POST /admin/tenants/devices — response envelope shape (Req 6.5)', ()
     const res = await post('/admin/tenants/devices', { tenantId: TENANT });
 
     expect(res.status).toBe(200);
-    expect(Object.keys(res.body).sort()).toEqual(['counts', 'devices', 'ok', 'tenantId']);
+    expect(Object.keys(res.body).sort()).toEqual(['counts', 'devices', 'hasMore', 'ok', 'tenantId']);
     expect(res.body.devices).toEqual([]);
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body).not.toHaveProperty('nextCursor');
     expect(res.body.counts).toEqual({ total: 0, online: 0, offline: 0 });
   });
 });

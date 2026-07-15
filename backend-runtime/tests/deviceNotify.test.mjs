@@ -65,7 +65,8 @@ describe('notify push wiring (Requirements 12.2, 12.3)', { skip }, () => {
 
   // Local loopback stub standing in for the Expo push endpoint.
   let expoStub;
-  const expoRequests = [];
+  const expoRequests = []; // flattened messages across all requests
+  const expoBatches = []; // one entry per HTTP request: the messages it carried
 
   function startExpoStub() {
     return new Promise((resolve) => {
@@ -82,8 +83,15 @@ describe('notify push wiring (Requirements 12.2, 12.3)', { skip }, () => {
           }
           const messages = Array.isArray(parsed) ? parsed : [parsed];
           expoRequests.push(...messages);
-          // Mirror the Expo push API success shape: one `ok` receipt per message.
-          const data = messages.map((_, i) => ({ status: 'ok', id: `stub-receipt-${i}` }));
+          expoBatches.push(messages);
+          // Mirror the Expo push API: one receipt per message. A token carrying
+          // `FAIL` gets an error receipt so per-target failure mapping is testable.
+          const data = messages.map((m, i) => {
+            const to = typeof m?.to === 'string' ? m.to : '';
+            return to.includes('FAIL')
+              ? { status: 'error', message: 'stub rejected', details: { error: 'MessageRateExceeded' } }
+              : { status: 'ok', id: `stub-receipt-${i}` };
+          });
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ data }));
         });
@@ -237,6 +245,79 @@ describe('notify push wiring (Requirements 12.2, 12.3)', { skip }, () => {
       // Mirror the returned counts against the persisted audit metadata.
       assert.strictEqual(result.successful, 1, 'result should report one successful delivery');
       assert.strictEqual(result.failed, 1, 'result should report one failed delivery');
+    },
+  );
+
+  it(
+    'batches ALL Expo targets of one notify into a single Expo HTTP request (not one-per-target) and maps per-target outcomes positionally',
+    async () => {
+      // Reset the loopback stub's request log so counts reflect only this call.
+      expoRequests.length = 0;
+      expoBatches.length = 0;
+
+      const stamp = Date.now();
+      const tenantId = `tenant-batch-${stamp}`;
+      const actor = { id: 'admin-uid-2', email: 'ops2@example.com', name: 'Ops Admin 2' };
+      const title = 'Batched broadcast';
+      const body = 'Delivered in one Expo request.';
+
+      // Five Expo-token targets; the 3rd carries FAIL so the stub rejects it —
+      // proving per-target outcome mapping survives batching.
+      const N = 5;
+      const targets = [];
+      const expectOkByDeviceId = new Map();
+      for (let i = 0; i < N; i += 1) {
+        const email = `batch-owner-${i}-${stamp}@example.com`;
+        const deviceId = `batch-device-${i}-${stamp}`;
+        const ok = i !== 2;
+        const token = `ExponentPushToken[${ok ? 'ok' : 'FAIL'}-${i}-${stamp}]`;
+        await seedDevice({ tenantId, email, deviceId, expoPushToken: token });
+        targets.push({ email, deviceId });
+        expectOkByDeviceId.set(deviceId, ok);
+      }
+
+      const result = await notify({ tenantId, title, body, targets, actor });
+
+      // --- BATCHING: all N Expo messages arrived in ONE HTTP request ---
+      assert.strictEqual(
+        expoBatches.length,
+        1,
+        'all Expo targets should be delivered in a single batched Expo HTTP request',
+      );
+      assert.strictEqual(
+        expoBatches[0].length,
+        N,
+        'the single batched request should carry every Expo message',
+      );
+      assert.strictEqual(expoRequests.length, N, 'exactly N Expo messages were sent in total');
+
+      // --- Per-target outcomes still map positionally / correctly ---
+      assert.strictEqual(result.results.length, N, 'one outcome per target');
+      for (let i = 0; i < N; i += 1) {
+        const outcome = result.results[i];
+        assert.strictEqual(outcome.email, targets[i].email, 'outcome preserves input order (email)');
+        assert.strictEqual(outcome.deviceId, targets[i].deviceId, 'outcome preserves input order (deviceId)');
+        assert.strictEqual(
+          outcome.ok,
+          expectOkByDeviceId.get(targets[i].deviceId),
+          'per-target ok reflects the stub receipt for that message',
+        );
+      }
+      assert.strictEqual(result.successful, N - 1, 'four Expo deliveries succeed');
+      assert.strictEqual(result.failed, 1, 'the FAIL target is the only failure');
+      assert.strictEqual(result.successful + result.failed, N, 'counts partition the target total');
+
+      // --- Exactly one notify audit entry for the batched action ---
+      const auditQuery = await db
+        .collection(DEVICE_AUDIT_LOG_COLLECTION)
+        .where('tenantId', '==', tenantId)
+        .get();
+      const notifyEntries = auditQuery.docs
+        .map((docSnap) => docSnap.data())
+        .filter((entry) => entry.action === 'notify');
+      assert.strictEqual(notifyEntries.length, 1, 'exactly one notify audit entry should be written');
+      assert.strictEqual(notifyEntries[0].metadata.total, N, 'audit metadata records the target total');
+      assert.strictEqual(notifyEntries[0].outcome, 'partial', 'mixed result => partial outcome');
     },
   );
 });

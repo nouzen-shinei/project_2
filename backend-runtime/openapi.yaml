@@ -617,16 +617,20 @@ paths:
                 hideInactive:
                   type: boolean
                   description: When true, excludes deleted / hard-banned / logged-out devices
-                limit: { type: integer, minimum: 1, maximum: 1000, description: Optional cap on the returned list }
-                cursor: { type: string, minLength: 1, maxLength: 400 }
+                limit: { type: integer, minimum: 1, maximum: 500, description: Page size for result-set pagination; defaults to 100 when omitted }
+                cursor: { type: string, minLength: 1, maxLength: 400, description: Opaque page cursor from a prior response's nextCursor; blank/absent/invalid returns the first page }
       responses:
         '200':
-          description: Tenant device list with counts
+          description: >-
+            Tenant device list page with full-tenant counts. Counts and the
+            search/filter/sort pipeline are computed over the full tenant set;
+            `devices` is a single page of the ordered result and `hasMore` /
+            `nextCursor` drive result-set pagination (Recommendation #2).
           content:
             application/json:
               schema:
                 type: object
-                required: [ok, tenantId, counts, devices]
+                required: [ok, tenantId, counts, devices, hasMore]
                 properties:
                   ok: { type: boolean }
                   tenantId: { type: string }
@@ -634,6 +638,8 @@ paths:
                   devices:
                     type: array
                     items: { $ref: '#/components/schemas/DeviceAdminRecord' }
+                  hasMore: { type: boolean, description: True when more result rows remain past this page }
+                  nextCursor: { type: string, description: Opaque cursor for the next page; present only when hasMore is true }
         '400':
           description: Validation failed (validation_failed with issues)
           content:

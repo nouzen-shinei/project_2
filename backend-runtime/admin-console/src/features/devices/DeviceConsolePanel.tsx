@@ -74,6 +74,15 @@ export function DeviceConsolePanel({ tenantId }: DeviceConsolePanelProps) {
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
 
+  // Result-set pagination (Recommendation #2). The first-page/refresh load
+  // (`loadDevices`) replaces the list and resets these from the response; the
+  // "Load more" control (`loadMoreDevices`) sends `nextCursor` and APPENDS the
+  // next page. `loadingMore` is tracked separately so the two never fight over
+  // the primary `loading` flag.
+  const [hasMore, setHasMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | undefined>(undefined);
+  const [loadingMore, setLoadingMore] = useState(false);
+
   // Devices list vs. tenant action/notification history.
   const [view, setView] = useState<ConsoleView>('devices');
 
@@ -102,6 +111,9 @@ export function DeviceConsolePanel({ tenantId }: DeviceConsolePanelProps) {
     if (!effectiveTenantId) return;
     const requestId = (requestIdRef.current += 1);
     setLoading(true);
+    // A fresh first-page load supersedes any in-flight "Load more"; clear its
+    // spinner so a superseded append never leaves the control stuck.
+    setLoadingMore(false);
     setError(null);
     try {
       const trimmedSearch = search.trim();
@@ -111,11 +123,16 @@ export function DeviceConsolePanel({ tenantId }: DeviceConsolePanelProps) {
         filter,
         sort,
         hideInactive: hideInactive ? true : undefined,
+        // No cursor: this path always fetches the FIRST page. Any search /
+        // filter / sort / hide-inactive change re-runs this effect and thereby
+        // resets pagination back to a single page.
       });
       if (requestIdRef.current !== requestId) return;
       const nextDevices = response.devices || [];
       setDevices(nextDevices);
       setCounts(response.counts || EMPTY_COUNTS);
+      setHasMore(response.hasMore === true);
+      setNextCursor(response.nextCursor);
       setLastUpdated(Date.now());
       setHasLoaded(true);
 
@@ -144,6 +161,58 @@ export function DeviceConsolePanel({ tenantId }: DeviceConsolePanelProps) {
       }
     }
   }, [effectiveTenantId, search, filter, sort, hideInactive]);
+
+  // "Load more" (Recommendation #2): fetch the next page with the stored
+  // `nextCursor` and APPEND it to the loaded list. Counts stay full-set (taken
+  // from the latest response). Stale/superseded responses are dropped via the
+  // shared `requestIdRef` guard so a first-page reload can never be clobbered by
+  // a slower append.
+  const loadMoreDevices = useCallback(async () => {
+    if (!effectiveTenantId || !hasMore || !nextCursor) return;
+    if (loading || loadingMore) return;
+    const requestId = (requestIdRef.current += 1);
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const trimmedSearch = search.trim();
+      const response = await fetchTenantDevices({
+        tenantId: effectiveTenantId,
+        search: trimmedSearch ? trimmedSearch : undefined,
+        filter,
+        sort,
+        hideInactive: hideInactive ? true : undefined,
+        cursor: nextCursor,
+      });
+      if (requestIdRef.current !== requestId) return;
+      // APPEND the new page. `devices` is captured from the closure; because
+      // every load bumps `requestIdRef`, a concurrent first-page reload would
+      // have failed the guard above, so this closure's `devices` is current.
+      const combined = [...devices, ...(response.devices || [])];
+      setDevices(combined);
+      setCounts(response.counts || EMPTY_COUNTS);
+      setHasMore(response.hasMore === true);
+      setNextCursor(response.nextCursor);
+      setLastUpdated(Date.now());
+      // Prune over the COMBINED list so ids selected on earlier pages survive
+      // (Requirement 14.5) — pruning over only the appended page would drop them.
+      setSelectedIds((prev) => pruneSelection(prev, combined));
+    } catch (err) {
+      if (requestIdRef.current !== requestId) return;
+      console.warn('[DeviceConsolePanel] device list load-more failed', err);
+      // Retain the already-loaded devices + counts; only surface the error.
+      if (err instanceof ApiError) {
+        setError(`More devices could not be loaded (${err.status}).`);
+      } else if (err instanceof Error) {
+        setError(err.message);
+      } else {
+        setError('More devices could not be loaded for this tenant.');
+      }
+    } finally {
+      if (requestIdRef.current === requestId) {
+        setLoadingMore(false);
+      }
+    }
+  }, [effectiveTenantId, hasMore, nextCursor, loading, loadingMore, search, filter, sort, hideInactive, devices]);
 
   // Fetch on scope change and whenever a control changes (loadDevices identity
   // captures the search/filter/sort/hideInactive dependencies).
@@ -181,6 +250,10 @@ export function DeviceConsolePanel({ tenantId }: DeviceConsolePanelProps) {
     });
   }, []);
 
+  // "Select all selectable" (and the select-all semantics generally) operate
+  // over the currently-loaded devices only — i.e. the pages fetched so far, not
+  // every match on the server. This is acceptable: an operator selects from
+  // what is on screen, and loading more pages first expands the selectable set.
   const handleSelectAllSelectable = useCallback(() => {
     setSelectedIds(new Set(selectableDevices.map((device) => device.deviceId)));
   }, [selectableDevices]);
@@ -365,6 +438,18 @@ export function DeviceConsolePanel({ tenantId }: DeviceConsolePanelProps) {
             onActionComplete={loadDevices}
             renderSelectionControl={renderSelectionControl}
           />
+          {hasMore && (
+            <div style={{ display: 'flex', justifyContent: 'center' }}>
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => void loadMoreDevices()}
+                disabled={loading || loadingMore}
+              >
+                {loadingMore ? 'Loading more…' : 'Load more'}
+              </button>
+            </div>
+          )}
         </div>
       ) : null}
         </>

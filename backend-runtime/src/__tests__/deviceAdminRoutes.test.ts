@@ -336,6 +336,10 @@ describe('happy paths (Requirement 15.4)', () => {
     expect(res.body.counts).toEqual({ total: 1, online: 1, offline: 0 });
     expect(res.body.devices).toHaveLength(1);
     expect(res.body.devices[0].deviceId).toBe(DEVICE);
+    // Result-set pagination envelope (Recommendation #2): a single device fits
+    // under the default page size, so there is no further page.
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body).not.toHaveProperty('nextCursor');
     expect(asMock(svc.listTenantDevices)).toHaveBeenCalledWith(TENANT);
   });
 
@@ -383,8 +387,11 @@ describe('happy paths (Requirement 15.4)', () => {
     expect(res.body.nextCursor).toBe('cursor-1');
   });
 
-  it('#13 timeline -> 200 with ordered entries', async () => {
-    asMock(svc.fetchTimeline).mockResolvedValue({ entries: [{ id: 'a' }, { id: 'b' }] });
+  it('#13 timeline -> 200 with ordered entries + hasMore (nextCursor omitted when absent)', async () => {
+    asMock(svc.fetchTimeline).mockResolvedValue({
+      entries: [{ id: 'a' }, { id: 'b' }],
+      hasMore: false,
+    });
 
     const res = await post('/admin/tenants/devices/timeline', {
       tenantId: TENANT,
@@ -393,7 +400,63 @@ describe('happy paths (Requirement 15.4)', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, entries: [{ id: 'a' }, { id: 'b' }] });
+    expect(res.body).toEqual({ ok: true, entries: [{ id: 'a' }, { id: 'b' }], hasMore: false });
+    expect(res.body).not.toHaveProperty('nextCursor');
+  });
+
+  it('#13 timeline -> 200 includes hasMore + nextCursor and forwards limit/cursor', async () => {
+    asMock(svc.fetchTimeline).mockResolvedValue({
+      entries: [{ id: 'a' }],
+      hasMore: true,
+      nextCursor: 'cursor-1',
+    });
+
+    const res = await post('/admin/tenants/devices/timeline', {
+      tenantId: TENANT,
+      email: EMAIL,
+      deviceId: DEVICE,
+      limit: 1,
+      cursor: 'cursor-0',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.hasMore).toBe(true);
+    expect(res.body.nextCursor).toBe('cursor-1');
+    expect(asMock(svc.fetchTimeline)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: TENANT,
+        email: EMAIL,
+        deviceId: DEVICE,
+        limit: 1,
+        cursor: 'cursor-0',
+      })
+    );
+  });
+
+  it('#13 timeline -> 404 device_not_found when the service reports an unknown device', async () => {
+    asMock(svc.fetchTimeline).mockRejectedValue(new DeviceNotFoundError());
+
+    const res = await post('/admin/tenants/devices/timeline', {
+      tenantId: TENANT,
+      email: EMAIL,
+      deviceId: DEVICE,
+    });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'device_not_found' });
+  });
+
+  it('#13 timeline -> 403 tenant_scope_violation for an out-of-scope device', async () => {
+    asMock(svc.fetchTimeline).mockRejectedValue(new TenantScopeError());
+
+    const res = await post('/admin/tenants/devices/timeline', {
+      tenantId: TENANT,
+      email: EMAIL,
+      deviceId: DEVICE,
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'tenant_scope_violation' });
   });
 
   it('#3 force-logout -> 200 { ok: true } and forwards the resolved actor', async () => {
@@ -567,6 +630,75 @@ describe('happy paths (Requirement 15.4)', () => {
     expect(res.body.ok).toBe(true);
     expect(res.body.successful).toBe(0);
     expect(res.body.failed).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// List pagination (Recommendation #2 — result-set pagination)
+// ---------------------------------------------------------------------------
+
+describe('list pagination (Recommendation #2)', () => {
+  it('returns hasMore + nextCursor when matches exceed the limit and pages through with the cursor', async () => {
+    const now = Date.now();
+    // Three in-tenant devices; distinct owner emails so the owner-grouping sort
+    // yields a stable a→b→c order (p1, p2, p3) — though the assertions only rely
+    // on the two pages being disjoint and jointly covering all three ids.
+    const all = [
+      { deviceId: 'p1', ownerEmail: 'a@example.com', deviceType: 'web', lastSeenMs: now - 1_000 },
+      { deviceId: 'p2', ownerEmail: 'b@example.com', deviceType: 'web', lastSeenMs: now - 2_000 },
+      { deviceId: 'p3', ownerEmail: 'c@example.com', deviceType: 'web', lastSeenMs: now - 3_000 },
+    ];
+    asMock(svc.listTenantDevices).mockResolvedValue(all);
+
+    // Page 1 (limit 2): first two of three, with a continuation cursor.
+    const page1 = await post('/admin/tenants/devices', { tenantId: TENANT, limit: 2 });
+    expect(page1.status).toBe(200);
+    expect(page1.body.devices).toHaveLength(2);
+    expect(page1.body.hasMore).toBe(true);
+    expect(typeof page1.body.nextCursor).toBe('string');
+    // Counts are computed over the FULL set regardless of the page size.
+    expect(page1.body.counts.total).toBe(3);
+
+    // Page 2 (same limit + the returned cursor): the remaining device, no more.
+    const page2 = await post('/admin/tenants/devices', {
+      tenantId: TENANT,
+      limit: 2,
+      cursor: page1.body.nextCursor,
+    });
+    expect(page2.status).toBe(200);
+    expect(page2.body.devices).toHaveLength(1);
+    expect(page2.body.hasMore).toBe(false);
+    expect(page2.body).not.toHaveProperty('nextCursor');
+    expect(page2.body.counts.total).toBe(3);
+
+    const ids1 = page1.body.devices.map((d: any) => d.deviceId);
+    const ids2 = page2.body.devices.map((d: any) => d.deviceId);
+    // The two pages are disjoint and together cover the whole ordered result —
+    // no drops, no duplicates.
+    expect(ids1.some((id: string) => ids2.includes(id))).toBe(false);
+    expect([...ids1, ...ids2].sort()).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('an invalid cursor is treated as the first page', async () => {
+    const now = Date.now();
+    const all = [
+      { deviceId: 'q1', ownerEmail: 'a@example.com', deviceType: 'web', lastSeenMs: now - 1_000 },
+      { deviceId: 'q2', ownerEmail: 'b@example.com', deviceType: 'web', lastSeenMs: now - 2_000 },
+    ];
+    asMock(svc.listTenantDevices).mockResolvedValue(all);
+
+    const garbage = await post('/admin/tenants/devices', {
+      tenantId: TENANT,
+      limit: 1,
+      cursor: 'not-a-real-cursor',
+    });
+    const first = await post('/admin/tenants/devices', { tenantId: TENANT, limit: 1 });
+
+    expect(garbage.status).toBe(200);
+    expect(garbage.body.devices.map((d: any) => d.deviceId)).toEqual(
+      first.body.devices.map((d: any) => d.deviceId),
+    );
+    expect(garbage.body.hasMore).toBe(first.body.hasMore);
   });
 });
 

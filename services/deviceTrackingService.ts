@@ -361,6 +361,48 @@ export interface DeviceNotificationFanoutResult {
   deduplicatedWebPushSubscriptionsCleaned: number;
 }
 
+// Boolean env-flag parser following the repo convention (see `parseEnvFlag` in
+// services/chatService.ts and `isFlagEnabled` in services/gifStickerProviderService.ts):
+// EXPO_PUBLIC_* string flags map to booleans, with a caller-supplied default when
+// the value is absent or unrecognized. Pure, no I/O.
+function parseEnvFlag(value: string | undefined, defaultValue: boolean): boolean {
+  if (value == null) {
+    return defaultValue;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return defaultValue;
+  }
+  if (['0', 'false', 'off', 'disabled', 'no'].includes(normalized)) {
+    return false;
+  }
+  if (['1', 'true', 'on', 'enabled', 'yes'].includes(normalized)) {
+    return true;
+  }
+  return defaultValue;
+}
+
+/**
+ * Fanout_Feature_Flag resolver (design §6, Requirements 9.1–9.3).
+ *
+ * Selects the push fan-out path: `true` routes push through the Server_Fanout
+ * (`POST /notifications/fanout`), `false` keeps the existing Client_Fanout.
+ *
+ * - Defaults to **false** — Client_Fanout stays authoritative until the server
+ *   path is deliberately enabled, so notifications never silently stop (Req 9.2).
+ * - Read from `EXPO_PUBLIC_SERVER_FANOUT_ENABLED` via the repo boolean env-flag
+ *   convention.
+ * - **Independent of the Device_Read_Rule**: the Server_Fanout can be enabled and
+ *   validated while `user_devices` reads are still open, before the read rule is
+ *   tightened (Req 9.3).
+ *
+ * Pure and side-effect free; consumed by `sendNotificationToUser` and the notice
+ * fan-out to choose Server vs Client fan-out.
+ */
+export function isServerFanoutEnabled(): boolean {
+  return parseEnvFlag(process.env.EXPO_PUBLIC_SERVER_FANOUT_ENABLED, false);
+}
+
 class DeviceTrackingService {
   private currentDeviceId: string | null = null;
   private currentDeviceIdSource: 'stable_seed' | 'fingerprint_fallback' | 'unknown' = 'unknown';
@@ -1268,7 +1310,10 @@ class DeviceTrackingService {
     return this.webPushSyncInFlight;
   }
 
-  private async sendPushViaBackend(message: Record<string, any> & { tenantId: string }): Promise<{ ok: boolean; result?: any }> {
+  private async sendPushViaBackend(
+    message: Record<string, any> & { tenantId: string },
+    path: string = '/notifications/push'
+  ): Promise<{ ok: boolean; result?: any }> {
     const baseUrl = this.getPushProxyBaseUrl();
     if (!baseUrl) {
       logger.error(
@@ -1305,7 +1350,7 @@ class DeviceTrackingService {
       logger.warn('Proceeding with backend push proxy request without internal auth token');
     }
 
-    let response = await fetch(`${baseUrl}/notifications/push`, {
+    let response = await fetch(`${baseUrl}${path}`, {
       method: 'POST',
       headers,
       body: JSON.stringify(message),
@@ -1319,7 +1364,7 @@ class DeviceTrackingService {
       } else {
         delete headers['Authorization'];
       }
-      response = await fetch(`${baseUrl}/notifications/push`, {
+      response = await fetch(`${baseUrl}${path}`, {
         method: 'POST',
         headers,
         body: JSON.stringify(message),
@@ -2638,9 +2683,23 @@ class DeviceTrackingService {
   }
 
   /**
-   * Get all devices for a user
+   * Get all devices for a user.
+   *
+   * Fanout_Feature_Flag (design §5 "Cross_User_Reader migration inventory";
+   * Req 7.2, 7.3, 7.4, 4.4): a read of the SIGNED-IN user's own devices is an
+   * Owner_Only_Read and MUST stay a direct client Firestore read (the legacy
+   * path below, unchanged). A read of ANOTHER user's devices routes, under the
+   * flag, to the server device-listing path so the client never reads that
+   * user's `user_devices` tree — the server resolves it via the Admin SDK and
+   * returns the same `UserDevice`-shaped devices minus the secret fields it
+   * strips (tokens/web-push endpoints/network metadata are never needed
+   * client-side for listing or authorization). When the flag is off, every
+   * caller runs the legacy client read UNCHANGED (rollback safety valve, Req 9.2).
    */
   async getUserDevices(userEmail: string, options?: DeviceTenantFilterOptions): Promise<UserDevice[]> {
+    if (isServerFanoutEnabled() && !this.isSelfEmail(userEmail)) {
+      return this.getUserDevicesViaServer(userEmail, options);
+    }
     try {
       const tenantFilterId = options?.tenantId ?? null;
       const includeUntagged = options?.includeUntagged ?? true;
@@ -2778,6 +2837,13 @@ class DeviceTrackingService {
     includeCurrentUser: boolean = false,
     options?: DeviceTenantFilterOptions
   ): Promise<AuthorizedUser[]> {
+    // Fanout_Feature_Flag (design §5; Req 7.3, 7.5, 4.4): under the flag, resolve
+    // the multi-user listing SERVER-SIDE (Admin SDK) — no cross-user client read
+    // — and overlay the profile-sourced `role`/`displayName` the endpoint omits.
+    // Flag OFF keeps the legacy client path below UNCHANGED (Req 9.2).
+    if (isServerFanoutEnabled()) {
+      return this.getAllUsersWithDevicesViaServer(authorizedEmails, currentUserEmail, includeCurrentUser, options);
+    }
     try {
       const usersData: AuthorizedUser[] = [];
       const normalizedAuthorizedEmails = Array.from(
@@ -2868,9 +2934,19 @@ class DeviceTrackingService {
   }
 
   /**
-   * Check if user is online (has at least one online device)
+   * Check if user is online (has at least one online device).
+   *
+   * Fanout_Feature_Flag (design §5; Req 7.3, 7.5, 4.4): under the flag, a read of
+   * ANOTHER user's online status resolves SERVER-SIDE (Admin SDK) so the client
+   * never reads that user's `user_devices` tree — preserving the exact "any
+   * device online" boolean. A self-read stays a direct client read
+   * (Owner_Only_Read, Req 7.4). Flag OFF keeps the legacy client path unchanged.
+   * The non-throwing contract is preserved: any error resolves to `false`.
    */
   async checkUserOnlineStatus(userEmail: string): Promise<boolean> {
+    if (isServerFanoutEnabled() && !this.isSelfEmail(userEmail)) {
+      return this.checkUserOnlineStatusViaServer(userEmail);
+    }
     try {
       const devices = await this.getUserDevices(userEmail);
       return devices.some(device => device.isOnline);
@@ -2880,21 +2956,11 @@ class DeviceTrackingService {
     }
   }
 
-  /**
-   * Get user's push tokens for notifications
-   */
-  async getUserPushTokens(userEmail: string, onlineOnly: boolean = true): Promise<string[]> {
-    try {
-      const devices = await this.getUserDevices(userEmail);
-      return devices
-        .filter(device => onlineOnly ? (device.isOnline && !device.isDeleted) : true)
-        .map(device => device.expoPushToken)
-        .filter(token => token) as string[];
-    } catch (error) {
-      logger.error('Error getting push tokens for', userEmail, error);
-      return [];
-    }
-  }
+  // NOTE (device-push-fanout-migration, Req 5.4/7.3): the cross-user
+  // `getUserPushTokens` reader was RETIRED. Push tokens are now resolved ONLY
+  // inside the Server_Fanout (backend Admin SDK) and are NEVER returned to the
+  // client — the client has no capability to list another user's push tokens.
+  // It had no callers, so it was removed outright (no self-only form was needed).
 
   private normalizeEmailValue(value: unknown): string {
     if (typeof value !== 'string') {
@@ -2986,6 +3052,15 @@ class DeviceTrackingService {
     deviceOverride?: UserDevice,
     options?: DeviceTenantFilterOptions
   ): Promise<DeviceNotificationAttemptResult> {
+    // Fanout_Feature_Flag (device-push-fanout-migration, task 12.1 Part B; Req
+    // 4.3, 4.4, 7.3, 9.1, 9.2). Under the Server_Fanout, single-device push
+    // routes through the backend Fanout_Endpoint so the client never reads
+    // another user's `user_devices` tree and never delivers a local push using
+    // another user's tokens — the ONLY local delivery is presence-to-self. When
+    // the flag is off, the existing local single-device path below runs UNCHANGED.
+    if (isServerFanoutEnabled()) {
+      return this.sendNotificationToDeviceViaServerFanout(deviceId, userEmail, notification, options);
+    }
     try {
       const device = deviceOverride ?? (await this.getUserDevices(userEmail, options)).find(d => d.deviceId === deviceId);
       
@@ -3081,6 +3156,113 @@ class DeviceTrackingService {
       }
     } catch (error) {
       logger.error('Error sending notification to device:', error);
+      return { delivered: false, deliverySource: 'unknown' };
+    }
+  }
+
+  /**
+   * Server_Fanout path for {@link sendNotificationToDeviceDetailed} (design §5,
+   * Stage 3, task 12.1 Part B; Req 4.1, 4.3, 4.4, 7.3, 9.1).
+   *
+   * When the Fanout_Feature_Flag selects the Server_Fanout, single-device push
+   * moves server-side:
+   *
+   *  - PRESENCE-TO-SELF STAYS LOCAL (Req 4.1): if the target device is the
+   *    signed-in user's OWN current web device, deliver a local (in-app)
+   *    notification using only local state — the exact
+   *    {@link sendWebBrowserNotification} `isCurrentDevice` branch — and report a
+   *    `'presence'` outcome. No server push is sent for that device, and no
+   *    device document is read.
+   *  - OTHERWISE the push is delegated to `POST /notifications/fanout` via the
+   *    existing {@link sendPushViaBackend} bridge, targeting the single `deviceId`.
+   *    The counts-only server result is mapped back to a
+   *    {@link DeviceNotificationAttemptResult}: `delivered` when the server
+   *    accepted any push; the `pushChannel` reflects the mobile-vs-web channel the
+   *    server actually delivered on.
+   *
+   * CRITICAL (invariant): this path performs NO cross-user `user_devices` read
+   * and NEVER delivers a local push using another user's tokens — push-target
+   * resolution and delivery happen server-side (Req 4.4). The tenant scope is
+   * resolved WITHOUT a device read via {@link resolveResolutionTenantId}. It is
+   * non-throwing: any error / missing tenant / failed backend call resolves to
+   * `{ delivered: false, deliverySource: 'unknown' }`, matching the legacy
+   * single-device path's `catch`.
+   */
+  private async sendNotificationToDeviceViaServerFanout(
+    deviceId: string,
+    userEmail: string,
+    notification: {
+      title: string;
+      body: string;
+      data?: any;
+    },
+    options?: DeviceTenantFilterOptions
+  ): Promise<DeviceNotificationAttemptResult> {
+    try {
+      // PRESENCE-TO-SELF: the target IS the signed-in user's own current device.
+      // Keep the LOCAL presence delivery for the current WEB device (mirrors the
+      // Client_Fanout `isCurrentDevice` branch). A current mobile device receives
+      // push server-side, exactly as under the recipient-wide Server_Fanout.
+      const isSelfCurrentDevice =
+        deviceId === this.currentDeviceId && userEmail === this.currentUserEmail;
+      if (isSelfCurrentDevice && Platform.OS === 'web') {
+        return await this.sendWebBrowserNotification(deviceId, userEmail, notification, undefined);
+      }
+
+      // Resolve the tenant scope WITHOUT reading any device documents (Req 4.4).
+      const tenantId = await this.resolveResolutionTenantId(options);
+      if (!tenantId) {
+        logger.warn('Server single-device push skipped: no tenant context available', {
+          userEmail,
+          deviceId,
+        });
+        return { delivered: false, deliverySource: 'unknown' };
+      }
+
+      // Delegate the single-device push to the Fanout_Endpoint. The body matches
+      // the backend `fanoutPayloadSchema` exactly, with `deviceId` targeting the
+      // one device. `onlineOnly: false` mirrors the legacy single-device path,
+      // which delivered regardless of the recipient-wide online filter.
+      const response = await this.sendPushViaBackend(
+        {
+          tenantId,
+          recipientEmail: userEmail,
+          notification: {
+            title: notification.title,
+            body: notification.body,
+            data: notification.data,
+          },
+          onlineOnly: false,
+          deviceId,
+        },
+        '/notifications/fanout'
+      );
+
+      if (!response.ok) {
+        return { delivered: false, deliverySource: 'unknown' };
+      }
+
+      // Map the counts-only server result back to the per-device attempt result.
+      const result = response.result ?? {};
+      const num = (value: unknown): number =>
+        typeof value === 'number' && Number.isFinite(value) ? value : 0;
+      const pushAcceptedCount = num(result.pushAcceptedCount);
+      const mobilePushAcceptedCount = num(result.mobilePushAcceptedCount);
+      const webPushAcceptedCount = num(result.webPushAcceptedCount);
+      const pushChannel: 'mobile_push' | 'web_push' | undefined =
+        mobilePushAcceptedCount > 0
+          ? 'mobile_push'
+          : webPushAcceptedCount > 0
+            ? 'web_push'
+            : undefined;
+
+      return {
+        delivered: pushAcceptedCount > 0,
+        deliverySource: 'push',
+        pushChannel,
+      };
+    } catch (error) {
+      logger.error('Error sending single-device notification via server fan-out:', error);
       return { delivered: false, deliverySource: 'unknown' };
     }
   }
@@ -3458,6 +3640,467 @@ class DeviceTrackingService {
   }
 
   /**
+   * Server_Fanout path for {@link sendNotificationToUser} (design §5, Stage 2;
+   * Req 4.1, 4.3, 6.1, 9.1, 9.2, 9.5).
+   *
+   * When the Fanout_Feature_Flag selects the Server_Fanout, push-target
+   * resolution and delivery move server-side: this method (a) performs
+   * Presence_Delivery to the signed-in user's OWN current device using only
+   * local state, (b) delegates Push_Target resolution and Push_Delivery to
+   * `POST /notifications/fanout` via the existing {@link sendPushViaBackend}
+   * bridge (reusing its `internalTokenManager` auth, `tenantId` propagation, and
+   * single 401-retry), and (c) merges the server push counts with the local
+   * presence outcome into the returned {@link DeviceNotificationFanoutResult}.
+   *
+   * CRITICAL: this path NEVER reads the recipient's `user_devices` tree — push
+   * target resolution happens server-side (Req 4.4). It never throws to the
+   * caller: any unexpected error resolves to the standard failure result,
+   * matching the Client_Fanout `catch` branch (Req 6.5-parity).
+   */
+  private async sendNotificationToUserViaServerFanout(
+    userEmail: string,
+    notification: {
+      title: string;
+      body: string;
+      data?: any;
+    },
+    onlineOnly: boolean,
+    options?: DeviceTenantFilterOptions
+  ): Promise<DeviceNotificationFanoutResult> {
+    try {
+      // (a) Presence_Delivery to the signed-in user's own current device, using
+      // only local state (Req 4.1) — no recipient device read.
+      const presenceDeliveredCount = await this.deliverPresenceToCurrentDeviceLocally(userEmail, notification);
+
+      // Resolve the tenant scope for the notification WITHOUT reading any device
+      // documents: prefer the caller's tenant option, then the payload's
+      // `data.tenantId`, then the signed-in user's own (cached) tenant metadata.
+      const tenantId = await this.resolveServerFanoutTenantId(notification, options);
+      if (!tenantId) {
+        logger.warn('Server fan-out skipped push delegation: no tenant context available', { userEmail });
+        return this.mergeServerFanoutResult(null, presenceDeliveredCount);
+      }
+
+      // (b) Delegate Push_Target resolution + Push_Delivery to the Fanout_Endpoint.
+      // The body matches the backend `fanoutPayloadSchema` exactly.
+      const backendResponse = await this.sendPushViaBackend(
+        {
+          tenantId,
+          recipientEmail: userEmail,
+          notification: {
+            title: notification.title,
+            body: notification.body,
+            data: notification.data,
+          },
+          onlineOnly,
+        },
+        '/notifications/fanout'
+      );
+
+      // (c) Merge the counts-only server push result with the local presence
+      // outcome. On a failed backend call, the push counts are treated as zero
+      // while the local presence delivery is still reported.
+      return this.mergeServerFanoutResult(backendResponse.ok ? backendResponse.result : null, presenceDeliveredCount);
+    } catch (error) {
+      logger.error('Error sending notification to user via server fan-out:', error);
+      return {
+        success: 0,
+        failed: 1,
+        deliverableDeviceCount: 0,
+        onlineDeliverableCount: 0,
+        presenceDeliveredCount: 0,
+        pushAcceptedCount: 0,
+        mobilePushAcceptedCount: 0,
+        webPushAcceptedCount: 0,
+        staleWebPushSubscriptionsCleaned: 0,
+        deduplicatedWebPushSubscriptionsCleaned: 0,
+      };
+    }
+  }
+
+  /**
+   * Presence_Delivery to the signed-in user's OWN current device, using ONLY
+   * local state (Req 4.1). This mirrors the Client_Fanout's `isCurrentDevice`
+   * branch in {@link sendWebBrowserNotification}: it delivers a local (in-app)
+   * notification to the current web device and NEVER reads another user's device
+   * documents. Returns the number of presence deliveries (0 or 1).
+   *
+   * It only fires when the recipient IS the signed-in user and this is the web
+   * current device — a current mobile device receives push server-side, exactly
+   * as in the Client_Fanout.
+   */
+  private async deliverPresenceToCurrentDeviceLocally(
+    userEmail: string,
+    notification: {
+      title: string;
+      body: string;
+      data?: any;
+    }
+  ): Promise<number> {
+    const recipient = this.normalizeEmailValue(userEmail);
+    const currentUser = this.normalizeEmailValue(this.currentUserEmail);
+    if (!recipient || !currentUser || recipient !== currentUser) {
+      return 0;
+    }
+
+    const deviceId = this.currentDeviceId;
+    if (!deviceId) {
+      return 0;
+    }
+
+    // The Client_Fanout only renders a local presence notification for the
+    // current WEB device; a current mobile device is delivered via push
+    // (server-side under the flag).
+    if (Platform.OS !== 'web') {
+      return 0;
+    }
+
+    // Honor the current device's own (locally-tracked) notifications toggle,
+    // unless the notification is marked `allowWhenDisabled`.
+    const allowWhenDisabled = notification?.data?.allowWhenDisabled === true;
+    if (!allowWhenDisabled && this.lastKnownNotificationsEnabled === false) {
+      return 0;
+    }
+
+    try {
+      const notificationId = typeof notification.data?.notificationId === 'string' && notification.data.notificationId.trim()
+        ? notification.data.notificationId.trim()
+        : `web:${deviceId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+
+      await getNotificationService().sendLocalNotification({
+        title: notification.title,
+        body: notification.body,
+        data: {
+          ...(notification.data ?? {}),
+          deviceId,
+          userEmail,
+          timestamp: Date.now(),
+          allowWhenDisabled: true,
+          notificationId,
+        },
+      });
+      return 1;
+    } catch (error) {
+      logger.warn('Server fan-out presence delivery to current device failed', { userEmail, error });
+      return 0;
+    }
+  }
+
+  /**
+   * Resolve the tenant scope for a Server_Fanout WITHOUT reading any device
+   * documents. Precedence: the caller's `options.tenantId`, then the payload's
+   * `data.tenantId`, then the signed-in user's own (cached) tenant metadata via
+   * {@link getTenantMetadataForTagging}. Returns `null` when no tenant can be
+   * resolved.
+   */
+  private async resolveServerFanoutTenantId(
+    notification: { data?: any },
+    options?: DeviceTenantFilterOptions
+  ): Promise<string | null> {
+    const optionTenantId = typeof options?.tenantId === 'string' ? options.tenantId.trim() : '';
+    if (optionTenantId) {
+      return optionTenantId;
+    }
+
+    const payloadTenantId = typeof notification?.data?.tenantId === 'string' ? notification.data.tenantId.trim() : '';
+    if (payloadTenantId) {
+      return payloadTenantId;
+    }
+
+    const metadata = await this.getTenantMetadataForTagging();
+    const activeTenantId = typeof metadata.activeTenantId === 'string' ? metadata.activeTenantId.trim() : '';
+    if (activeTenantId) {
+      return activeTenantId;
+    }
+
+    const firstTenantId = metadata.tenantIds.find((id) => typeof id === 'string' && id.trim());
+    return firstTenantId ? firstTenantId.trim() : null;
+  }
+
+  /**
+   * Merge the counts-only Server_Fanout push result with the local
+   * Presence_Delivery outcome into the {@link DeviceNotificationFanoutResult}
+   * contract callers depend on (Req 6.1, 9.5). The shape is IDENTICAL to the
+   * Client_Fanout path — the same ten numeric fields.
+   *
+   * The server owns the push and cleanup counts (it performed the resolution and
+   * delivery); the client contributes only the presence delivery. `success`
+   * therefore accumulates the local presence count on top of the server's
+   * push-based success, matching the fan-out's `success === presenceDeliveredCount
+   * + pushAcceptedCount` accounting. Every field is coerced to a finite number so
+   * the shape is always complete, even when the backend returned an error body.
+   */
+  private mergeServerFanoutResult(
+    serverResult: Partial<DeviceNotificationFanoutResult> | null | undefined,
+    presenceDeliveredCount: number
+  ): DeviceNotificationFanoutResult {
+    const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+    const server = serverResult ?? {};
+    const presence = num(presenceDeliveredCount);
+
+    const pushAcceptedCount = num(server.pushAcceptedCount);
+
+    return {
+      success: num(server.success) + presence,
+      failed: num(server.failed),
+      deliverableDeviceCount: num(server.deliverableDeviceCount),
+      onlineDeliverableCount: num(server.onlineDeliverableCount),
+      presenceDeliveredCount: num(server.presenceDeliveredCount) + presence,
+      pushAcceptedCount,
+      mobilePushAcceptedCount: num(server.mobilePushAcceptedCount),
+      webPushAcceptedCount: num(server.webPushAcceptedCount),
+      staleWebPushSubscriptionsCleaned: num(server.staleWebPushSubscriptionsCleaned),
+      deduplicatedWebPushSubscriptionsCleaned: num(server.deduplicatedWebPushSubscriptionsCleaned),
+    };
+  }
+
+  // ===========================================================================
+  // Server-backed Cross_User_Reader resolution (device-push-fanout-migration
+  // Stage 3, task 12.1; Req 7.2, 7.3, 7.4, 7.5, 4.4). These helpers replace the
+  // cross-user client `user_devices` reads with tenant-scoped Admin-SDK
+  // resolution behind the Fanout_Feature_Flag, reusing the existing
+  // internal-token bridge ({@link sendPushViaBackend}). None of them reads
+  // another user's `user_devices` tree from the client.
+  // ===========================================================================
+
+  /**
+   * Whether `userEmail` is the SIGNED-IN user — the discriminator used to keep
+   * self-reads as Owner_Only_Read (direct client reads) while routing cross-user
+   * reads to the server under the flag (Req 7.4). Falls back to the auth
+   * service's current user when the locally-tracked email is not yet set. When
+   * no signed-in identity can be resolved, this returns `false` so a read is
+   * treated as cross-user (the safe default: never a cross-user client read
+   * under the flag).
+   */
+  private isSelfEmail(userEmail: string): boolean {
+    const recipient = this.normalizeEmailValue(userEmail);
+    if (!recipient) {
+      return false;
+    }
+    let signedIn = this.normalizeEmailValue(this.currentUserEmail);
+    if (!signedIn) {
+      try {
+        signedIn = this.normalizeEmailValue(authService.getCurrentUser()?.email);
+      } catch {
+        signedIn = '';
+      }
+    }
+    return signedIn.length > 0 && recipient === signedIn;
+  }
+
+  /**
+   * Resolve the tenant scope for a server-side resolution call WITHOUT reading
+   * any device documents. Precedence mirrors the notification tenant resolution:
+   * the caller's `options.tenantId`, then the cached selected tenant, then the
+   * signed-in user's own (cached) tenant metadata. Returns `null` when no tenant
+   * can be resolved (the caller then declines the server call and returns its
+   * empty/`false` fallback).
+   */
+  private async resolveResolutionTenantId(options?: DeviceTenantFilterOptions): Promise<string | null> {
+    const optionTenantId = typeof options?.tenantId === 'string' ? options.tenantId.trim() : '';
+    if (optionTenantId) {
+      return optionTenantId;
+    }
+
+    try {
+      const cached = await tenantService.getCachedSelectedTenant();
+      if (cached) {
+        return cached;
+      }
+    } catch (error) {
+      logger.debug('Server resolution tenant lookup (cached selected) failed', error);
+    }
+
+    const metadata = await this.getTenantMetadataForTagging();
+    const activeTenantId = typeof metadata.activeTenantId === 'string' ? metadata.activeTenantId.trim() : '';
+    if (activeTenantId) {
+      return activeTenantId;
+    }
+    const firstTenantId = metadata.tenantIds.find((id) => typeof id === 'string' && id.trim());
+    return firstTenantId ? firstTenantId.trim() : null;
+  }
+
+  /**
+   * POST the tenant-scoped multi-user device listing to the backend
+   * (`POST /notifications/device-listing`) through the internal-token bridge and
+   * return the server's counts-only, secret-free `users` array. The server
+   * resolves each recipient's devices via the Admin SDK and strips push tokens,
+   * web-push endpoints, and device network metadata (Req 5.4, 7.5). Returns `[]`
+   * on any non-OK response so callers preserve their non-throwing contract.
+   */
+  private async listUsersWithDevicesViaServer(
+    recipientEmails: string[],
+    params: { tenantId: string; currentUserEmail?: string; includeCurrentUser?: boolean }
+  ): Promise<Array<{
+    email: string;
+    devices: UserDevice[];
+    isOnline: boolean;
+    totalDevices: number;
+    tenantIds?: string[];
+  }>> {
+    const message: Record<string, any> & { tenantId: string } = {
+      tenantId: params.tenantId,
+      recipientEmails,
+    };
+    if (params.currentUserEmail) {
+      message.currentUserEmail = params.currentUserEmail;
+    }
+    if (typeof params.includeCurrentUser === 'boolean') {
+      message.includeCurrentUser = params.includeCurrentUser;
+    }
+
+    const response = await this.sendPushViaBackend(message, '/notifications/device-listing');
+    if (!response.ok || !Array.isArray(response.result?.users)) {
+      return [];
+    }
+    return response.result.users as Array<{
+      email: string;
+      devices: UserDevice[];
+      isOnline: boolean;
+      totalDevices: number;
+      tenantIds?: string[];
+    }>;
+  }
+
+  /**
+   * Server-backed replacement for a cross-user {@link getUserDevices} read
+   * (Req 7.3, 4.4): resolve a SINGLE other user's devices via the device-listing
+   * endpoint and return the same `UserDevice`-shaped observable devices (minus
+   * the secret fields the server strips). Non-throwing: any error / empty result
+   * resolves to `[]`, matching the client reader's `catch`.
+   */
+  private async getUserDevicesViaServer(
+    userEmail: string,
+    options?: DeviceTenantFilterOptions
+  ): Promise<UserDevice[]> {
+    try {
+      const tenantId = await this.resolveResolutionTenantId(options);
+      if (!tenantId) {
+        logger.warn('Server device-listing skipped: no tenant context available', { userEmail });
+        return [];
+      }
+
+      // Single recipient; `includeCurrentUser: true` guarantees the requested
+      // user is never skipped by the server's own-email filter.
+      const users = await this.listUsersWithDevicesViaServer([userEmail], {
+        tenantId,
+        includeCurrentUser: true,
+      });
+
+      const normalizedTarget = this.normalizeEmailValue(userEmail);
+      const match = users.find((user) => this.normalizeEmailValue(user.email) === normalizedTarget);
+      return (match?.devices ?? []) as UserDevice[];
+    } catch (error) {
+      logger.error('Error fetching user devices via server for', userEmail, error);
+      return [];
+    }
+  }
+
+  /**
+   * Server-backed replacement for {@link getAllUsersWithDevices} (Req 7.3, 7.5,
+   * 4.4): resolve the multi-user listing via the device-listing endpoint and
+   * reconstruct the SAME `AuthorizedUser[]` shape the client produced today —
+   * same fields, same online-first-then-email ordering (the server pre-sorts
+   * identically) — overlaying `role`/`displayName` from the unchanged
+   * {@link authService.getUserProfile} lookup, since the endpoint returns only
+   * `user_devices`-derived fields. Non-throwing: resolves to `[]` on error.
+   */
+  private async getAllUsersWithDevicesViaServer(
+    authorizedEmails: string[],
+    currentUserEmail: string | undefined,
+    includeCurrentUser: boolean,
+    options?: DeviceTenantFilterOptions
+  ): Promise<AuthorizedUser[]> {
+    try {
+      const normalizedAuthorizedEmails = Array.from(
+        new Set(
+          authorizedEmails
+            .map((email) => email?.toLowerCase?.())
+            .filter((email): email is string => Boolean(email))
+        )
+      );
+      if (normalizedAuthorizedEmails.length === 0) {
+        return [];
+      }
+
+      const tenantId = await this.resolveResolutionTenantId(options);
+      if (!tenantId) {
+        logger.warn('Server multi-user device-listing skipped: no tenant context available');
+        return [];
+      }
+
+      const users = await this.listUsersWithDevicesViaServer(normalizedAuthorizedEmails, {
+        tenantId,
+        currentUserEmail,
+        includeCurrentUser,
+      });
+
+      // Overlay profile-sourced fields the endpoint omits (Req 7.5). Order is
+      // preserved from the server (online-first-then-email), matching the
+      // client's final sort — so no re-sort is needed.
+      const withProfiles = await Promise.all(
+        users.map(async (user) => {
+          const email = user.email;
+          let role: 'user' | 'admin' = 'user';
+          let displayName = this.extractDisplayName(email);
+          try {
+            const profile = await authService.getUserProfile(email);
+            role = profile?.role || 'user';
+            displayName = profile?.displayName || this.extractDisplayName(email);
+          } catch (error) {
+            logger.warn('Failed to overlay profile for user in server device listing', { email, error });
+          }
+
+          const devices = (user.devices ?? []) as UserDevice[];
+          const authorizedUser: AuthorizedUser = {
+            email,
+            role,
+            displayName,
+            devices,
+            isOnline: user.isOnline === true,
+            totalDevices: typeof user.totalDevices === 'number' ? user.totalDevices : devices.length,
+            tenantIds: Array.isArray(user.tenantIds) && user.tenantIds.length
+              ? user.tenantIds
+              : [tenantId],
+          };
+          return authorizedUser;
+        })
+      );
+
+      return withProfiles;
+    } catch (error) {
+      logger.error('Error fetching all users with devices via server:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Server-backed replacement for a cross-user {@link checkUserOnlineStatus}
+   * read (Req 7.3, 7.5, 4.4): resolve "any device online" via the
+   * `POST /notifications/online-status` endpoint (Admin SDK). Preserves the
+   * boolean result and the non-throwing contract (returns `false` on error or
+   * when no tenant context is available).
+   */
+  private async checkUserOnlineStatusViaServer(userEmail: string): Promise<boolean> {
+    try {
+      const tenantId = await this.resolveResolutionTenantId();
+      if (!tenantId) {
+        logger.warn('Server online-status skipped: no tenant context available', { userEmail });
+        return false;
+      }
+
+      const response = await this.sendPushViaBackend(
+        { tenantId, recipientEmail: userEmail },
+        '/notifications/online-status'
+      );
+      return response.ok && response.result?.online === true;
+    } catch (error) {
+      logger.error('Error checking online status via server for', userEmail, error);
+      return false;
+    }
+  }
+
+  /**
    * Send notification to all user's devices
    */
   async sendNotificationToUser(userEmail: string, notification: {
@@ -3465,6 +4108,14 @@ class DeviceTrackingService {
     body: string;
     data?: any;
   }, onlineOnly: boolean = true, options?: DeviceTenantFilterOptions): Promise<DeviceNotificationFanoutResult> {
+    // Fanout_Feature_Flag (design §6; Req 9.1, 9.2): when the Server_Fanout is
+    // enabled, delegate Push_Target resolution and Push_Delivery to the backend
+    // Fanout_Endpoint while keeping Presence_Delivery client-local — the client
+    // never reads the recipient's `user_devices` tree (Req 4.3, 4.4). When the
+    // flag is off, the existing Client_Fanout below runs UNCHANGED (Req 9.2).
+    if (isServerFanoutEnabled()) {
+      return this.sendNotificationToUserViaServerFanout(userEmail, notification, onlineOnly, options);
+    }
     try {
       const devices = await this.getUserDevices(userEmail, options);
       const cleanupResult = await this.cleanupStaleWebPushSubscriptions(userEmail, devices);

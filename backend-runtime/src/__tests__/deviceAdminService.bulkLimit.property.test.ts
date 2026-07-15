@@ -283,8 +283,17 @@ function seedDeliverableDevices(store: FakeStore, targets: DeviceTarget[]): void
 
 beforeEach(() => {
   jest.clearAllMocks();
-  // Accepted (<=500) notify case: every delivery succeeds.
-  mockedSendExpo.mockResolvedValue({ sent: 1, failed: 0, tickets: [] } as any);
+  // Accepted (<=500) notify case: every delivery succeeds. `notify` now BATCHES
+  // all Expo targets into a single `sendExpoMessages` call and maps each target's
+  // outcome from the index-aligned `results` array, so the mock must return one
+  // `ok` result per input message (plus the backward-compatible aggregate counts).
+  mockedSendExpo.mockImplementation(async (messages: any[]) => {
+    const results = (messages ?? []).map((m: any) => ({
+      to: typeof m?.to === 'string' ? m.to : '',
+      ok: true,
+    }));
+    return { sent: results.length, failed: 0, invalidTokens: [], results } as any;
+  });
   mockedSendWebPush.mockResolvedValue({ ok: true } as any);
   mockedSanitize.mockReturnValue(null);
 });

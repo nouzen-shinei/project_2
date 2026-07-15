@@ -82,13 +82,21 @@ const mockedSendWeb = sendWebPushNotification as jest.MockedFunction<typeof send
 let pushServiceUnavailable = false;
 
 function configurePushMocks(): void {
+  // Batched Expo send: ONE call carries ALL Expo messages. The mock returns the
+  // new index-aligned `results` array (results[i] describes messages[i]) plus the
+  // backward-compatible aggregate counts, so `notify`'s positional mapping works.
   mockedSendExpo.mockImplementation(async (messages: any[]) => {
     if (pushServiceUnavailable) {
       throw new Error('expo_push_service_unavailable');
     }
-    const to = typeof messages?.[0]?.to === 'string' ? messages[0].to : '';
-    const ok = !to.includes('FAIL');
-    return { sent: ok ? 1 : 0, failed: ok ? 0 : 1, invalidTokens: [] };
+    const results = (messages ?? []).map((m: any) => {
+      const to = typeof m?.to === 'string' ? m.to : '';
+      const ok = !to.includes('FAIL');
+      return { to, ok, error: ok ? undefined : 'expo_delivery_failed' };
+    });
+    const sent = results.filter((r: any) => r.ok).length;
+    const failed = results.length - sent;
+    return { sent, failed, invalidTokens: [], results };
   });
   mockedSendWeb.mockImplementation(async (options: any) => {
     if (pushServiceUnavailable) {
@@ -475,6 +483,74 @@ describe('Property 18 — notification and bulk-action completeness', () => {
         ),
         { numRuns: 120, verbose: false }
       );
+    },
+    30_000
+  );
+
+  // Feature: notify-expo-batching, Property 18 (batching): the notify orchestrator
+  // BATCHES all Expo targets into a SINGLE sendExpoMessages call (rather than one
+  // call per device) while still producing exactly one correct per-target outcome.
+  it(
+    'notify: batches all Expo targets into a single sendExpoMessages call and maps outcomes positionally',
+    async () => {
+      pushServiceUnavailable = false;
+      jest.clearAllMocks();
+      configurePushMocks();
+
+      const store = new FakeStore();
+      mockedGetFirestore.mockReturnValue(store as any);
+
+      // Mix ok/FAIL Expo targets plus a web target; only Expo targets are batched.
+      const N = 250;
+      const targets: Array<{ email: string; deviceId: string }> = [];
+      const expectOkByDeviceId = new Map<string, boolean>();
+      for (let i = 0; i < N; i += 1) {
+        const { email, deviceId } = targetAddress(i);
+        const ok = i % 5 !== 0; // every 5th target fails delivery
+        store.seed(`user_devices/${email}/devices/${deviceId}`, {
+          tenantIds: [TENANT],
+          expoPushToken: ok ? `ExpoToken-ok-${i}` : `ExpoToken-FAIL-${i}`,
+        });
+        targets.push({ email, deviceId });
+        expectOkByDeviceId.set(deviceId, ok);
+      }
+      // One web target interleaved — must NOT be routed through the Expo batch.
+      const web = { email: 'web-owner@example.com', deviceId: 'web-dev' };
+      store.seed(`user_devices/${web.email}/devices/${web.deviceId}`, {
+        tenantIds: [TENANT],
+        webPushSubscription: { endpoint: 'https://push.example/ok-web', keys: { p256dh: 'p', auth: 'a' } },
+      });
+      targets.push(web);
+
+      const result = await notify({
+        tenantId: TENANT,
+        title: 'Title',
+        body: 'Body',
+        targets,
+        actor: {},
+      });
+
+      // BATCHING: exactly ONE Expo send call for the whole notify, carrying every
+      // Expo message (250) — not one call per device.
+      expect(mockedSendExpo).toHaveBeenCalledTimes(1);
+      const sentMessages = mockedSendExpo.mock.calls[0][0] as any[];
+      expect(sentMessages).toHaveLength(N);
+
+      // Completeness + positional correctness: one outcome per target, in order.
+      expect(result.results).toHaveLength(targets.length);
+      for (let i = 0; i < targets.length; i += 1) {
+        const outcome = result.results[i];
+        expect(outcome.email).toBe(targets[i].email);
+        expect(outcome.deviceId).toBe(targets[i].deviceId);
+        if (targets[i].deviceId === web.deviceId) {
+          expect(outcome.ok).toBe(true); // web target delivered via web-push path
+        } else {
+          expect(outcome.ok).toBe(expectOkByDeviceId.get(targets[i].deviceId));
+        }
+      }
+      const expectedExpoSuccesses = [...expectOkByDeviceId.values()].filter(Boolean).length;
+      expect(result.successful).toBe(expectedExpoSuccesses + 1); // + web target
+      expect(result.successful + result.failed).toBe(targets.length);
     },
     30_000
   );

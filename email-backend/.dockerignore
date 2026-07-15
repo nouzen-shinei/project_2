@@ -9,3 +9,13 @@ secure-data
 coverage
 **/*.test.*
 *.md
+.DS_Store
+*.log
+firebase-debug.log
+firestore-debug.log
+.github
+.idea
+.gitignore
+tests
+tsconfig.tsbuildinfo
+*.b64

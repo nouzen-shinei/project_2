@@ -302,7 +302,7 @@ describe('firestore.rules — device-tracking collection lockdown (Req 16.1/16.2
 
   // ─────────────────────────── MUST-ALLOW (Req 18 runtime) ─────────────────
 
-  describe('user_devices — owner self-writes and open reads', () => {
+  describe('user_devices — owner self-writes and owner-only reads', () => {
     it('ALLOWS a user to write their OWN parent device doc', async () => {
       const db = aliceDb();
       await assertSucceeds(
@@ -323,14 +323,17 @@ describe('firestore.rules — device-tracking collection lockdown (Req 16.1/16.2
       );
     });
 
-    it("ALLOWS reading device docs — own and a peer's (open-read enforcement query)", async () => {
+    it("ALLOWS reading OWN device doc but DENIES a peer's (owner-only read enforcement)", async () => {
       await seed(async (db) => {
         await setDoc(doc(db, `user_devices/${ALICE.email}`), { email: ALICE.email });
         await setDoc(doc(db, `user_devices/${BOB.email}`), { email: BOB.email });
       });
       const db = aliceDb();
+      // Owner-only reads (device-push-fanout-migration Req 8): alice reads her OWN
+      // device doc, but reading a peer's (BOB's) is now denied — cross-user device
+      // reads moved server-side to the Admin-SDK-backed /notifications/fanout.
       await assertSucceeds(getDoc(doc(db, `user_devices/${ALICE.email}`)));
-      await assertSucceeds(getDoc(doc(db, `user_devices/${BOB.email}`)));
+      await assertFails(getDoc(doc(db, `user_devices/${BOB.email}`)));
     });
   });
 

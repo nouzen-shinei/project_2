@@ -29,10 +29,33 @@ interface SendExpoMessagesOptions {
   expoEndpoint?: string;
 }
 
+/**
+ * Per-message delivery result, INDEX-ALIGNED to the `messages` array passed to
+ * {@link sendExpoMessages} (`results[i]` describes `messages[i]`). `ok` marks a
+ * delivered message; `error` carries a stable failure description otherwise.
+ *
+ * This positional mapping is intentional: two different device targets could in
+ * theory carry the same `to` token, so callers MUST map results back by index,
+ * not by token, to avoid crediting/blaming the wrong target.
+ */
+export interface ExpoMessageResult {
+  to: string;
+  ok: boolean;
+  error?: string;
+}
+
 export interface SendExpoMessagesResult {
   sent: number;
   failed: number;
   invalidTokens: string[];
+  /**
+   * Per-message outcomes, index-aligned to the input `messages` array. The
+   * aggregate `sent`/`failed` counts always equal the number of `ok`/non-`ok`
+   * entries in this array (`sent === results.filter(r => r.ok).length`).
+   * `invalidTokens`/`sent`/`failed` keep their original semantics for backward
+   * compatibility; `results` is additive.
+   */
+  results: ExpoMessageResult[];
 }
 
 export async function sendExpoMessages(
@@ -43,7 +66,7 @@ export async function sendExpoMessages(
   const endpoint = expoEndpoint || process.env.EXPO_PUSH_ENDPOINT || DEFAULT_EXPO_PUSH_ENDPOINT;
 
   if (messages.length === 0) {
-    return { sent: 0, failed: 0, invalidTokens: [] };
+    return { sent: 0, failed: 0, invalidTokens: [], results: [] };
   }
 
   const normalizedMessages = messages.map((message) => {
@@ -64,8 +87,29 @@ export async function sendExpoMessages(
   let sent = 0;
   let failed = 0;
   const invalidTokens = new Set<string>();
+  // Pre-sized so every input message is written at its own GLOBAL index,
+  // independent of chunk boundaries and recursion.
+  const results: ExpoMessageResult[] = new Array(normalizedMessages.length);
 
+  /** Record one message's failure at its global index and bump the failed count. */
+  const recordFailure = (globalIndex: number, message: ExpoPushMessage, error: string): void => {
+    failed += 1;
+    results[globalIndex] = { to: String(message.to), ok: false, error };
+  };
+
+  /** Record one message's success at its global index and bump the sent count. */
+  const recordSuccess = (globalIndex: number, message: ExpoPushMessage): void => {
+    sent += 1;
+    results[globalIndex] = { to: String(message.to), ok: true };
+  };
+
+  // `chunkOffset` is the index of the chunk's first message in
+  // `normalizedMessages`, so `chunkOffset + localIdx` is the global index used to
+  // write positional results back (chunks are contiguous slices).
+  let chunkOffset = 0;
   for (const chunk of chunkArray(normalizedMessages, MAX_EXPO_MESSAGES_PER_BATCH)) {
+    const offset = chunkOffset;
+    chunkOffset += chunk.length;
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -100,11 +144,15 @@ export async function sendExpoMessages(
 
         if (attemptSplit && chunk.length > 1) {
           console.warn(`[${context}] retrying chunk individually after failure`, { size: chunk.length });
-          for (const single of chunk) {
+          // Retry each message on its own; the single-message recursion returns
+          // exactly one positional result, which we map back to its global index.
+          for (let i = 0; i < chunk.length; i += 1) {
+            const single = chunk[i];
             const result = await sendExpoMessages([single], { attemptSplit: false, context, expoEndpoint: endpoint });
             sent += result.sent;
             failed += result.failed;
             result.invalidTokens.forEach(token => invalidTokens.add(token));
+            results[offset + i] = result.results[0] ?? { to: String(single.to), ok: false, error: 'expo_no_result' };
             if (!result.sent && result.failed) {
               console.warn(`[${context}] single token retry failed`, { token: single.to });
             }
@@ -112,22 +160,31 @@ export async function sendExpoMessages(
           continue;
         }
 
-        failed += chunk.length;
+        const httpError = `expo_push_http_${response.status}`;
+        chunk.forEach((message, i) => recordFailure(offset + i, message, httpError));
         continue;
       }
 
       if (receipts.length === 0) {
-        sent += chunk.length;
+        chunk.forEach((message, i) => recordSuccess(offset + i, message));
         continue;
       }
 
-      receipts.forEach((receipt: any, idx: number) => {
+      // Iterate over the CHUNK (not the receipts) so every message gets exactly
+      // one positional result even if the server returns fewer receipts than
+      // messages; a missing receipt is treated as a failure.
+      chunk.forEach((message, idx) => {
+        const receipt: any = receipts[idx];
         const status = receipt?.status;
-        const token = typeof chunk[idx]?.to === 'string' ? String(chunk[idx].to) : undefined;
+        const token = typeof message?.to === 'string' ? String(message.to) : undefined;
         if (status === 'ok') {
-          sent += 1;
+          recordSuccess(offset + idx, message);
         } else {
-          failed += 1;
+          const receiptError =
+            (typeof receipt?.message === 'string' && receipt.message) ||
+            (typeof receipt?.details?.error === 'string' && receipt.details.error) ||
+            (receipt === undefined ? 'expo_missing_receipt' : 'expo_receipt_error');
+          recordFailure(offset + idx, message, receiptError);
           if (receipt?.message || receipt?.details) {
             console.warn(`[${context}] expo push receipt error`, {
               token,
@@ -135,17 +192,18 @@ export async function sendExpoMessages(
               details: receipt?.details,
             });
           }
-          const invalidToken = extractInvalidTokenFromReceipt(receipt, chunk[idx]);
+          const invalidToken = extractInvalidTokenFromReceipt(receipt, message);
           if (invalidToken) invalidTokens.add(invalidToken);
         }
       });
     } catch (error: any) {
       console.warn(`[${context}] expo push network error`, error?.message || error);
-      failed += chunk.length;
+      const networkError = typeof error?.message === 'string' && error.message ? error.message : 'expo_network_error';
+      chunk.forEach((message, i) => recordFailure(offset + i, message, networkError));
     }
   }
 
-  return { sent, failed, invalidTokens: Array.from(invalidTokens) };
+  return { sent, failed, invalidTokens: Array.from(invalidTokens), results };
 }
 
 export async function markPushTokensInvalid(
