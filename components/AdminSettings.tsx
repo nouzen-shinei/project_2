@@ -247,7 +247,7 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
 
     setPickingLogo(true);
     try {
-      let result: { canceled: boolean; assets?: Array<{ uri: string; mimeType?: string; fileName?: string | null }> };
+      let result: { canceled: boolean; assets?: Array<{ uri: string; mimeType?: string; fileName?: string | null }> | null };
 
       if (source === 'camera') {
         result = await MediaPickerUtil.captureImage();

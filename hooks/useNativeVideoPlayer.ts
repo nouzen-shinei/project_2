@@ -191,7 +191,7 @@ export function useNativeVideoPlayer(options: UseNativeVideoPlayerOptions): {
   useEffect(() => {
     return () => {
       try {
-        player.remove();
+        player.release();
       } catch {
         // Ignore errors during cleanup.
       }

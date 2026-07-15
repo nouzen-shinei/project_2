@@ -115,7 +115,7 @@ function createEngine() {
         // Trigger a re-render synchronously.
         if (renderFn) renderFn();
       };
-      hookState.states.push({ value, setter });
+      hookState.states.push({ value, setter: setter as (v: unknown) => void });
     }
     const state = hookState.states[idx];
     return [state.value as T, state.setter as (v: T | ((prev: T) => T)) => void];
