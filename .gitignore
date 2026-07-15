@@ -129,3 +129,9 @@ patch_chat.py
 .kiro
 *.swp
 semantic-review
+
+# Firebase Realtime Database exports (contain private user data — NEVER commit)
+*-rtdb-*export.json
+tution-app-*-export.json
+tution-app-6c0c3-default-rtdb-CGnHGq43PFF8WD2DJekx-export.json
+tution-app-6c0c3-default-rtdb-invipika_gmail_com__krvikrantsingh51_gmail_com-export.json
