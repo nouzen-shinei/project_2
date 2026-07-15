@@ -1,23 +1,20 @@
-// Feature: device-push-fanout-migration, Stage 3 (Task 12.1, Part B) — client
-// single-device push migration. `sendNotificationToDeviceDetailed` routes a
-// single-device push through the backend Fanout_Endpoint under the
-// Fanout_Feature_Flag, while presence-to-self stays local.
+// Feature: device-push-fanout-migration — client single-device push.
+// `sendNotificationToDeviceDetailed` routes a single-device push through the
+// backend Fanout_Endpoint, while presence-to-self stays local.
 //
 // With Firestore, auth, the internal-token bridge, and fetch fully mocked (no
 // real network / Firestore), mirroring `deviceFanoutClientDelegation.test.ts`,
 // this suite proves:
 //
-//   - flag ON, cross-user target → POST /notifications/fanout with the
-//     `deviceId` field, NO cross-user `getDocs`, and the counts-only server
-//     result mapped to `{ delivered, deliverySource: 'push', pushChannel }`
-//     (mobile vs web) (Req 4.3, 4.4, 7.3, 9.1);
-//   - flag ON, presence-to-self (signed-in user's own current web device) →
-//     delivers LOCALLY (a local notification) with NO endpoint call and NO device
-//     read, reporting `{ delivered: true, deliverySource: 'presence' }` (Req 4.1);
-//   - flag ON, failed backend call → `{ delivered: false, deliverySource:
-//     'unknown' }` (non-throwing contract preserved), still no device read;
-//   - flag OFF → the legacy local single-device path runs UNCHANGED and never
-//     hits the Fanout_Endpoint (Req 9.2).
+//   - cross-user target → POST /notifications/fanout with the `deviceId` field,
+//     NO cross-user `getDocs`, and the counts-only server result mapped to
+//     `{ delivered, deliverySource: 'push', pushChannel }` (mobile vs web)
+//     (Req 4.3, 4.4, 7.3, 9.1);
+//   - presence-to-self (signed-in user's own current web device) → delivers
+//     LOCALLY (a local notification) with NO endpoint call and NO device read,
+//     reporting `{ delivered: true, deliverySource: 'presence' }` (Req 4.1);
+//   - failed backend call → `{ delivered: false, deliverySource: 'unknown' }`
+//     (non-throwing contract preserved), still no device read.
 
 // ---------------------------------------------------------------------------
 // Module-level mocks — declared before the service is imported.
@@ -196,7 +193,6 @@ const RECIPIENT = 'recipient@example.com';
 const SELF = 'self@example.com';
 const TENANT_ID = 'tenant-abc-123';
 const BASE_URL = 'https://api.example.com';
-const FLAG = 'EXPO_PUBLIC_SERVER_FANOUT_ENABLED';
 
 /** A counts-only Fanout_Result body, as `serializeFanoutResponse` returns. */
 function serverCounts(overrides: Partial<DeviceNotificationFanoutResult> = {}): DeviceNotificationFanoutResult {
@@ -251,22 +247,13 @@ beforeEach(() => {
   runtime.currentUserEmail = null;
   runtime.currentDeviceId = null;
   runtime.lastKnownNotificationsEnabled = true;
-  delete process.env[FLAG];
-});
-
-afterAll(() => {
-  delete process.env[FLAG];
 });
 
 // ---------------------------------------------------------------------------
-// Flag ON — single-device push delegated to the Fanout_Endpoint
+// Single-device push delegated to the Fanout_Endpoint
 // ---------------------------------------------------------------------------
 
-describe('sendNotificationToDeviceDetailed — single-device Server_Fanout (flag ON)', () => {
-  beforeEach(() => {
-    process.env[FLAG] = 'true';
-  });
-
+describe('sendNotificationToDeviceDetailed — single-device Server_Fanout', () => {
   it('POSTs /notifications/fanout with the deviceId target and maps mobile counts, with no cross-user device read', async () => {
     fetchMock.mockResolvedValue(
       okResponse(serverCounts({ pushAcceptedCount: 1, mobilePushAcceptedCount: 1, webPushAcceptedCount: 0 }))
@@ -376,12 +363,11 @@ describe('sendNotificationToDeviceDetailed — single-device Server_Fanout (flag
 });
 
 // ---------------------------------------------------------------------------
-// Flag ON — presence-to-self stays LOCAL
+// Presence-to-self stays LOCAL
 // ---------------------------------------------------------------------------
 
-describe('sendNotificationToDeviceDetailed — presence-to-self (flag ON)', () => {
+describe('sendNotificationToDeviceDetailed — presence-to-self', () => {
   beforeEach(() => {
-    process.env[FLAG] = 'true';
     runtime.currentUserEmail = SELF;
     runtime.currentDeviceId = 'current-device-1';
   });
@@ -420,38 +406,4 @@ describe('sendNotificationToDeviceDetailed — presence-to-self (flag ON)', () =
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flag OFF — legacy local single-device path runs UNCHANGED
-// ---------------------------------------------------------------------------
 
-describe('sendNotificationToDeviceDetailed — legacy local path (flag OFF)', () => {
-  beforeEach(() => {
-    process.env[FLAG] = 'false';
-    runtime.currentUserEmail = SELF;
-    runtime.currentDeviceId = 'legacy-device';
-  });
-
-  it('runs the legacy local path with a device override and never calls the Fanout_Endpoint', async () => {
-    const deviceOverride = {
-      deviceId: 'legacy-device',
-      deviceType: 'web',
-      isOnline: true,
-      tenantIds: [TENANT_ID],
-      webPushSubscription: { endpoint: 'https://push.example/legacy', keys: { p256dh: 'a', auth: 'b' } },
-    };
-
-    const result = await runtime.sendNotificationToDeviceDetailed(
-      'legacy-device',
-      SELF,
-      { title: 'Hi', body: 'There', data: { tenantId: TENANT_ID } },
-      deviceOverride,
-      { tenantId: TENANT_ID }
-    );
-
-    // No delegation to the Server_Fanout endpoint.
-    expect(fanoutCall()).toBeUndefined();
-    // Legacy current-web-device delivery is local presence.
-    expect(mockSendLocalNotification).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ delivered: true, deliverySource: 'presence' });
-  });
-});

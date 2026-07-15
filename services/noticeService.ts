@@ -1,12 +1,9 @@
 import { logger } from '@/lib/logger';
-import { authService } from '../hooks/useAuthUnified';
 import { Notice } from '../types/notice';
-import { deviceTrackingService, isServerFanoutEnabled, UserDevice } from './deviceTrackingService';
+import { deviceTrackingService } from './deviceTrackingService';
 import type { DeviceNotificationFanoutResult, DeviceTenantFilterOptions } from './deviceTrackingService';
 import { tenantService } from './tenantService';
 import type { TenantMembershipRole } from '../types/tenant';
-
-type DeliveryScope = 'online' | 'offline';
 
 interface DispatchSummary {
   recipients: number;
@@ -39,9 +36,6 @@ class NoticeService {
         priority: notice.priority,
       });
 
-  const currentDeviceId = deviceTrackingService.getCurrentDeviceId();
-  const currentUserEmail = authService.getCurrentUser()?.email?.toLowerCase?.() ?? null;
-
       const tenantFilterOptions = await this.getTenantFilterOptions(notice.tenantId);
       if (!tenantFilterOptions?.tenantId) {
         logger.warn('[noticeService] Missing tenant context for notice broadcast; aborting', {
@@ -70,110 +64,19 @@ class NoticeService {
         failed: 0,
       };
 
-      // Fanout_Feature_Flag (Stage 3, Req 7.1/7.3/7.5): when the Server_Fanout is
-      // enabled, per-recipient push delivery is delegated to the backend
-      // Fanout_Endpoint (`POST /notifications/fanout`) via the shipped
-      // `deviceTrackingService.sendNotificationToUser` bridge — which resolves the
-      // recipient's devices SERVER-SIDE. This removes the cross-user
-      // `getUserDevices` read (the exact read this migration eliminates). When the
-      // flag is off, the legacy client path below runs UNCHANGED (Req 9.2).
-      const useServerFanout = isServerFanoutEnabled();
-
+      // Per-recipient push delivery is delegated to the backend Fanout_Endpoint
+      // (`POST /notifications/fanout`) via the `sendNotificationToUser` bridge,
+      // which resolves the recipient's devices SERVER-SIDE. The client never
+      // reads another user's `user_devices` tree (Req 7.1/7.3/7.5).
       for (const email of recipients) {
         try {
-          if (useServerFanout) {
-            const dispatch = await this.dispatchNoticeViaServerFanout(email, notice, tenantFilterOptions);
-            if (dispatch.deliverableDeviceCount > 0) {
-              summary.recipients++;
-            }
-            summary.devices += dispatch.deliverableDeviceCount;
-            summary.success += dispatch.success;
-            summary.failed += dispatch.failed;
-            continue;
+          const dispatch = await this.dispatchNoticeViaServerFanout(email, notice, tenantFilterOptions);
+          if (dispatch.deliverableDeviceCount > 0) {
+            summary.recipients++;
           }
-
-          const devices = await deviceTrackingService.getUserDevices(email, tenantFilterOptions);
-          const evaluatedDevices = devices.map((device) => ({
-            device,
-            evaluation: this.evaluateDeviceEligibility(device),
-          }));
-
-          const eligibleDevices = evaluatedDevices
-            .filter(({ evaluation }) => evaluation.eligible)
-            .map(({ device }) => device);
-
-          if (eligibleDevices.length === 0) {
-            if (evaluatedDevices.length > 0) {
-              const excluded = evaluatedDevices
-                .filter(({ evaluation }) => !evaluation.eligible)
-                .map(({ device, evaluation }) => ({
-                  deviceId: device.deviceId,
-                  reason: evaluation.reason,
-                  isOnline: device.isOnline,
-                  isDeleted: device.isDeleted,
-                  isHardBanned: device.isHardBanned,
-                  logoutType: device.logoutType,
-                  manualLogoutAt: device.manualLogoutAt,
-                  forcedLogoutAt: device.forcedLogoutAt,
-                  noticeNotificationsEnabled: device.noticeNotificationsEnabled,
-                }));
-
-              logger.debug('[noticeService] Recipient has no eligible devices', {
-                email,
-                totalDevices: evaluatedDevices.length,
-                excluded,
-              });
-            } else {
-              logger.debug('[noticeService] Recipient has no registered devices', {
-                email,
-              });
-            }
-            continue;
-          }
-
-          let filteredDevices = eligibleDevices;
-
-          if (currentDeviceId && currentUserEmail && email.toLowerCase() === currentUserEmail) {
-            filteredDevices = eligibleDevices.filter((device) => device.deviceId !== currentDeviceId);
-          }
-
-          if (eligibleDevices.length !== filteredDevices.length) {
-            logger.debug('[noticeService] Skipping current device for recipient', {
-              email,
-              skippedDeviceId: currentDeviceId,
-            });
-          }
-
-          if (filteredDevices.length === 0) {
-            logger.debug('[noticeService] No deliverable devices after excluding current device', {
-              email,
-            });
-            continue;
-          }
-
-          summary.recipients++;
-
-          const { online, offline } = this.partitionDevices(filteredDevices);
-          summary.devices += online.length + offline.length;
-
-          logger.debug('[noticeService] Eligible devices resolved for recipient', {
-            email,
-            totalEligible: filteredDevices.length,
-            online: online.length,
-            offline: offline.length,
-          });
-
-          if (online.length > 0) {
-            const result = await this.sendToDevices(email, online, notice, 'online', tenantFilterOptions);
-            summary.success += result.success;
-            summary.failed += result.failed;
-          }
-
-          if (offline.length > 0) {
-            const result = await this.sendToDevices(email, offline, notice, 'offline', tenantFilterOptions);
-            summary.success += result.success;
-            summary.failed += result.failed;
-          }
+          summary.devices += dispatch.deliverableDeviceCount;
+          summary.success += dispatch.success;
+          summary.failed += dispatch.failed;
         } catch (error) {
           logger.warn('[noticeService] Failed to process devices for recipient', {
             email,
@@ -263,136 +166,6 @@ class NoticeService {
     }
   }
 
-  private isDeviceEligible(device: UserDevice): boolean {
-    return this.evaluateDeviceEligibility(device).eligible;
-  }
-
-  private evaluateDeviceEligibility(device: UserDevice): { eligible: boolean; reason?: string } {
-    if (!device || !device.deviceId) {
-      return { eligible: false, reason: 'invalid_device' };
-    }
-
-    if (device.isDeleted) {
-      return { eligible: false, reason: 'deleted' };
-    }
-
-    if (device.isHardBanned) {
-      return { eligible: false, reason: 'hard_banned' };
-    }
-
-    const isCurrentlyOnline = device.isOnline === true;
-    const logoutType = typeof device.logoutType === 'string' ? device.logoutType.toLowerCase() : undefined;
-
-    if (!isCurrentlyOnline) {
-      if (logoutType === 'manual' || logoutType === 'forced') {
-        return { eligible: false, reason: `logout_type_${logoutType}` };
-      }
-
-      if (device.manualLogoutAt) {
-        return { eligible: false, reason: 'manual_logout_flag' };
-      }
-
-      if (device.forcedLogoutAt) {
-        return { eligible: false, reason: 'forced_logout_flag' };
-      }
-    }
-
-    if (device.noticeNotificationsEnabled === false) {
-      return { eligible: false, reason: 'notice_pref_disabled' };
-    }
-
-    return { eligible: true };
-  }
-
-  private partitionDevices(devices: UserDevice[]): { online: UserDevice[]; offline: UserDevice[] } {
-    const online: UserDevice[] = [];
-    const offline: UserDevice[] = [];
-
-    devices.forEach((device) => {
-      if (device.isOnline) {
-        online.push(device);
-      } else {
-        offline.push(device);
-      }
-    });
-
-    return { online, offline };
-  }
-
-  private async sendToDevices(
-    userEmail: string,
-    devices: UserDevice[],
-    notice: Notice,
-    scope: DeliveryScope,
-    tenantFilterOptions?: DeviceTenantFilterOptions
-  ): Promise<{ success: number; failed: number }> {
-    if (devices.length === 0) {
-      return { success: 0, failed: 0 };
-    }
-
-    const uniqueDevices = this.dedupeDevices(devices);
-
-    let success = 0;
-    let failed = 0;
-    const seenMobileTokens = new Set<string>();
-
-    for (const device of uniqueDevices) {
-      try {
-        if (device.deviceType !== 'web') {
-          const token = (device.expoPushToken || '').trim();
-          if (token) {
-            if (seenMobileTokens.has(token)) {
-              logger.debug('[noticeService] Skipping duplicate mobile push token for recipient', {
-                userEmail,
-                deviceId: device.deviceId,
-              });
-              continue;
-            }
-            seenMobileTokens.add(token);
-          }
-        }
-
-        const delivered = await deviceTrackingService.sendNotificationToDevice(
-          device.deviceId,
-          userEmail,
-          this.buildNotificationPayload(notice, scope, device),
-          device,
-          tenantFilterOptions
-        );
-
-        if (delivered) {
-          success++;
-        } else {
-          failed++;
-          logger.debug('[noticeService] Device declined notice delivery', {
-            userEmail,
-            deviceId: device.deviceId,
-            scope,
-          });
-        }
-      } catch (error) {
-        failed++;
-        logger.warn('[noticeService] Device notice delivery failed', {
-          userEmail,
-          deviceId: device.deviceId,
-          scope,
-          error,
-        });
-      }
-    }
-
-    if (failed > 0) {
-      logger.debug('[noticeService] Notice delivery issues', {
-        userEmail,
-        scope,
-        failed,
-        success,
-      });
-    }
-
-    return { success, failed };
-  }
-
   /**
    * Server_Fanout delivery for a single notice recipient (Stage 3; Req 7.1, 7.3,
    * 7.5). Delegates push-target resolution and delivery to the backend
@@ -452,9 +225,9 @@ class NoticeService {
 
   /**
    * Build the recipient-level notice payload delegated to the Fanout_Endpoint.
-   * Mirrors {@link buildNotificationPayload} but WITHOUT the per-device
-   * `deviceId`/`deliveryScope` fields (resolution is server-side and
-   * per-recipient — see {@link dispatchNoticeViaServerFanout}). The
+   * The fan-out is per-recipient (resolution is server-side — see
+   * {@link dispatchNoticeViaServerFanout}), so the payload carries NO per-device
+   * `deviceId`/`deliveryScope` fields. The
    * `data.type = 'notice_created'` drives the server's notice Per_Type_Toggle +
    * ban/logout exclusion.
    */
@@ -467,48 +240,6 @@ class NoticeService {
       createdBy: notice.createdByName,
       createdByEmail: notice.createdByEmail,
       createdAt: notice.createdAt || new Date().toISOString(),
-      hasAudio: Boolean(notice.audioUrl),
-    };
-
-    // Only include audioDurationMs if it's defined to prevent Firebase push errors
-    if (notice.audioDurationMs !== undefined) {
-      data.audioDurationMs = notice.audioDurationMs;
-    }
-
-    return {
-      title: this.buildTitle(notice),
-      body: this.buildBody(notice),
-      data,
-    };
-  }
-
-  private dedupeDevices(devices: UserDevice[]): UserDevice[] {
-    const seen = new Map<string, UserDevice>();
-
-    devices.forEach((device) => {
-      if (device.deviceId && !seen.has(device.deviceId)) {
-        seen.set(device.deviceId, device);
-      }
-    });
-
-    return Array.from(seen.values());
-  }
-
-  private buildNotificationPayload(
-    notice: Notice,
-    scope: DeliveryScope,
-    device: UserDevice
-  ) {
-    const data: any = {
-      type: 'notice_created',
-      noticeId: notice.id,
-      priority: notice.priority,
-      targetAudience: notice.targetAudience || ['all'],
-      createdBy: notice.createdByName,
-      createdByEmail: notice.createdByEmail,
-      createdAt: notice.createdAt || new Date().toISOString(),
-      deliveryScope: scope,
-      deviceId: device.deviceId,
       hasAudio: Boolean(notice.audioUrl),
     };
 

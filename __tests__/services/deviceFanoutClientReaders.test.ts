@@ -1,26 +1,22 @@
-// Feature: device-push-fanout-migration, Stage 3 (Task 12.1, Part A) — client
-// migration of the remaining Cross_User_Readers of `user_devices` to the
-// server-backed resolution endpoints under the Fanout_Feature_Flag.
+// Feature: device-push-fanout-migration — client migration of the remaining
+// Cross_User_Readers of `user_devices` to the server-backed resolution endpoints.
 //
-// This suite proves the read/listing/online-status boundary the migration
-// introduces, with Firestore, auth, the internal-token bridge, and fetch fully
-// mocked (no real network / Firestore), mirroring the mocking style in
+// This suite proves the read/listing/online-status boundary, with Firestore,
+// auth, the internal-token bridge, and fetch fully mocked (no real network /
+// Firestore), mirroring the mocking style in
 // `deviceFanoutClientDelegation.test.ts`:
 //
-//   - flag ON:
-//       * checkUserOnlineStatus(other) → POST /notifications/online-status,
-//         returns its boolean, and performs NO cross-user `getDocs` (Req 7.3, 7.5);
-//       * getAllUsersWithDevices(...) → POST /notifications/device-listing,
-//         reconstructs the AuthorizedUser[] shape (with profile overlay), and
-//         performs NO cross-user `getDocs` (Req 7.3, 7.5);
-//       * cross-user getUserDevices(other) → POST /notifications/device-listing
-//         (single recipient), returns UserDevice[]-shaped devices, NO cross-user
-//         `getDocs` (Req 7.3, 4.4);
-//       * self getUserDevices(self) → STILL reads via `getDocs` (Owner_Only_Read,
-//         Req 7.4) and never hits an endpoint;
-//   - flag OFF: every legacy path reads via `getDocs` and never hits the endpoints
-//     (Req 9.2);
-//   - `getUserPushTokens` no longer exists on the service — the cross-user token
+//   * checkUserOnlineStatus(other) → POST /notifications/online-status,
+//     returns its boolean, and performs NO cross-user `getDocs` (Req 7.3, 7.5);
+//   * getAllUsersWithDevices(...) → POST /notifications/device-listing,
+//     reconstructs the AuthorizedUser[] shape (with profile overlay), and
+//     performs NO cross-user `getDocs` (Req 7.3, 7.5);
+//   * cross-user getUserDevices(other) → POST /notifications/device-listing
+//     (single recipient), returns UserDevice[]-shaped devices, NO cross-user
+//     `getDocs` (Req 7.3, 4.4);
+//   * self getUserDevices(self) → STILL reads via `getDocs` (Owner_Only_Read,
+//     Req 7.4) and never hits an endpoint;
+//   * `getUserPushTokens` no longer exists on the service — the cross-user token
 //     listing was RETIRED (Req 5.4, 7.3).
 
 // ---------------------------------------------------------------------------
@@ -204,7 +200,6 @@ const R1 = 'alice@example.com';
 const R2 = 'bob@example.com';
 const TENANT_ID = 'tenant-abc-123';
 const BASE_URL = 'https://api.example.com';
-const FLAG = 'EXPO_PUBLIC_SERVER_FANOUT_ENABLED';
 
 /** A successful fetch Response stand-in returning `bodyJson` (as sendPushViaBackend expects). */
 function okResponse(bodyJson: unknown) {
@@ -236,22 +231,13 @@ beforeEach(() => {
   (global as any).fetch = fetchMock;
   runtime.currentUserEmail = null;
   runtime.currentDeviceId = null;
-  delete process.env[FLAG];
-});
-
-afterAll(() => {
-  delete process.env[FLAG];
 });
 
 // ---------------------------------------------------------------------------
-// Flag ON — server-backed resolution, no cross-user device read
+// Server-backed resolution — no cross-user device read
 // ---------------------------------------------------------------------------
 
-describe('Cross_User_Readers — Server-backed resolution (flag ON)', () => {
-  beforeEach(() => {
-    process.env[FLAG] = 'true';
-  });
-
+describe('Cross_User_Readers — Server-backed resolution', () => {
   it('checkUserOnlineStatus(other) POSTs /notifications/online-status, returns its boolean, and never reads devices', async () => {
     mockGetCachedSelectedTenant.mockResolvedValue(TENANT_ID);
     fetchMock.mockResolvedValue(okResponse({ online: true }));
@@ -374,43 +360,6 @@ describe('Cross_User_Readers — Server-backed resolution (flag ON)', () => {
     // And it never delegates to the server device-listing.
     expect(callEndingWith('/notifications/device-listing')).toBeUndefined();
     expect(Array.isArray(devices)).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Flag OFF — legacy client reads, endpoints never hit
-// ---------------------------------------------------------------------------
-
-describe('Cross_User_Readers — legacy client path (flag OFF)', () => {
-  beforeEach(() => {
-    process.env[FLAG] = 'false';
-  });
-
-  it('getUserDevices(other) reads the recipient devices via getDocs and never calls the device-listing endpoint', async () => {
-    const devices = await deviceTrackingService.getUserDevices(OTHER, { tenantId: TENANT_ID });
-
-    expect(mockGetDocs).toHaveBeenCalled();
-    expect(callEndingWith('/notifications/device-listing')).toBeUndefined();
-    expect(Array.isArray(devices)).toBe(true);
-  });
-
-  it('checkUserOnlineStatus(other) reads via getDocs and never calls the online-status endpoint', async () => {
-    const online = await deviceTrackingService.checkUserOnlineStatus(OTHER);
-
-    expect(mockGetDocs).toHaveBeenCalled();
-    expect(callEndingWith('/notifications/online-status')).toBeUndefined();
-    expect(online).toBe(false);
-  });
-
-  it('getAllUsersWithDevices(...) reads via getDocs and never calls the device-listing endpoint', async () => {
-    // Legacy path scopes emails to tenant membership before reading.
-    mockGetActiveMembershipsForTenant.mockResolvedValue([{ email: R1 }]);
-
-    const users = await deviceTrackingService.getAllUsersWithDevices([R1], SELF, false, { tenantId: TENANT_ID });
-
-    expect(mockGetDocs).toHaveBeenCalled();
-    expect(callEndingWith('/notifications/device-listing')).toBeUndefined();
-    expect(Array.isArray(users)).toBe(true);
   });
 });
 

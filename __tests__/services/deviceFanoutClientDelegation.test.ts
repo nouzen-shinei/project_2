@@ -1,19 +1,16 @@
-// Feature: device-push-fanout-migration, Stage 2 (Task 7.2) — client delegation
-// of `sendNotificationToUser` push to the backend Fanout_Endpoint under the
-// Fanout_Feature_Flag.
+// Feature: device-push-fanout-migration — client delegation of
+// `sendNotificationToUser` push to the backend Fanout_Endpoint.
 //
-// These tests prove the client/server delivery boundary the migration introduces,
-// with Firestore, auth, the internal-token bridge, and fetch fully mocked (no real
-// network / Firestore), mirroring the mocking style in
+// These tests prove the client/server delivery boundary, with Firestore, auth,
+// the internal-token bridge, and fetch fully mocked (no real network /
+// Firestore), mirroring the mocking style in
 // `deviceTrackingForceLogoutAll.test.ts`:
 //
-//   - flag ON → push resolution/delivery is delegated to `POST /notifications/fanout`
+//   - push resolution/delivery is delegated to `POST /notifications/fanout`
 //     (via the existing `sendPushViaBackend` bridge) and the client performs NO
 //     recipient `user_devices` read (getDocs is never called) (Req 4.3, 4.4, 9.1);
-//   - flag OFF → the legacy Client_Fanout runs and reads the recipient's devices
-//     via getDocs, and never hits the Fanout_Endpoint (Req 9.2);
 //   - the `DeviceNotificationFanoutResult` contract (the exact ten numeric fields)
-//     is IDENTICAL across both flag states (Req 6.1, 9.5);
+//     is preserved (Req 6.1, 9.5);
 //   - Presence_Delivery to the signed-in user's OWN current device uses only local
 //     state — a local notification, and STILL no recipient device read (Req 4.1).
 
@@ -183,7 +180,6 @@ const RECIPIENT = 'recipient@example.com';
 const SELF = 'self@example.com';
 const TENANT_ID = 'tenant-abc-123';
 const BASE_URL = 'https://api.example.com';
-const FLAG = 'EXPO_PUBLIC_SERVER_FANOUT_ENABLED';
 
 /** The exact ten numeric keys of the DeviceNotificationFanoutResult contract. */
 const RESULT_KEYS = [
@@ -246,11 +242,6 @@ beforeEach(() => {
   runtime.currentUserEmail = null;
   runtime.currentDeviceId = null;
   runtime.lastKnownNotificationsEnabled = true;
-  delete process.env[FLAG];
-});
-
-afterAll(() => {
-  delete process.env[FLAG];
 });
 
 /** The single `/notifications/fanout` call (if any) made during the test. */
@@ -261,14 +252,10 @@ function fanoutCall(): [string, any] | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Flag ON — delegates to the Fanout_Endpoint, no recipient device read
+// Server_Fanout — delegates to the Fanout_Endpoint, no recipient device read
 // ---------------------------------------------------------------------------
 
-describe('sendNotificationToUser — Server_Fanout (flag ON)', () => {
-  beforeEach(() => {
-    process.env[FLAG] = 'true';
-  });
-
+describe('sendNotificationToUser — Server_Fanout', () => {
   it('delegates push to POST /notifications/fanout with the schema-shaped body and no recipient device read', async () => {
     const result = await deviceTrackingService.sendNotificationToUser(
       RECIPIENT,
@@ -347,9 +334,8 @@ describe('sendNotificationToUser — Server_Fanout (flag ON)', () => {
 // Presence_Delivery — signed-in user's own current device, local state only
 // ---------------------------------------------------------------------------
 
-describe('sendNotificationToUser — Presence_Delivery to own current device (flag ON)', () => {
+describe('sendNotificationToUser — Presence_Delivery to own current device', () => {
   beforeEach(() => {
-    process.env[FLAG] = 'true';
     runtime.currentUserEmail = SELF;
     runtime.currentDeviceId = 'current-device-1';
   });
@@ -386,15 +372,11 @@ describe('sendNotificationToUser — Presence_Delivery to own current device (fl
 });
 
 // ---------------------------------------------------------------------------
-// Flag OFF — legacy Client_Fanout runs, reads recipient devices, no endpoint
+// Contract — the full ten-field result shape is preserved on the server path
 // ---------------------------------------------------------------------------
 
-describe('sendNotificationToUser — Client_Fanout (flag OFF)', () => {
-  beforeEach(() => {
-    process.env[FLAG] = 'false';
-  });
-
-  it('runs the legacy path: reads the recipient devices via getDocs and never calls the Fanout_Endpoint', async () => {
+describe('sendNotificationToUser — DeviceNotificationFanoutResult contract', () => {
+  it('returns the full ten-field contract of finite numbers via the Server_Fanout', async () => {
     const result = await deviceTrackingService.sendNotificationToUser(
       RECIPIENT,
       CHAT_NOTIFICATION,
@@ -402,53 +384,10 @@ describe('sendNotificationToUser — Client_Fanout (flag OFF)', () => {
       { tenantId: TENANT_ID }
     );
 
-    // Legacy fan-out enumerates the recipient's devices client-side.
-    expect(mockGetDocs).toHaveBeenCalled();
-    // No delegation to the Server_Fanout endpoint.
-    expect(fanoutCall()).toBeUndefined();
-    // With no devices returned, all counts are zero — but the shape is complete.
     expect(Object.keys(result).sort()).toEqual(RESULT_KEYS);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Contract parity — identical result shape across both flag states
-// ---------------------------------------------------------------------------
-
-describe('sendNotificationToUser — DeviceNotificationFanoutResult contract parity', () => {
-  it('returns the identical ten-field contract whether the flag is ON or OFF', async () => {
-    process.env[FLAG] = 'true';
-    const onResult = await deviceTrackingService.sendNotificationToUser(
-      RECIPIENT,
-      CHAT_NOTIFICATION,
-      false,
-      { tenantId: TENANT_ID }
-    );
-
-    jest.clearAllMocks();
-    fetchMock = jest.fn(async () => okResponse(serverCounts()));
-    (global as any).fetch = fetchMock;
-    mockGetPreferredBackendBaseUrl.mockReturnValue(BASE_URL);
-    mockGetToken.mockResolvedValue('internal-token-abc');
-
-    process.env[FLAG] = 'false';
-    const offResult = await deviceTrackingService.sendNotificationToUser(
-      RECIPIENT,
-      CHAT_NOTIFICATION,
-      false,
-      { tenantId: TENANT_ID }
-    );
-
-    const onKeys = Object.keys(onResult).sort();
-    const offKeys = Object.keys(offResult).sort();
-    expect(onKeys).toEqual(RESULT_KEYS);
-    expect(offKeys).toEqual(RESULT_KEYS);
-    expect(onKeys).toEqual(offKeys);
-
-    // Every field is a finite number in both states.
     for (const key of RESULT_KEYS) {
-      expect(typeof (onResult as any)[key]).toBe('number');
-      expect(typeof (offResult as any)[key]).toBe('number');
+      expect(typeof (result as any)[key]).toBe('number');
+      expect(Number.isFinite((result as any)[key])).toBe(true);
     }
   });
 });

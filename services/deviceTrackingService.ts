@@ -1,6 +1,5 @@
 import { logger } from '@/lib/logger';
 import { resolveExpoProjectId } from '@/lib/expoProjectId';
-import { resolveNotificationChannelId } from '@/lib/notificationChannels';
 import { tenantService } from './tenantService';
 import type { TenantMembershipRole, TenantMembershipStatus } from '@/types';
 import { authService } from '../hooks/useAuthUnified';
@@ -361,48 +360,6 @@ export interface DeviceNotificationFanoutResult {
   deduplicatedWebPushSubscriptionsCleaned: number;
 }
 
-// Boolean env-flag parser following the repo convention (see `parseEnvFlag` in
-// services/chatService.ts and `isFlagEnabled` in services/gifStickerProviderService.ts):
-// EXPO_PUBLIC_* string flags map to booleans, with a caller-supplied default when
-// the value is absent or unrecognized. Pure, no I/O.
-function parseEnvFlag(value: string | undefined, defaultValue: boolean): boolean {
-  if (value == null) {
-    return defaultValue;
-  }
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) {
-    return defaultValue;
-  }
-  if (['0', 'false', 'off', 'disabled', 'no'].includes(normalized)) {
-    return false;
-  }
-  if (['1', 'true', 'on', 'enabled', 'yes'].includes(normalized)) {
-    return true;
-  }
-  return defaultValue;
-}
-
-/**
- * Fanout_Feature_Flag resolver (design §6, Requirements 9.1–9.3).
- *
- * Selects the push fan-out path: `true` routes push through the Server_Fanout
- * (`POST /notifications/fanout`), `false` keeps the existing Client_Fanout.
- *
- * - Defaults to **false** — Client_Fanout stays authoritative until the server
- *   path is deliberately enabled, so notifications never silently stop (Req 9.2).
- * - Read from `EXPO_PUBLIC_SERVER_FANOUT_ENABLED` via the repo boolean env-flag
- *   convention.
- * - **Independent of the Device_Read_Rule**: the Server_Fanout can be enabled and
- *   validated while `user_devices` reads are still open, before the read rule is
- *   tightened (Req 9.3).
- *
- * Pure and side-effect free; consumed by `sendNotificationToUser` and the notice
- * fan-out to choose Server vs Client fan-out.
- */
-export function isServerFanoutEnabled(): boolean {
-  return parseEnvFlag(process.env.EXPO_PUBLIC_SERVER_FANOUT_ENABLED, false);
-}
-
 class DeviceTrackingService {
   private currentDeviceId: string | null = null;
   private currentDeviceIdSource: 'stable_seed' | 'fingerprint_fallback' | 'unknown' = 'unknown';
@@ -415,8 +372,6 @@ class DeviceTrackingService {
   private readonly DEVICE_SEED_KEY = 'device_seed_v1';
   private readonly DEVICE_ID_SOURCE_KEY_SUFFIX = '_source';
   private readonly HEARTBEAT_INTERVAL = 30000; // 30 seconds
-  private readonly OFFLINE_THRESHOLD = 120000; // 2 minutes
-  private readonly ACTIVE_CHAT_SUPPRESSION_WINDOW_MS = 120000; // 2 minutes
   private lastKnownExpoPushToken: string | null = null;
   private pushTokenRefreshInFlight = false;
   private hasPushTokenRefreshMonitor = false;
@@ -429,11 +384,6 @@ class DeviceTrackingService {
     tenantIds: string[];
     membershipSummaries: TenantMembershipSummary[];
     activeTenantId: string | null;
-  } | null = null;
-  private tenantAuthorizedEmailsCache: {
-    tenantId: string;
-    fetchedAt: number;
-    emails: string[];
   } | null = null;
   private backendApiBaseUrl?: string;
   private devicePingWarnedMissingBackend = false;
@@ -503,58 +453,6 @@ class DeviceTrackingService {
     }
   }
 
-  private async getTenantAuthorizedEmails(tenantId: string): Promise<string[]> {
-    const CACHE_TTL_MS = 60 * 1000;
-    const now = Date.now();
-
-    if (
-      this.tenantAuthorizedEmailsCache &&
-      this.tenantAuthorizedEmailsCache.tenantId === tenantId &&
-      now - this.tenantAuthorizedEmailsCache.fetchedAt < CACHE_TTL_MS
-    ) {
-      return this.tenantAuthorizedEmailsCache.emails;
-    }
-
-    try {
-      const memberships = await tenantService.getActiveMembershipsForTenant(tenantId);
-      const emails = memberships
-        .map((membership) => membership.email?.toLowerCase?.())
-        .filter((email): email is string => Boolean(email));
-
-      this.tenantAuthorizedEmailsCache = {
-        tenantId,
-        fetchedAt: now,
-        emails,
-      };
-
-      return emails;
-    } catch (error) {
-      logger.warn('DeviceTrackingService: failed to resolve tenant authorized emails', {
-        tenantId,
-        error,
-      });
-      this.tenantAuthorizedEmailsCache = null;
-      return [];
-    }
-  }
-
-  private async scopeAuthorizedEmailsToTenant(
-    authorizedEmails: string[],
-    tenantId?: string
-  ): Promise<string[]> {
-    if (!tenantId) {
-      return authorizedEmails;
-    }
-
-    const tenantEmails = await this.getTenantAuthorizedEmails(tenantId);
-    if (!tenantEmails.length) {
-      return [];
-    }
-
-    const allowed = new Set(tenantEmails);
-    return authorizedEmails.filter((email) => allowed.has(email));
-  }
-
   private deviceMatchesTenant(
     device: UserDevice,
     tenantId?: string | null,
@@ -622,147 +520,6 @@ class DeviceTrackingService {
     }
 
     return null;
-  }
-
-  private canAttemptRemoteNotificationDelivery(device: UserDevice): boolean {
-    if (device.isDeleted) {
-      return false;
-    }
-
-    if (this.isDeviceLoggedOut(device)) {
-      return false;
-    }
-
-    if (device.isOnline) {
-      return true;
-    }
-
-    if (device.deviceType === 'web') {
-      return typeof device.webPushSubscription?.endpoint === 'string'
-        && device.webPushSubscription.endpoint.trim().length > 0;
-    }
-
-    return typeof device.expoPushToken === 'string' && device.expoPushToken.trim().length > 0;
-  }
-
-  private isDeviceLoggedOut(device: UserDevice): boolean {
-    if (device.sessionActive === false) {
-      return true;
-    }
-
-    if (device.logoutType === 'manual' || device.logoutType === 'forced') {
-      return true;
-    }
-
-    return device.lastActivityType === 'logout' || device.lastActivityType === 'forced_logout';
-  }
-
-  private getWebPushEndpointKey(device: UserDevice): string | null {
-    const endpoint = typeof device.webPushSubscription?.endpoint === 'string'
-      ? device.webPushSubscription.endpoint.trim()
-      : '';
-    return endpoint || null;
-  }
-
-  private getDeviceFreshnessMs(device: UserDevice): number {
-    const candidates = [
-      device.updatedAt,
-      device.lastSeen,
-      device.webPushLastSyncedAt,
-      device.webPushSubscribedAt,
-      device.lastTenantPingAt,
-    ];
-    return candidates.reduce((latest, value) => {
-      if (!value) {
-        return latest;
-      }
-      try {
-        return Math.max(latest, DeviceTrackingService.resolveTimestamp(value).getTime());
-      } catch {
-        return latest;
-      }
-    }, 0);
-  }
-
-  private async cleanupStaleWebPushSubscriptions(
-    userEmail: string,
-    devices: UserDevice[]
-  ): Promise<{
-    devices: UserDevice[];
-    staleCleanedCount: number;
-    deduplicatedCount: number;
-  }> {
-    const webDevices = devices.filter((device) => device.deviceType === 'web' && !device.isDeleted);
-    if (!webDevices.length) {
-      return { devices, staleCleanedCount: 0, deduplicatedCount: 0 };
-    }
-
-    const now = Date.now();
-    const updates: Array<Promise<void>> = [];
-    const staleIds = new Set<string>();
-    const dedupedIds = new Set<string>();
-    const endpointWinners = new Map<string, UserDevice>();
-
-    for (const device of webDevices) {
-      const endpointKey = this.getWebPushEndpointKey(device);
-      const expirationTime = typeof device.webPushSubscription?.expirationTime === 'number'
-        ? device.webPushSubscription.expirationTime
-        : null;
-      const hasExpiredSubscription = typeof expirationTime === 'number' && Number.isFinite(expirationTime) && expirationTime > 0 && expirationTime <= now;
-      const subscribedWithoutEndpoint = device.webPushStatus === 'subscribed' && !endpointKey;
-
-      if (hasExpiredSubscription || subscribedWithoutEndpoint) {
-        staleIds.add(device.deviceId);
-        const deviceRef = doc(firestore, 'user_devices', userEmail, 'devices', device.deviceId);
-        updates.push(updateDoc(deviceRef, {
-          webPushSubscription: deleteField(),
-          webPushStatus: subscribedWithoutEndpoint ? 'sync_required' : 'unsubscribed',
-          webPushLastErrorCode: subscribedWithoutEndpoint ? 'subscription_missing' : 'subscription_expired',
-          webPushLastErrorAt: this.createResolvedTimestamp(),
-          updatedAt: this.createResolvedTimestamp(),
-        }).catch((error) => {
-          logger.warn('Failed to cleanup stale web push subscription', { userEmail, deviceId: device.deviceId, error });
-        }));
-        continue;
-      }
-
-      if (!endpointKey) {
-        continue;
-      }
-
-      const existingWinner = endpointWinners.get(endpointKey);
-      if (!existingWinner) {
-        endpointWinners.set(endpointKey, device);
-        continue;
-      }
-
-      const keepExisting = this.getDeviceFreshnessMs(existingWinner) >= this.getDeviceFreshnessMs(device);
-      const winner = keepExisting ? existingWinner : device;
-      const loser = keepExisting ? device : existingWinner;
-      endpointWinners.set(endpointKey, winner);
-      dedupedIds.add(loser.deviceId);
-
-      const loserRef = doc(firestore, 'user_devices', userEmail, 'devices', loser.deviceId);
-      updates.push(updateDoc(loserRef, {
-        webPushSubscription: deleteField(),
-        webPushStatus: 'unsubscribed',
-        webPushLastErrorCode: 'duplicate_subscription_replaced',
-        webPushLastErrorAt: this.createResolvedTimestamp(),
-        updatedAt: this.createResolvedTimestamp(),
-      }).catch((error) => {
-        logger.warn('Failed to deduplicate web push subscription', { userEmail, deviceId: loser.deviceId, error });
-      }));
-    }
-
-    if (updates.length) {
-      await Promise.all(updates);
-    }
-
-    return {
-      devices: devices.filter((device) => !staleIds.has(device.deviceId) && !dedupedIds.has(device.deviceId)),
-      staleCleanedCount: staleIds.size,
-      deduplicatedCount: dedupedIds.size,
-    };
   }
 
   /**
@@ -1502,39 +1259,6 @@ class DeviceTrackingService {
     } catch (error) {
       logger.warn('Failed to send tenant device ping', error);
     }
-  }
-
-  private extractExpoPushStatus(result: any): string | undefined {
-    if (!result) return undefined;
-
-    if (typeof result.ok === 'boolean') {
-      return result.ok ? 'ok' : 'error';
-    }
-
-    if (Array.isArray(result)) {
-      const first = result[0];
-      if (first && typeof first.status === 'string') {
-        return first.status;
-      }
-    }
-
-    const data = result.data;
-    if (data) {
-      if (Array.isArray(data) && data.length > 0) {
-        const first = data[0];
-        if (first && typeof first.status === 'string') {
-          return first.status;
-        }
-      } else if (typeof data === 'object' && typeof (data as any).status === 'string') {
-        return (data as any).status;
-      }
-    }
-
-    if (typeof result.status === 'string') {
-      return result.status;
-    }
-
-    return undefined;
   }
 
   /**
@@ -2697,7 +2421,12 @@ class DeviceTrackingService {
    * caller runs the legacy client read UNCHANGED (rollback safety valve, Req 9.2).
    */
   async getUserDevices(userEmail: string, options?: DeviceTenantFilterOptions): Promise<UserDevice[]> {
-    if (isServerFanoutEnabled() && !this.isSelfEmail(userEmail)) {
+    // CROSS-USER reads route SERVER-SIDE (Admin SDK) so the client never reads
+    // another user's `user_devices` tree; the server returns the same
+    // `UserDevice`-shaped devices minus the secret fields it strips. A SELF read
+    // (owner reading own devices) stays a direct client Firestore read, which the
+    // Owner_Only_Read rule permits — that is the direct-Firestore body below.
+    if (!this.isSelfEmail(userEmail)) {
       return this.getUserDevicesViaServer(userEmail, options);
     }
     try {
@@ -2837,100 +2566,10 @@ class DeviceTrackingService {
     includeCurrentUser: boolean = false,
     options?: DeviceTenantFilterOptions
   ): Promise<AuthorizedUser[]> {
-    // Fanout_Feature_Flag (design §5; Req 7.3, 7.5, 4.4): under the flag, resolve
-    // the multi-user listing SERVER-SIDE (Admin SDK) — no cross-user client read
-    // — and overlay the profile-sourced `role`/`displayName` the endpoint omits.
-    // Flag OFF keeps the legacy client path below UNCHANGED (Req 9.2).
-    if (isServerFanoutEnabled()) {
-      return this.getAllUsersWithDevicesViaServer(authorizedEmails, currentUserEmail, includeCurrentUser, options);
-    }
-    try {
-      const usersData: AuthorizedUser[] = [];
-      const normalizedAuthorizedEmails = Array.from(
-        new Set(
-          authorizedEmails
-            .map((email) => email?.toLowerCase?.())
-            .filter((email): email is string => Boolean(email))
-        )
-      );
-
-      let scopedTenantOptions = options;
-      if (!scopedTenantOptions?.tenantId) {
-        const selectedTenantId = await tenantService.getCachedSelectedTenant();
-        if (selectedTenantId) {
-          scopedTenantOptions = {
-            tenantId: selectedTenantId,
-            includeUntagged: scopedTenantOptions?.includeUntagged ?? false,
-          };
-        }
-      }
-
-      const emailsToProcess = scopedTenantOptions?.tenantId
-        ? await this.scopeAuthorizedEmailsToTenant(normalizedAuthorizedEmails, scopedTenantOptions.tenantId)
-        : normalizedAuthorizedEmails;
-
-      if (emailsToProcess.length === 0) {
-        logger.debug('DeviceTrackingService: no authorized emails available for tenant scope', {
-          tenantId: scopedTenantOptions?.tenantId,
-        });
-        return [];
-      }
-
-      const normalizedCurrentUser = currentUserEmail?.toLowerCase();
-
-      // Use statically imported authService
-
-      for (const email of emailsToProcess) {
-        // Skip current user if specified and not explicitly including them
-        if (normalizedCurrentUser && email === normalizedCurrentUser && !includeCurrentUser) continue;
-
-        try {
-          const profile = await authService.getUserProfile(email);
-          const devices = await this.getUserDevices(email, scopedTenantOptions);
-          const derivedTenantIds = Array.from(
-            new Set(
-              devices.flatMap((device) => (Array.isArray(device.tenantIds) ? device.tenantIds : []))
-            )
-          );
-          const isOnline = devices.some(device => device.isOnline && !device.isDeleted);
-          
-          usersData.push({
-            email,
-            role: profile?.role || 'user',
-            displayName: profile?.displayName || this.extractDisplayName(email),
-            devices,
-            isOnline,
-            totalDevices: devices.length,
-            tenantIds: derivedTenantIds.length
-              ? derivedTenantIds
-              : scopedTenantOptions?.tenantId
-              ? [scopedTenantOptions.tenantId]
-              : undefined,
-          });
-        } catch (error) {
-          logger.error(`Error loading data for user ${email}:`, error);
-          // Add user with minimal data
-          usersData.push({
-            email,
-            role: 'user',
-            displayName: this.extractDisplayName(email),
-            devices: [],
-            isOnline: false, // No devices means offline
-            totalDevices: 0,
-            tenantIds: scopedTenantOptions?.tenantId ? [scopedTenantOptions.tenantId] : undefined,
-          });
-        }
-      }
-
-      return usersData.sort((a, b) => {
-        // Sort by online status first, then by email
-        if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
-        return a.email.localeCompare(b.email);
-      });
-    } catch (error) {
-      logger.error('Error fetching all users with devices:', error);
-      return [];
-    }
+    // Multi-user device listing is inherently CROSS-USER, so it always resolves
+    // SERVER-SIDE (Admin SDK): no cross-user client read, and the profile-sourced
+    // `role`/`displayName` the endpoint omits is overlaid server-path-side.
+    return this.getAllUsersWithDevicesViaServer(authorizedEmails, currentUserEmail, includeCurrentUser, options);
   }
 
   /**
@@ -2944,7 +2583,10 @@ class DeviceTrackingService {
    * The non-throwing contract is preserved: any error resolves to `false`.
    */
   async checkUserOnlineStatus(userEmail: string): Promise<boolean> {
-    if (isServerFanoutEnabled() && !this.isSelfEmail(userEmail)) {
+    // A read of ANOTHER user's online status resolves SERVER-SIDE (Admin SDK) so
+    // the client never reads that user's `user_devices` tree. A self-read stays a
+    // direct client read (Owner_Only_Read) via the local path below.
+    if (!this.isSelfEmail(userEmail)) {
       return this.checkUserOnlineStatusViaServer(userEmail);
     }
     try {
@@ -2967,60 +2609,6 @@ class DeviceTrackingService {
       return '';
     }
     return value.trim().toLowerCase();
-  }
-
-  private resolveTimestampMs(value: unknown): number {
-    if (!value) {
-      return 0;
-    }
-
-    try {
-      const resolved = DeviceTrackingService.resolveTimestamp(value);
-      const time = resolved.getTime();
-      return Number.isFinite(time) ? time : 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  private isDeviceActivelyViewingChat(device: UserDevice, senderEmail: string, activeWindowMs: number): boolean {
-    const normalizedSender = this.normalizeEmailValue(senderEmail);
-    if (!normalizedSender || device.activeChatIsFocused !== true) {
-      return false;
-    }
-
-    const activePartner = this.normalizeEmailValue(device.activeChatPartner);
-    const activePartnerId = this.normalizeEmailValue(device.activeChatPartnerId);
-    const partnerMatches = activePartner === normalizedSender || activePartnerId === normalizedSender;
-    if (!partnerMatches) {
-      return false;
-    }
-
-    const activityCandidates = [
-      this.resolveTimestampMs(device.activeChatLastSeenAt),
-      this.resolveTimestampMs(device.lastTenantPingAt),
-      this.resolveTimestampMs(device.lastSeen),
-      this.resolveTimestampMs(device.updatedAt),
-    ].filter((value) => value > 0);
-
-    if (!activityCandidates.length) {
-      return false;
-    }
-
-    const lastActiveMs = Math.max(...activityCandidates);
-    return Date.now() - lastActiveMs <= Math.max(0, activeWindowMs);
-  }
-
-  private findActiveChatViewerDevice(devices: UserDevice[], senderEmail: string, activeWindowMs: number): UserDevice | null {
-    for (const device of devices) {
-      if (!device || device.isDeleted) {
-        continue;
-      }
-      if (this.isDeviceActivelyViewingChat(device, senderEmail, activeWindowMs)) {
-        return device;
-      }
-    }
-    return null;
   }
 
   /**
@@ -3052,112 +2640,11 @@ class DeviceTrackingService {
     deviceOverride?: UserDevice,
     options?: DeviceTenantFilterOptions
   ): Promise<DeviceNotificationAttemptResult> {
-    // Fanout_Feature_Flag (device-push-fanout-migration, task 12.1 Part B; Req
-    // 4.3, 4.4, 7.3, 9.1, 9.2). Under the Server_Fanout, single-device push
-    // routes through the backend Fanout_Endpoint so the client never reads
-    // another user's `user_devices` tree and never delivers a local push using
-    // another user's tokens — the ONLY local delivery is presence-to-self. When
-    // the flag is off, the existing local single-device path below runs UNCHANGED.
-    if (isServerFanoutEnabled()) {
-      return this.sendNotificationToDeviceViaServerFanout(deviceId, userEmail, notification, options);
-    }
-    try {
-      const device = deviceOverride ?? (await this.getUserDevices(userEmail, options)).find(d => d.deviceId === deviceId);
-      
-      if (!device) {
-        logger.warn('Device not found:', deviceId);
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-      if (options?.tenantId && !this.deviceMatchesTenant(device, options.tenantId, options.includeUntagged ?? true)) {
-        logger.warn('Blocked device notification outside tenant scope', {
-          userEmail,
-          deviceId,
-          tenantId: options.tenantId,
-        });
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-      if (!this.canAttemptRemoteNotificationDelivery(device)) {
-        logger.debug('Skipping device notification: no active delivery channel available', {
-          userEmail,
-          deviceId,
-          deviceType: device.deviceType,
-        });
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-  const allowWhenDisabled = notification?.data?.allowWhenDisabled === true;
-  const notificationType = notification?.data?.type;
-  const isChatNotification = notificationType === 'chat_message';
-  const isNoticeNotification = notificationType === 'notice_created';
-  const isTeamNotification = notificationType === 'team_membership_change';
-      const senderEmail = typeof notification?.data?.senderEmail === 'string'
-        ? notification.data.senderEmail.toLowerCase()
-        : null;
-
-      if (!allowWhenDisabled) {
-        if (device.notificationsEnabled === false) {
-          logger.debug('Skipping device notification: device opted out of all notifications', {
-            userEmail,
-            deviceId,
-          });
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-
-        if (isChatNotification && device.chatNotificationsEnabled === false) {
-          logger.debug('Skipping device notification: device opted out of chat notifications', {
-            userEmail,
-            deviceId,
-          });
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-
-        if (isNoticeNotification && device.noticeNotificationsEnabled === false) {
-          logger.debug('Skipping device notification: device opted out of notice notifications', {
-            userEmail,
-            deviceId,
-          });
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-
-        if (isTeamNotification && device.teamNotificationsEnabled === false) {
-          logger.debug('Skipping device notification: device opted out of team notifications', {
-            userEmail,
-            deviceId,
-          });
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-
-        if (notificationType === 'daily_quote' && device.dailyQuotesEnabled === false) {
-          logger.debug('Skipping device notification: device opted out of daily quotes', {
-            userEmail,
-            deviceId,
-          });
-          return { delivered: false, deliverySource: 'unknown' };
-        }
-      }
-
-      if (isChatNotification && senderEmail && this.isDeviceActivelyViewingChat(device, senderEmail, this.ACTIVE_CHAT_SUPPRESSION_WINDOW_MS)) {
-        logger.debug('Skipping device notification: user actively viewing chat on this device (direct send)', {
-          userEmail,
-          deviceId,
-          senderEmail,
-        });
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-      // Handle web browser devices and mobile devices differently using notification service
-      if (device.deviceType === 'web') {
-        return await this.sendWebBrowserNotification(deviceId, userEmail, notification, device);
-      } else {
-        // Handle mobile/Android devices with Expo push notifications
-        return await this.sendMobileAppNotification(userEmail, device, notification);
-      }
-    } catch (error) {
-      logger.error('Error sending notification to device:', error);
-      return { delivered: false, deliverySource: 'unknown' };
-    }
+    // Single-device push always routes through the backend Fanout_Endpoint so the
+    // client never reads another user's `user_devices` tree and never delivers a
+    // local push using another user's tokens. The ONLY local delivery is
+    // presence-to-self, which stays local inside the server-fan-out helper.
+    return this.sendNotificationToDeviceViaServerFanout(deviceId, userEmail, notification, options);
   }
 
   /**
@@ -3416,226 +2903,6 @@ class DeviceTrackingService {
     } catch (error) {
       logger.error('Error sending remote web browser notification:', error);
       return { delivered: false, deliverySource: 'unknown' };
-    }
-  }
-
-  /**
-   * Send push notification to mobile/Android app
-   */
-  private async sendMobileAppNotification(userEmail: string, device: UserDevice, notification: {
-    title: string;
-    body: string;
-    data?: any;
-  }): Promise<DeviceNotificationAttemptResult> {
-    try {
-      if (!device.expoPushToken) {
-        logger.warn('No push token available for mobile device:', device.deviceId);
-        await this.requestPushTokenRefresh(userEmail, device.deviceId);
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-      const channelId = resolveNotificationChannelId({
-        type: typeof notification.data?.type === 'string' ? notification.data.type : undefined,
-        priority:
-          typeof notification.data?.priority === 'string' ? notification.data.priority : undefined,
-      });
-
-      // Use Expo push notification API for mobile devices
-      const targetPush = this.resolvePreferredMobilePushTarget(device);
-      if (!targetPush) {
-        logger.warn('No preferred push token available for mobile device:', device.deviceId);
-        await this.requestPushTokenRefresh(userEmail, device.deviceId);
-        return { delivered: false, deliverySource: 'unknown' };
-      }
-
-      const expoMessage = {
-        to: targetPush.token,
-        sound: 'default',
-        title: notification.title,
-        body: notification.body,
-        data: {
-          ...(notification.data || {}),
-          _tmPushTransportHint: targetPush.transport,
-          _tmNativePlatform: device.platformOS,
-        },
-        priority: 'high',
-        channelId,
-      };
-
-      const result = await this.sendExpoPushMessage(userEmail, device, notification, expoMessage);
-      const status = this.extractExpoPushStatus(result);
-      let effectiveStatus = status;
-      let effectiveResult = result;
-
-      if (effectiveStatus !== 'ok') {
-        const expoFallbackToken = typeof device.expoPushToken === 'string' ? device.expoPushToken.trim() : '';
-        const primaryToken = targetPush.token;
-        if (expoFallbackToken && expoFallbackToken !== primaryToken) {
-          try {
-            const fallbackMessage = {
-              ...expoMessage,
-              to: expoFallbackToken,
-              data: {
-                ...(expoMessage.data as Record<string, any>),
-                _tmPushTransportHint: 'expo',
-                _tmTransportFallbackFrom: targetPush.transport,
-              },
-            };
-            const fallbackResult = await this.sendExpoPushMessage(userEmail, device, notification, fallbackMessage);
-            const fallbackStatus = this.extractExpoPushStatus(fallbackResult);
-            if (fallbackStatus === 'ok') {
-              logger.warn('Primary native push transport failed; Expo fallback accepted', {
-                deviceId: device.deviceId,
-                userEmail,
-                failedTransport: targetPush.transport,
-              });
-              effectiveStatus = fallbackStatus;
-              effectiveResult = fallbackResult;
-            } else {
-              logger.warn('Expo fallback push was not accepted after native transport failure', {
-                deviceId: device.deviceId,
-                userEmail,
-                failedTransport: targetPush.transport,
-                fallbackResult,
-              });
-            }
-          } catch (fallbackError) {
-            logger.warn('Expo fallback push failed after native transport failure', {
-              deviceId: device.deviceId,
-              userEmail,
-              failedTransport: targetPush.transport,
-              error: fallbackError,
-            });
-          }
-        }
-      }
-
-      if (effectiveStatus === 'ok') {
-        logger.debug('Mobile app notification sent successfully to device:', device.deviceId);
-
-        const backgroundProbe = this.buildBackgroundReceiptProbeMessage(device, notification);
-        if (backgroundProbe) {
-          try {
-            const backgroundResult = await this.sendExpoPushMessage(userEmail, device, notification, backgroundProbe);
-            const backgroundStatus = this.extractExpoPushStatus(backgroundResult);
-            if (backgroundStatus !== 'ok') {
-              logger.warn('Background receipt probe push was not accepted', {
-                deviceId: device.deviceId,
-                userEmail,
-                backgroundResult,
-              });
-            }
-          } catch (backgroundError) {
-            logger.warn('Failed to send background receipt probe push', {
-              deviceId: device.deviceId,
-              userEmail,
-              error: backgroundError,
-            });
-          }
-        }
-
-        return { delivered: true, deliverySource: 'push', pushChannel: 'mobile_push' };
-      }
-
-      logger.error('Failed to send mobile app notification:', effectiveResult);
-      return { delivered: false, deliverySource: 'unknown' };
-    } catch (error) {
-      logger.error('Error sending mobile app notification:', error);
-      return { delivered: false, deliverySource: 'unknown' };
-    }
-  }
-
-  private buildBackgroundReceiptProbeMessage(
-    device: UserDevice,
-    notification: {
-      title: string;
-      body: string;
-      data?: any;
-    }
-  ): Record<string, unknown> | null {
-    const type = typeof notification.data?.type === 'string' ? notification.data.type : '';
-    if (type !== 'chat_message' && type !== 'team_chat_message') {
-      return null;
-    }
-
-    const targetPush = this.resolvePreferredMobilePushTarget(device);
-    if (!targetPush) {
-      return null;
-    }
-
-    return {
-      to: targetPush.token,
-      data: {
-        ...(notification.data || {}),
-        _tmReceiptProbe: true,
-        receiptProbe: true,
-        receiptProbeSentAt: new Date().toISOString(),
-        _tmPushTransportHint: targetPush.transport,
-        _tmNativePlatform: device.platformOS,
-      },
-      priority: 'high',
-      ttl: 120,
-      expiration: Math.floor(Date.now() / 1000) + 120,
-      _contentAvailable: true,
-      mutableContent: true,
-    };
-  }
-
-  private async sendExpoPushMessage(
-    userEmail: string,
-    device: UserDevice,
-    notification: {
-      title: string;
-      body: string;
-      data?: any;
-    },
-    expoMessage: Record<string, unknown>
-  ): Promise<any> {
-    const tenantId = this.resolveTenantIdForNotification(device, notification);
-    if (!tenantId) {
-      logger.error('Cannot send push via backend proxy without tenantId', {
-        deviceId: device.deviceId,
-        userEmail,
-      });
-      return { error: 'tenant_required' };
-    }
-
-    const backendResult = await this.sendPushViaBackend({ ...expoMessage, tenantId });
-    return backendResult.result;
-  }
-
-  private resolvePreferredMobilePushTarget(
-    device: UserDevice
-  ): { token: string; transport: 'fcm' | 'apns' | 'expo' } | null {
-    const apnsToken = typeof device.apnsToken === 'string' ? device.apnsToken.trim() : '';
-    if (apnsToken) {
-      return { token: apnsToken, transport: 'apns' };
-    }
-
-    const fcmToken = typeof device.fcmToken === 'string' ? device.fcmToken.trim() : '';
-    if (fcmToken) {
-      return { token: fcmToken, transport: 'fcm' };
-    }
-
-    const expoToken = typeof device.expoPushToken === 'string' ? device.expoPushToken.trim() : '';
-    if (expoToken) {
-      return { token: expoToken, transport: 'expo' };
-    }
-
-    return null;
-  }
-
-  private async requestPushTokenRefresh(userEmail: string, deviceId: string): Promise<void> {
-    try {
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      await updateDoc(deviceDoc, {
-        needsExpoPushTokenRefresh: true,
-        pushTokenStatus: 'missing',
-        lastPushTokenErrorAt: this.createResolvedTimestamp()
-      });
-      logger.debug('Requested push token refresh for device:', deviceId);
-    } catch (error) {
-      logger.warn('Failed to request push token refresh:', error);
     }
   }
 
@@ -4108,194 +3375,11 @@ class DeviceTrackingService {
     body: string;
     data?: any;
   }, onlineOnly: boolean = true, options?: DeviceTenantFilterOptions): Promise<DeviceNotificationFanoutResult> {
-    // Fanout_Feature_Flag (design §6; Req 9.1, 9.2): when the Server_Fanout is
-    // enabled, delegate Push_Target resolution and Push_Delivery to the backend
-    // Fanout_Endpoint while keeping Presence_Delivery client-local — the client
-    // never reads the recipient's `user_devices` tree (Req 4.3, 4.4). When the
-    // flag is off, the existing Client_Fanout below runs UNCHANGED (Req 9.2).
-    if (isServerFanoutEnabled()) {
-      return this.sendNotificationToUserViaServerFanout(userEmail, notification, onlineOnly, options);
-    }
-    try {
-      const devices = await this.getUserDevices(userEmail, options);
-      const cleanupResult = await this.cleanupStaleWebPushSubscriptions(userEmail, devices);
-      const allowWhenDisabled = notification?.data?.allowWhenDisabled === true;
-      const notificationType = notification?.data?.type;
-      const isChatNotification = notificationType === 'chat_message';
-      const isNoticeNotification = notificationType === 'notice_created';
-      const isTeamNotification = notificationType === 'team_membership_change';
-      const senderEmail = typeof notification?.data?.senderEmail === 'string'
-        ? notification.data.senderEmail.toLowerCase()
-        : null;
-
-      if (isChatNotification && senderEmail) {
-        const activeViewerDevice = this.findActiveChatViewerDevice(
-          cleanupResult.devices,
-          senderEmail,
-          this.ACTIVE_CHAT_SUPPRESSION_WINDOW_MS
-        );
-
-        if (activeViewerDevice) {
-          logger.debug('Skipping chat notification fan-out: recipient actively viewing this conversation', {
-            userEmail,
-            senderEmail,
-            deviceId: activeViewerDevice.deviceId,
-          });
-          return {
-            success: 0,
-            failed: 0,
-            deliverableDeviceCount: 0,
-            onlineDeliverableCount: 0,
-            presenceDeliveredCount: 0,
-            pushAcceptedCount: 0,
-            mobilePushAcceptedCount: 0,
-            webPushAcceptedCount: 0,
-            staleWebPushSubscriptionsCleaned: cleanupResult.staleCleanedCount,
-            deduplicatedWebPushSubscriptionsCleaned: cleanupResult.deduplicatedCount,
-          };
-        }
-      }
-
-      const targetDevices = cleanupResult.devices.filter(device => {
-        if (device.isDeleted) {
-          return false;
-        }
-
-        if (onlineOnly && !device.isOnline) {
-          return false;
-        }
-
-        if (!onlineOnly && !this.canAttemptRemoteNotificationDelivery(device)) {
-          return false;
-        }
-
-        if (!allowWhenDisabled) {
-          if (device.notificationsEnabled === false) {
-            logger.debug('Skipping device due to notifications disabled', {
-              userEmail,
-              deviceId: device.deviceId,
-            });
-            return false;
-          }
-
-          if (isChatNotification && device.chatNotificationsEnabled === false) {
-            logger.debug('Skipping device due to chat notifications disabled', {
-              userEmail,
-              deviceId: device.deviceId,
-            });
-            return false;
-          }
-
-          if (isNoticeNotification && device.noticeNotificationsEnabled === false) {
-            logger.debug('Skipping device due to notice notifications disabled', {
-              userEmail,
-              deviceId: device.deviceId,
-            });
-            return false;
-          }
-
-          if (isTeamNotification && device.teamNotificationsEnabled === false) {
-            logger.debug('Skipping device due to team notifications disabled', {
-              userEmail,
-              deviceId: device.deviceId,
-            });
-            return false;
-          }
-        }
-
-        if (!allowWhenDisabled && notification?.data?.type === 'daily_quote' && device.dailyQuotesEnabled === false) {
-          logger.debug('Skipping device due to daily quotes disabled', {
-            userEmail,
-            deviceId: device.deviceId,
-          });
-          return false;
-        }
-
-        if (isChatNotification && senderEmail && this.isDeviceActivelyViewingChat(device, senderEmail, this.ACTIVE_CHAT_SUPPRESSION_WINDOW_MS)) {
-          logger.debug('Skipping device notification: user actively viewing chat on this device', {
-            userEmail,
-            deviceId: device.deviceId,
-            senderEmail,
-          });
-          return false;
-        }
-
-        return true;
-      });
-
-      let success = 0;
-      let failed = 0;
-      let presenceDeliveredCount = 0;
-      let pushAcceptedCount = 0;
-      let mobilePushAcceptedCount = 0;
-      let webPushAcceptedCount = 0;
-      const seenMobileTokens = new Set<string>();
-      const onlineDeliverableCount = targetDevices.filter((device) => device.isOnline).length;
-
-      // Send notifications to each device individually
-      for (const device of targetDevices) {
-        if (device.deviceType !== 'web') {
-          const token = this.resolvePreferredMobilePushTarget(device)?.token || '';
-          if (token) {
-            if (seenMobileTokens.has(token)) {
-              logger.debug('Skipping duplicate mobile push token for notification delivery', {
-                userEmail,
-                deviceId: device.deviceId
-              });
-              continue;
-            }
-            seenMobileTokens.add(token);
-          }
-        }
-
-        const attempt = await this.sendNotificationToDeviceDetailed(device.deviceId, userEmail, notification, device, options);
-        if (attempt.delivered) {
-          success++;
-          if (attempt.deliverySource === 'presence') {
-            presenceDeliveredCount += 1;
-          }
-          if (attempt.deliverySource === 'push') {
-            pushAcceptedCount += 1;
-            if (attempt.pushChannel === 'mobile_push') {
-              mobilePushAcceptedCount += 1;
-            }
-            if (attempt.pushChannel === 'web_push') {
-              webPushAcceptedCount += 1;
-            }
-          }
-        } else {
-          failed++;
-        }
-      }
-
-      logger.debug(`Notification sent to user ${userEmail}: ${success} successful, ${failed} failed`);
-      return {
-        success,
-        failed,
-        deliverableDeviceCount: targetDevices.length,
-        onlineDeliverableCount,
-        presenceDeliveredCount,
-        pushAcceptedCount,
-        mobilePushAcceptedCount,
-        webPushAcceptedCount,
-        staleWebPushSubscriptionsCleaned: cleanupResult.staleCleanedCount,
-        deduplicatedWebPushSubscriptionsCleaned: cleanupResult.deduplicatedCount,
-      };
-    } catch (error) {
-      logger.error('Error sending notification to user:', error);
-      return {
-        success: 0,
-        failed: 1,
-        deliverableDeviceCount: 0,
-        onlineDeliverableCount: 0,
-        presenceDeliveredCount: 0,
-        pushAcceptedCount: 0,
-        mobilePushAcceptedCount: 0,
-        webPushAcceptedCount: 0,
-        staleWebPushSubscriptionsCleaned: 0,
-        deduplicatedWebPushSubscriptionsCleaned: 0,
-      };
-    }
+    // Push_Target resolution and Push_Delivery always go through the backend
+    // Fanout_Endpoint, while Presence_Delivery to the signed-in user's OWN
+    // current device stays client-local — the client never reads the recipient's
+    // `user_devices` tree (Req 4.3, 4.4).
+    return this.sendNotificationToUserViaServerFanout(userEmail, notification, onlineOnly, options);
   }
 
   // Private helper methods
@@ -5078,14 +4162,6 @@ class DeviceTrackingService {
     }
   }
 
-  private getUserAgent(): string {
-    try {
-      return Platform.OS === 'web' ? navigator.userAgent : '';
-    } catch (error) {
-      return '';
-    }
-  }
-
   private async getTotalDevicesCount(userEmail: string): Promise<number> {
     try {
       const devicesCollection = collection(firestore, 'user_devices', userEmail, 'devices');
@@ -5401,64 +4477,6 @@ class DeviceTrackingService {
     } catch (error) {
       logger.error('Failed to restore deleted device:', error);
       throw error;
-    }
-  }
-
-  /**
-   * Debug method to check ban documents for a specific device (public method for troubleshooting)
-   */
-  async debugDeviceBans(userEmail: string, deviceId: string): Promise<void> {
-    try {
-      logger.debug(`🔍 DEBUG: Checking ban documents for device ${deviceId} (user: ${userEmail})`);
-      
-      // Get the device to find its fingerprint
-      const deviceDoc = doc(firestore, 'user_devices', userEmail, 'devices', deviceId);
-      const deviceSnapshot = await getDoc(deviceDoc);
-      
-      if (!deviceSnapshot.exists()) {
-        logger.debug('❌ Device not found');
-        return;
-      }
-
-      const device = deviceSnapshot.data() as UserDevice;
-      const deviceFingerprint = await this.generateDeviceFingerprint(device);
-      
-      logger.debug(`📱 Device fingerprint: ${deviceFingerprint}`);
-      
-      // Query ALL ban documents for this fingerprint (not just active ones)
-      const allBansQuery = query(
-        collection(firestore, 'device_bans'),
-        where('deviceFingerprint', '==', deviceFingerprint)
-      );
-
-      const allBansSnapshot = await getDocs(allBansQuery);
-      logger.debug(`📋 Total ban documents found: ${allBansSnapshot.size}`);
-      
-      allBansSnapshot.docs.forEach((banDoc, index) => {
-        const banData = banDoc.data();
-        logger.debug(`🚫 Ban ${index + 1}:`, {
-          id: banDoc.id,
-          deviceFingerprint: banData.deviceFingerprint,
-          targetUserEmail: banData.targetUserEmail,
-          isActive: banData.isActive,
-          createdAt: banData.createdAt,
-          reason: banData.reason
-        });
-      });
-      
-      // Query active bans specifically for this user+device
-      const activeBansQuery = query(
-        collection(firestore, 'device_bans'),
-        where('deviceFingerprint', '==', deviceFingerprint),
-        where('targetUserEmail', '==', userEmail),
-        where('isActive', '==', true)
-      );
-
-      const activeBansSnapshot = await getDocs(activeBansQuery);
-      logger.debug(`⚡ Active ban documents for this user: ${activeBansSnapshot.size}`);
-      
-    } catch (error) {
-      logger.error('❌ Debug ban check failed:', error);
     }
   }
 
@@ -5903,52 +4921,6 @@ class DeviceTrackingService {
 
     logger.debug('Device fingerprint source: fingerprint fallback', { platform: Platform.OS });
     return this.computeFallbackFingerprintHash(device);
-  }
-
-  /**
-   * Check if a device is banned based on its fingerprint
-   */
-  async isDeviceBanned(device: UserDevice): Promise<DeviceBan | null> {
-    try {
-      const deviceFingerprint = await this.generateDeviceFingerprint(device);
-      
-      // Query for active bans with matching fingerprint
-      const bansQuery = query(
-        collection(firestore, 'device_bans'),
-        where('deviceFingerprint', '==', deviceFingerprint),
-        where('isActive', '==', true)
-      );
-
-      const bansSnapshot = await getDocs(bansQuery);
-      
-      for (const banDoc of bansSnapshot.docs) {
-        const banData = banDoc.data() as Omit<DeviceBan, 'id'>;
-        const ban: DeviceBan = { id: banDoc.id, ...banData };
-
-        // Check if ban has expired
-        if (ban.expiresAt) {
-          const expirationDate = ban.expiresAt instanceof Timestamp 
-            ? ban.expiresAt.toDate() 
-            : new Date(ban.expiresAt);
-          
-          if (new Date() > expirationDate) {
-            // Ban has expired, deactivate it
-            await updateDoc(banDoc.ref, { isActive: false });
-            continue;
-          }
-        }
-
-        // Update last checked timestamp
-        await updateDoc(banDoc.ref, { lastChecked: this.createResolvedTimestamp() });
-        
-        return ban;
-      }
-
-      return null;
-    } catch (error) {
-      logger.error('❌ Failed to check device ban:', error);
-      return null;
-    }
   }
 
   /**
