@@ -68,7 +68,7 @@ function enqueue(type: Job['type'], payload: any) {
   const tenantId = deriveTenantId(payload);
   if (!payload.tenantId) payload.tenantId = tenantId; // ensure downstream payloads include tenant
   JOBS[id] = { id, type, payload, status: 'queued', attempts: 0, enqueuedAt: Date.now(), tenantId };
-  console.log('[queue] enqueued', { id, type, tenantId, to: payload?.to, amount: payload?.amount, selectedLanguage: payload?.selectedLanguage, hasEnNote: !!payload?.customNotesEnglish, hasHiNote: !!payload?.customNotesHindi });
+  console.log('[queue] enqueued', { id, type, tenantId, toMasked: maskRecipient(payload?.to), selectedLanguage: payload?.selectedLanguage, hasEnNote: !!payload?.customNotesEnglish, hasHiNote: !!payload?.customNotesHindi });
   inc(metricNames.enqueued, { type, tenantId });
   persistSnapshot(JOBS);
   drain();
@@ -107,6 +107,15 @@ async function run(job: Job) {
           await db.runTransaction(async (tx) => {
             const snap = await tx.get(ref);
             const existing = snap.exists ? snap.data() || {} : {};
+            // L13: never overwrite a reminderHistory doc owned by a DIFFERENT tenant.
+            // Guards against a job carrying a spoofed historyId that points at another
+            // tenant's record. In normal operation the doc's tenantId equals
+            // job.tenantId (the client created it in its own tenant) or the doc
+            // doesn't exist yet.
+            const existingTenantId = (existing as any)?.tenantId;
+            if (snap.exists && typeof existingTenantId === 'string' && existingTenantId && existingTenantId !== job.tenantId) {
+              return;
+            }
             const existingCreatedAt = (existing as any)?.createdAt;
             const needsCreatedAt = !(existingCreatedAt instanceof admin.firestore.Timestamp);
 
@@ -148,6 +157,7 @@ async function run(job: Job) {
               historyId,
               finalStatus: result.ok ? 'success' : 'failed',
               fallbackTenantId: job.tenantId,
+              expectedTenantId: job.tenantId,
               fallbackChannel: 'whatsapp',
             });
           } catch (e) {
@@ -170,6 +180,15 @@ async function run(job: Job) {
           await db.runTransaction(async (tx) => {
             const snap = await tx.get(ref);
             const existing = snap.exists ? snap.data() || {} : {};
+            // L13: never overwrite a reminderHistory doc owned by a DIFFERENT tenant.
+            // Guards against a job carrying a spoofed historyId that points at another
+            // tenant's record. In normal operation the doc's tenantId equals
+            // job.tenantId (the client created it in its own tenant) or the doc
+            // doesn't exist yet.
+            const existingTenantId = (existing as any)?.tenantId;
+            if (snap.exists && typeof existingTenantId === 'string' && existingTenantId && existingTenantId !== job.tenantId) {
+              return;
+            }
             const existingCreatedAt = (existing as any)?.createdAt;
             const needsCreatedAt = !(existingCreatedAt instanceof admin.firestore.Timestamp);
 
@@ -210,6 +229,7 @@ async function run(job: Job) {
               historyId,
               finalStatus: ok ? 'success' : 'failed',
               fallbackTenantId: job.tenantId,
+              expectedTenantId: job.tenantId,
               fallbackChannel: 'whatsapp',
             });
           } catch (e) {
@@ -234,6 +254,12 @@ async function run(job: Job) {
         await db.runTransaction(async (tx) => {
           const snap = await tx.get(ref);
           const existing = snap.exists ? snap.data() || {} : {};
+          // L13: never overwrite a reminderHistory doc owned by a DIFFERENT tenant
+          // (exception/throw path — mirrors the success-path guard).
+          const existingTenantId = (existing as any)?.tenantId;
+          if (snap.exists && typeof existingTenantId === 'string' && existingTenantId && existingTenantId !== job.tenantId) {
+            return;
+          }
           const existingCreatedAt = (existing as any)?.createdAt;
           const needsCreatedAt = !(existingCreatedAt instanceof admin.firestore.Timestamp);
 
@@ -260,6 +286,7 @@ async function run(job: Job) {
             historyId,
             finalStatus: 'failed',
             fallbackTenantId: job.tenantId,
+            expectedTenantId: job.tenantId,
             fallbackChannel: 'whatsapp',
           });
         } catch (quotaError) {
@@ -303,8 +330,32 @@ async function sendBirthday(p: BirthdayGreetingPayload) {
   return sendTemplate(p.to, built.templateName, built.language, built.parameters, built.headerParameters);
 }
 
+// Minimal, safe recipient normalization for the WhatsApp Cloud API.
+// Strips formatting noise (spaces, dashes, parentheses, dots) that WABA rejects,
+// while PRESERVING an already-valid number: a single leading '+' is kept and all
+// digits are retained (including the country code). It intentionally does NOT
+// infer or add a country code, so numbers that already deliver are unchanged.
+function normalizeWhatsAppRecipient(raw: string): string {
+  if (typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  const hasPlus = trimmed.startsWith('+');
+  const digits = trimmed.replace(/[^0-9]/g, '');
+  if (!digits) return trimmed; // nothing usable; let WABA report the error
+  return hasPlus ? `+${digits}` : digits;
+}
+
+// Mask a recipient phone number for logs — keep only the last 4 digits so logs
+// stay debuggable without leaking full PII (security-rules-hardening L9).
+function maskRecipient(value: unknown): string | undefined {
+  const s = value == null ? '' : String(value);
+  if (!s) return undefined;
+  return s.length <= 4 ? '****' : `****${s.slice(-4)}`;
+}
+
 async function sendTemplate(to: string, templateName: string, language: string, params: any[], headerParams?: any[]) {
   if (!process.env.WABA_PHONE_NUMBER_ID || !process.env.WABA_TOKEN) { console.log('[wa] dry-run (missing WABA env)'); return { ok: true }; }// dry-run
+  to = normalizeWhatsAppRecipient(to);
   // WhatsApp Cloud API expects each parameter to be an object like { type: 'text', text: 'value' }
   const mappedParams = params.map(p => {
     if (p && typeof p === 'object' && 'type' in p) return p; // already structured
@@ -320,16 +371,17 @@ async function sendTemplate(to: string, templateName: string, language: string, 
     components.push({ type: 'header', parameters: mappedHeader });
   }
   components.push({ type: 'body', parameters: mappedParams });
-  console.log('[wa] params preview', { header: headerParams ? headerParams.slice(0, 3) : undefined, body: mappedParams.slice(0,5) });
+  // Do NOT log rendered params (they contain parent names/amounts — PII, L9).
+  console.log('[wa] params', { bodyCount: mappedParams.length, headerCount: headerParams?.length ?? 0 });
   const body = { messaging_product: 'whatsapp', to, type: 'template', template: { name: templateName, language: { code: language }, components } };
   const url = `https://graph.facebook.com/v20.0/${process.env.WABA_PHONE_NUMBER_ID}/messages`;
-  console.log('[wa] sending', { to, templateName, language, url });
+  console.log('[wa] sending', { toMasked: maskRecipient(to), templateName, language, url });
   const r = await fetch(url, { method:'POST', headers:{'Authorization':`Bearer ${process.env.WABA_TOKEN}`,'Content-Type':'application/json'}, body: JSON.stringify(body) });
   let messageId: string|undefined;
   let json: any = null;
   try { json = await r.json(); messageId = json?.messages?.[0]?.id; } catch(e){ console.warn('[wa] response parse error', e); }
-  if(!r.ok) console.warn('[wa] send failed', { status: r.status, statusText: r.statusText, response: json, requestBody: body });
-  else console.log('[wa] sent', { to, templateName, messageId });
+  if(!r.ok) console.warn('[wa] send failed', { status: r.status, statusText: r.statusText, response: json, templateName, toMasked: maskRecipient(to) });
+  else console.log('[wa] sent', { toMasked: maskRecipient(to), templateName, messageId });
   return { ok: r.ok, messageId, templateName, language, components };
 }
 

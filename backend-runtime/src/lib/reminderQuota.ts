@@ -57,6 +57,11 @@ export async function finalizeReminderQuotaFromHistory(
     fallbackTenantId?: string;
     fallbackChannel?: ReminderChannel;
     fallbackMonthId?: string;
+    // When set, refuse to finalize (and never touch quota counters) if the
+    // reminderHistory doc resolves to a DIFFERENT tenant than expected. Guards
+    // against a spoofed historyId pointing at another tenant's record
+    // (security-rules-hardening L13).
+    expectedTenantId?: string;
   }
 ): Promise<void> {
   const historyId = typeof options.historyId === 'string' ? options.historyId.trim() : '';
@@ -77,6 +82,13 @@ export async function finalizeReminderQuotaFromHistory(
     const tenantIdFromQuota = typeof quota?.tenantId === 'string' ? String(quota.tenantId).trim() : '';
     const tenantId = tenantIdFromHistory || tenantIdFromQuota || (options.fallbackTenantId || '').trim();
     if (!tenantId) {
+      return;
+    }
+
+    // L13: if the caller told us which tenant this finalize is for, never mutate a
+    // different tenant's quota — the history doc belongs to someone else (spoofed id).
+    const expectedTenantId = (options.expectedTenantId || '').trim();
+    if (expectedTenantId && tenantId !== expectedTenantId) {
       return;
     }
 

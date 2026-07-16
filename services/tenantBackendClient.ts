@@ -180,6 +180,30 @@ class TenantBackendClient {
         return 'This join request has already been reviewed.';
       case 'tenant_mismatch':
         return 'You can only manage requests for the active coaching center.';
+      case 'owner_must_transfer_first':
+        return 'Owners must transfer or downgrade their role before leaving the coaching center.';
+      case 'membership_not_found':
+        return 'You are not a member of this coaching center.';
+      case 'admin_role_required':
+        return 'Only owners and admins can perform this action.';
+      case 'max_active_codes_reached':
+        return 'Maximum active join codes reached. Revoke or expire an existing code to generate a new one.';
+      case 'code_required':
+        return 'A join code id is required.';
+      case 'empty_update':
+        return 'No changes to save.';
+      case 'validation_failed':
+        return 'Some of the details are invalid. Please review and try again.';
+      case 'tenant_create_failed':
+        return 'Unable to create the coaching center right now. Please try again.';
+      case 'tenant_update_failed':
+        return 'Unable to update the coaching center right now. Please try again.';
+      case 'tenant_leave_failed':
+        return 'Unable to leave the coaching center right now. Please try again.';
+      case 'tenant_code_create_failed':
+        return 'Unable to generate a join code right now. Please try again.';
+      case 'tenant_code_revoke_failed':
+        return 'Unable to revoke this join code right now. Please try again.';
       default:
         return 'Unexpected error while contacting the coaching center backend.';
     }
@@ -486,6 +510,110 @@ class TenantBackendClient {
     const path = `/tenants/${encodeURIComponent(tenantId)}/preferences`;
     return this.request<TenantNotificationPreferenceUpdateResponse>(path, {
       notificationPreferences: payload.notificationPreferences,
+      metadata: payload.metadata,
+    });
+  }
+
+  // ── Tenant lifecycle (security-rules-hardening C1: server-mediated writes) ──
+
+  createTenant(payload: {
+    name: string;
+    defaultCurrency?: string;
+    contactEmail?: string;
+    contactPhone?: string;
+    address?: string;
+    timezone?: string;
+    logoUrl?: string;
+    heroImageUrl?: string;
+    theme?: Record<string, unknown>;
+  }): Promise<{ ok: boolean; tenant: Record<string, any> }> {
+    if (!payload.name?.trim()) {
+      throw new TenantBackendError('validation_failed', 'Coaching center name is required');
+    }
+    return this.request('/tenants', payload);
+  }
+
+  updateTenant(payload: {
+    tenantId: string;
+    name?: string;
+    contactEmail?: string;
+    contactPhone?: string;
+    address?: string;
+    timezone?: string;
+    defaultCurrency?: string;
+    logoUrl?: string | null;
+    heroImageUrl?: string | null;
+    theme?: Record<string, unknown>;
+    branding?: Record<string, unknown>;
+    settings?: Record<string, unknown>;
+    onboardingProgress?: Record<string, unknown>;
+  }): Promise<{ ok: boolean; tenant: Record<string, any> }> {
+    const tenantId = payload.tenantId?.trim();
+    if (!tenantId) {
+      throw new TenantBackendError('tenant_required', 'Tenant id is required');
+    }
+    const { tenantId: _tenantId, ...rest } = payload;
+    return this.request(`/tenants/${encodeURIComponent(tenantId)}/update`, rest);
+  }
+
+  leaveTenant(payload: { tenantId: string }): Promise<{ ok: boolean; alreadyLeft?: boolean }> {
+    const tenantId = payload.tenantId?.trim();
+    if (!tenantId) {
+      throw new TenantBackendError('tenant_required', 'Tenant id is required');
+    }
+    return this.request(`/tenants/${encodeURIComponent(tenantId)}/leave`, {});
+  }
+
+  createTenantCode(payload: {
+    tenantId: string;
+    expiresInDays?: number;
+    usageCap?: number | null;
+  }): Promise<{ ok: boolean; code: Record<string, any> }> {
+    const tenantId = payload.tenantId?.trim();
+    if (!tenantId) {
+      throw new TenantBackendError('tenant_required', 'Tenant id is required');
+    }
+    return this.request(`/tenants/${encodeURIComponent(tenantId)}/codes`, {
+      expiresInDays: payload.expiresInDays,
+      usageCap: payload.usageCap,
+    });
+  }
+
+  revokeTenantCode(payload: { tenantId: string; codeId: string }): Promise<{ ok: boolean }> {
+    const tenantId = payload.tenantId?.trim();
+    const codeId = payload.codeId?.trim();
+    if (!tenantId || !codeId) {
+      throw new TenantBackendError('tenant_required', 'Tenant and code ids are required');
+    }
+    return this.request(`/tenants/${encodeURIComponent(tenantId)}/codes/${encodeURIComponent(codeId)}/revoke`, {});
+  }
+
+  // Mirror the caller's incoming invites into their own membership placeholder
+  // docs. The backend derives uid + email from the token and queries invites
+  // itself; only `displayName` is forwarded (for rejected-event actor labels).
+  syncInviteMemberships(payload?: { displayName?: string }): Promise<{ ok: boolean; synced: number }> {
+    return this.request('/tenants/invites/sync-memberships', {
+      displayName: payload?.displayName,
+    });
+  }
+
+  // Record a client-authored activity audit entry (attendance/fee operations).
+  // The actor identity and tenant are enforced server-side from the token/guard.
+  logActivityAudit(payload: {
+    tenantId: string;
+    action: string;
+    targetId?: string;
+    targetType?: 'fee' | 'attendance';
+    metadata?: Record<string, unknown>;
+  }): Promise<{ ok: boolean }> {
+    const tenantId = payload.tenantId?.trim();
+    if (!tenantId) {
+      throw new TenantBackendError('tenant_required', 'Tenant id is required');
+    }
+    return this.request(`/tenants/${encodeURIComponent(tenantId)}/audit/log`, {
+      action: payload.action,
+      targetId: payload.targetId,
+      targetType: payload.targetType,
       metadata: payload.metadata,
     });
   }

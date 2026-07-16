@@ -65,7 +65,9 @@ export function setupChatInboxWebsocket(server: Server): void {
     }
 
     // Actor is derived from the token, never trusted from the query param.
-    if (typeof tokenPayload.email === 'string' && normalizeEmail(tokenPayload.email) !== normalizedUser) {
+    // Require an email on non-master tokens (only the raw master key is exempt)
+    // rather than skipping the check when it's absent (security-rules-hardening L5).
+    if (!tokenPayload.master && normalizeEmail(tokenPayload.email ?? '') !== normalizedUser) {
       socket.close(4401, 'unauthorized');
       return;
     }

@@ -21,8 +21,7 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { ref as storageRef, deleteObject } from 'firebase/storage';
-import { storage } from '../config/firebase';
+import { deleteStorageObjectViaBackend } from '../services/backendStorageUploadService';
 import { studentService } from '../services/studentService';
 import { tenantService } from '../services/tenantService';
 
@@ -43,21 +42,16 @@ const extractStoragePath = (downloadUrl: string): string | null => {
   }
 };
 
-const deleteReceiptAsset = async (pathOrUrl: string) => {
+const deleteReceiptAsset = async (tenantId: string, pathOrUrl: string) => {
   if (!pathOrUrl) {
     return;
   }
 
   try {
-    let targetRef;
-    if (pathOrUrl.startsWith('http')) {
-      const storagePath = extractStoragePath(pathOrUrl);
-      targetRef = storageRef(storage, storagePath ?? pathOrUrl);
-    } else {
-      targetRef = storageRef(storage, pathOrUrl);
-    }
-
-    await deleteObject(targetRef);
+    // Server-mediated delete (security-rules-hardening M1): client deleteObject is
+    // disabled in storage.rules; the backend verifies the receipt is under this
+    // tenant's `receipts/{tenantId}/…` prefix before deleting.
+    await deleteStorageObjectViaBackend({ tenantId, target: pathOrUrl });
   } catch (error) {
     logger.warn('Failed to delete receipt asset from storage', { pathOrUrl, error });
     throw error;
@@ -347,7 +341,7 @@ function useFees() {
             .filter((value): value is string => typeof value === 'string' && value.length > 0)
             .map(async (pathOrUrl) => {
               try {
-                await deleteReceiptAsset(pathOrUrl);
+                await deleteReceiptAsset(tenantId, pathOrUrl);
               } catch (receiptError) {
                 logger.warn('Failed to delete receipt while removing fee', {
                   feeId: id,
@@ -372,7 +366,10 @@ function useFees() {
       }
       
       try {
-        const paymentsRef = collection(db, 'fees', id, 'payments');
+        // Tenant-scoped read (security-rules-hardening Phase 3.5): the payments
+        // subcollection rule authorises reads by tenantId, so the query must be
+        // constrained to this tenant. New payment docs carry `tenantId`.
+        const paymentsRef = query(collection(db, 'fees', id, 'payments'), where('tenantId', '==', tenantId));
         const paymentsSnapshot = await getDocs(paymentsRef);
         if (!paymentsSnapshot.empty) {
           paymentsRemoved = paymentsSnapshot.size;

@@ -61,7 +61,11 @@ export function setupChatWebsocket(server: Server): void {
       return;
     }
 
-    if (typeof tokenPayload.email === 'string' && normalizeEmail(tokenPayload.email) !== normalizedUser) {
+    // Require the token to carry the actor's email and match the target user.
+    // The raw master key (no email) is exempt; any other token WITHOUT an email is
+    // rejected rather than skipping the check (security-rules-hardening L5 — close
+    // the email-less fail-open). The system token isn't used for user chat streams.
+    if (!tokenPayload.master && normalizeEmail(tokenPayload.email ?? '') !== normalizedUser) {
       socket.close(4401, 'unauthorized');
       return;
     }

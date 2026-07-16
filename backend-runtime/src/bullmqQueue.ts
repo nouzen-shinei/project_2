@@ -112,6 +112,12 @@ const worker = new Worker(queueName, async job => {
       await db.runTransaction(async (tx) => {
         const snap = await tx.get(ref);
         const existing = snap.exists ? snap.data() || {} : {};
+        // L13: never overwrite a reminderHistory doc owned by a DIFFERENT tenant
+        // (guards against a spoofed historyId targeting another tenant's record).
+        const existingTenantId = (existing as any)?.tenantId;
+        if (snap.exists && typeof existingTenantId === 'string' && existingTenantId && existingTenantId !== tenantId) {
+          return;
+        }
         const existingCreatedAt = (existing as any)?.createdAt;
         const needsCreatedAt = !(existingCreatedAt instanceof admin.firestore.Timestamp);
         const errorMessage =
@@ -145,6 +151,7 @@ const worker = new Worker(queueName, async job => {
           historyId,
           finalStatus: ok ? 'success' : 'failed',
           fallbackTenantId: tenantId,
+          expectedTenantId: tenantId,
           fallbackChannel: 'whatsapp',
         });
       } catch (e) {

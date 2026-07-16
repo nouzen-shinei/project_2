@@ -30,8 +30,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as XLSX from 'xlsx';
 import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
-import { ref, getDownloadURL, deleteObject } from 'firebase/storage';
-import { reconcileTenantStorageUsageViaBackend, uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { reconcileTenantStorageUsageViaBackend, uploadBlobViaBackend, deleteStorageObjectViaBackend } from '../../services/backendStorageUploadService';
 import { maybeShowStorageLimitReachedAlert } from '../../services/storageLimitAlert';
 import { getFirestore as getFirestoreClient, doc as docClient, setDoc as setDocClient, deleteDoc as deleteDocClient, collection as collectionClient } from 'firebase/firestore';
 import { storage } from '../../config/firebase';
@@ -377,7 +376,7 @@ export default function Fees() {
     const runtimeCoverage = runtimeCoverageRef.current.get(studentId);
     return runtimeCoverage?.has(normalizedMonth) ?? false;
   }, [feeCoverageMap]);
-  const { getStudentHistory } = useReminderHistory();
+  const { getStudentHistory, canViewAllReminders } = useReminderHistory();
   // Call all hooks at the top-level before any conditional returns
   const {
     headerCompensation,
@@ -3296,10 +3295,12 @@ export default function Fees() {
       const history = await getStudentHistory(fee.studentId, 50, 'all');
       // Also fetch the full count for the student (across all users)
       try {
-        const total = await reminderHistoryService.getReminderCount(tenantId, null, { studentId: fee.studentId });
+        const total = await reminderHistoryService.getReminderCount(tenantId, canViewAllReminders ? null : (user?.uid || null), { studentId: fee.studentId });
         setStudentTotalReminderCount(total);
-      } catch (e) {
-        logger.warn('Failed to fetch total reminder count for student', e);
+      } catch {
+        // getReminderCount only throws on permission-denied; the service already
+        // logged it (quietly for an expected all-scope denial, loudly for an
+        // unexpected self-scoped one). Just hide the count for this student.
         setStudentTotalReminderCount(null);
       }
       
@@ -3538,58 +3539,16 @@ export default function Fees() {
 
   const deleteReceiptFromStorage = async (receiptUrl: string) => {
     try {
-      logger.debug('Attempting to delete receipt:', receiptUrl); // Debug log
-      
-      // For Firebase Storage, we need to extract the file path from the download URL
-      // URL format: https://firebasestorage.googleapis.com/v0/b/[bucket]/o/[path]?alt=media&token=[token]
-      const url = new URL(receiptUrl);
-      logger.debug('Parsed URL:', url.href); // Debug log
-      
-      const pathSegments = url.pathname.split('/');
-      logger.debug('Path segments:', pathSegments); // Debug log
-      
-      // Find the 'o' segment and get the encoded path after it
-      const oIndex = pathSegments.indexOf('o');
-      if (oIndex !== -1 && oIndex < pathSegments.length - 1) {
-        const encodedPath = pathSegments[oIndex + 1];
-        const filePath = decodeURIComponent(encodedPath);
-        
-        logger.debug('Extracted file path:', filePath); // Debug log
-        
-        const receiptRef = ref(storage, filePath);
-        await deleteObject(receiptRef);
-        logger.debug('Successfully deleted from storage'); // Debug log
-      } else {
-        logger.debug('Could not find o segment, trying fallback method'); // Debug log
-        // Fallback: try to extract path from URL parameters
-        const urlParams = new URLSearchParams(url.search);
-        const altParam = urlParams.get('alt');
-        if (altParam === 'media') {
-          // Try to use the pathname directly
-          const pathWithoutPrefix = url.pathname.replace('/v0/b/', '').split('/o/')[1];
-          if (pathWithoutPrefix) {
-            const filePath = decodeURIComponent(pathWithoutPrefix);
-            logger.debug('Fallback file path:', filePath); // Debug log
-            const receiptRef = ref(storage, filePath);
-            await deleteObject(receiptRef);
-            logger.debug('Successfully deleted from storage (fallback)'); // Debug log
-          } else {
-            logger.error('Could not extract file path from URL pathname:', url.pathname); // Debug log
-            throw new Error('Could not extract file path from URL');
-          }
-        } else {
-          logger.error('Invalid alt parameter:', altParam); // Debug log
-          throw new Error('Invalid Firebase Storage URL format');
-        }
+      // Server-mediated delete (security-rules-hardening M1): client deleteObject
+      // is disabled in storage.rules; the backend resolves the object path from the
+      // URL and verifies it is under this tenant's `receipts/{tenantId}/…` prefix.
+      if (!tenantId) {
+        throw new Error('Select a coaching center before deleting receipts.');
       }
+      await deleteStorageObjectViaBackend({ tenantId, target: receiptUrl });
+      logger.debug('Successfully deleted receipt from storage');
     } catch (error) {
       logger.error('Error deleting receipt from storage:', error);
-      // Add more specific error information
-      if (error instanceof Error) {
-        logger.error('Error name:', error.name);
-        logger.error('Error message:', error.message);
-        logger.error('Error stack:', error.stack);
-      }
       throw error;
     }
   };
@@ -4910,7 +4869,10 @@ export default function Fees() {
                 amount: amountForMessage,
                 paymentDate: paymentDateStr,
                 greeting: 'Dear', // default greeting per requirement
-                additionalNote: paymentForm.notes?.trim() || 'No additional note',
+                // Leave undefined when empty so the backend applies the
+                // language-correct default (English "No additional note" /
+                // Hindi "कोई अतिरिक्त नोट नहीं") per the selected template.
+                additionalNote: paymentForm.notes?.trim() || undefined,
                 teacherName: teacherNameForSig,
                 coachingName: coachingNameForSig,
                 selectedLanguage: paymentForm.selectedLanguage,

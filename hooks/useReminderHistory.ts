@@ -1,4 +1,5 @@
 import { logger } from '@/lib/logger';
+import { isPermissionDeniedError } from '@/lib/firestoreErrors';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from './useAuthUnified';
 import { reminderHistoryService, ReminderHistoryEntry, ReminderBatch } from '../services/reminderHistoryService';
@@ -16,7 +17,34 @@ export interface ReminderHistoryStats {
 
 export function useReminderHistory() {
   const { user } = useAuth();
-  const { activeTenant } = useTenant();
+  const { activeTenant, activeMembership, refreshTenants } = useTenant();
+
+  // Mirror the Firestore `reminderHistory` read rule exactly: only a global admin,
+  // a tenant owner/admin, or (when the tenant flag is enabled) an active member may
+  // read across all users. Everyone else is clamped to their OWN reminders so that
+  // dashboard/fees "all users" reads don't trigger permission-denied errors.
+  const canViewAllReminders =
+    user?.role === 'admin' ||
+    activeMembership?.role === 'owner' ||
+    activeMembership?.role === 'admin' ||
+    !!activeTenant?.settings?.allowNonAdminAllReminderHistory;
+
+  // The tenant doc is fetched once and cached (see useTenantContext.loadTenantsFor),
+  // so a settings change made elsewhere — e.g. an admin turning OFF the non-admin
+  // "all reminders" flag — does NOT propagate to this client until the tenant is
+  // re-fetched. If the server actually denies an 'all'-scope read, our cached
+  // `canViewAllReminders` is stale; force-refresh the tenant so it recomputes to
+  // false and every reminder read (here, on the dashboard, and on fees) clamps to
+  // the caller's own data. Guarded so we only refresh once per stale window.
+  const allScopeDeniedRefreshRef = useRef(false);
+  useEffect(() => {
+    allScopeDeniedRefreshRef.current = false;
+  }, [activeTenant?.id, activeTenant?.settings?.allowNonAdminAllReminderHistory, activeMembership?.role, user?.role]);
+  const handleAllScopeDenied = useCallback(() => {
+    if (allScopeDeniedRefreshRef.current) return;
+    allScopeDeniedRefreshRef.current = true;
+    void Promise.resolve(refreshTenants?.()).catch(() => {});
+  }, [refreshTenants]);
   const [history, setHistory] = useState<ReminderHistoryEntry[]>([]);
   const [batches, setBatches] = useState<ReminderBatch[]>([]);
   const [stats, setStats] = useState<ReminderHistoryStats>({
@@ -76,8 +104,11 @@ export function useReminderHistory() {
     setLoadingMore(false);
     return;
   }
-  // If requesting allUsers, pass null as userId to the service
-  if (!user?.uid && !allUsers) return;
+  // Clamp an 'all users' request down to the current user unless they are actually
+  // authorized to read all reminders (mirrors the Firestore rule). This keeps the
+  // request rule-compatible instead of failing with permission-denied.
+  const effectiveAllUsers = allUsers && canViewAllReminders;
+  if (!user?.uid && !effectiveAllUsers) return;
 
     try {
       if (reset) {
@@ -98,7 +129,7 @@ export function useReminderHistory() {
         days: days ?? currentDaysRef.current,
       };
   setCurrentFilters(filters);
-  currentAllUsersRef.current = allUsers;
+  currentAllUsersRef.current = effectiveAllUsers;
       currentStudentIdRef.current = studentId;
       currentReminderTypeRef.current = reminderType === 'all' ? undefined : reminderType;
       currentStatusRef.current = status === 'all' ? undefined : status;
@@ -107,7 +138,7 @@ export function useReminderHistory() {
 
     const result = await reminderHistoryService.getPaginatedReminderHistory(
       tenantId,
-      allUsers ? null : user?.uid || null,
+      effectiveAllUsers ? null : user?.uid || null,
         pageSize || 20,
     reset ? undefined : lastDocumentRef.current || undefined,
   filters
@@ -131,13 +162,27 @@ export function useReminderHistory() {
       lastDocumentRef.current = result.lastDocument;
       setHasMore(result.hasMore);
     } catch (err) {
-      logger.error('Error loading reminder history:', err);
-      setError(err instanceof Error ? err.message : 'Failed to load reminder history');
+      if (isPermissionDeniedError(err) && effectiveAllUsers) {
+        // Expected/benign: an 'all users' read the caller isn't authorized for.
+        // Degrade to an empty result and self-heal the (likely stale) tenant flag.
+        // The service already logged this at debug, so we don't re-log or surface it.
+        handleAllScopeDenied();
+        if (reset) {
+          setHistory([]);
+        }
+        setHasMore(false);
+        setError(null);
+      } else {
+        // A self-scoped permission-denied (unexpected) OR any non-permission failure.
+        // The service logged it loudly; surface it on screen so a real problem isn't
+        // hidden as "no reminders".
+        setError(err instanceof Error ? err.message : 'Failed to load reminder history');
+      }
     } finally {
       setLoading(false);
       setLoadingMore(false);
     }
-  }, [user?.uid, activeTenant?.id]);
+  }, [user?.uid, activeTenant?.id, canViewAllReminders, handleAllScopeDenied]);
 
   // Load more reminders
   const loadMoreHistory = useCallback(async () => {
@@ -195,7 +240,8 @@ export function useReminderHistory() {
 
   // Load reminder statistics
   const loadStats = useCallback(async (days: number | 'all' = 30, override?: { searchQuery?: string }) => {
-    if (!user?.uid && !currentAllUsersRef.current) return;
+    const statsAllUsers = currentAllUsersRef.current && canViewAllReminders;
+    if (!user?.uid && !statsAllUsers) return;
     const tenantId = activeTenant?.id;
     if (!tenantId) {
       setStatsLoading(false);
@@ -217,7 +263,7 @@ export function useReminderHistory() {
 
     const reminderStats = await reminderHistoryService.getReminderStats(
         tenantId,
-        currentAllUsersRef.current ? null : (user?.uid || null),
+        statsAllUsers ? null : (user?.uid || null),
         days,
         {
           studentId: currentStudentIdRef.current,
@@ -228,18 +274,36 @@ export function useReminderHistory() {
       );
       setStats(reminderStats);
     } catch (err) {
-      logger.error('Error loading reminder stats:', err);
-      setError(err instanceof Error ? err.message : 'Failed to load reminder stats');
+      if (isPermissionDeniedError(err) && statsAllUsers) {
+        // Expected/benign all-scope stats denial. Reset to zero and self-heal the
+        // (likely stale) tenant flag. The service already logged this at debug.
+        handleAllScopeDenied();
+        setStats({
+          totalReminders: 0,
+          successfulReminders: 0,
+          failedReminders: 0,
+          pendingReminders: 0,
+          remindersByType: {},
+          remindersByStatus: {},
+        });
+        setError(null);
+      } else {
+        // A self-scoped permission-denied (unexpected) — the service logged it loudly;
+        // surface it so a real regression isn't hidden as "zero reminders".
+        setError(err instanceof Error ? err.message : 'Failed to load reminder stats');
+      }
     } finally {
   setStatsLoading(false);
     }
-  }, [user?.uid, activeTenant?.id]);
+  }, [user?.uid, activeTenant?.id, canViewAllReminders, handleAllScopeDenied]);
 
   // Get history for a specific student
   const getStudentHistory = useCallback(async (studentId: string, limit?: number, scope: 'mine' | 'all' = 'all') => {
-    // For dashboard/fees views we want to see all users by default
-    // scope='mine' preserves legacy behavior
-    const userFilter = scope === 'mine' ? (user?.uid || null) : null;
+    // For dashboard/fees views we want to see all users by default, but only if the
+    // current user is authorized to (mirrors the Firestore rule). Otherwise clamp to
+    // their own reminders so the read doesn't get rejected.
+    const readsAllUsers = scope === 'all' && canViewAllReminders;
+    const userFilter = readsAllUsers ? null : (user?.uid || null);
     const tenantId = activeTenant?.id;
     if (!tenantId) {
       return [];
@@ -254,15 +318,23 @@ export function useReminderHistory() {
       );
       return studentHistory;
     } catch (err) {
-      logger.error('Error loading student reminder history:', err);
+      // Only an all-scope denial is benign — self-heal the likely-stale tenant flag.
+      // A self-scoped denial was already logged loudly by the service. Either way this
+      // is a secondary widget, so return empty (the primary list surfaces real errors).
+      if (isPermissionDeniedError(err) && readsAllUsers) {
+        handleAllScopeDenied();
+      }
       return [];
     }
-  }, [user?.uid, activeTenant?.id]);
+  }, [user?.uid, activeTenant?.id, canViewAllReminders, handleAllScopeDenied]);
 
   // Get recent reminders
   const getRecentReminders = useCallback(async (limit: number = 10, scope: 'mine' | 'all' = 'all') => {
-    // Default to all users for dashboard display
-    const userFilter = scope === 'mine' ? (user?.uid || null) : null;
+    // Default to all users for dashboard display, but only when the current user is
+    // authorized to read all reminders (mirrors the Firestore rule). Otherwise clamp
+    // to their own reminders to avoid a permission-denied read.
+    const readsAllUsers = scope === 'all' && canViewAllReminders;
+    const userFilter = readsAllUsers ? null : (user?.uid || null);
     const tenantId = activeTenant?.id;
     if (!tenantId) {
       return [];
@@ -272,10 +344,15 @@ export function useReminderHistory() {
       const recentReminders = await reminderHistoryService.getReminderHistory(tenantId, userFilter, limit);
       return recentReminders;
     } catch (err) {
-      logger.error('Error loading recent reminders:', err);
+      // Only an all-scope denial is benign — self-heal the likely-stale tenant flag.
+      // A self-scoped denial was already logged loudly by the service. Either way this
+      // is a secondary widget, so return empty (the primary list surfaces real errors).
+      if (isPermissionDeniedError(err) && readsAllUsers) {
+        handleAllScopeDenied();
+      }
       return [];
     }
-  }, [user?.uid, activeTenant?.id]);
+  }, [user?.uid, activeTenant?.id, canViewAllReminders, handleAllScopeDenied]);
 
   // Refresh all data
   const refresh = useCallback(async () => {
@@ -337,5 +414,6 @@ export function useReminderHistory() {
     
     // Utilities
     isAuthenticated: !!user?.uid,
+    canViewAllReminders,
   };
 }

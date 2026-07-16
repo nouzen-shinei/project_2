@@ -278,13 +278,13 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
 
   const handleRevokeCode = useCallback(
     async (codeId: string) => {
-      if (!user?.uid) {
-        Alert.alert('Unable to revoke', 'Sign in again to manage join codes.');
+      if (!user?.uid || !activeTenant?.id) {
+        Alert.alert('Unable to revoke', 'Sign in and select a coaching center first.');
         return;
       }
       setRevokingCodeId(codeId);
       try {
-        await tenantService.revokeCode(codeId, user.uid);
+        await tenantService.revokeCode(activeTenant.id, codeId, user.uid);
         Toast.show({
           type: 'info',
           text1: 'Join code revoked',
@@ -305,7 +305,7 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
         setRevokingCodeId(null);
       }
     },
-    [user?.uid],
+    [activeTenant?.id, user?.uid],
   );
 
   const closeRevokeModal = useCallback(() => {

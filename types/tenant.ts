@@ -51,6 +51,11 @@ export interface TenantSettings {
   notifyOnJoinRequest: boolean;
   notifyViaEmail: boolean;
   inviteExpiryDaysDefault: number;
+  // Tenant-scoped visibility policies (security-rules-hardening H2 — moved off the
+  // global appSettings/globalSettings doc so they are per-tenant and only
+  // owner/admin-editable via the backend). Absent ⇒ treated as false (restrictive).
+  allowNonAdminAllReminderHistory?: boolean;
+  hideAuthorizedEmailsForNonAdmins?: boolean;
 }
 
 export interface TenantNotificationPreferences {

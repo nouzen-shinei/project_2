@@ -299,7 +299,10 @@ export function decodeInternalToken(token: string | undefined | null): InternalT
     return null;
   }
   const expected = crypto.createHmac('sha256', master).update(payload).digest('base64url');
-  if (expected !== signature) {
+  // Constant-time comparison to avoid leaking signature bytes via timing (L1).
+  const expectedBuf = Buffer.from(expected);
+  const signatureBuf = Buffer.from(signature);
+  if (expectedBuf.length !== signatureBuf.length || !crypto.timingSafeEqual(expectedBuf, signatureBuf)) {
     return null;
   }
   try {

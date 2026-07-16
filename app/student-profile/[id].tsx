@@ -192,10 +192,11 @@ export default function StudentProfile() {
   ): Promise<{ url: string | null; skippedBecauseStorageLimit: boolean; failed: boolean }> => {
     try {
       setIsUploadingImage(true);
+      const tenantId = (activeTenant?.id || student?.tenantId || '').trim();
       // Delete old profile image if it exists
       if (existingImageUrl) {
         try {
-          await chatService.deleteProfilePicture(existingImageUrl);
+          await chatService.deleteProfilePicture(existingImageUrl, tenantId);
           logger.debug('Old student profile picture deleted successfully');
         } catch (deleteError) {
           logger.warn('Failed to delete old student profile picture:', deleteError);
@@ -203,7 +204,6 @@ export default function StudentProfile() {
         }
       }
       
-      const tenantId = (activeTenant?.id || student?.tenantId || '').trim();
       if (!tenantId) {
         throw new Error('Select a coaching center before uploading student profile images.');
       }

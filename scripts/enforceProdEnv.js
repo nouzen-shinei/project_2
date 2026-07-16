@@ -73,12 +73,17 @@ if (buildEnv !== 'development') {
   // preview/production. These are all "insecure by design" escape hatches
   // (direct third-party API tokens, internal auth bypass secrets, or a
   // reviewer bypass join code) that are safe only on developer machines.
+  //
+  // Defense-in-depth: the client-side WhatsApp (WABA) direct-send path and its
+  // access token were removed entirely — all WhatsApp delivery now goes through
+  // the backend queue. No client code reads EXPO_PUBLIC_WABA_ACCESS_TOKEN, but we
+  // keep this guard so a token can never be reintroduced into a shipped bundle.
   if ((env.EXPO_PUBLIC_WABA_ACCESS_TOKEN || '').trim()) {
-    fail('EXPO_PUBLIC_WABA_ACCESS_TOKEN (dev-only direct WhatsApp token) must not be set for ' + buildEnv + ' builds. Use the backend proxy instead.');
+    fail('EXPO_PUBLIC_WABA_ACCESS_TOKEN must not be set for ' + buildEnv + ' builds. The client-side WhatsApp token path was removed; all WhatsApp delivery is backend-handled.');
   }
-  if ((env.EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET || '').trim()) {
-    fail('EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET (dev-only auth bypass) must not be set for ' + buildEnv + ' builds.');
-  }
+  // NOTE: EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET is intentionally no longer checked
+  // here — the client dev-secret token flow was removed entirely; the client only
+  // uses the Firebase ID token -> /auth/bridge exchange, so the var is unused.
   if (isTruthy(env.EXPO_PUBLIC_REVIEWER_QUICK_JOIN_ENABLED)) {
     warn('EXPO_PUBLIC_REVIEWER_QUICK_JOIN_ENABLED=1 in ' + buildEnv + '. Confirm this temporary reviewer bypass is still intended before shipping; disable it after the review window (see docs/reviewer-quick-join-temporary.md).');
   }

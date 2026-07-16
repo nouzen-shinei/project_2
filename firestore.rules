@@ -5,20 +5,16 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    // Fetch global app settings used for feature flags
-    function settings() {
-      return get(/databases/$(database)/documents/appSettings/globalSettings).data;
-    }
-
-    // Feature flags from settings
-    function allowAllReminderHistory() {
-      return exists(/databases/$(database)/documents/appSettings/globalSettings) &&
-        settings().allowNonAdminAllReminderHistory == true;
-    }
-
-    function hideAuthorizedEmailsForNonAdmins() {
-      return exists(/databases/$(database)/documents/appSettings/globalSettings) &&
-        settings().hideAuthorizedEmailsForNonAdmins == true;
+    // Tenant-scoped visibility policy (security-rules-hardening H2): the
+    // "let non-admins view ALL reminder history" flag now lives on the OWNING
+    // tenant's settings map (tenants/{tenantId}.settings), not the world-writable
+    // global appSettings/globalSettings doc. A missing tenant, missing settings
+    // map, or missing flag ⇒ false (restrictive default).
+    function tenantAllowsAllReminderHistory(tenantId) {
+      return tenantId is string
+        && exists(/databases/$(database)/documents/tenants/$(tenantId))
+        && get(/databases/$(database)/documents/tenants/$(tenantId))
+             .data.get('settings', {}).get('allowNonAdminAllReminderHistory', false) == true;
     }
 
     function tenantMembershipDocId(tenantId) {
@@ -35,6 +31,36 @@ service cloud.firestore {
         tenantMembership(tenantId).data.role == 'admin' ||
         tenantMembership(tenantId).data.role == 'staff'
       );
+    }
+
+    // Tenant OWNER/ADMIN only (excludes 'staff'). Used where "non-admins" — which
+    // includes staff — must be gated by a tenant setting (e.g. the reminder-history
+    // "allow non-admins to view ALL" flag): only owner/admin see everything
+    // unconditionally; staff + members are flag-gated.
+    function hasTenantAdminAccess(tenantId) {
+      return isSignedIn() && tenantMembership(tenantId).data.status == 'active' && (
+        tenantMembership(tenantId).data.role == 'owner' ||
+        tenantMembership(tenantId).data.role == 'admin'
+      );
+    }
+
+    // Active membership of a tenant, ANY role (owner/admin/staff/member) — used to
+    // scope tenant-owned records (e.g. students) to members of the OWNING tenant.
+    // A missing membership doc makes tenantMembership(...).data error → denies,
+    // which is exactly the cross-tenant block we want (security-rules-hardening H4).
+    function isActiveTenantMember(tenantId) {
+      return isSignedIn()
+        && tenantId is string
+        && tenantMembership(tenantId).data.status == 'active';
+    }
+
+    // True when `email` equals the caller's own (lower-cased) auth email. Used to
+    // let a user manage their OWN tenant-scoped profile/presence doc regardless of
+    // role, while others require staff access. Guards against a null token email.
+    function isSelfEmail(email) {
+      return isSignedIn()
+        && request.auth.token.email != null
+        && email == request.auth.token.email.lower();
     }
 
   // Admin check via custom auth claims (set by backend/admin tooling).
@@ -81,87 +107,240 @@ service cloud.firestore {
 
     // Reminder History: restrict reads to owner unless the flag allows all
     match /reminderHistory/{docId} {
-      // Reads: allow all when flag is on or admin; otherwise only owner
+      // Reads: owner always; global admin always; otherwise only when the OWNING
+      // tenant enabled `allowNonAdminAllReminderHistory` AND the caller is an
+      // active member of that tenant (security-rules-hardening H2, tenant-scoped).
       allow read: if isSignedIn() && (
-        allowAllReminderHistory() || isAdmin() || resource.data.userId == request.auth.uid
+        isAdmin()
+        || resource.data.userId == request.auth.uid
+        || hasTenantAdminAccess(resource.data.tenantId)
+        || (tenantAllowsAllReminderHistory(resource.data.tenantId) && isActiveTenantMember(resource.data.tenantId))
       );
       // Writes: only the owner can write their own history documents
       allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
       allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
     }
 
-    // Students: allow reads/updates as before, but block client-side creation so limits can be enforced by backend.
+    // Students (security-rules-hardening, finding H4): tenant-scoped.
+    // Reads/updates/deletes are limited to active members of the student's OWNING
+    // tenant (any role) or a global admin — closing the cross-tenant IDOR where any
+    // signed-in user could read/modify/delete any tenant's students. All client
+    // student queries already filter `where('tenantId','==',tenantId)`, so the
+    // list rule is satisfiable; studentService also re-checks tenant ownership.
+    // Creation stays backend-only so plan limits are enforced server-side.
+    // NOTE: also excluded from the trailing default fallback so its permissive
+    // `isSignedIn()` grant cannot re-open it.
     match /students/{studentId} {
-      allow read: if isSignedIn();
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
       allow create: if false;
-      allow update, delete: if isSignedIn();
+      allow update, delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
     }
 
-    // Reminder Batches: same visibility as reminder history
+    // Attendance (security-rules-hardening, Phase 3.5 extension — same model as
+    // students/H4): tenant-scoped to active members of the OWNING tenant (any
+    // role) or a global admin. Every client attendance query filters
+    // `where('tenantId','==',tenantId)` (attendanceService + the student-deletion
+    // cleanup in students.tsx, which was updated to add the tenant filter), and
+    // every write is tagged with the caller's tenantId, so this closes the
+    // cross-tenant IDOR where any signed-in user could read/modify another
+    // tenant's attendance. Client create/update/delete stay allowed in-tenant;
+    // tenantId is immutable on update. Excluded from the permissive fallback.
+    match /attendance/{attendanceId} {
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isActiveTenantMember(request.resource.data.tenantId);
+      allow update: if (isActiveTenantMember(resource.data.tenantId) || isAdmin())
+        && request.resource.data.tenantId == resource.data.tenantId;
+      allow delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+    }
+
+    // Notices (security-rules-hardening, Phase 3.5 extension): tenant-scoped. The
+    // only client notices query filters `where('tenantId','==',tenantId)`
+    // (useNotices), and creates/updates (post, view-count, reactions) are done by
+    // active members of the owning tenant. DELETES are backend-only
+    // (noticeBackendClient → Admin SDK, which enforces role/ownership and bypasses
+    // these rules), so client delete is denied. tenantId is immutable on update.
+    // Excluded from the permissive fallback.
+    match /notices/{noticeId} {
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isActiveTenantMember(request.resource.data.tenantId);
+      allow update: if (isActiveTenantMember(resource.data.tenantId) || isAdmin())
+        && request.resource.data.tenantId == resource.data.tenantId;
+      allow delete: if false;
+    }
+
+    // Fees + payment sub-records (security-rules-hardening, Phase 3.5). Tenant-
+    // scoped like students/attendance. Every client fee query filters
+    // `where('tenantId','==',tenantId)` (useFees, studentService, the students.tsx
+    // deletion cleanup), and the payments-history screen now issues a
+    // tenant-constrained `collectionGroup('payments')` query (usePaymentsHistory
+    // was migrated off the old cross-tenant scan). Payment sub-docs carry their
+    // own `tenantId` (written by fees.tsx). Reads/writes are scoped to active
+    // members of the OWNING tenant (any role) or a global admin; `tenantId` is
+    // immutable on update. Excluded from the permissive fallback.
+    match /fees/{feeId} {
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isActiveTenantMember(request.resource.data.tenantId);
+      allow update: if (isActiveTenantMember(resource.data.tenantId) || isAdmin())
+        && request.resource.data.tenantId == resource.data.tenantId;
+      allow delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+    }
+
+    // Payment sub-records live at `fees/{feeId}/payments/{paymentId}`. A RECURSIVE
+    // collection-group match is required so the payments-history screen's
+    // `collectionGroup('payments')` query is authorised — a nested match under
+    // /fees/{feeId} does NOT cover collection-group queries. Scoped by the payment
+    // doc's own tenantId (written by fees.tsx); the client always constrains reads
+    // with `where('tenantId','==',tenantId)`, and this same rule also covers the
+    // direct `fees/{id}/payments` subcollection reads/writes.
+    match /{path=**}/payments/{paymentId} {
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isActiveTenantMember(request.resource.data.tenantId);
+      allow update: if (isActiveTenantMember(resource.data.tenantId) || isAdmin())
+        && request.resource.data.tenantId == resource.data.tenantId;
+      allow delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Remaining client collections (security-rules-hardening, Phase 3.5) — given
+    // explicit rules so the permissive fallback can be collapsed to deny-all.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // User profile docs (uid-keyed): a signed-in user may read/write ONLY their
+    // own doc (`users/{uid}` where uid == auth.uid). All client access is self
+    // (useAuthUnified + settings.tsx); cross-user display data lives in
+    // tenantProfiles. No cross-user access.
+    match /users/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Device action log (append-only). The client only appends via
+    // logDeviceAction (best-effort, errors swallowed); the history reader methods
+    // have no callers. Reads: global admin only (diagnostics). Appends: any
+    // signed-in user (their own device lifecycle events). No update/delete.
+    match /device_actions/{actionId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+    // Admin notification history (contains recipient emails / delivery PII).
+    // Scoped to a global admin or active staff of the OWNING tenant. Global-scoped
+    // entries (tenantId '__global__') are admin-only because
+    // hasTenantStaffAccess('__global__') is false. Deletes are admin-only. All
+    // client writes here degrade gracefully (the sender flow swallows failures).
+    match /admin_notification_history/{docId} {
+      allow read: if isAdmin()
+        || (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId));
+      allow create: if isAdmin()
+        || (request.resource.data.tenantId is string && hasTenantStaffAccess(request.resource.data.tenantId));
+      allow update: if isAdmin()
+        || (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId));
+      allow delete: if isAdmin();
+    }
+
+    // Legacy data-import collections: only written by the client during data
+    // import (tagged with tenantId) and never read by the client. Tenant-scoped to
+    // active members of the owning tenant or a global admin.
+    match /deviceTracking/{docId} {
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isActiveTenantMember(request.resource.data.tenantId);
+      allow update, delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+    }
+    match /quotes/{docId} {
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isActiveTenantMember(request.resource.data.tenantId);
+      allow update, delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+    }
+
+    // Shared-file share-link records: managed entirely by the backend
+    // (`/shared-files/*` endpoints via the Admin SDK, which bypasses these rules).
+    // The app client never reads/writes this collection directly. No client access.
+    match /sharedFiles/{shareId} {
+      allow read, write: if false;
+    }
+
+    // Reminder Batches: same visibility as reminder history (tenant-scoped H2).
     match /reminderBatches/{docId} {
       allow read: if isSignedIn() && (
-        allowAllReminderHistory() || isAdmin() || resource.data.userId == request.auth.uid
+        isAdmin()
+        || resource.data.userId == request.auth.uid
+        || hasTenantAdminAccess(resource.data.tenantId)
+        || (tenantAllowsAllReminderHistory(resource.data.tenantId) && isActiveTenantMember(resource.data.tenantId))
       );
       allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
       allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
     }
 
-    // Authorized Emails: when hidden, only allow users to read their own entry
+    // Authorized Emails (security-rules-hardening H3): legacy team-roster
+    // collection. The client no longer reads or writes it directly — the team
+    // roster is served by tenantMemberships/tenantProfiles, and role/status
+    // changes are backend-mediated. Lock it down: a signed-in user may read only
+    // their own entry, global admins may read all, and ALL client writes are
+    // denied (any legacy maintenance runs via the Admin SDK, which bypasses these
+    // rules). Excluded from the permissive fallback so this is authoritative.
     match /authorizedEmails/{docId} {
-      // Read rules
       allow get: if isSignedIn() && (
-        isAdmin() || !hideAuthorizedEmailsForNonAdmins() || resource.data.email == request.auth.token.email
+        isAdmin() || resource.data.email == request.auth.token.email
       );
-      // List: allow admins always; block non-admins when hidden; allow when visible
-      allow list: if isSignedIn() && (
-        isAdmin() || !hideAuthorizedEmailsForNonAdmins()
-      );
-
-      // Writes: keep permissive for now (client admin UI enforces role)
-      allow create, update, delete: if isSignedIn();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
     }
 
-    // Tenant-scoped profile records (source of truth for per-tenant user profile fields)
+    // Tenant-scoped profile records (per-tenant user profile fields; doc id is
+    // `${tenantId}_${emailKey}`). security-rules-hardening Phase 3.5 — rewritten to
+    // match real usage so it survives the fallback collapse:
+    //   - Read: any ACTIVE MEMBER of the owning tenant (the chat/team UI lists all
+    //     teammates via where('tenantId','==',tenantId)), or a global admin.
+    //   - Create (doc absent): the profile owner (email == self) in a tenant they
+    //     belong to, or staff managing a member's profile, or admin. Requires the
+    //     payload to carry tenantId+email (updateTenantProfilesForUser does).
+    //   - Update (doc present): authorised off the EXISTING doc so merge-writes
+    //     that omit tenantId/email (pinned-chats, default-photo, role mirror) still
+    //     work — the owner or staff of the owning tenant, or admin.
     match /tenantProfiles/{docId} {
-      allow get, list: if isSignedIn() && (
-        (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId)) ||
-        isAdmin()
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isAdmin() || (
+        request.resource.data.tenantId is string
+        && isActiveTenantMember(request.resource.data.tenantId)
+        && (isSelfEmail(request.resource.data.email) || hasTenantStaffAccess(request.resource.data.tenantId))
       );
-
-      allow create, update: if isSignedIn() && (
-        (
-          request.resource.data.tenantId is string &&
-          hasTenantStaffAccess(request.resource.data.tenantId) &&
-          request.resource.data.email == request.auth.token.email
-        ) ||
-        isAdmin()
-      );
-
+      allow update: if isAdmin()
+        || isSelfEmail(resource.data.email)
+        || (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId));
       allow delete: if isAdmin();
     }
 
-    // Tenant-scoped presence records (online/lastSeen/typing)
+    // Tenant-scoped presence records (online/lastSeen/typing; doc id
+    // `${tenantId}_${emailKey}`). Same access model as tenantProfiles
+    // (security-rules-hardening Phase 3.5). updateTenantPresenceForUser always
+    // writes tenantId+email, so create is clean; updates authorise off the
+    // existing doc. Read is scoped to active members of the owning tenant so the
+    // chat presence listener (where('tenantId','==',tenantId)) keeps working.
     match /tenantPresence/{docId} {
-      allow get, list: if isSignedIn() && (
-        (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId)) ||
-        isAdmin()
+      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
+      allow create: if isAdmin() || (
+        request.resource.data.tenantId is string
+        && isActiveTenantMember(request.resource.data.tenantId)
+        && (isSelfEmail(request.resource.data.email) || hasTenantStaffAccess(request.resource.data.tenantId))
       );
-
-      allow create, update: if isSignedIn() && (
-        (
-          request.resource.data.tenantId is string &&
-          hasTenantStaffAccess(request.resource.data.tenantId) &&
-          request.resource.data.email == request.auth.token.email
-        ) ||
-        isAdmin()
-      );
-
+      allow update: if isAdmin()
+        || isSelfEmail(resource.data.email)
+        || (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId));
       allow delete: if isAdmin();
     }
 
-    // App settings: readable and writable to authenticated users (admin UI is client-side)
+    // App settings (security-rules-hardening H2): the global appSettings/* docs
+    // (globalSettings feature flags, runtimeEndpoints, reminderChannels) are read
+    // by signed-in clients but are editable only by GLOBAL ADMINS. Runtime/channel
+    // docs are written by the operator admin-console through backend endpoints
+    // (Admin SDK, which bypasses these rules); globalSettings is edited from the
+    // admin-console "Global Settings" panel. The tenant-scoped visibility flags
+    // that the rules above trust were MOVED off this doc onto tenants/{id}.settings,
+    // so a compromised client can no longer flip a rule-trusted flag here.
+    // Excluded from the permissive fallback so `write: if isAdmin()` is authoritative.
     match /appSettings/{docId} {
-      allow read, write: if isSignedIn();
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
 
     // Video transcode results: written by the backend, readable by authenticated users.
@@ -264,13 +443,188 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Default fallback: keep existing permissive behavior for other collections.
-    // The four device-tracking collections above are excluded here so their
-    // tighter rules are authoritative (Firestore allows access if ANY matching
-    // rule grants it, so leaving them in scope would re-open client writes).
-    match /{collection}/{document=**} {
-      allow read, write: if isSignedIn()
-        && !(collection in ['user_devices', 'device_bans', 'logout_signals', 'deviceAuditLogs']);
+    // ─────────────────────────────────────────────────────────────────────────
+    // Backend-only billing / webhook / system collections
+    // (security-rules-hardening, finding C1).
+    //
+    // These are written EXCLUSIVELY by backend-runtime via the Admin SDK (which
+    // bypasses these rules) and are NEVER read or written by the app client
+    // directly — verified: zero client references across services/hooks/app/
+    // components/lib/utils. Client-facing billing data is served through
+    // authenticated backend endpoints (/billing/*), not direct Firestore.
+    //   - ALL client writes are DENIED (closes the billing-tier / plan / quota
+    //     tampering vector and the invoice-PII cross-tenant read vector).
+    //   - Reads are scoped to the owning tenant's active staff (or a global admin)
+    //     where a tenant is identifiable; purely-internal collections deny client
+    //     reads outright. The Admin SDK is unaffected by any of this.
+    // These collections are ALSO excluded from the trailing default fallback so
+    // its permissive `isSignedIn()` grant cannot re-open them (Firestore grants
+    // access when ANY matching rule allows it).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Tenant subscription/billing state (planId, quotas snapshot, subscription id).
+    match /tenantBilling/{tenantId} {
+      allow read: if hasTenantStaffAccess(tenantId) || isAdmin();
+      allow write: if false;
+    }
+
+    // Per-tenant invoices (payer email, masked instrument, amounts) + parent doc.
+    match /billingInvoices/{tenantId} {
+      allow read: if hasTenantStaffAccess(tenantId) || isAdmin();
+      allow write: if false;
+      match /invoices/{invoiceId} {
+        allow read: if hasTenantStaffAccess(tenantId) || isAdmin();
+        allow write: if false;
+      }
+    }
+
+    // Hosted-checkout session records + per-tenant checkout locks (transient/internal).
+    // Sessions are resolved server-side via /billing/checkout/session-public.
+    match /billingCheckoutSessions/{sessionId} {
+      allow read, write: if false;
+    }
+    match /billingCheckoutLocks/{tenantId} {
+      allow read, write: if false;
+    }
+
+    // Provider webhook idempotency + ops/backfill diagnostics + distributed locks
+    // + global counters + security audit trail — all backend-only.
+    match /webhookEvents/{eventId} {
+      allow read, write: if false;
+    }
+    match /billingOpsEvents/{eventId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+    match /billingBackfillRuns/{runId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+    match /billingLocks/{lockId} {
+      allow read, write: if false;
+    }
+    match /systemCounters/{counterId} {
+      allow read, write: if false;
+    }
+    match /adminSecurityAuditLogs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Tenant lifecycle collections (security-rules-hardening, finding C1 — core).
+    //
+    // All WRITES are now performed exclusively by backend-runtime via the Admin
+    // SDK (server-mediated tenant create/update/leave, membership role/status,
+    // invite + join-request lifecycle, join codes, and the audit trail). The app
+    // client calls authenticated backend endpoints (services/tenantBackendClient)
+    // instead of writing these docs directly — closing the privilege-escalation
+    // vector where any signed-in user could self-grant owner/admin, tamper a
+    // tenant's billing tier / quota fields, forge invites or join codes, approve
+    // their own join requests, or tamper the audit trail by writing Firestore
+    // directly. The Admin SDK bypasses these rules, so backend writes are
+    // unaffected.
+    //   - Client writes: DENIED for all of these collections.
+    //   - Reads: scoped per collection to the owning tenant's members / the row
+    //     owner / the invitee (by email) / global admins. Only the `tenants` doc
+    //     itself stays signed-in-readable (invite-acceptance preview needs it).
+    // These collections are ALSO excluded from the trailing default fallback so
+    // its permissive `isSignedIn()` grant cannot re-open writes.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Tenant documents. Editable fields are updated via POST /tenants/:id/update
+    // (owner/admin) and created via POST /tenants; identity, billing, quotas and
+    // membership counts are never client-settable. Client-managed per-tenant
+    // subcollections (e.g. settings/reminders) keep their previous access.
+    // Reads stay open to any signed-in user because the invite-acceptance preview
+    // (components/InviteOverlay) legitimately reads a tenant the invitee is NOT
+    // yet a member of; the tenant doc holds low-sensitivity fields (name, contact,
+    // tier) and all writes are locked, so this is an accepted residual.
+    match /tenants/{tenantId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+
+      // Per-tenant settings docs (e.g. settings/reminders) are still managed by
+      // the client (reminderSettingsService). A recursive wildcard here would also
+      // re-match the parent tenant doc and re-open its writes, so scope explicitly
+      // to the settings subcollection.
+      match /settings/{settingsDoc} {
+        allow read, write: if isSignedIn();
+      }
+    }
+
+    // Tenant memberships: roles / status / member PII. Reads are scoped to the
+    // caller's own membership rows and to active members of the same tenant (team
+    // lists); global admins may read all. All writes are backend-only.
+    match /tenantMemberships/{membershipId} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        // The caller reading their OWN membership rows by email — powers
+        // getUserRole()/role-refresh, which query `where('email','==',self)`
+        // before a uid is necessarily linked. Only ever matches the caller's own
+        // rows, so it's not a cross-user leak (mirrors the tenantInvites rule).
+        (request.auth.token.email != null && resource.data.email == request.auth.token.email.lower()) ||
+        isActiveTenantMember(resource.data.tenantId) ||
+        isAdmin()
+      );
+      allow write: if false;
+    }
+
+    // Invites carry the invitee's email + role. Reads are scoped to: the invitee
+    // (their own email — powers the incoming-invite list and the invite-link
+    // preview), any active member of the owning tenant (admin invite management +
+    // the member-visible team list), or a global admin. All writes backend-only.
+    match /tenantInvites/{inviteId} {
+      allow read: if isSignedIn() && (
+        (request.auth.token.email != null && resource.data.email == request.auth.token.email.lower()) ||
+        isActiveTenantMember(resource.data.tenantId) ||
+        isAdmin()
+      );
+      allow write: if false;
+    }
+    // Join requests carry applicant email / name / message. Reads are scoped to
+    // the requester (their own request) or any active member of the owning tenant
+    // (the review listener is attached for every active member), or a global
+    // admin. All writes backend-only.
+    match /tenantJoinRequests/{requestId} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        isActiveTenantMember(resource.data.tenantId) ||
+        isAdmin()
+      );
+      allow write: if false;
+    }
+    // Join codes grant tenant access, so scope reads to the owning tenant's staff
+    // (owner/admin/staff) or a global admin. All writes backend-only.
+    match /tenantCodes/{codeId} {
+      allow read: if hasTenantStaffAccess(resource.data.tenantId) || isAdmin();
+      allow write: if false;
+    }
+
+    // Tenant audit trail: not read by the client (admins use backend endpoints);
+    // scope reads to global admins / active tenant staff. Writes backend-only.
+    match /tenantAuditLogs/{logId} {
+      allow read: if isAdmin() ||
+        (resource.data.tenantId is string && hasTenantStaffAccess(resource.data.tenantId));
+      allow write: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DENY-BY-DEFAULT (security-rules-hardening, Phase 3.5 — COMPLETE).
+    //
+    // The former permissive `allow read, write: if isSignedIn()` catch-all has
+    // been REMOVED. Every collection the app client legitimately accesses now has
+    // an explicit, scoped rule above (tenant collections, domain collections —
+    // students/attendance/notices/fees/payments — reminderHistory/reminderBatches,
+    // tenantProfiles/tenantPresence, users, device_actions,
+    // admin_notification_history, deviceTracking/quotes, sharedFiles, appSettings,
+    // videoTranscodes, appConfig, and the device-tracking + billing/system
+    // collections). Anything else — including unknown or future collections — is
+    // denied to the client SDK by this terminal rule. backend-runtime uses the
+    // Firebase Admin SDK, which bypasses all of these rules.
+    // ─────────────────────────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

@@ -66,14 +66,22 @@ type VideoProbeInfo = {
  *
  * Silent version — returns defaults on any error (backward compat).
  */
+// Run ffprobe via execFile (argv, NO shell) so a crafted file path can never be
+// interpreted as a shell command (security-rules-hardening L12). Paths are always
+// absolute temp paths, so they can't be mistaken for an ffprobe option either.
+function runFfprobe(args: string[]): string {
+  return child_process
+    .execFileSync('ffprobe', args, { timeout: 15_000, encoding: 'utf8' })
+    .trim();
+}
+
 function probeVideo(filePath: string): VideoProbeInfo {
   try {
-    const output = child_process.execSync(
-      `ffprobe -v quiet -select_streams v:0 ` +
-      `-show_entries stream=codec_name,pix_fmt ` +
-      `-of csv=p=0 "${filePath}"`,
-      { timeout: 15_000, encoding: 'utf8' }
-    ).trim();
+    const output = runFfprobe([
+      '-v', 'quiet', '-select_streams', 'v:0',
+      '-show_entries', 'stream=codec_name,pix_fmt',
+      '-of', 'csv=p=0', filePath,
+    ]);
 
     // output format: "codec_name,pix_fmt"
     const [codec, pixFmt] = output.split(',').map(s => s.trim().toLowerCase());
@@ -99,12 +107,11 @@ export function probeInputVideo(filePath: string): VideoProbeInfo {
   // non-zero exit. An empty result means the codec is unidentifiable (not that
   // the file is absent), so we fall through to a container-level fallback.
   try {
-    const output = child_process.execSync(
-      `ffprobe -v quiet -select_streams v:0 ` +
-      `-show_entries stream=codec_name,pix_fmt ` +
-      `-of csv=p=0 "${filePath}"`,
-      { timeout: 15_000, encoding: 'utf8' }
-    ).trim();
+    const output = runFfprobe([
+      '-v', 'quiet', '-select_streams', 'v:0',
+      '-show_entries', 'stream=codec_name,pix_fmt',
+      '-of', 'csv=p=0', filePath,
+    ]);
 
     if (output) {
       // Take only the first line (guard against multi-stream output).
@@ -129,10 +136,9 @@ export function probeInputVideo(filePath: string): VideoProbeInfo {
   // compatible H.264 is harmless; skipping a HEVC that looks codec-free causes
   // playback failures on Android Chrome.
   try {
-    const fallbackOutput = child_process.execSync(
-      `ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
-      { timeout: 15_000, encoding: 'utf8' }
-    ).trim();
+    const fallbackOutput = runFfprobe([
+      '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath,
+    ]);
 
     if (fallbackOutput) {
       console.warn(
@@ -164,13 +170,12 @@ export function probeInputVideo(filePath: string): VideoProbeInfo {
  * Requirements: 6.1, 6.2, 6.3, 6.4
  */
 export function verifyOutputFile(outputPath: string): VideoProbeInfo {
-  // execSync throws by default on non-zero exit code
-  const output = child_process.execSync(
-    `ffprobe -v quiet -select_streams v:0 ` +
-    `-show_entries stream=codec_name,pix_fmt ` +
-    `-of csv=p=0 "${outputPath}"`,
-    { timeout: 15_000, encoding: 'utf8' }
-  ).trim();
+  // execFileSync throws by default on non-zero exit code
+  const output = runFfprobe([
+    '-v', 'quiet', '-select_streams', 'v:0',
+    '-show_entries', 'stream=codec_name,pix_fmt',
+    '-of', 'csv=p=0', outputPath,
+  ]);
 
   if (!output) {
     const err = new Error(`verifyOutputFile: no video stream found in "${outputPath}"`);

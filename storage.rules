@@ -8,12 +8,14 @@ service firebase.storage {
       // Allow SDK reads for authenticated users
       allow get: if request.auth != null;
 
-      // Backend-mediated uploads: block client-side creates/updates.
+      // Backend-mediated uploads AND deletes: block ALL client-side mutations.
       // Note: Admin SDK bypasses these rules.
-      allow create, update: if false;
-
-      // Keep deletes enabled for now to avoid breaking existing cleanup flows.
-      allow delete: if request.auth != null;
+      //   - create/update: uploads go through POST /storage/upload (tenant-scoped).
+      //   - delete: security-rules-hardening M1 — client `deleteObject` previously
+      //     allowed ANY authenticated user to delete ANY object across all tenants.
+      //     Deletes now route through POST /storage/delete, which verifies the
+      //     object lives under the caller's `{category}/{tenantId}/…` prefix.
+      allow create, update, delete: if false;
 
       // Note: Public token URLs from getDownloadURL() continue to work for anyone with the link,
       // independent of these rules. Revoke access by deleting/rotating the object token.

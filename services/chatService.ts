@@ -12,7 +12,7 @@ import { database, storage, auth } from '@/config/firebase';
 import { Alert, Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import { ref, push, set, get, onValue, onChildAdded, onChildChanged, off, query, orderByChild, child, update, endAt, limitToLast, runTransaction, equalTo } from 'firebase/database';
-import { ref as storageRef, deleteObject } from 'firebase/storage';
+import { deleteStorageObjectViaBackend } from './backendStorageUploadService';
 import { internalTokenManager } from './internalTokenManager';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 import { maybeShowStorageLimitReachedAlert } from './storageLimitAlert';
@@ -3436,11 +3436,12 @@ class ChatService {
     }
   }
 
-  async deleteProfilePicture(photoURL: string): Promise<void> {
+  async deleteProfilePicture(photoURL: string, tenantId: string): Promise<void> {
     try {
-      // Create storage reference from the URL
-      const fileRef = storageRef(storage, photoURL);
-      await deleteObject(fileRef);
+      // Server-mediated delete (security-rules-hardening M1): client deleteObject
+      // is disabled in storage.rules; the backend verifies the object is under
+      // this tenant's `profile-pictures/{tenantId}/…` prefix before deleting.
+      await deleteStorageObjectViaBackend({ tenantId, target: photoURL });
       logger.debug('Profile picture deleted successfully from storage');
     } catch (error) {
       logger.error('Error deleting profile picture:', error);

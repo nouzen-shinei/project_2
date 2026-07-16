@@ -5,6 +5,7 @@ import { AuthConfigPanel } from './features/settings/AuthConfigPanel';
 import { RuntimeEndpointsPanel } from './features/settings/RuntimeEndpointsPanel';
 import { MaintenanceModePanel } from './features/settings/MaintenanceModePanel';
 import { ReminderChannelsPanel } from './features/settings/ReminderChannelsPanel';
+import { GlobalSettingsPanel } from './features/settings/GlobalSettingsPanel';
 import { GlobalAdminClaimsPanel } from './features/settings/GlobalAdminClaimsPanel';
 import { DiagnosticsPanel } from './features/diagnostics/DiagnosticsPanel';
 import { WhatsAppPanel } from './features/whatsapp/WhatsAppPanel';
@@ -115,7 +116,7 @@ const TAB_CONFIG: TabDefinition[] = [
     label: 'Connection & auth',
     description: 'Base URL, master key, scoped console tokens, and runtime endpoints.',
     icon: Settings2,
-    panels: [AuthConfigPanel, GlobalAdminClaimsPanel, RuntimeEndpointsPanel, MaintenanceModePanel, ReminderChannelsPanel],
+    panels: [AuthConfigPanel, GlobalAdminClaimsPanel, GlobalSettingsPanel, RuntimeEndpointsPanel, MaintenanceModePanel, ReminderChannelsPanel],
   },
 ];
 

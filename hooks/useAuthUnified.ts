@@ -1016,60 +1016,6 @@ async function ensureAuthorizedEmailHasPhoto(email: string, googlePhotoURL?: str
   }
 }
 
-// Change role in tenant memberships; does not force logout
-async function changeAuthorizedEmailRole(email: string, newRole: 'user' | 'admin'): Promise<void> {
-  const normalizedEmail = email.toLowerCase();
-  const tenantId = await resolveTenantScopeForMembershipNotifications();
-  if (!tenantId) {
-    throw new Error('No tenant selected for role update');
-  }
-
-  const membershipsQuery = query(
-    collection(firestore, 'tenantMemberships'),
-    where('tenantId', '==', tenantId),
-    where('email', '==', normalizedEmail),
-    where('status', '==', 'active')
-  );
-  const membershipSnapshot = await getDocs(membershipsQuery);
-  const membershipDocs = membershipSnapshot.docs;
-  const previousRole = membershipDocs.length
-    ? ((String((membershipDocs[0].data() as any)?.role || '').toLowerCase() === 'owner' ||
-        String((membershipDocs[0].data() as any)?.role || '').toLowerCase() === 'admin')
-        ? 'admin'
-        : 'user')
-    : null;
-
-  const nextTenantRole: TenantMembershipRole = newRole === 'admin' ? 'admin' : 'member';
-  await Promise.all(
-    membershipDocs.map((membershipDoc) =>
-      updateDoc(membershipDoc.ref, {
-        role: nextTenantRole,
-        updatedAt: new Date().toISOString(),
-      })
-    )
-  );
-
-  const emailKey = sanitizeEmailKey(normalizedEmail);
-  await setDoc(
-    doc(firestore, 'tenantProfiles', `${tenantId}_${emailKey}`),
-    { role: nextTenantRole, updatedAt: new Date() },
-    { merge: true }
-  );
-
-  if (previousRole && previousRole !== newRole) {
-    triggerTeamMembershipNotification({
-      tenantId,
-      action: 'role_changed',
-      targetEmail: normalizedEmail,
-      targetRole: newRole,
-      previousRole,
-      metadata: {
-        reason: 'role_updated',
-      },
-    });
-  }
-}
-
 // Set user online status with reduced logging and better error handling
 async function setUserOnline(email: string, isOnline: boolean = true) {
   try {
@@ -2932,6 +2878,48 @@ function triggerTeamMembershipNotification(payload: TeamMembershipChangePayload)
     });
 }
 
+// Server-mediated (security-rules-hardening C1): route the legacy "authorized
+// email" admin membership mutations (role/status) through the backend, which now
+// owns all `tenantMemberships` writes. The backend derives/verifies the caller's
+// owner/admin authorization from the token, writes the audit trail, and emits the
+// team-membership notifications. Clients can no longer write membership docs
+// directly. This maps each matched membership doc (found by email) to its userId,
+// which the backend endpoints key on, and only issues a call when the field
+// actually changes to avoid redundant writes/notifications.
+async function applyAuthorizedMembershipChangeViaBackend(
+  tenantId: string,
+  membershipDocs: Array<{ data: () => any }>,
+  change: { role?: TenantMembershipRole; status?: 'active' | 'revoked' },
+): Promise<void> {
+  const initiatedFrom: 'web' | 'mobile' = Platform.OS === 'web' ? 'web' : 'mobile';
+  const actorName = globalAuthState.user?.displayName || globalAuthState.user?.email || undefined;
+  await Promise.all(
+    membershipDocs.map(async (membershipDoc) => {
+      const data = (membershipDoc.data() || {}) as any;
+      const targetUserId = String(data?.userId || '').trim();
+      if (!targetUserId) {
+        return;
+      }
+      if (change.role && String(data?.role || '') !== change.role) {
+        await tenantBackendClient.updateMembershipRole({
+          tenantId,
+          userId: targetUserId,
+          role: change.role,
+          metadata: { initiatedFrom, actorName, reason: 'authorized_email_admin' },
+        });
+      }
+      if (change.status && String(data?.status || '') !== change.status) {
+        await tenantBackendClient.updateMembershipStatus({
+          tenantId,
+          userId: targetUserId,
+          status: change.status,
+          metadata: { initiatedFrom, actorName, reason: 'authorized_email_admin' },
+        });
+      }
+    }),
+  );
+}
+
 // Add authorized email
 async function addAuthorizedEmail(email: string, role: 'user' | 'admin' = 'user'): Promise<void> {
   const normalizedEmail = email.toLowerCase();
@@ -2985,15 +2973,10 @@ async function addAuthorizedEmail(email: string, role: 'user' | 'admin' = 'user'
     );
     const membershipSnapshot = await getDocs(membershipsQuery);
     if (!membershipSnapshot.empty) {
-      await Promise.all(
-        membershipSnapshot.docs.map((membershipDoc) =>
-          updateDoc(membershipDoc.ref, {
-            role: nextTenantRole,
-            status: 'active',
-            updatedAt: now.toISOString(),
-          })
-        )
-      );
+      await applyAuthorizedMembershipChangeViaBackend(tenantId, membershipSnapshot.docs, {
+        role: nextTenantRole,
+        status: 'active',
+      });
     }
 
     triggerTeamMembershipNotification({
@@ -3083,14 +3066,7 @@ async function removeAuthorizedEmail(email: string): Promise<void> {
       where('email', '==', normalizedEmail)
     );
     const membershipSnapshot = await getDocs(membershipsQuery);
-    await Promise.all(
-      membershipSnapshot.docs.map((membershipDoc) =>
-        updateDoc(membershipDoc.ref, {
-          status: 'revoked',
-          updatedAt: new Date().toISOString(),
-        })
-      )
-    );
+    await applyAuthorizedMembershipChangeViaBackend(tenantId, membershipSnapshot.docs, { status: 'revoked' });
 
     await Promise.allSettled([
       deleteDoc(doc(firestore, 'tenantPresence', `${tenantId}_${emailKey}`)),
@@ -3147,74 +3123,7 @@ async function updateAuthorizedEmails(emails: string[]): Promise<void> {
   }
 }
 
-// Update user profile (deprecated - use updateUserProfileSafe instead)
-async function updateUserProfile(email: string, profileData: {
-  displayName?: string;
-  photoURL?: string;
-  customImageURL?: string;
-  isOnline?: boolean;
-  lastSeen?: string;
-  typingTo?: string | null;
-}): Promise<void> {
-  try {
-    await updateUserProfileSafe(email, {
-      ...profileData,
-      customImageURL: profileData.customImageURL,
-    });
-  } catch (error) {
-    // Handle permission errors silently
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const errorCode = (error as any)?.code || '';
-    
-    // Check for permission errors more robustly
-    const isPermissionError = errorMessage.includes('Missing or insufficient permissions') || 
-                             errorMessage.includes('insufficient permissions') ||
-                             errorCode === 'permission-denied';
-    
-    if (isPermissionError) {
-      flagReloginRequired('updateUserProfile', error);
-    }
-    if (!isPermissionError) {
-      // Only log 10% of non-permission errors to reduce noise
-      if (Math.random() < 0.1) {
-        logger.error('Error updating user profile:', error);
-      }
-    }
-    // Don't throw - this is used by other parts of the app that shouldn't fail
-  }
-}
-
-// Get all authorized users with their profile information
-async function getAuthorizedUsersWithProfiles(): Promise<Array<{
-  email: string;
-  displayName: string;
-  photoURL?: string;
-  role: 'user' | 'admin';
-  isOnline?: boolean;
-  lastSeen?: string;
-}>> {
-  try {
-    const members = await forceRefreshTeamMembers();
-    return members.map((member) => ({
-      email: member.email,
-      displayName: member.name,
-      photoURL: member.customImageURL || member.photoURL,
-      role: member.role,
-      isOnline: member.isOnline,
-      lastSeen: member.lastSeen,
-    }));
-  } catch (error) {
-    logger.warn('Failed to fetch user profiles:', error);
-    // Fallback to basic email list
-    return authorizedEmails.map(email => ({
-      email,
-      displayName: fallbackDisplayNameFromEmail(email),
-  role: 'user' as const,
-    }));
-  }
-}
-
-// Update typing status for a user in authorizedEmails collection
+// Update typing status for a user
 async function updateTypingStatus(email: string, typingTo: string | null): Promise<void> {
   try {
     const normalizedEmail = email.toLowerCase();
@@ -3422,15 +3331,12 @@ export const authService = {
   addAuthorizedEmail,
   removeAuthorizedEmail,
   updateAuthorizedEmails,
-  updateUserProfile,
   onTeamMembersChange,
   forceRefreshTeamMembers,
-  changeAuthorizedEmailRole,
   signInWithGoogle,
   signOut,
   setUserOnline,
   updateUserProfileSafe,
-  getAuthorizedUsersWithProfiles,
   updateTypingStatus,
   getCleanErrorMessage,
   isDeviceBanError,

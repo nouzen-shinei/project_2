@@ -272,7 +272,9 @@ export default function Settings() {
     );
   }, []);
 
-  const canShowTeamMembersList = isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins;
+  // H2: this visibility flag is now TENANT-scoped (tenants/{id}.settings), not a
+  // global appSettings flag.
+  const canShowTeamMembersList = isAdmin || !activeTenant?.settings?.hideAuthorizedEmailsForNonAdmins;
 
   const [componentLoading, setComponentLoading] = useState(true);
 
@@ -2865,7 +2867,7 @@ export default function Settings() {
             ) : (
               <>
                 <Text style={[styles.modalDescription, { color: theme.textSecondary }] }>
-                  These are all active team members in this coaching center. {isAdmin || !appSettings?.hideAuthorizedEmailsForNonAdmins ? 'All members can view this list for transparency.' : 'Only admins can view this list (as configured in Admin Settings).'}
+                  These are all active team members in this coaching center. {isAdmin || !activeTenant?.settings?.hideAuthorizedEmailsForNonAdmins ? 'All members can view this list for transparency.' : 'Only admins can view this list (as configured in Admin Settings).'}
                 </Text>
                 
                 {/* Admin-only note */}

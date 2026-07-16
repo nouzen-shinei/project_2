@@ -103,14 +103,11 @@ jest.mock('@react-native-async-storage/async-storage', () => ({
   default: { getItem: jest.fn(async () => null), setItem: jest.fn(async () => {}), removeItem: jest.fn(async () => {}) },
 }));
 jest.mock('../../services/twilioBackendClient', () => ({ __esModule: true, twilioBackendClient: {} }));
-jest.mock('../../services/wabaService', () => ({ __esModule: true, whatsappBusinessService: {} }));
-jest.mock('../../services/wabaTemplateConstants', () => ({ __esModule: true, getTemplateLanguage: jest.fn(() => 'en') }));
 jest.mock('../../services/chatReceiptSync', () => ({
   __esModule: true,
   confirmInboundChatDeliveryFromNotificationData: jest.fn(async () => {}),
   flushPendingInboundChatDeliveryReceipts: jest.fn(async () => {}),
 }));
-jest.mock('../../services/whatsappConversationService', () => ({ __esModule: true, whatsappConversationService: {} }));
 jest.mock('../../services/emailService', () => ({ __esModule: true, emailService: { initialize: jest.fn(async () => {}) } }));
 jest.mock('../../services/quotesService', () => ({ __esModule: true, quotesService: {} }));
 jest.mock('../../types', () => ({ __esModule: true }));

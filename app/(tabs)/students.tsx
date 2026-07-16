@@ -20,9 +20,8 @@ import { Plus, Search, MoveVertical as MoreVertical, User, Phone, Mail, MessageC
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as XLSX from 'xlsx';
-import { ref, deleteObject, listAll } from 'firebase/storage';
 import { collection, query, where, getDocs, deleteDoc, doc } from 'firebase/firestore';
-import { storage , firestore } from '../../config/firebase';
+import { firestore } from '../../config/firebase';
 import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
 import useStudents from '../../hooks/useStudents';
 import { useAttendance } from '../../hooks/useAttendance';
@@ -38,7 +37,7 @@ import { chatService } from '../../services/chatService';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
-import { uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { uploadBlobViaBackend, deleteStorageObjectViaBackend } from '../../services/backendStorageUploadService';
 import { tryExtractStorageLimitReachedInfo } from '../../services/storageLimitAlert';
 import UsageAlertInlineBanner from '@/components/UsageAlertInlineBanner';
 import { useActiveUsageAlerts } from '@/hooks/useActiveUsageAlerts';
@@ -189,7 +188,7 @@ export default function Students() {
       // Delete old profile image if it exists
       if (existingImageUrl) {
         try {
-          await chatService.deleteProfilePicture(existingImageUrl);
+          await chatService.deleteProfilePicture(existingImageUrl, tenantId);
           logger.debug('Old student profile picture deleted successfully');
         } catch (deleteError) {
           logger.warn('Failed to delete old student profile picture:', deleteError);
@@ -467,179 +466,61 @@ export default function Students() {
     };
 
     try {
-      // First, get all fee records for this student to find receipt folders
-      let studentFeeIds: string[] = [];
+      // Gather this student's fee records + their receipt storage targets.
+      // Storage deletes are backend-mediated (security-rules-hardening M1):
+      // client `listAll`/`deleteObject` are denied by storage.rules, so we delete
+      // by known URL/path via the backend (which verifies the tenant prefix).
+      const receiptTargets: string[] = [];
       try {
         logger.debug('🗑️ Finding fee records for student...');
         const feesQuery = query(
           collection(firestore, 'fees'),
+          where('tenantId', '==', tenantId),
           where('studentId', '==', studentId)
         );
         const feesSnapshot = await getDocs(feesQuery);
-        studentFeeIds = feesSnapshot.docs.map(doc => doc.id);
-        logger.debug(`🗑️ Found ${studentFeeIds.length} fee records with IDs:`, studentFeeIds);
+        feesSnapshot.docs.forEach((d) => {
+          const receipts = (d.data() as any)?.receipts;
+          if (Array.isArray(receipts)) {
+            for (const r of receipts) {
+              const target = r?.storagePath || r?.url;
+              if (typeof target === 'string' && target) receiptTargets.push(target);
+            }
+          }
+        });
+        logger.debug(`🗑️ Found ${feesSnapshot.size} fee records; ${receiptTargets.length} receipt asset(s)`);
       } catch (error) {
         logger.warn('🗑️ Error getting fee records for receipt deletion:', error);
         deletionResults.errors.push(`Fee records query failed: ${error}`);
       }
 
-      // 1. Delete student profile image from storage
+      // 1. Delete the student profile image via the backend (best-effort). The
+      // backend verifies the object lives under this tenant's managed prefix
+      // before deleting; a non-matching/legacy URL is simply skipped.
       try {
-        logger.debug('🗑️ Searching for profile images...');
-        const profileImageRef = ref(storage, `student_profiles`);
-        const profileList = await listAll(profileImageRef);
-        
-        logger.debug(`🗑️ Found ${profileList.items.length} files in student_profiles folder`);
-        
-        // Get student data to access profile image URL
         const student = students.find(s => s.id === studentId);
-        
-        for (const item of profileList.items) {
-          logger.debug(`🗑️ Checking file: ${item.name}`);
-          
-          let shouldDelete = false;
-          
-          // Method 1: Check by student ID
-          if (item.name.includes(studentId)) {
-            shouldDelete = true;
-            logger.debug(`🗑️ Match by student ID: ${studentId}`);
-          }
-          
-          // Method 2: Check by student name variations
-          if (!shouldDelete) {
-            const nameVariations = [
-              studentName.toLowerCase(),
-              studentName.toLowerCase().replace(/\s+/g, '_'),
-              studentName.toLowerCase().replace(/\s+/g, '-'),
-              studentName.toLowerCase().replace(/\s+/g, ''),
-              studentName.replace(/\s+/g, '_'),
-              studentName.replace(/\s+/g, '-'),
-              studentName.replace(/\s+/g, '')
-            ];
-            
-            shouldDelete = nameVariations.some(variation => 
-              item.name.toLowerCase().includes(variation)
-            );
-            if (shouldDelete) {
-              logger.debug(`🗑️ Match by name variation`);
-            }
-          }
-          
-          // Method 3: If student has profile URL, extract filename and match
-          if (!shouldDelete && student?.profileImageUrl) {
-            try {
-              const url = student.profileImageUrl;
-              // Try different URL pattern matches
-              const patterns = [
-                /student_profiles%2F([^?&]+)/,
-                /student_profiles\/([^?&]+)/,
-                /\/([^\/]+)\?/
-              ];
-              
-              for (const pattern of patterns) {
-                const match = url.match(pattern);
-                if (match) {
-                  const fileName = decodeURIComponent(match[1]);
-                  if (item.name === fileName) {
-                    shouldDelete = true;
-                    logger.debug(`🗑️ Match by profile URL filename: ${fileName}`);
-                    break;
-                  }
-                }
-              }
-            } catch (urlError) {
-              logger.warn(`🗑️ URL parsing error: ${urlError}`);
-            }
-          }
-          
-          if (shouldDelete) {
-            try {
-              await deleteObject(item);
-              deletionResults.profileImage = true;
-              logger.debug(`🗑️ ✅ Deleted profile image: ${item.name}`);
-            } catch (deleteError) {
-              logger.warn(`🗑️ Failed to delete ${item.name}:`, deleteError);
-            }
-          }
+        const profileUrl = student?.profileImageUrl;
+        if (tenantId && typeof profileUrl === 'string' && profileUrl) {
+          await deleteStorageObjectViaBackend({ tenantId, target: profileUrl });
+          deletionResults.profileImage = true;
+          logger.debug('🗑️ ✅ Requested profile image deletion via backend');
         }
       } catch (error) {
-        logger.warn('🗑️ ❌ Error deleting profile images:', error);
-        deletionResults.errors.push(`Profile image deletion failed: ${error}`);
+        logger.warn('🗑️ Profile image deletion (backend) skipped/failed:', error);
       }
 
-      // 2. Delete receipt files from storage using fee IDs and student name matching
+      // 2. Delete fee receipt assets via the backend (best-effort), using the
+      // receipt URLs/paths recorded on each fee document.
       try {
-        logger.debug('🗑️ Searching for receipts...');
-        const receiptsRef = ref(storage, `receipts`);
-        const receiptsList = await listAll(receiptsRef);
-        
-        logger.debug(`🗑️ Found ${receiptsList.items.length} folders in receipts directory`);
-        
-        // Method 1: Delete by fee IDs (primary method)
-        for (const feeId of studentFeeIds) {
+        for (const target of receiptTargets) {
           try {
-            const feeReceiptsRef = ref(storage, `receipts/${feeId}`);
-            const feeReceiptsList = await listAll(feeReceiptsRef);
-            logger.debug(`🗑️ Found ${feeReceiptsList.items.length} receipts in fee folder: ${feeId}`);
-            
-            for (const receiptItem of feeReceiptsList.items) {
-              try {
-                await deleteObject(receiptItem);
-                deletionResults.receipts++;
-                logger.debug(`🗑️ ✅ Deleted receipt: ${receiptItem.name} from fee folder: ${feeId}`);
-              } catch (deleteError) {
-                logger.warn(`🗑️ Failed to delete receipt ${receiptItem.name}:`, deleteError);
-              }
-            }
-          } catch (error) {
-            logger.warn(`🗑️ No receipts found for fee ID: ${feeId}`, error);
+            await deleteStorageObjectViaBackend({ tenantId, target });
+            deletionResults.receipts++;
+          } catch (deleteError) {
+            logger.warn('🗑️ Failed to delete receipt via backend:', deleteError);
           }
         }
-        
-        // Method 2: Also check for receipts that might be stored by student name (fallback)
-        for (const folderItem of receiptsList.items) {
-          logger.debug(`🗑️ Checking receipt folder/file: ${folderItem.name}`);
-          
-          let shouldDelete = false;
-          
-          // Check by student ID
-          if (folderItem.name.includes(studentId)) {
-            shouldDelete = true;
-            logger.debug(`🗑️ Receipt match by student ID: ${studentId}`);
-          }
-          
-          // Check by student name variations
-          if (!shouldDelete) {
-            const nameVariations = [
-              studentName.toLowerCase(),
-              studentName.toLowerCase().replace(/\s+/g, '_'),
-              studentName.toLowerCase().replace(/\s+/g, '-'),
-              studentName.toLowerCase().replace(/\s+/g, ''),
-              studentName.replace(/\s+/g, '_'),
-              studentName.replace(/\s+/g, '-'),
-              studentName.replace(/\s+/g, '')
-            ];
-            
-            shouldDelete = nameVariations.some(variation => 
-              folderItem.name.toLowerCase().includes(variation)
-            );
-            if (shouldDelete) {
-              logger.debug(`🗑️ Receipt match by name variation`);
-            }
-          }
-          
-          if (shouldDelete) {
-            try {
-              await deleteObject(folderItem);
-              deletionResults.receipts++;
-              logger.debug(`🗑️ ✅ Deleted receipt: ${folderItem.name}`);
-            } catch (deleteError) {
-              logger.warn(`🗑️ Failed to delete receipt ${folderItem.name}:`, deleteError);
-            }
-          }
-        }
-        
-        logger.debug(`🗑️ Total receipts deleted: ${deletionResults.receipts}`);
+        logger.debug(`🗑️ Receipt asset deletions requested: ${deletionResults.receipts}`);
       } catch (error) {
         logger.warn('🗑️ ❌ Error deleting receipts:', error);
         deletionResults.errors.push(`Receipt files deletion failed: ${error}`);
@@ -650,6 +531,7 @@ export default function Students() {
         logger.debug('🗑️ Deleting attendance records...');
         const attendanceQuery = query(
           collection(firestore, 'attendance'),
+          where('tenantId', '==', tenantId),
           where('studentId', '==', studentId)
         );
         const attendanceSnapshot = await getDocs(attendanceQuery);
@@ -669,6 +551,7 @@ export default function Students() {
         logger.debug('🗑️ Deleting fee records...');
         const feesQuery = query(
           collection(firestore, 'fees'),
+          where('tenantId', '==', tenantId),
           where('studentId', '==', studentId)
         );
         const feesSnapshot = await getDocs(feesQuery);

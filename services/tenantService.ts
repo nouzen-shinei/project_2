@@ -95,9 +95,11 @@ export interface CreateTenantInput {
   theme?: TenantTheme;
 }
 
-export interface UpdateTenantInput extends Partial<Omit<Tenant, 'id'>> {
+export interface UpdateTenantInput extends Partial<Omit<Tenant, 'id' | 'settings'>> {
   id: string;
   updatedBy?: string;
+  // Settings is merged server-side, so callers may send only the keys they change.
+  settings?: Partial<TenantSettings>;
 }
 
 export interface CreateJoinRequestInput {
@@ -263,85 +265,27 @@ class TenantService {
   }
 
   async createTenant(input: CreateTenantInput): Promise<Tenant> {
+    // Server-mediated (security-rules-hardening C1): the backend creates the
+    // tenant doc, the owner membership, and the audit entry via the Admin SDK,
+    // deriving the owner from the authenticated token. Clients can no longer
+    // write `tenants`/`tenantMemberships` directly.
     try {
-      const now = new Date().toISOString();
-      const slug = slugifyName(input.name);
-      const code = generateTenantCode();
-
-      const tenantDoc = doc(this.tenantRef);
-      const billingTier: Tenant['billingTier'] = 'free';
-      const tenantData: Omit<Tenant, 'id'> = {
-        name: input.name.trim(),
-        slug,
-        code,
-        ownerUserId: input.ownerUserId,
-        ownerEmail: input.ownerEmail.toLowerCase(),
-        defaultCurrency: input.defaultCurrency || 'INR',
-        contactEmail: input.contactEmail || input.ownerEmail,
-        status: 'active',
-        billingTier,
-        quotas: NO_QUOTA_OVERRIDES,
-        settings: { ...DEFAULT_SETTINGS },
-        onboardingProgress: {
-          dismissedChecklistItems: [],
-          lastReviewedAt: now,
-        },
-        notificationPreferences: { ...DEFAULT_TENANT_NOTIFICATION_PREFERENCES },
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      if (input.address && input.address.trim()) {
-        tenantData.address = input.address.trim();
-      }
-      if (input.timezone && input.timezone.trim()) {
-        tenantData.timezone = input.timezone.trim();
-      }
-      if (input.contactPhone && input.contactPhone.trim()) {
-        tenantData.contactPhone = input.contactPhone.trim();
-      }
-      if (typeof input.logoUrl === 'string' && input.logoUrl.trim()) {
-        tenantData.logoUrl = input.logoUrl.trim();
-      }
-      if (typeof input.heroImageUrl === 'string' && input.heroImageUrl.trim()) {
-        tenantData.heroImageUrl = input.heroImageUrl.trim();
-      }
-      if (input.theme) {
-        tenantData.theme = input.theme;
-      }
-
-      await setDoc(tenantDoc, tenantData);
-
-      const ownerStatusEvent = this.createStatusEvent('active', {
-        actorId: input.ownerUserId,
-        actorEmail: input.ownerEmail.toLowerCase(),
-        actorName: input.ownerEmail.split('@')[0],
-        reason: 'tenant_owner_created',
-        at: now,
+      const response = await tenantBackendClient.createTenant({
+        name: input.name,
+        defaultCurrency: input.defaultCurrency,
+        contactEmail: input.contactEmail,
+        contactPhone: input.contactPhone,
+        address: input.address,
+        timezone: input.timezone,
+        logoUrl: input.logoUrl,
+        heroImageUrl: input.heroImageUrl,
+        theme: input.theme as unknown as Record<string, unknown> | undefined,
       });
-
-      await setDoc(doc(this.membershipRef, membershipDocId(tenantDoc.id, input.ownerUserId)), {
-        tenantId: tenantDoc.id,
-        userId: input.ownerUserId,
-        email: input.ownerEmail.toLowerCase(),
-        displayName: input.ownerEmail.split('@')[0],
-        role: 'owner',
-        status: 'active',
-        createdAt: now,
-        updatedAt: now,
-        statusHistory: [ownerStatusEvent],
-      } satisfies Omit<TenantMembership, 'id'>);
-
-      await this.createAuditEntry({
-        tenantId: tenantDoc.id,
-        actorId: input.ownerUserId,
-        actorEmail: input.ownerEmail,
-        action: 'tenant_created',
-        targetId: tenantDoc.id,
-        targetType: 'tenant',
-      });
-
-      return { id: tenantDoc.id, ...tenantData };
+      const tenant = { ...(response.tenant as any) } as Tenant;
+      tenant.notificationPreferences = normalizeTenantNotificationPreferences(
+        (tenant.notificationPreferences as Partial<TenantNotificationPreferences> | undefined) ?? undefined,
+      );
+      return tenant;
     } catch (error) {
       logger.error('tenantService.createTenant failed', error);
       throw new Error('Failed to create coaching center');
@@ -349,22 +293,31 @@ class TenantService {
   }
 
   async updateTenant(input: UpdateTenantInput): Promise<void> {
+    // Server-mediated (security-rules-hardening C1): the backend owns writes to
+    // the `tenants` collection and the audit trail. We forward only the
+    // editable fields (identity, billing, quotas and counts are not settable).
+    const { id, updatedBy: _updatedBy, ...fields } = input;
     try {
-      const { id, updatedBy, ...fields } = input;
-      await updateDoc(doc(this.tenantRef, id), {
-        ...fields,
-        updatedAt: new Date().toISOString(),
-      });
-      await this.createAuditEntry({
+      await tenantBackendClient.updateTenant({
         tenantId: id,
-        actorId: updatedBy || 'system',
-        action: 'tenant_updated',
-        targetId: id,
-        targetType: 'tenant',
-        metadata: fields,
+        name: fields.name,
+        contactEmail: fields.contactEmail,
+        contactPhone: fields.contactPhone,
+        address: fields.address,
+        timezone: fields.timezone,
+        defaultCurrency: fields.defaultCurrency,
+        logoUrl: fields.logoUrl,
+        heroImageUrl: fields.heroImageUrl,
+        theme: fields.theme as unknown as Record<string, unknown> | undefined,
+        branding: fields.branding as unknown as Record<string, unknown> | undefined,
+        settings: fields.settings as unknown as Record<string, unknown> | undefined,
+        onboardingProgress: fields.onboardingProgress as unknown as Record<string, unknown> | undefined,
       });
     } catch (error) {
       logger.error('tenantService.updateTenant failed', error);
+      if (error instanceof TenantBackendError) {
+        throw error;
+      }
       throw new Error('Failed to update coaching center');
     }
   }
@@ -604,155 +557,21 @@ class TenantService {
 
   async leaveMembership(
     tenantId: string,
-    userId: string,
-    actorEmail?: string,
-    options?: { tenantName?: string },
+    _userId: string,
+    _actorEmail?: string,
+    _options?: { tenantName?: string },
   ): Promise<void> {
-    const docId = membershipDocId(tenantId, userId);
-    const membershipRef = doc(this.membershipRef, docId);
+    // Server-mediated (security-rules-hardening C1): the backend revokes the
+    // caller's own membership (deriving the uid from the token), withdraws any
+    // pending join request, writes the audit entry, and notifies tenant admins.
+    // Owners are rejected server-side until they transfer/downgrade first.
     try {
-      const snapshot = await getDoc(membershipRef);
-      if (!snapshot.exists()) {
-        throw new Error('Membership not found');
-      }
-      const membership = snapshot.data() as TenantMembership;
-      const normalizedRole = (membership.role || '').toString().toLowerCase();
-      if (normalizedRole === 'owner') {
-        throw new Error('Owners must transfer or downgrade their role before leaving the coaching center.');
-      }
-      const nowIso = new Date().toISOString();
-      const isPendingRequest = membership.status === 'pending_request';
-      const leaveReason = isPendingRequest ? 'request_withdrawn' : 'self_leave';
-
-      if (isPendingRequest) {
-        const fallbackAt = membership.updatedAt || membership.createdAt || nowIso;
-        const normalizedHistory: TenantMembershipStatusEvent[] = [];
-        if (Array.isArray(membership.statusHistory)) {
-          membership.statusHistory.forEach((event) => {
-            if (!event || typeof event !== 'object' || !('status' in event) || !event.status) {
-              return;
-            }
-            let at = fallbackAt;
-            if (typeof event.at === 'string') {
-              const parsed = Date.parse(event.at);
-              if (!Number.isNaN(parsed)) {
-                at = new Date(parsed).toISOString();
-              }
-            }
-            const normalizedEvent: TenantMembershipStatusEvent = {
-              status: event.status as TenantMembershipStatus,
-              at,
-            };
-            if (typeof event.actorId === 'string' && event.actorId) {
-              normalizedEvent.actorId = event.actorId;
-            }
-            if (typeof event.actorEmail === 'string' && event.actorEmail) {
-              normalizedEvent.actorEmail = event.actorEmail;
-            }
-            if (typeof event.actorName === 'string' && event.actorName) {
-              normalizedEvent.actorName = event.actorName;
-            }
-            if (typeof event.reason === 'string' && event.reason) {
-              normalizedEvent.reason = event.reason;
-            }
-            normalizedHistory.push(normalizedEvent);
-          });
-        }
-
-        if (normalizedHistory.length) {
-          let latestPendingIndex = -1;
-          let latestPendingAt = Number.NEGATIVE_INFINITY;
-          normalizedHistory.forEach((event, index) => {
-            if (event.status !== 'pending_request') {
-              return;
-            }
-            const timestamp = Date.parse(event.at);
-            const value = Number.isNaN(timestamp) ? 0 : timestamp;
-            if (value >= latestPendingAt) {
-              latestPendingAt = value;
-              latestPendingIndex = index;
-            }
-          });
-          if (latestPendingIndex !== -1) {
-            normalizedHistory.splice(latestPendingIndex, 1);
-          }
-        }
-
-        if (!normalizedHistory.length) {
-          await deleteDoc(membershipRef);
-        } else {
-          const sortedHistory = [...normalizedHistory].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
-          const latestEvent = sortedHistory[sortedHistory.length - 1];
-          await updateDoc(membershipRef, {
-            status: latestEvent.status,
-            updatedAt: nowIso,
-            statusHistory: sortedHistory,
-          });
-        }
-
-        try {
-          const pendingRequestsSnap = await getDocs(
-            query(
-              this.joinRequestRef,
-              where('tenantId', '==', tenantId),
-              where('userId', '==', userId),
-              where('status', '==', 'pending'),
-              limit(10),
-            ),
-          );
-          const deletions = pendingRequestsSnap.docs.map((docSnap) => deleteDoc(docSnap.ref));
-          await Promise.all(deletions);
-        } catch (joinRequestCleanupError) {
-          logger.debug('tenantService.leaveMembership: failed to cleanup join request on withdraw', joinRequestCleanupError);
-        }
-      } else {
-        if (membership.status === 'revoked') {
-          return;
-        }
-        await updateDoc(membershipRef, {
-          status: 'revoked',
-          updatedAt: nowIso,
-          statusHistory: arrayUnion(
-            this.createStatusEvent('revoked', {
-              actorId: userId,
-              actorEmail,
-              reason: leaveReason,
-              at: nowIso,
-            }),
-          ),
-        });
-      }
-      await this.createAuditEntry({
-        tenantId,
-        actorId: userId,
-        actorEmail,
-        action: 'membership_revoked',
-        targetId: docId,
-        targetType: 'membership',
-        metadata: {
-          previousRole: membership.role,
-          previousStatus: membership.status,
-          reason: leaveReason,
-        },
-      });
-
-      const initiatedFrom = Platform.OS === 'web' ? 'web' : 'mobile';
-      void teamMembershipNotifier
-        .notifyChange({
-          tenantId,
-          tenantName: options?.tenantName,
-          action: 'removed',
-          targetEmail: membership.email,
-          targetRole: membership.role,
-          metadata: {
-            displayName: membership.displayName,
-            reason: leaveReason,
-            initiatedFrom,
-          },
-        })
-        .catch((error) => logger.debug('tenantService: notify leave membership skipped', error));
+      await tenantBackendClient.leaveTenant({ tenantId });
     } catch (error) {
       logger.error('tenantService.leaveMembership failed', error);
+      if (error instanceof TenantBackendError) {
+        throw new Error(error.message);
+      }
       throw new Error('Failed to leave coaching center');
     }
   }
@@ -1280,44 +1099,22 @@ class TenantService {
     expiresInDays?: number;
     usageCap?: number | null;
   }): Promise<TenantCode> {
-    const now = new Date();
-    const expires = params.expiresInDays
-      ? new Date(now.getTime() + params.expiresInDays * 24 * 60 * 60 * 1000)
-      : undefined;
-
-    const activeCodesSnap = await getDocs(
-      query(
-        this.codeRef,
-        where('tenantId', '==', params.tenantId),
-        where('status', '==', 'active'),
-        limit(MAX_ACTIVE_JOIN_CODES + 1),
-      ),
-    );
-    if (activeCodesSnap.size >= MAX_ACTIVE_JOIN_CODES) {
-      throw new Error('Maximum active join codes reached. Revoke or expire an existing code to generate a new one.');
+    // Server-mediated (security-rules-hardening C1): the backend enforces the
+    // active-code cap, generates the code, and writes the audit entry.
+    try {
+      const response = await tenantBackendClient.createTenantCode({
+        tenantId: params.tenantId,
+        expiresInDays: params.expiresInDays,
+        usageCap: params.usageCap,
+      });
+      return response.code as TenantCode;
+    } catch (error) {
+      logger.error('tenantService.createTenantCode failed', error);
+      if (error instanceof TenantBackendError) {
+        throw new Error(error.message);
+      }
+      throw new Error('Failed to create join code');
     }
-
-    const codeData: Omit<TenantCode, 'id'> = {
-      tenantId: params.tenantId,
-      code: generateTenantCode(),
-      createdBy: params.createdBy,
-      createdAt: now.toISOString(),
-      expiresAt: expires?.toISOString(),
-      usageCount: 0,
-      usageCap: typeof params.usageCap === 'number' ? params.usageCap : null,
-      status: 'active',
-    };
-
-    const docRef = await addDoc(this.codeRef, codeData);
-    await this.createAuditEntry({
-      tenantId: params.tenantId,
-      actorId: params.createdBy,
-      action: 'invite_regenerated',
-      targetId: docRef.id,
-      targetType: 'code',
-      metadata: { code: codeData.code },
-    });
-    return { id: docRef.id, ...codeData };
   }
 
   async incrementCodeUsage(codeId: string): Promise<void> {
@@ -1339,22 +1136,18 @@ class TenantService {
     return { id: snap.id, ...snap.data() } as TenantCode;
   }
 
-  async revokeCode(codeId: string, actorId: string): Promise<void> {
-    const code = await this.getCode(codeId);
-    if (!code) {
-      throw new Error('Tenant code not found');
+  async revokeCode(tenantId: string, codeId: string, _actorId: string): Promise<void> {
+    // Server-mediated (security-rules-hardening C1): the backend verifies the
+    // code belongs to the tenant, flips it to revoked, and writes the audit entry.
+    try {
+      await tenantBackendClient.revokeTenantCode({ tenantId, codeId });
+    } catch (error) {
+      logger.error('tenantService.revokeCode failed', error);
+      if (error instanceof TenantBackendError) {
+        throw new Error(error.message);
+      }
+      throw new Error('Failed to revoke join code');
     }
-    await updateDoc(doc(this.codeRef, codeId), {
-      status: 'revoked',
-      updatedAt: new Date().toISOString(),
-    });
-    await this.createAuditEntry({
-      tenantId: code.tenantId,
-      actorId,
-      action: 'invite_regenerated',
-      targetId: codeId,
-      targetType: 'code',
-    });
   }
 
   async expireStaleJoinCodes(tenantId: string): Promise<{ expired: number }> {
@@ -1565,172 +1358,21 @@ class TenantService {
     displayName?: string;
     invites: TenantInvite[];
   }): Promise<void> {
-    const userId = (params.userId || '').trim();
+    // Server-mediated (security-rules-hardening C1): mirroring invites into
+    // `tenantMemberships/{tenantId}_{uid}` placeholder docs is now done by the
+    // backend, which derives uid + email from the auth token and queries the
+    // caller's invites itself. The client only forwards a display name for the
+    // rejected-event actor label. `userId`/`email`/`invites` are ignored here
+    // (kept in the signature for call-site compatibility).
     const email = (params.email || '').trim().toLowerCase();
-    if (!userId || !email) {
+    if (!email) {
       return;
     }
-
-    const invites = Array.isArray(params.invites) ? params.invites : [];
-    const nowIso = new Date().toISOString();
-
-    const parseIsoTs = (value: unknown): number => {
-      if (typeof value !== 'string') return Number.NEGATIVE_INFINITY;
-      const parsed = Date.parse(value);
-      return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
-    };
-
-    const bestInviteByTenant = new Map<string, { invite: TenantInvite; sortKey: number }>();
-    for (const invite of invites) {
-      const tenantId = typeof invite?.tenantId === 'string' ? invite.tenantId.trim() : '';
-      if (!tenantId) continue;
-
-      const raw = invite as any;
-      const sortKey = Math.max(
-        parseIsoTs(raw.updatedAt),
-        parseIsoTs(raw.revokedAt),
-        parseIsoTs(raw.rejectedAt),
-        parseIsoTs(raw.acceptedAt),
-        parseIsoTs(raw.issuedAt),
-      );
-
-      const existing = bestInviteByTenant.get(tenantId);
-      if (!existing || sortKey >= existing.sortKey) {
-        bestInviteByTenant.set(tenantId, { invite, sortKey });
-      }
-    }
-
-    // Only the invitee can map an invite -> membership doc id because it requires the user's uid.
-    // This mirrors how join-code claim updates tenantMemberships/{tenantId}_{uid}.
-    for (const { invite } of bestInviteByTenant.values()) {
-      if (!invite?.tenantId) continue;
-
-      if (invite.status === 'accepted') continue;
-
-      const nextStatus: TenantMembershipStatus | null =
-        invite.status === 'pending'
-          ? 'pending_invite'
-          : invite.status === 'rejected'
-            ? 'rejected'
-            : invite.status === 'revoked' || invite.status === 'expired'
-              ? 'revoked'
-              : null;
-
-      if (!nextStatus) {
-        continue;
-      }
-
-      const membershipId = membershipDocId(invite.tenantId, userId);
-      const membershipRef = doc(this.membershipRef, membershipId);
-      const snap = await getDoc(membershipRef);
-      const existing = snap.exists() ? (snap.data() as Partial<TenantMembership>) : null;
-
-      const existingStatus = (existing?.status as TenantMembershipStatus | undefined) ?? undefined;
-
-      // Never let a stale invite overwrite an active membership.
-      if (existingStatus === 'active') {
-        continue;
-      }
-
-      // Avoid creating noise: if the user never saw a pending invite, don't create a revoked/rejected membership.
-      if (!snap.exists() && nextStatus !== 'pending_invite') {
-        continue;
-      }
-
-      const existingRole = (existing?.role as TenantMembershipRole | undefined) ?? undefined;
-      const existingCreatedAt = typeof existing?.createdAt === 'string' ? existing.createdAt : nowIso;
-      const existingToken = typeof existing?.inviteToken === 'string' ? existing.inviteToken : undefined;
-      const existingExpiresAt = existing?.inviteExpiresAt;
-      const inviteAt =
-        nextStatus === 'pending_invite'
-          ? invite.issuedAt
-          : nextStatus === 'rejected'
-            ? invite.rejectedAt || invite.issuedAt || nowIso
-            : ((invite as any).revokedAt as string | undefined) || (invite as any).updatedAt || invite.issuedAt || nowIso;
-
-      const shouldUpdateStatus = existingStatus !== nextStatus;
-      const shouldUpdateToken = nextStatus === 'pending_invite' && existingToken !== invite.token;
-      const shouldUpdateExpiry =
-        nextStatus === 'pending_invite' &&
-        typeof invite.expiresAt === 'string' &&
-        (typeof existingExpiresAt !== 'string' || existingExpiresAt !== invite.expiresAt);
-      const shouldClearInviteFields =
-        (nextStatus === 'rejected' || nextStatus === 'revoked') &&
-        (typeof existingToken === 'string' || typeof existingExpiresAt === 'string' || typeof existing?.invitedBy === 'string');
-
-      // Keep role aligned with the invite for non-active memberships.
-      const shouldUpdateRole = existingRole !== invite.role;
-
-      if (
-        !snap.exists() ||
-        shouldUpdateStatus ||
-        shouldUpdateToken ||
-        shouldUpdateExpiry ||
-        shouldUpdateRole ||
-        shouldClearInviteFields
-      ) {
-        const statusEvent = this.createStatusEvent(nextStatus, {
-          at: typeof inviteAt === 'string' ? inviteAt : nowIso,
-          actorId:
-            nextStatus === 'pending_invite'
-              ? invite.issuedBy
-              : nextStatus === 'rejected'
-                ? userId
-                : String(((invite as any).revokedBy as string | undefined) || invite.issuedBy || 'system'),
-          actorEmail: nextStatus === 'rejected' ? email : undefined,
-          actorName: nextStatus === 'rejected' ? params.displayName : undefined,
-          reason:
-            nextStatus === 'pending_invite'
-              ? 'invite_received'
-              : nextStatus === 'rejected'
-                ? 'invite_rejected_by_user'
-                : invite.status === 'expired'
-                  ? 'invite_expired'
-                  : 'invite_revoked',
-        });
-
-        if (!snap.exists()) {
-          const payload: Omit<TenantMembership, 'id'> = {
-            tenantId: invite.tenantId,
-            userId,
-            email,
-            displayName: (params.displayName || email.split('@')[0] || email).slice(0, 120),
-            role: invite.role,
-            status: nextStatus,
-            createdAt: existingCreatedAt,
-            updatedAt: nowIso,
-            statusHistory: [statusEvent],
-          };
-
-          if (nextStatus === 'pending_invite') {
-            payload.inviteToken = invite.token;
-            payload.inviteExpiresAt = invite.expiresAt;
-            payload.invitedBy = invite.issuedBy;
-          }
-          await setDoc(membershipRef, payload);
-        } else {
-          const updatePayload: Record<string, unknown> = {
-            updatedAt: nowIso,
-          };
-          if (shouldUpdateStatus) updatePayload.status = nextStatus;
-          if (shouldUpdateRole) updatePayload.role = invite.role;
-
-          if (nextStatus === 'pending_invite') {
-            updatePayload.inviteToken = invite.token;
-            updatePayload.inviteExpiresAt = invite.expiresAt;
-            updatePayload.invitedBy = invite.issuedBy;
-          } else if (nextStatus === 'rejected' || nextStatus === 'revoked') {
-            updatePayload.inviteToken = deleteField();
-            updatePayload.inviteExpiresAt = deleteField();
-            updatePayload.invitedBy = deleteField();
-          }
-
-          // Keep status history consistent with join-code claim behavior.
-          updatePayload.statusHistory = arrayUnion(statusEvent);
-
-          await setDoc(membershipRef, updatePayload, { merge: true });
-        }
-      }
+    try {
+      await tenantBackendClient.syncInviteMemberships({ displayName: params.displayName });
+    } catch (error) {
+      // Best-effort sync; never surface as a hard error to the UI.
+      logger.debug('tenantService.syncIncomingInvitesToMembershipsForUser failed', error);
     }
   }
 
@@ -1756,19 +1398,16 @@ class TenantService {
         q,
         (snapshot) => {
           const now = Date.now();
-          const nowIso = new Date().toISOString();
 
           const codes = snapshot.docs.map((docSnap) => {
             const data = { id: docSnap.id, ...docSnap.data() } as TenantCode;
-            // Proactively mark expired codes in the database when we detect them.
+            // Present expired-but-not-yet-flipped codes correctly in the UI.
+            // The DB flip is performed server-side (the backend self-heals stale
+            // 'active' codes when enforcing the active-code cap); the client no
+            // longer writes to `tenantCodes` (locked to backend-only writes).
             if (data.status === 'active' && data.expiresAt) {
               const expiresMs = Date.parse(data.expiresAt);
               if (!Number.isNaN(expiresMs) && expiresMs <= now) {
-                // Fire-and-forget: update DB so status becomes 'expired'.
-                void updateDoc(docSnap.ref, { status: 'expired', updatedAt: nowIso }).catch((err) =>
-                  logger.warn('tenantService.listenToCodes: failed to expire stale code', { id: docSnap.id, err }),
-                );
-                // Return the corrected status immediately so the UI is consistent.
                 return { ...data, status: 'expired' as const };
               }
             }
@@ -1801,18 +1440,25 @@ class TenantService {
   }
 
   async logAuditEvent(entry: Omit<TenantAuditLogEntry, 'id' | 'createdAt'>): Promise<void> {
-    await this.createAuditEntry(entry);
-  }
-
-  private async createAuditEntry(entry: Omit<TenantAuditLogEntry, 'id' | 'createdAt'>): Promise<void> {
+    // Server-mediated (security-rules-hardening C1): `tenantAuditLogs` is
+    // backend-only. Activity audit entries (attendance/fee actions) are appended
+    // via the backend, which stamps the actor from the verified token. Other
+    // audit actions are already written server-side by their own endpoints.
+    const tenantId = (entry.tenantId || '').trim();
+    if (!tenantId) {
+      return;
+    }
     try {
-      const payload = stripUndefinedDeep({
-        ...entry,
-        createdAt: new Date().toISOString(),
+      await tenantBackendClient.logActivityAudit({
+        tenantId,
+        action: entry.action,
+        targetId: entry.targetId,
+        targetType: entry.targetType as 'fee' | 'attendance' | undefined,
+        metadata: entry.metadata,
       });
-      await addDoc(this.auditRef, payload as any);
     } catch (error) {
-      logger.warn('tenantService.createAuditEntry failed', error);
+      // Audit logging is best-effort and must never block the underlying action.
+      logger.debug('tenantService.logAuditEvent failed', error);
     }
   }
 }

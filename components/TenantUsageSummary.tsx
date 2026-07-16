@@ -1,17 +1,15 @@
 import React, { useMemo, useState, useCallback, useEffect } from 'react';
-import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Platform, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import { RefreshCw } from 'lucide-react-native';
 import Toast from 'react-native-toast-message';
-import { doc, updateDoc } from 'firebase/firestore';
 
-import { firestore } from '@/config/firebase';
 import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
 import useStudents from '@/hooks/useStudents';
 import { useTenantUsageSummary } from '@/hooks/useTenantUsageSummary';
 import { usageAnalyticsService } from '@/services/usageAnalyticsService';
-import { normalizeTenantNotificationPreferences } from '@/services/tenantService';
+import { normalizeTenantNotificationPreferences, tenantService } from '@/services/tenantService';
 import { logger } from '@/lib/logger';
 import type { ThemeColors } from '@/types/theme';
 import type { UsageAlertRecord, UsageMetricKey, UsageSummaryResponse } from '@/types/usage';
@@ -392,23 +390,19 @@ const TenantUsageSummary = ({
     }
 
     try {
-      const membershipId = activeMembership?.id?.trim();
-      if (!membershipId) {
-        throw new Error('Membership not found for current user.');
-      }
-
-      const membershipRef = doc(firestore, 'tenantMemberships', membershipId);
-      await updateDoc(membershipRef, {
-        [`notificationPreferences.${key}`]: nextValue,
-        updatedAt: new Date().toISOString(),
+      // Server-mediated (security-rules-hardening C1): tenant notification
+      // preferences are owned by the backend (`tenants` is backend-only write).
+      // These usage-alert toggles are tenant-level and gated to owner/admin.
+      const { notificationPreferences: updatedPrefs } = await tenantService.updateNotificationPreferences({
+        tenantId,
+        notificationPreferences: { [key]: nextValue },
+        metadata: {
+          initiatedFrom: Platform.OS === 'web' ? 'web' : 'mobile',
+          reason: 'usage_alert_preference_toggled',
+        },
       });
 
-      const normalized = normalizeTenantNotificationPreferences(activeTenant?.notificationPreferences);
-      const nextPrefs = {
-        ...normalized,
-        [key]: nextValue,
-      };
-      applyTenantNotificationPreferencesSnapshot(tenantId, nextPrefs);
+      applyTenantNotificationPreferencesSnapshot(tenantId, updatedPrefs);
     } catch (error) {
       setUsageAlertEmailEnabled(previousEmail);
       setUsageAlertPushEnabled(previousPush);

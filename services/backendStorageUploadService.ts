@@ -84,6 +84,67 @@ function buildReconcileUrl(baseUrl: string, args: { tenantId: string }): string 
   return url.toString();
 }
 
+export type BackendStorageDeleteResponse = {
+  ok: boolean;
+  deleted?: boolean;
+  alreadyDeleted?: boolean;
+  path?: string;
+  bytes?: number;
+};
+
+/**
+ * Delete a tenant-owned storage object via the backend (Admin SDK). Client-side
+ * `deleteObject` is disabled in storage.rules (M1); the backend verifies the
+ * object lives under this tenant's managed prefix before deleting. `target` may
+ * be a Firebase download URL, a gs:// URL, or a raw object path.
+ */
+export async function deleteStorageObjectViaBackend(args: {
+  tenantId: string;
+  target: string;
+}): Promise<BackendStorageDeleteResponse> {
+  const tenantId = (args.tenantId || '').trim();
+  const target = (args.target || '').trim();
+  if (!tenantId) {
+    throw new Error('Tenant id is required to delete storage objects.');
+  }
+  if (!target) {
+    return { ok: true, alreadyDeleted: true };
+  }
+
+  const baseUrl = resolveBackendBaseUrl();
+  const url = new URL(`${baseUrl}/storage/delete`);
+  url.searchParams.set('tenantId', tenantId);
+
+  let headers = await buildAuthHeaders(baseUrl);
+  headers['Content-Type'] = 'application/json';
+  const body = JSON.stringify({ target });
+
+  let response = await fetch(url.toString(), { method: 'POST', headers, body });
+
+  if (response.status === 401) {
+    await internalTokenManager.forceRefresh(baseUrl);
+    headers = await buildAuthHeaders(baseUrl);
+    headers['Content-Type'] = 'application/json';
+    response = await fetch(url.toString(), { method: 'POST', headers, body });
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    maybeShowMaintenanceAlertFromRaw(response.status, text);
+    throw new Error(text || `storage_delete_failed_${response.status}`);
+  }
+
+  const text = await response.text();
+  if (!text) {
+    return { ok: true };
+  }
+  try {
+    return JSON.parse(text) as BackendStorageDeleteResponse;
+  } catch {
+    return { ok: true };
+  }
+}
+
 async function ensureUploadPreflight(args: {
   baseUrl: string;
   tenantId: string;

@@ -67,8 +67,9 @@ export interface QueuePaymentConfirmationPayload {
 interface QueueResult { jobId?: string; queued?: boolean; error?: string }
 
 export class WhatsAppQueueClient {
-  // Legacy direct master key path removed: we no longer support EXPO_PUBLIC_INTERNAL_API_KEY in production.
-  // Dev-only shortcut using EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET is handled by internalTokenManager.
+  // Legacy direct master key path removed: we no longer support EXPO_PUBLIC_INTERNAL_API_KEY.
+  // Auth is the Firebase ID token -> /auth/bridge exchange via internalTokenManager
+  // (the client dev-secret token flow was removed entirely — security-rules-hardening M3).
   private debug = (process.env.EXPO_PUBLIC_DEBUG_AUTH === '1' || process.env.EXPO_PUBLIC_DEBUG_AUTH === 'true');
   private log(...args:any[]){ if(this.debug) logger.debug('[wa-queue-debug]', ...args); }
 
@@ -152,24 +153,6 @@ export class WhatsAppQueueClient {
       res = await fetch(`${base}/whatsapp/queue/payment-confirmation`, { method: 'POST', headers: await this.buildHeaders(base), body: JSON.stringify(payload) });
     }
     if(this.debug && !res.ok){ try { const t=await res.text(); this.log('payment-confirmation error', t.slice(0,200)); } catch {} }
-    if (!res.ok) return { error: await this.safeText(res) };
-    return await res.json();
-  }
-
-  async previewCustomTemplate(payload: QueueCustomMessagePayload) {
-    const base = this.resolveBase();
-    this.assertTenant(payload.tenantId);
-    let res = await fetch(`${base}/whatsapp/preview/custom-template`, {
-      method: 'POST',
-      headers: await this.buildHeaders(base),
-      body: JSON.stringify(payload),
-    });
-    if (res.status === 401) {
-      if(this.debug) this.log('401 preview-custom first attempt');
-      await internalTokenManager.forceRefresh(base);
-      res = await fetch(`${base}/whatsapp/preview/custom-template`, { method: 'POST', headers: await this.buildHeaders(base), body: JSON.stringify(payload) });
-    }
-    if(this.debug && !res.ok){ try { const t=await res.text(); this.log('preview-custom error', t.slice(0,200)); } catch {} }
     if (!res.ok) return { error: await this.safeText(res) };
     return await res.json();
   }

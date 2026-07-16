@@ -1,6 +1,26 @@
 import { logger } from '@/lib/logger';
+import { isPermissionDeniedError } from '@/lib/firestoreErrors';
 import { collection, addDoc, query, where, orderBy, getDocs, doc, updateDoc, Timestamp, limit, startAfter, QueryDocumentSnapshot, DocumentData, getCountFromServer, getDoc } from 'firebase/firestore';
 import { firestore } from '../config/firebase';
+
+// Classify a permission-denied on a reminder read by SCOPE:
+//  - A tenant-wide ('all users', userId === null) read that gets denied is an
+//    EXPECTED, feature-gated outcome (the caller isn't authorized to read all
+//    reminders). Log it at `debug` so it degrades quietly and does NOT trip the
+//    global auth-recovery interceptor (which reacts to warn/error permission-denied).
+//  - A SELF-scoped read (the caller's own userId) should NEVER be denied — the rules
+//    always allow a user to read their own reminders. A denial here indicates a real
+//    Firestore rules/config regression, so log it at `error` so it stays loud and
+//    visible instead of being silently swallowed as "no data".
+// Returns true if the denial was the expected/benign all-scope case.
+function logReminderPermissionDenied(op: string, userId: string | null, error: unknown): boolean {
+  if (userId === null) {
+    logger.debug(`${op}: tenant-wide reminder read denied (expected — caller not authorized for 'all' scope)`);
+    return true;
+  }
+  logger.error(`${op}: self-scoped reminder read denied (UNEXPECTED — possible Firestore rules regression)`, error);
+  return false;
+}
 
 // Firestore doesn't allow undefined values anywhere in the payload (including nested fields or arrays).
 // This helper removes all undefined values recursively so we can safely write documents
@@ -294,6 +314,12 @@ class ReminderHistoryService {
 
       return reminders;
     } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        // Scope-aware: quiet for an expected all-scope denial, loud for a self-scoped
+        // one. Re-throw either way so the caller can degrade / self-heal / surface it.
+        logReminderPermissionDenied('getReminderHistory', userId, error);
+        throw error;
+      }
       logger.error('Error fetching reminder history:', error);
       return [];
     }
@@ -432,6 +458,10 @@ class ReminderHistoryService {
         hasMore
       };
     } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        logReminderPermissionDenied('getPaginatedReminderHistory', userId, error);
+        throw error;
+      }
       logger.error('Error fetching paginated reminder history:', error);
       throw error instanceof Error ? error : new Error('Failed to load reminder history');
     }
@@ -485,6 +515,11 @@ class ReminderHistoryService {
 
       return batches;
     } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        // Batches are always read self-scoped, so a denial is never expected.
+        logReminderPermissionDenied('getReminderBatches', userId, error);
+        return [];
+      }
       logger.error('Error fetching reminder batches:', error);
       return [];
     }
@@ -601,6 +636,10 @@ class ReminderHistoryService {
 
   return stats;
     } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        logReminderPermissionDenied('getReminderStats', userId, error);
+        throw error;
+      }
       logger.error('Error fetching reminder stats:', error);
       return {
         totalReminders: 0,
@@ -635,6 +674,10 @@ class ReminderHistoryService {
       const snapshot = await getCountFromServer(q);
       return snapshot.data().count;
     } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        logReminderPermissionDenied('getReminderCount', userId, error);
+        throw error;
+      }
       logger.error('Error fetching reminder count:', error);
       return 0;
     }
@@ -715,6 +758,10 @@ class ReminderHistoryService {
 
       return stats;
     } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        logReminderPermissionDenied('getReminderStatsForDateRange', userId, error);
+        throw error;
+      }
       logger.error('Error fetching reminder stats for date range:', error);
       return {
         totalReminders: 0,
@@ -744,7 +791,11 @@ class ReminderHistoryService {
         pendingReminders: stats.pendingReminders,
       };
     } catch (error) {
-      logger.error('Error loading monthly reminder usage summary', error);
+      if (isPermissionDeniedError(error)) {
+        logger.debug('Monthly reminder usage summary denied for current scope; returning zeroes');
+      } else {
+        logger.error('Error loading monthly reminder usage summary', error);
+      }
       return {
         windowStart: windowStart.toISOString(),
         windowEnd: windowEnd.toISOString(),

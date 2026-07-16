@@ -191,6 +191,38 @@ export function updateMaintenanceMode(payload: Partial<MaintenanceModeDoc>) {
   });
 }
 
+// Global app settings (appSettings/globalSettings) — support contact, legal
+// links, and the default brand name. The tenant-scoped visibility flags
+// (allowNonAdminAllReminderHistory / hideAuthorizedEmailsForNonAdmins) live on
+// each tenant's settings map and are NOT edited here.
+export type GlobalSettingsDoc = {
+  supportEmail?: string;
+  supportPhone?: string;
+  whatsappNumber?: string;
+  bugReportFormUrl?: string;
+  coachingName?: string;
+  legal?: {
+    privacyPolicyUrl?: string;
+    termsOfServiceUrl?: string;
+  };
+  createdAt?: string;
+  updatedAt?: string;
+} & Record<string, unknown>;
+
+export function fetchGlobalSettings() {
+  return apiRequest<{ ok: true; data: GlobalSettingsDoc | null }>('/admin/settings/global-settings', {
+    auth: 'auto',
+  });
+}
+
+export function updateGlobalSettings(payload: Partial<GlobalSettingsDoc>) {
+  return apiRequest<{ ok: true; data: GlobalSettingsDoc | null }>('/admin/settings/global-settings', {
+    method: 'POST',
+    auth: 'auto',
+    body: payload,
+  });
+}
+
 export type GlobalAdminMe = {
   ok: boolean;
   uid: string | null;

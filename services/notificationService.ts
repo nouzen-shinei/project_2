@@ -11,13 +11,10 @@ import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { twilioBackendClient, SMSMessage, VoiceCallMessage } from './twilioBackendClient';
-import { whatsappBusinessService, WABATemplateComponentParam } from './wabaService';
-import { getTemplateLanguage } from './wabaTemplateConstants';
 import {
   confirmInboundChatDeliveryFromNotificationData,
   flushPendingInboundChatDeliveryReceipts,
 } from './chatReceiptSync';
-import { whatsappConversationService } from './whatsappConversationService';
 import { emailService } from './emailService';
 import { quotesService } from './quotesService';
 import { Student } from '../types';
@@ -26,7 +23,6 @@ import { adminNotificationHistoryService } from './adminNotificationHistoryServi
 import { router } from 'expo-router';
 import type { DeviceNotificationFanoutResult, DeviceTenantFilterOptions } from './deviceTrackingService';
 import { tenantService } from './tenantService';
-import { runtimeEndpoints } from './runtimeEndpoints';
 
 type DeviceTrackingServiceType = typeof import('./deviceTrackingService').deviceTrackingService;
 
@@ -1019,312 +1015,11 @@ class NotificationService {
     }
   }
 
-  async sendWhatsAppMessage(phoneNumber: string, message: string): Promise<boolean> {
-    try {
-      // Direct WABA only (Twilio WhatsApp removed)
-      const success = await whatsappBusinessService.sendTextMessage({ to: phoneNumber, text: message });
-      if (!success) logger.warn('WABA session send failed; verify 24h window or use a template.');
-      return success;
-    } catch (error) {
-      logger.error('Error sending WhatsApp message (WABA):', error);
-      return false;
-    }
-  }
-
-  // Removed legacy basic fee_due_reminder template usage (now only extended template is supported)
-
-  /** Enhanced fee due template with extra variables (requires updating template to include them)
-   * Updated unified style (matches SMS/Voice wording; placeholders unchanged):
-   * "{{1}} {{2}}, this is a reminder that {{3}}'s tuition fee of {{4}} is due on {{5}}. {{6}} Please make the payment at your earliest convenience. Thank you! Regards, {{7}} {{8}}"
-   * Variables:
-  * 1 Greeting ("Dear" / custom)
-   * 2 Parent name
-   * 3 Student name
-   * 4 Amount (₹...)
-   * 5 Due date
-   * 6 Optional custom notes / extra line (or '-' if none)
-   * 7 Teacher name (or Coaching name if teacher hidden)
-   * 8 Coaching name (or '-')
+  /** Payment received confirmation via the backend WhatsApp queue
+   * (fee_payment_received_confirmation template family). All delivery is
+   * template-based and handled server-side; there is no client-side session
+   * (24h-window) text path. Returns true when the job is accepted by the queue.
    */
-  async sendWhatsAppFeeDueTemplateExtended(options: {
-    to: string;
-    parentName?: string;
-    studentName: string;
-    amount: number;
-    dueDate: string;
-    greeting?: string;
-    customNotes?: string;
-    teacherName?: string;
-    coachingName?: string;
-    selectedLanguage?: 'english' | 'hindi' | 'both';
-    languageOrder?: 'english-first' | 'hindi-first';
-  }): Promise<boolean> {
-    try {
-      const useWABA =
-        !!process.env.EXPO_PUBLIC_WABA_PHONE_NUMBER_ID ||
-        !!runtimeEndpoints.getSnapshot().wabaApiBaseUrl ||
-        !!runtimeEndpoints.getPreferredBackendBaseUrl();
-
-      if (!useWABA) {
-        logger.warn('WABA not configured; cannot send WhatsApp template.');
-        return false;
-      }
-
-      const greeting = (options.greeting || 'Dear').trim();
-      const parent = 'Parent';
-      const amountFmt = `₹${options.amount.toLocaleString()}`;
-      const customBase =
-        options.customNotes && options.customNotes.trim() ? options.customNotes.trim() : 'No additional note';
-      const teacher = options.teacherName && options.teacherName.trim() ? options.teacherName.trim() : '-';
-      const coaching = options.coachingName && options.coachingName.trim() ? options.coachingName.trim() : '-';
-
-      if (options.selectedLanguage === 'both') {
-        const englishFirst = options.languageOrder === 'english-first';
-        const templateName = englishFirst
-          ? 'fee_due_reminder_extended_bilingual_en_hi'
-          : 'fee_due_reminder_extended_bilingual_hi_en';
-        const hindiGreeting = greeting.toLowerCase().startsWith('dear') ? 'प्रिय' : greeting;
-        const hindiParent = 'अभिभावक';
-
-        const bodyParams: WABATemplateComponentParam[] = englishFirst
-          ? [
-              { type: 'text' as const, text: greeting },
-              { type: 'text' as const, text: parent },
-              { type: 'text' as const, text: options.studentName },
-              { type: 'text' as const, text: amountFmt },
-              { type: 'text' as const, text: options.dueDate },
-              { type: 'text' as const, text: customBase },
-              { type: 'text' as const, text: teacher },
-              { type: 'text' as const, text: coaching },
-              { type: 'text' as const, text: hindiGreeting },
-              { type: 'text' as const, text: hindiParent },
-              { type: 'text' as const, text: options.studentName },
-              { type: 'text' as const, text: amountFmt },
-              { type: 'text' as const, text: options.dueDate },
-              { type: 'text' as const, text: 'कोई नोट नहीं' },
-              { type: 'text' as const, text: teacher },
-              { type: 'text' as const, text: coaching },
-            ]
-          : [
-              { type: 'text' as const, text: hindiGreeting },
-              { type: 'text' as const, text: hindiParent },
-              { type: 'text' as const, text: options.studentName },
-              { type: 'text' as const, text: amountFmt },
-              { type: 'text' as const, text: options.dueDate },
-              { type: 'text' as const, text: 'कोई नोट नहीं' },
-              { type: 'text' as const, text: teacher },
-              { type: 'text' as const, text: coaching },
-              { type: 'text' as const, text: greeting },
-              { type: 'text' as const, text: parent },
-              { type: 'text' as const, text: options.studentName },
-              { type: 'text' as const, text: amountFmt },
-              { type: 'text' as const, text: options.dueDate },
-              { type: 'text' as const, text: customBase },
-              { type: 'text' as const, text: teacher },
-              { type: 'text' as const, text: coaching },
-            ];
-
-        return await whatsappBusinessService.sendTemplateMessage({
-          to: options.to,
-          templateName,
-          language: getTemplateLanguage(templateName),
-          bodyParams,
-        });
-      }
-
-      if (options.selectedLanguage === 'hindi') {
-        const hindiGreeting = greeting.toLowerCase().startsWith('dear') ? 'प्रिय' : greeting;
-        const hindiParent = 'अभिभावक';
-        const customHi =
-          options.customNotes && options.customNotes.trim() ? options.customNotes.trim() : 'कोई नोट नहीं';
-
-        return await whatsappBusinessService.sendTemplateMessage({
-          to: options.to,
-          templateName: 'fee_due_reminder_extended_hi',
-          language: getTemplateLanguage('fee_due_reminder_extended_hi'),
-          bodyParams: [
-            { type: 'text', text: hindiGreeting },
-            { type: 'text', text: hindiParent },
-            { type: 'text', text: options.studentName },
-            { type: 'text', text: amountFmt },
-            { type: 'text', text: options.dueDate },
-            { type: 'text', text: customHi },
-            { type: 'text', text: teacher },
-            { type: 'text', text: coaching },
-          ],
-        });
-      }
-
-      return await whatsappBusinessService.sendTemplateMessage({
-        to: options.to,
-        templateName: 'fee_due_reminder_extended',
-        language: getTemplateLanguage('fee_due_reminder_extended'),
-        bodyParams: [
-          { type: 'text', text: greeting },
-          { type: 'text', text: parent },
-          { type: 'text', text: options.studentName },
-          { type: 'text', text: amountFmt },
-          { type: 'text', text: options.dueDate },
-          { type: 'text', text: customBase },
-          { type: 'text', text: teacher },
-          { type: 'text', text: coaching },
-        ],
-      });
-    } catch (error) {
-      logger.error('Error sending extended fee_due_reminder template', error);
-      return false;
-    }
-  }
-
-  /** WhatsApp payment received confirmation via template (EN/HI/bilingual)
-   * Template bodies (see templates.txt):
-   * EN: "Payment received – {{1}} {{2}}, we have received payment of {{4}} for {{3}} on {{5}}. Additional note: {{6}}. ... Regards, {{7}} {{8}}"
-   * Variables:
-   * 1 Greeting (e.g., Dear)
-   * 2 Parent name (fallback "Parent")
-   * 3 Student name
-   * 4 Amount (₹...)
-   * 5 Payment date (formatted)
-   * 6 Optional additional note (fallback "No additional note")
-   * 7 Teacher name (or coaching if desired)
-   * 8 Coaching name
-   */
-  async sendWhatsAppPaymentReceivedTemplate(options: {
-    to: string;
-    parentName?: string;
-    studentName: string;
-    amount: number;
-    paymentDate: string; // raw string or ISO; will be formatted
-    greeting?: string; // default "Dear"; Hindi uses "प्रिय"
-    additionalNote?: string;
-    teacherName?: string;
-    coachingName?: string;
-    selectedLanguage?: 'english' | 'hindi' | 'both';
-    languageOrder?: 'english-first' | 'hindi-first';
-  }): Promise<boolean> {
-    try {
-      const useWABA =
-        !!process.env.EXPO_PUBLIC_WABA_PHONE_NUMBER_ID ||
-        !!runtimeEndpoints.getSnapshot().wabaApiBaseUrl ||
-        !!runtimeEndpoints.getPreferredBackendBaseUrl();
-      if (!useWABA) {
-        logger.warn('WABA not configured; cannot send WhatsApp template.');
-        return false;
-      }
-      const formattedDate = this.formatDueDate(options.paymentDate);
-      const amountFmt = `₹${options.amount.toLocaleString()}`;
-      const teacher = options.teacherName && options.teacherName.trim() ? options.teacherName.trim() : '-';
-      const coaching = options.coachingName && options.coachingName.trim() ? options.coachingName.trim() : '-';
-
-      // English/Hindi defaults
-      const enGreeting = (options.greeting || 'Dear').trim();
-      const enParent = (options.parentName && options.parentName.trim()) ? options.parentName.trim() : 'Parent';
-      const enNote = options.additionalNote && options.additionalNote.trim() ? options.additionalNote.trim() : 'No additional note';
-      const hiGreeting = enGreeting.toLowerCase().startsWith('dear') ? 'प्रिय' : (enGreeting || 'प्रिय');
-      const hiParent = (options.parentName && options.parentName.trim()) ? options.parentName.trim() : 'अभिभावक';
-      const hiNote = options.additionalNote && options.additionalNote.trim() ? options.additionalNote.trim() : 'कोई अतिरिक्त नोट नहीं';
-
-      // Bilingual
-      if (options.selectedLanguage === 'both') {
-        const englishFirst = options.languageOrder === 'english-first';
-        const templateName = englishFirst
-          ? 'fee_payment_received_confirmation_bilingual_en_hi'
-          : 'fee_payment_received_confirmation_bilingual_hi_en';
-        // Single combined Additional note placed between the two language blocks
-        const sharedNote = options.additionalNote && options.additionalNote.trim() ? options.additionalNote.trim() : 'No additional note';
-        const bodyParams: WABATemplateComponentParam[] = englishFirst ? [
-          // EN block (without note)
-          { type: 'text', text: enGreeting },     // 1
-          { type: 'text', text: enParent },       // 2
-          { type: 'text', text: options.studentName }, // 3
-          { type: 'text', text: amountFmt },      // 4
-          { type: 'text', text: formattedDate },  // 5
-          { type: 'text', text: teacher },        // 6
-          { type: 'text', text: coaching },       // 7
-          // Combined note between blocks
-          { type: 'text', text: sharedNote },     // 8
-          // HI block (without note)
-          { type: 'text', text: hiGreeting },     // 9
-          { type: 'text', text: hiParent },       // 10
-          { type: 'text', text: options.studentName }, // 11
-          { type: 'text', text: amountFmt },      // 12
-          { type: 'text', text: formattedDate },  // 13
-          { type: 'text', text: teacher },        // 14
-          { type: 'text', text: coaching },       // 15
-        ] : [
-          // HI block (without note)
-          { type: 'text', text: hiGreeting },     // 1
-          { type: 'text', text: hiParent },       // 2
-          { type: 'text', text: options.studentName }, // 3
-          { type: 'text', text: amountFmt },      // 4
-          { type: 'text', text: formattedDate },  // 5
-          { type: 'text', text: teacher },        // 6
-          { type: 'text', text: coaching },       // 7
-          // Combined note between blocks
-          { type: 'text', text: sharedNote },     // 8
-          // EN block (without note)
-          { type: 'text', text: enGreeting },     // 9
-          { type: 'text', text: enParent },       // 10
-          { type: 'text', text: options.studentName }, // 11
-          { type: 'text', text: amountFmt },      // 12
-          { type: 'text', text: formattedDate },  // 13
-          { type: 'text', text: teacher },        // 14
-          { type: 'text', text: coaching },       // 15
-        ];
-        return await whatsappBusinessService.sendTemplateMessage({
-          to: options.to,
-          templateName,
-          language: getTemplateLanguage(templateName),
-          bodyParams,
-        });
-      }
-
-      // Hindi-only
-      if (options.selectedLanguage === 'hindi') {
-        const templateName = 'fee_payment_received_confirmation_hi';
-        const bodyParams: WABATemplateComponentParam[] = [
-          { type: 'text', text: hiGreeting },     // 1
-          { type: 'text', text: hiParent },       // 2
-          { type: 'text', text: options.studentName }, // 3
-          { type: 'text', text: amountFmt },      // 4
-          { type: 'text', text: formattedDate },  // 5
-          { type: 'text', text: hiNote },         // 6
-          { type: 'text', text: teacher },        // 7
-          { type: 'text', text: coaching },       // 8
-        ];
-        return await whatsappBusinessService.sendTemplateMessage({
-          to: options.to,
-          templateName,
-          language: getTemplateLanguage(templateName),
-          bodyParams,
-        });
-      }
-
-      // English-only (default)
-      const templateName = 'fee_payment_received_confirmation';
-      const bodyParams: WABATemplateComponentParam[] = [
-        { type: 'text', text: enGreeting },     // 1
-        { type: 'text', text: enParent },       // 2
-        { type: 'text', text: options.studentName }, // 3
-        { type: 'text', text: amountFmt },      // 4
-        { type: 'text', text: formattedDate },  // 5
-        { type: 'text', text: enNote },         // 6
-        { type: 'text', text: teacher },        // 7
-        { type: 'text', text: coaching },       // 8
-      ];
-      return await whatsappBusinessService.sendTemplateMessage({
-        to: options.to,
-        templateName,
-        language: getTemplateLanguage(templateName),
-        bodyParams,
-      });
-    } catch (e) {
-      logger.error('Error sending payment_received template', e);
-      return false;
-    }
-  }
-
-  /** Smart payment received confirmation: uses template outside 24h window, session text inside. */
   async sendSmartWhatsAppPaymentReceived(options: {
     tenantId: string;
     to: string;
@@ -1339,197 +1034,39 @@ class NotificationService {
     selectedLanguage?: 'english' | 'hindi' | 'both';
     languageOrder?: 'english-first' | 'hindi-first';
   }): Promise<boolean> {
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
     try {
       if (!options.tenantId) {
         logger.warn('sendSmartWhatsAppPaymentReceived called without tenantId');
         return false;
       }
-      const state = await whatsappConversationService.getState(options.to);
-      const now = Date.now();
-      const lastInbound = state?.lastInboundAt;
       const formattedDate = this.formatDueDate(options.paymentDate);
-      const amountFmt = `₹${options.amount.toLocaleString()}`;
-      const outsideWindow = !lastInbound || (now - lastInbound) > TWENTY_FOUR_HOURS;
-      if (outsideWindow) {
-        // Prefer queue-based delivery similar to fee reminders; fallback to direct template
-        try {
-          const { whatsappQueueClient } = require('./whatsappQueueClient');
-          const resp = await whatsappQueueClient.queuePaymentConfirmation({
-            tenantId: options.tenantId,
-            to: options.to,
-            parentName: options.parentName,
-            studentName: options.studentName,
-            amount: options.amount,
-            paymentDate: formattedDate,
-            greeting: options.greeting,
-            additionalNote: options.additionalNote,
-            teacherName: options.teacherName,
-            coachingName: options.coachingName,
-            selectedLanguage: options.selectedLanguage,
-            languageOrder: options.languageOrder,
-          });
-          if (resp?.jobId) return true;
-        } catch (qe) {
-          logger.warn('Queue payment confirmation failed; fallback to direct template', qe);
-        }
-        return await this.sendWhatsAppPaymentReceivedTemplate({ ...options, paymentDate: formattedDate });
-      }
-      // Inside 24h window: session text
-      const enGreeting = (options.greeting || 'Dear').trim();
-      const parent = options.parentName && options.parentName.trim() ? options.parentName.trim() : 'Parent';
-      const note = options.additionalNote && options.additionalNote.trim() ? options.additionalNote.trim() : 'No additional note';
-      const signOffParts: string[] = [];
-      if (options.teacherName) signOffParts.push(options.teacherName.trim());
-      if (options.coachingName) signOffParts.push(options.coachingName.trim());
-      const signOff = signOffParts.length ? `\nRegards, ${signOffParts.join(' ')}` : '';
-      const sessionMessage = `Payment received – ${enGreeting} ${parent}, we have received payment of ${amountFmt} for ${options.studentName} on ${formattedDate}. Additional note: ${note}. Thank you for your payment!${signOff}`;
-      return await this.sendWhatsAppMessage(options.to, sessionMessage);
-    } catch (e) {
-      logger.error('Error in smart WhatsApp payment received', e);
-      return false;
-    }
-  }
-
-  /** Generic custom message template (with optional teacher & coaching signature)
-   * Template name: custom_message_with_signature
-   * Suggested template body:
-   * "{{1}}\n\nRegards, {{2}} {{3}}"
-   * Variables:
-   * 1 Custom message body (can contain line breaks)
-   * 2 Teacher name (or '-')
-   * 3 Coaching / Institute name (or '-')
-   */
-  async sendWhatsAppCustomTemplate(options: {
-    to: string;
-    message: string;          // raw combined message (used for single-language)
-    teacherName?: string;     // optional teacher
-    coachingName?: string;    // optional coaching
-    selectedLanguage?: 'english' | 'hindi' | 'both';
-    languageOrder?: 'english-first' | 'hindi-first';
-    englishMessage?: string;  // optional explicit English segment when bilingual
-    hindiMessage?: string;    // optional explicit Hindi segment when bilingual
-  }): Promise<boolean> {
-    try {
-  const useWABA =
-    !!process.env.EXPO_PUBLIC_WABA_PHONE_NUMBER_ID ||
-    !!runtimeEndpoints.getSnapshot().wabaApiBaseUrl ||
-    !!runtimeEndpoints.getPreferredBackendBaseUrl();
-      if (!useWABA) {
-        logger.warn('WABA not configured; cannot send custom WhatsApp template.');
+      const { whatsappQueueClient } = require('./whatsappQueueClient');
+      const resp = await whatsappQueueClient.queuePaymentConfirmation({
+        tenantId: options.tenantId,
+        to: options.to,
+        parentName: options.parentName,
+        studentName: options.studentName,
+        amount: options.amount,
+        paymentDate: formattedDate,
+        greeting: options.greeting,
+        additionalNote: options.additionalNote,
+        teacherName: options.teacherName,
+        coachingName: options.coachingName,
+        selectedLanguage: options.selectedLanguage,
+        languageOrder: options.languageOrder,
+      });
+      if (resp?.error) {
+        logger.error('Queue payment confirmation failed', resp.error);
         return false;
       }
-      const teacher = options.teacherName && options.teacherName.trim() ? options.teacherName.trim() : '-';
-      const coaching = options.coachingName && options.coachingName.trim() ? options.coachingName.trim() : '-';
-
-      if (options.selectedLanguage === 'both') {
-        const englishFirst = options.languageOrder === 'english-first';
-        const templateName = englishFirst ? 'custom_message_with_signature_bilingual_en_hi' : 'custom_message_with_signature_bilingual_hi_en';
-        let enBody = (options.englishMessage || '').trim();
-        let hiBody = (options.hindiMessage || '').trim();
-        if ((!enBody || !hiBody) && options.message.includes('\n\n')) {
-          const parts = options.message.split(/\n\n+/);
-          if (parts.length >= 2) {
-            if (englishFirst) {
-              enBody = enBody || parts[0].trim();
-              hiBody = hiBody || parts.slice(1).join('\n\n').trim();
-            } else {
-              hiBody = hiBody || parts[0].trim();
-              enBody = enBody || parts.slice(1).join('\n\n').trim();
-            }
-          }
-        }
-        enBody = enBody || 'This is a notice regarding your ward.';
-        hiBody = hiBody || 'यह आपके विद्यार्थी के संबंध में एक नोट है।';
-        const bodyParams: WABATemplateComponentParam[] = englishFirst ? [
-          { type: 'text', text: enBody },      // 1 EN body
-          { type: 'text', text: teacher },     // 2 EN teacher
-          { type: 'text', text: coaching },    // 3 EN coaching
-          { type: 'text', text: hiBody },      // 4 HI body
-          { type: 'text', text: teacher },     // 5 HI teacher (same value allowed)
-          { type: 'text', text: coaching },    // 6 HI coaching
-        ] : [
-          { type: 'text', text: hiBody },      // 1 HI body
-          { type: 'text', text: teacher },     // 2 HI teacher
-          { type: 'text', text: coaching },    // 3 HI coaching
-          { type: 'text', text: enBody },      // 4 EN body
-          { type: 'text', text: teacher },     // 5 EN teacher
-          { type: 'text', text: coaching },    // 6 EN coaching
-        ];
-        return await whatsappBusinessService.sendTemplateMessage({
-          to: options.to,
-          templateName,
-          language: getTemplateLanguage(templateName),
-          bodyParams,
-        });
-      }
-
-      if (options.selectedLanguage === 'hindi') {
-        const hiBody = (options.hindiMessage || options.message).trim() || 'यह आपके विद्यार्थी के संबंध में एक नोट है।';
-        return await whatsappBusinessService.sendTemplateMessage({
-          to: options.to,
-          templateName: 'custom_message_with_signature_hi_new',
-          language: getTemplateLanguage('custom_message_with_signature_hi_new'),
-          bodyParams: [
-            { type: 'text', text: hiBody },    // 1 Body
-            { type: 'text', text: teacher },   // 2 Teacher
-            { type: 'text', text: coaching },  // 3 Coaching
-          ],
-        });
-      }
-
-      // English (default)
-    const body = options.message.trim() || 'This is a notice regarding your ward.';
-      return await whatsappBusinessService.sendTemplateMessage({
-        to: options.to,
-        templateName: 'custom_message_with_signature',
-        language: getTemplateLanguage('custom_message_with_signature'),
-        bodyParams: [
-      { type: 'text', text: body },       // 1 Body
-      { type: 'text', text: teacher },    // 2 Teacher
-      { type: 'text', text: coaching },   // 3 Coaching
-        ],
-      });
+      return !!resp?.jobId;
     } catch (e) {
-      logger.error('Failed to send custom WhatsApp template', e);
+      logger.error('Error queuing WhatsApp payment received', e);
       return false;
     }
   }
 
-  /** Smart custom WhatsApp message: uses template outside 24h window, session text inside. */
-  async sendSmartWhatsAppCustomMessage(options: {
-    to: string;
-    message: string;          // full desired message body (without explicit Regards line; signature auto-handled)
-    teacherName?: string;
-    coachingName?: string;
-  }): Promise<boolean> {
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
-    try {
-      const state = await whatsappConversationService.getState(options.to);
-      const now = Date.now();
-      const lastInbound = state?.lastInboundAt;
-      const outsideWindow = !lastInbound || (now - lastInbound) > TWENTY_FOUR_HOURS;
-      if (outsideWindow) {
-        return await this.sendWhatsAppCustomTemplate({
-          to: options.to,
-          message: options.message,
-          teacherName: options.teacherName,
-          coachingName: options.coachingName,
-        });
-      }
-      // Inside window: append signature inline for session text
-      const signOffParts: string[] = [];
-      if (options.teacherName) signOffParts.push(options.teacherName.trim());
-      if (options.coachingName) signOffParts.push(options.coachingName.trim());
-      const signOff = signOffParts.length ? `\nRegards, ${signOffParts.join(' ')}` : '';
-      return await this.sendWhatsAppMessage(options.to, `${options.message.trim()}${signOff}`);
-    } catch (e) {
-      logger.error('Error in smart custom WhatsApp message', e);
-      return false;
-    }
-  }
-
-  /** Unified smart fee reminder (auto template vs session) */
+  /** Fee reminder via the backend WhatsApp queue (fee_due_reminder_extended template family). */
   async sendSmartWhatsAppFeeReminder(options: {
     tenantId: string;
     to: string;
@@ -1544,71 +1081,34 @@ class NotificationService {
   selectedLanguage?: 'english' | 'hindi' | 'both';
   languageOrder?: 'english-first' | 'hindi-first';
   }): Promise<boolean> {
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
     try {
       if (!options.tenantId) {
         logger.warn('sendSmartWhatsAppFeeReminder called without tenantId');
         return false;
       }
-      // Fetch last inbound timestamp
-      const state = await whatsappConversationService.getState(options.to);
-      const now = Date.now();
-      const lastInbound = state?.lastInboundAt;
-
-      // Format due date nicely (e.g., 15 Sept 2025)
       const formattedDue = this.formatDueDate(options.dueDate);
-
-      const outsideWindow = !lastInbound || (now - lastInbound) > TWENTY_FOUR_HOURS;
-      if (outsideWindow) {
-        // Queue instead of direct send to unify flow
-        try {
-          const { whatsappQueueClient } = require('./whatsappQueueClient');
-          const resp = await whatsappQueueClient.queueFeeReminder({
-            tenantId: options.tenantId,
-            to: options.to,
-            parentName: options.parentName,
-            studentName: options.studentName,
-            amount: options.amount,
-            dueDate: formattedDue,
-            greeting: options.greeting,
-            customNotes: options.customNotes,
-            teacherName: options.teacherName,
-            coachingName: options.coachingName,
-            selectedLanguage: options.selectedLanguage,
-            languageOrder: options.languageOrder,
-          });
-          return !!resp.jobId;
-        } catch (qe) {
-          logger.warn('Queue fee reminder fallback to direct template send', qe);
-          const sentExtended = await this.sendWhatsAppFeeDueTemplateExtended({
-            to: options.to,
-            parentName: options.parentName,
-            studentName: options.studentName,
-            amount: options.amount,
-            dueDate: formattedDue,
-            greeting: options.greeting,
-            customNotes: options.customNotes,
-            teacherName: options.teacherName,
-            coachingName: options.coachingName,
-            selectedLanguage: options.selectedLanguage,
-            languageOrder: options.languageOrder,
-          });
-          return sentExtended;
-        }
+      const { whatsappQueueClient } = require('./whatsappQueueClient');
+      const resp = await whatsappQueueClient.queueFeeReminder({
+        tenantId: options.tenantId,
+        to: options.to,
+        parentName: options.parentName,
+        studentName: options.studentName,
+        amount: options.amount,
+        dueDate: formattedDue,
+        greeting: options.greeting,
+        customNotes: options.customNotes,
+        teacherName: options.teacherName,
+        coachingName: options.coachingName,
+        selectedLanguage: options.selectedLanguage,
+        languageOrder: options.languageOrder,
+      });
+      if (resp?.error) {
+        logger.error('Queue fee reminder failed', resp.error);
+        return false;
       }
-      // Inside window → send session text
-      const displayParent = options.parentName && options.parentName.trim() ? options.parentName.trim() : 'Parent';
-      const amountFmt = `₹${options.amount.toLocaleString()}`;
-  const base = `${options.greeting || 'Dear'} ${displayParent}, ${options.studentName}'s tuition fee of ${amountFmt} is due on ${formattedDue}.`;
-      const notes = options.customNotes ? ` ${options.customNotes}` : '';
-      const signOffParts: string[] = [];
-      if (options.teacherName) signOffParts.push(options.teacherName);
-      if (options.coachingName) signOffParts.push(options.coachingName);
-      const signOff = signOffParts.length ? `\nRegards, ${signOffParts.join(' ')}` : '';
-      const sessionMessage = base + notes + signOff;
-      return await this.sendWhatsAppMessage(options.to, sessionMessage);
+      return !!resp?.jobId;
     } catch (e) {
-      logger.error('Error in smart WhatsApp fee reminder', e);
+      logger.error('Error queuing WhatsApp fee reminder', e);
       return false;
     }
   }

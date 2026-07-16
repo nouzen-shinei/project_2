@@ -23,7 +23,7 @@ import { useAuth } from '@/hooks/useAuthUnified';
 import { formatDateToString } from '@/lib/utils';
 import { logger } from '@/lib/logger';
 import { Save, RefreshCw, ImagePlus, Trash2, KeyRound, Info } from 'lucide-react-native';
-import type { TenantMembershipRole, TenantNotificationPreferences, TenantJoinRequestStatus } from '@/types';
+import type { TenantMembershipRole, TenantNotificationPreferences, TenantJoinRequestStatus, TenantSettings } from '@/types';
 import TenantMembershipManager from './TenantMembershipManager';
 import TenantInviteManager, { TenantInviteManagerHandle } from './TenantInviteManager';
 import TenantJoinCodeManager, { TenantJoinCodeManagerHandle } from './TenantJoinCodeManager';
@@ -429,8 +429,11 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
       const resolvedLogoUrl = activeTenant?.branding?.logoUrl || activeTenant?.logoUrl || null;
       setLogoPreviewUrl(resolvedLogoUrl || null);
       setPendingLogoAsset(null);
-      setAllowNonAdminAllReminderHistory(!!currentSettings.allowNonAdminAllReminderHistory);
-      setHideAuthorizedEmailsForNonAdmins(!!currentSettings.hideAuthorizedEmailsForNonAdmins);
+      // H2: these visibility flags are now TENANT-scoped (tenants/{id}.settings),
+      // not global appSettings. Read them from the active tenant.
+      const tenantSettings = (activeTenant?.settings || {}) as Partial<TenantSettings>;
+      setAllowNonAdminAllReminderHistory(!!tenantSettings.allowNonAdminAllReminderHistory);
+      setHideAuthorizedEmailsForNonAdmins(!!tenantSettings.hideAuthorizedEmailsForNonAdmins);
       // Capture original snapshot for dirty tracking
       setOriginalValues({
         supportEmail: currentSettings.supportEmail,
@@ -438,8 +441,8 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
         whatsappNumber: currentSettings.whatsappNumber,
         bugReportFormUrl: currentSettings.bugReportFormUrl,
         coachingName: resolvedBrandName,
-        allowNonAdminAllReminderHistory: !!currentSettings.allowNonAdminAllReminderHistory,
-        hideAuthorizedEmailsForNonAdmins: !!currentSettings.hideAuthorizedEmailsForNonAdmins,
+        allowNonAdminAllReminderHistory: !!tenantSettings.allowNonAdminAllReminderHistory,
+        hideAuthorizedEmailsForNonAdmins: !!tenantSettings.hideAuthorizedEmailsForNonAdmins,
         logoUrl: resolvedLogoUrl || null,
       });
     } catch (error) {
@@ -453,7 +456,7 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
     } finally {
       setLoading(false);
     }
-  }, [activeTenant?.id, activeTenant?.name]);
+  }, [activeTenant?.id, activeTenant?.name, activeTenant?.settings]);
 
   useEffect(() => {
     if (tenantUnavailable) {
@@ -832,19 +835,16 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
     }
     try {
       setSaving(true);
-      
-      const updatedSettings: Partial<AppSettings> = {
-        supportEmail,
-        supportPhone,
-        whatsappNumber,
-        bugReportFormUrl,
-        allowNonAdminAllReminderHistory,
-        hideAuthorizedEmailsForNonAdmins,
-      };
 
-      await settingsService.updateSettings(updatedSettings);
-
+      // H2: the two visibility flags are TENANT-scoped now and written via the
+      // backend (tenants/{id}.settings). AdminSettings no longer writes the global
+      // appSettings/globalSettings doc at all (that is global-admin-only, edited
+      // from the operator admin-console). Support-contact fields were never
+      // editable here.
       const nameChanged = activeTenant?.id && trimmedCoachingName !== (activeTenant.name || '').trim();
+      const flagsChanged =
+        (originalValues?.allowNonAdminAllReminderHistory ?? false) !== allowNonAdminAllReminderHistory ||
+        (originalValues?.hideAuthorizedEmailsForNonAdmins ?? false) !== hideAuthorizedEmailsForNonAdmins;
       const existingLogoUrl = originalValues?.logoUrl || null;
       let finalLogoUrl = logoPreviewUrl || null;
       const hasPendingLogoUpload = Boolean(pendingLogoAsset);
@@ -867,7 +867,7 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
 
       const logoChanged = (existingLogoUrl || null) !== (finalLogoUrl || null);
 
-      if (activeTenant?.id && (nameChanged || logoChanged)) {
+      if (activeTenant?.id && (nameChanged || logoChanged || flagsChanged)) {
         const tenantUpdatePayload: Parameters<typeof tenantService.updateTenant>[0] = {
           id: activeTenant.id,
           updatedBy: user?.uid,
@@ -882,6 +882,12 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
             logoUrl: finalLogoUrl || null,
           };
         }
+        if (flagsChanged) {
+          tenantUpdatePayload.settings = {
+            allowNonAdminAllReminderHistory,
+            hideAuthorizedEmailsForNonAdmins,
+          };
+        }
         await tenantService.updateTenant(tenantUpdatePayload);
         await refreshTenants();
       }
@@ -890,7 +896,7 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
       const shouldDeletePreviousLogo = Boolean(existingLogoUrl && logoChanged && existingLogoUrl !== (finalLogoUrl || null));
       if (shouldDeletePreviousLogo) {
         try {
-          await deleteTenantLogoByUrl(existingLogoUrl);
+          await deleteTenantLogoByUrl(activeTenant?.id || '', existingLogoUrl);
         } catch (deleteError) {
           deleteOldLogoError = deleteError instanceof Error ? deleteError : new Error('Old logo could not be removed.');
           logger.warn('AdminSettings: delete tenant logo failed', deleteError);

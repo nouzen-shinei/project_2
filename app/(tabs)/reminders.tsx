@@ -444,6 +444,10 @@ export default function SendReminders() {
               if (statusMap[jobId] === 'success') return { ...s, status: 'success', message: 'Delivered (queued)' };
               if (statusMap[jobId] === 'failed') return { ...s, status: 'failed', message: 'Failed after queue' };
               if (statusMap[jobId] === 'processing') return { ...s, status: 'queued', message: 'Processing...' };
+              // Job is no longer tracked by the backend (e.g., queue was reset /
+              // restarted). Treat as terminal so the modal doesn't poll forever;
+              // the authoritative outcome remains in reminderHistory.
+              if (statusMap[jobId] === 'unknown') return { ...s, status: 'failed', message: 'Send status unavailable' };
             }
             // Still queued
             anyRemainingQueued = true;

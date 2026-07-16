@@ -29,7 +29,7 @@ import { FontAwesome } from '@expo/vector-icons';
 import { useTheme } from '../hooks/useTheme';
 import { useReminderHistory } from '../hooks/useReminderHistory';
 import { useAuth } from '../hooks/useAuthUnified';
-import { settingsService } from '../services/settingsService';
+import { useTenant } from '../hooks/useTenantContext';
 import { ReminderHistoryEntry } from '../services/reminderHistoryService';
 
 interface ReminderHistoryViewerProps {
@@ -546,6 +546,7 @@ export default function ReminderHistoryViewer({
 }: ReminderHistoryViewerProps) {
   const { theme } = useTheme();
   const { user } = useAuth();
+  const { activeTenant } = useTenant();
   const { 
     history, 
     stats, 
@@ -557,7 +558,8 @@ export default function ReminderHistoryViewer({
     loadHistory, 
     loadMoreHistory,
     loadStats, 
-    refresh 
+    refresh,
+    canViewAllReminders,
   } = useReminderHistory();
   
   const [filter, setFilter] = useState<ReminderStatusFilter>('all');
@@ -668,19 +670,24 @@ export default function ReminderHistoryViewer({
     return () => clearTimeout(t);
   }, [searchQuery]);
 
-  // Load app setting to decide if non-admins can see All scope
-  const loadScopeSettings = useCallback(async () => {
-    try {
-      const appSettings = await settingsService.getSettings();
-      setAllowAllForNonAdmins(!!appSettings.allowNonAdminAllReminderHistory);
-    } catch {
-      setAllowAllForNonAdmins(false);
-    }
-  }, []);
-
+  // H2: whether non-admins may switch to the "All reminders" scope is now a
+  // TENANT-scoped setting (tenants/{id}.settings.allowNonAdminAllReminderHistory),
+  // not a global appSettings flag. Read it off the active tenant.
   useEffect(() => {
-    void loadScopeSettings();
-  }, [loadScopeSettings]);
+    setAllowAllForNonAdmins(!!activeTenant?.settings?.allowNonAdminAllReminderHistory);
+  }, [activeTenant?.settings?.allowNonAdminAllReminderHistory]);
+
+  // If the caller loses permission to view all reminders while the "All Reminders"
+  // scope is active (e.g. an admin turns the tenant flag off mid-session), snap the
+  // scope back to the caller's own reminders. Without this the viewer would keep
+  // requesting the tenant-wide feed that the rules now deny — and each denied read
+  // would otherwise churn the auth-recovery machinery. Whenever the scope toggle is
+  // visible, canViewAllReminders is already true, so this never fights the user.
+  useEffect(() => {
+    if (!canViewAllReminders && scope === 'all') {
+      setScope('mine');
+    }
+  }, [canViewAllReminders, scope]);
 
   const formatDate = useCallback((timestamp: any) => {
     try {

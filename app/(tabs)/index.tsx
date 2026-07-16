@@ -1,5 +1,6 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useEffect, useCallback } from 'react';
+import { isPermissionDeniedError } from '@/lib/firestoreErrors';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -45,10 +46,20 @@ export default function Dashboard() {
   const { students: studentList, loading: studentsLoading } = useStudents();
   const students = studentList as Student[];
   const { fees, loading: feesLoading } = useFees();
-  const { history: reminderHistory, loading: reminderLoading, getRecentReminders, refresh: refreshReminders } = useReminderHistory();
+  const { history: reminderHistory, loading: reminderLoading, getRecentReminders, refresh: refreshReminders, canViewAllReminders } = useReminderHistory();
   const { notices, loading: noticesLoading } = useNotices();
-  const { activeTenant } = useTenant();
+  const { activeTenant, refreshTenants } = useTenant();
   const tenantId = activeTenant?.id;
+
+  // The tenant doc is cached client-side, so an admin turning OFF the non-admin
+  // "all reminders" flag isn't seen here until the tenant is re-fetched. If the
+  // server denies the tenant-wide today-stats read, our cached canViewAllReminders
+  // is stale — force-refresh the tenant once so it recomputes and the read clamps
+  // to the caller's own reminders.
+  const staleReminderFlagRefreshRef = useRef(false);
+  useEffect(() => {
+    staleReminderFlagRefreshRef.current = false;
+  }, [tenantId, activeTenant?.settings?.allowNonAdminAllReminderHistory]);
 
   const {
     highlightedAlert: storageUsageAlert,
@@ -134,9 +145,11 @@ export default function Dashboard() {
       const now = new Date();
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
       const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
+      // Only read across all users when authorized (mirrors the Firestore rule);
+      // otherwise scope to the current user's own reminders to avoid a denied read.
       const stats = await reminderHistoryService.getReminderStatsForDateRange(
         tenantId,
-        null,
+        canViewAllReminders ? null : (user?.uid || null),
         start,
         end,
         { status: 'all' }
@@ -147,14 +160,25 @@ export default function Dashboard() {
         pending: stats.pendingReminders,
       });
     } catch (error) {
-      logger.error('Error loading today reminder stats:', error);
+      // A permission-denied here is expected/benign (e.g. a non-admin's tenant-wide
+      // read when the flag is off). Log at debug so it doesn't trip the global
+      // auth-recovery interceptor into a reattach loop.
+      // getReminderStatsForDateRange only throws on permission-denied (it swallows
+      // other errors); the service logs it scope-aware (quiet for an expected
+      // all-scope denial, loud for an unexpected self-scoped one). When it's the
+      // expected all-scope case, our cached tenant flag is likely stale — refresh
+      // once so canViewAllReminders self-corrects and the read clamps to 'mine'.
+      if (isPermissionDeniedError(error) && canViewAllReminders && !staleReminderFlagRefreshRef.current) {
+        staleReminderFlagRefreshRef.current = true;
+        void Promise.resolve(refreshTenants?.()).catch(() => {});
+      }
       setTodayReminderTotals({ total: 0, failed: 0, pending: 0 });
     } finally {
       if (showLoader) {
         setTodayStatsLoading(false);
       }
     }
-  }, [tenantId]);
+  }, [tenantId, canViewAllReminders, user?.uid, refreshTenants]);
 
   useEffect(() => {
     loadRecentReminders();
@@ -802,11 +826,15 @@ export default function Dashboard() {
             });
           }
           
-          if (student.parentWhatsApp && !sent) {
-            sent = await notificationService.sendWhatsAppMessage(
-              student.parentWhatsApp,
-              message
-            );
+          if (tenantId && student.parentWhatsApp && !sent) {
+            sent = await notificationService.sendSmartWhatsAppFeeReminder({
+              tenantId,
+              to: student.parentWhatsApp,
+              studentName: student.name,
+              amount: correctAmount,
+              dueDate: fee.dueDate,
+              teacherName: user?.displayName || undefined,
+            });
           }
           
           if (student.parentContact && !sent) {
@@ -909,11 +937,25 @@ export default function Dashboard() {
           }
           break;
         case 'WhatsApp':
+          if (!tenantId) {
+            Toast.show({
+              type: 'error',
+              text1: '❌ Cannot Send WhatsApp',
+              text2: 'No active coaching center selected',
+              position: 'top',
+              visibilityTime: 3000,
+            });
+            return;
+          }
           if (student.parentWhatsApp) {
-            success = await notificationService.sendWhatsAppMessage(
-              student.parentWhatsApp,
-              message
-            );
+            success = await notificationService.sendSmartWhatsAppFeeReminder({
+              tenantId,
+              to: student.parentWhatsApp,
+              studentName: student.name,
+              amount: correctAmount,
+              dueDate: fee.dueDate,
+              teacherName: user?.displayName || undefined,
+            });
           } else {
             Toast.show({
               type: 'error',

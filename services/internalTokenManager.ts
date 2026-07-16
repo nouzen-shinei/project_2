@@ -1,21 +1,24 @@
 import { logger } from '@/lib/logger';
 import { maybeShowMaintenanceAlertFromRaw } from './maintenanceAlert';
 // Internal token manager for short‑lived backend-issued tokens.
-// Updated to use secure Firebase ID token -> /auth/bridge exchange for production.
-// Dev fallback: if EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET is set we still hit /internal/auth/issue
-// (ONLY for local development). Never ship that dev secret in production builds.
-// The bridge endpoint returns { token, expiresIn?, expiresAt? }.
-// We compute expiresAt if only expiresIn provided and refresh slightly early.
-
-// Strategy precedence:
-// 1. If dev secret present (EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET) use legacy /internal/auth/issue.
-// 2. Else if Firebase user signed in, obtain ID token and POST to /auth/bridge with both Authorization
-//    bearer and body { firebaseIdToken } for forward/backward compatibility.
-// 3. Else: cannot obtain internal token yet (user not authenticated) -> return undefined.
-
+// Uses the secure Firebase ID token -> /auth/bridge exchange as the SOLE client
+// flow (no client-side secret ever). The bridge endpoint returns
+// { token, expiresIn?, expiresAt? }; we compute expiresAt if only expiresIn is
+// provided and refresh slightly early.
+//
+// Strategy:
+// 1. If a Firebase user is signed in, obtain their ID token and POST it to
+//    /auth/bridge (Authorization bearer + body { firebaseIdToken }).
+// 2. Else: cannot obtain an internal token yet (user not authenticated) -> undefined.
+//
+// (security-rules-hardening M3) The legacy dev-secret flow — which POSTed to
+// /internal/auth/issue with EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET, a secret that
+// would ship in the client bundle — has been REMOVED entirely. That endpoint is
+// used only by the operator admin-console, which holds the master key server-side.
+//
 // This module purposefully does NOT import heavy Firebase modules synchronously at bundle time in web
 // environments that tree-shake; we lazily import the auth instance from config/firebase.
-
+//
 // Edge cases handled:
 // - Concurrent refresh calls collapse into single network call.
 // - Expiry skew: refresh 10s before actual expiry.
@@ -71,25 +74,16 @@ class InternalTokenManager {
     if (existing) return await existing;
     const flight = (async () => {
       try {
-      const devSecret = (process.env.EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET || '').trim();
-
+      // Secure token acquisition (security-rules-hardening M3): the ONLY client
+      // flow is the Firebase ID token -> /auth/bridge exchange. There is no
+      // client-side secret. (The legacy dev-secret flow that POSTed to
+      // /internal/auth/issue with EXPO_PUBLIC_INTERNAL_TOKEN_DEV_SECRET has been
+      // removed — that endpoint is now used only by the operator admin-console,
+      // which holds the master key server-side.)
       let data: IssueResponse | undefined;
 
-      if (devSecret) {
-        // Legacy dev flow
-        this.log('using dev secret flow');
-        const headers: Record<string,string> = { 'X-Internal-Secret': devSecret };
-        const res = await fetch(`${baseUrl}/internal/auth/issue`, { method: 'POST', headers });
-        this.log('dev issue status', res.status);
-        if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          maybeShowMaintenanceAlertFromRaw(res.status, text);
-          return undefined;
-        }
-        data = await res.json();
-      } else {
-        // Production flow via Firebase ID token bridge using imported firebaseAuth.
-        // Wait for user to be available (up to ~3s) with short polling
+      {
+        // Wait for the Firebase user to be available (up to ~3s) with short polling.
         let user = firebaseAuth?.currentUser;
         if (!user) {
           this.log('no currentUser, waiting for auth state');

@@ -1,7 +1,5 @@
 import { logger } from '@/lib/logger';
-import { storage } from '@/config/firebase';
-import { deleteObject, ref } from 'firebase/storage';
-import { uploadBlobViaBackend } from './backendStorageUploadService';
+import { uploadBlobViaBackend, deleteStorageObjectViaBackend } from './backendStorageUploadService';
 import { tryExtractStorageLimitReachedInfo } from './storageLimitAlert';
 
 export interface TenantLogoAsset {
@@ -77,17 +75,16 @@ export async function uploadTenantLogo(tenantId: string, asset: TenantLogoAsset)
   }
 }
 
-export async function deleteTenantLogoByUrl(url?: string | null): Promise<void> {
+export async function deleteTenantLogoByUrl(tenantId: string, url?: string | null): Promise<void> {
   if (!url) {
     return;
   }
   try {
-    const objectRef = ref(storage, url);
-    await deleteObject(objectRef);
+    // Server-mediated delete (security-rules-hardening M1): client deleteObject is
+    // disabled in storage.rules; the backend verifies the object is under this
+    // tenant's `tenant-branding/{tenantId}/…` prefix before deleting.
+    await deleteStorageObjectViaBackend({ tenantId, target: url });
   } catch (error: any) {
-    if (error?.code === 'storage/object-not-found') {
-      return;
-    }
     logger.warn('tenantBrandingService: failed to delete logo', error);
     throw new Error('Unable to remove the previous logo from storage.');
   }

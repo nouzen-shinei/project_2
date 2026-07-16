@@ -212,8 +212,15 @@ function rateLimitMiddleware(opts: { windowMs: number; max: number }) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     // Allow skipping in tests
     if (process.env.TEST_MODE === '1') return next();
-    const key = `${req.ip}:${req.path}`;
     const now = Date.now();
+    // Opportunistic eviction so the in-memory bucket store can't grow unbounded
+    // across many distinct client IPs over time (only scans when it gets large).
+    if (rlStore.size > 5000) {
+      for (const [k, b] of rlStore) {
+        if (now - b.updated > opts.windowMs) rlStore.delete(k);
+      }
+    }
+    const key = `${req.ip}:${req.path}`;
     const win = opts.windowMs;
     let bucket = rlStore.get(key);
     if (!bucket) { bucket = { tokens: opts.max, updated: now }; rlStore.set(key, bucket); }
@@ -398,7 +405,9 @@ const reminderHistoryStatusQuerySchema = z.object({
 });
 
 const expoPushMessageSchema = z.object({
-  to: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+  // Cap the recipient-token array to bound request size / abuse (L10). Legitimate
+  // sends target a single user's handful of devices; 1000 is far above that.
+  to: z.union([z.string().min(1), z.array(z.string().min(1)).min(1).max(1000)]),
   title: z.string().optional(),
   body: z.string().optional(),
   data: z.record(z.any()).optional(),
@@ -1873,6 +1882,15 @@ async function assertTenantReminderQuotaAvailable(
       tx.get(ref),
       historyRef ? tx.get(historyRef) : Promise.resolve(null),
     ]);
+    // L13: refuse to reserve/write when the client-supplied historyId targets
+    // ANOTHER tenant's reminderHistory doc (spoofed id) — never reserve quota for
+    // it or write onto it.
+    if (historyRef && historySnap && historySnap.exists) {
+      const existingHistTenantId = ((historySnap.data() || {}) as Record<string, any>).tenantId;
+      if (typeof existingHistTenantId === 'string' && existingHistTenantId && existingHistTenantId !== tenantId) {
+        throw new TenantAccessError(403, { error: 'history_tenant_mismatch' });
+      }
+    }
     const data = snap.exists ? (snap.data() || {}) : {};
     const totalUsed = typeof data.total === 'number' && Number.isFinite(data.total) ? data.total : 0;
     const usedByChannel = typeof (data as any)[reminderType] === 'number' && Number.isFinite((data as any)[reminderType])
@@ -2258,6 +2276,15 @@ async function consumeTenantReminderReservationToken(
       tx.get(usageRef),
       historyRef ? tx.get(historyRef) : Promise.resolve(null),
     ]);
+
+    // L13: refuse when the client-supplied historyId targets ANOTHER tenant's
+    // reminderHistory doc (spoofed id).
+    if (historyRef && existingHistory && existingHistory.exists) {
+      const existingHistTenantId = ((existingHistory.data() || {}) as Record<string, any>).tenantId;
+      if (typeof existingHistTenantId === 'string' && existingHistTenantId && existingHistTenantId !== tenantId) {
+        throw new TenantAccessError(403, { error: 'history_tenant_mismatch' });
+      }
+    }
 
     if (!snap.exists) {
       throw new TenantAccessError(409, { error: 'reminder_quota_reservation_missing' });
@@ -5833,6 +5860,36 @@ export function storagePathFromUrl(url: string): string {
   return decodeURIComponent(match[1]);
 }
 
+// True iff `url` is an https Firebase Storage / GCS download URL for OUR bucket.
+// Used to constrain chat UPLOADED-file references (fileUrl / attachments[].url) to
+// the app's own bucket so a client can't pass an arbitrary external URL that the
+// recipient's client would then render/download (security-rules-hardening L7).
+// Note: sticker/GIF/thumbnail fields are intentionally NOT constrained here — those
+// legitimately reference external providers (Tenor/Giphy/link previews).
+export function isOwnBucketStorageUrl(url: string, bucket: string): boolean {
+  if (!url || !bucket) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase();
+  // Firebase download URL: firebasestorage.googleapis.com/v0/b/{bucket}/o/...
+  if (host === 'firebasestorage.googleapis.com') {
+    return parsed.pathname.startsWith(`/v0/b/${bucket}/o/`);
+  }
+  // GCS URL forms.
+  if (host === 'storage.googleapis.com') {
+    return parsed.pathname.startsWith(`/${bucket}/`);
+  }
+  if (host === `${bucket}.storage.googleapis.com`) return true;
+  // Newer Firebase Storage download host.
+  if (host === bucket || host === `${bucket}.firebasestorage.app`) return true;
+  return false;
+}
+
 export function createApp(options: CreateAppOptions = {}){
   const app = express();
   const isTestProcess = process.env.TEST_MODE === '1' || process.argv.includes('--test');
@@ -6126,6 +6183,7 @@ export function createApp(options: CreateAppOptions = {}){
     /^\/admin\/settings\/runtime-endpoints$/,
     /^\/admin\/settings\/maintenance$/,
     /^\/admin\/settings\/reminder-channels$/,
+    /^\/admin\/settings\/global-settings$/,
     /^\/admin\/auth\/global-admin\//,
     /^\/notifications\/daily-quotes\/status$/,
     /^\/metrics$/,
@@ -6134,9 +6192,12 @@ export function createApp(options: CreateAppOptions = {}){
     /^\/csp-report$/,
     /^\/internal\/presence\/sweep$/,
     /^\/notifications\/tenant-join-request$/,
+    /^\/tenants$/,
+    /^\/tenants\/[^/]+\/leave$/,
     /^\/tenants\/join-code\/resolve$/,
     /^\/tenants\/join-code\/claim$/,
     /^\/tenants\/invites\/accept$/,
+    /^\/tenants\/invites\/sync-memberships$/,
     /^\/shared-files\/public\//,
     /^\/shared-files$/,
     /^\/shared-files\/mine$/,
@@ -6185,6 +6246,19 @@ export function createApp(options: CreateAppOptions = {}){
       'https://firebasestorage.googleapis.com'
     ]
   }));
+
+  // Security-hardening L2: surface wildcard CORS in production. Auth is
+  // bearer-token (not cookie) based, so `*` is not directly exploitable, but a
+  // production deployment should pin an explicit allowlist of trusted web origins
+  // via CORS_ALLOW_ORIGINS. Warn once at startup rather than silently allowing `*`.
+  {
+    const corsStartupConfig = (process.env.CORS_ALLOW_ORIGINS || '*').trim();
+    if (corsStartupConfig === '*' && process.env.NODE_ENV === 'production') {
+      console.warn(
+        '[startup] CORS_ALLOW_ORIGINS is "*" in production. Set an explicit comma-separated allowlist of trusted web origins (bearer-token auth limits the risk, but wildcard CORS is not recommended for production).'
+      );
+    }
+  }
 
   /* c8 ignore start - CORS pattern matching branches excluded */
   // --- CORS (copied from original) ---
@@ -6367,7 +6441,19 @@ export function createApp(options: CreateAppOptions = {}){
 
   // Auth middleware
   app.use((req,res,next)=>{
-    const master=process.env.INTERNAL_API_KEY; if(!master) return next();
+    const master=process.env.INTERNAL_API_KEY;
+    if(!master){
+      // Fail closed in production: never serve the API unauthenticated (M4).
+      // In dev/test (NODE_ENV !== 'production') keep the pass-through so local and
+      // e2e setups without a configured master key still run; liveness probes are
+      // always allowed so orchestrators can detect the misconfiguration.
+      if (process.env.NODE_ENV === 'production') {
+        const pp = req.path;
+        if (pp === '/health' || pp === '/ready') return next();
+        return res.status(503).json({ error: 'auth_not_configured' });
+      }
+      return next();
+    }
     const p=req.path; if(p==='/health'||p==='/ready'||p.startsWith('/webhooks/whatsapp')||p==='/auth/bridge'||p.startsWith('/shared-files/public/')) return next();
     if(p==='/billing/stripe/webhook'||p==='/billing/razorpay/webhook'||p==='/billing/play/notifications'||p==='/billing/appstore/notifications') return next();
     if(p==='/billing/checkout/session-public') return next();
@@ -6823,7 +6909,11 @@ export function createApp(options: CreateAppOptions = {}){
         // ignore
       }
 
-      return res.json({ token, ...data });
+      // This endpoint is PUBLIC (no auth). Do not expose the creator's identity
+      // or internal tenant metadata — a share link can leak via logs/referrers
+      // (security-rules-hardening L8). Return the file payload only.
+      const { createdByEmail: _cbe, createdByUid: _cbu, tenantId: _tid, ...publicData } = (data || {}) as Record<string, any>;
+      return res.json({ token, ...publicData });
     } catch (error) {
       console.error('[shared_files] resolve failed', error);
       return res.status(500).json({ error: 'internal_error' });
@@ -6833,9 +6923,20 @@ export function createApp(options: CreateAppOptions = {}){
   function requireOperatorAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
     const authContext = req.authContext;
     const tokenType = authContext?.tokenType;
-    if (tokenType === 'master' || tokenType === 'internal') {
+    // The raw master key is a trusted operator principal.
+    if (tokenType === 'master') {
       return next();
     }
+    // An `internal` token is trusted for operator routes ONLY when it is the
+    // master-minted SYSTEM token (sub==='system', issued exclusively by
+    // /internal/auth/issue which requires the x-internal-secret master key).
+    // Bridge-minted user tokens (/auth/bridge) carry sub===<firebase uid> and
+    // MUST NOT reach operator routes — otherwise any signed-in user could hit
+    // operator-only endpoints (security-rules-hardening C2).
+    if (tokenType === 'internal' && authContext?.uid === 'system') {
+      return next();
+    }
+    // A verified global-admin Firebase user is an operator.
     if (tokenType === 'firebase' && authContext?.isGlobalAdmin === true) {
       return next();
     }
@@ -8194,6 +8295,78 @@ export function createApp(options: CreateAppOptions = {}){
     } catch (error) {
       console.error('[admin_reminder_channels] update failed', error);
       return res.status(500).json({ error: 'reminder_channels_update_failed' });
+    }
+  });
+
+  // ── Global app settings (security-rules-hardening H2) ──────────────────────
+  // appSettings/globalSettings holds GLOBAL, app-wide config (support contact,
+  // legal links, default brand). It is world-readable to signed-in clients but
+  // client writes are now denied by firestore.rules (write: if isAdmin()); the
+  // operator admin-console edits it here via the Admin SDK. The tenant-scoped
+  // visibility flags (allowNonAdminAllReminderHistory / hideAuthorizedEmailsForNonAdmins)
+  // were moved to tenants/{id}.settings and are intentionally NOT settable here.
+  const globalSettingsAdminUpdateSchema = z
+    .object({
+      supportEmail: z.string().trim().email().optional(),
+      supportPhone: z.string().trim().max(40).optional(),
+      whatsappNumber: z.string().trim().max(40).optional(),
+      bugReportFormUrl: z.string().trim().max(2000).optional(),
+      coachingName: z.string().trim().max(160).optional(),
+      legal: z
+        .object({
+          privacyPolicyUrl: z.string().trim().max(2000).optional(),
+          termsOfServiceUrl: z.string().trim().max(2000).optional(),
+        })
+        .strict()
+        .optional(),
+    })
+    .strict();
+
+  app.get('/admin/settings/global-settings', requireOperatorAuth, async (_req, res) => {
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appSettings').doc('globalSettings');
+      const snap = await ref.get();
+      const data = snap.exists ? (snap.data() as Record<string, unknown>) : null;
+      return res.json({ ok: true, data });
+    } catch (error) {
+      console.error('[admin_global_settings] fetch failed', error);
+      return res.status(500).json({ error: 'global_settings_fetch_failed' });
+    }
+  });
+
+  app.post('/admin/settings/global-settings', requireOperatorAuth, async (req, res) => {
+    const parsed = globalSettingsAdminUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const { legal, ...topLevel } = parsed.data;
+    const patch: Record<string, unknown> = { ...topLevel };
+    if (!Object.keys(parsed.data).length) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const ref = db.collection('appSettings').doc('globalSettings');
+      const snap = await ref.get();
+      const now = new Date().toISOString();
+      const isCreate = !snap.exists;
+      // Deep-merge the `legal` sub-map instead of overwriting it wholesale.
+      if (legal && Object.keys(legal).length) {
+        const existingLegal = (snap.data()?.legal as Record<string, unknown> | undefined) || {};
+        patch.legal = { ...existingLegal, ...legal };
+      }
+      if (Object.keys(patch).length === 0) {
+        return res.status(400).json({ error: 'empty_update' });
+      }
+      await ref.set({ ...patch, updatedAt: now, ...(isCreate ? { createdAt: now } : {}) }, { merge: true });
+      const updated = await ref.get();
+      return res.json({ ok: true, data: updated.data() ?? null });
+    } catch (error) {
+      console.error('[admin_global_settings] update failed', error);
+      return res.status(500).json({ error: 'global_settings_update_failed' });
     }
   });
 
@@ -10063,6 +10236,713 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Tenant lifecycle endpoints (security-rules-hardening, finding C1).
+  //
+  // These move the last client-direct writes to `tenants`, `tenantMemberships`,
+  // `tenantCodes` (and the audit trail) server-side so those collections can be
+  // locked to backend-only in firestore.rules. Each verifies the caller through
+  // the shared auth/tenant guards and writes via the Admin SDK.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  // Keep in sync with the client UI cap (components/TenantJoinCodeManager.tsx MAX_ACTIVE_CODES).
+  const MAX_ACTIVE_JOIN_CODES = 5;
+
+  function slugifyTenantName(name: string): string {
+    const base = (name || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40);
+    return base || `tenant-${Date.now().toString(36)}`;
+  }
+
+  function generateTenantJoinCode(): string {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let out = '';
+    const bytes = crypto.randomBytes(8);
+    for (let i = 0; i < 8; i += 1) {
+      out += alphabet[bytes[i] % alphabet.length];
+    }
+    return out;
+  }
+
+  const createTenantSchema = z.object({
+    name: z.string().trim().min(1).max(160),
+    defaultCurrency: z.string().trim().max(10).optional(),
+    contactEmail: z.string().trim().email().optional(),
+    contactPhone: z.string().trim().max(40).optional(),
+    address: z.string().trim().max(500).optional(),
+    timezone: z.string().trim().max(60).optional(),
+    logoUrl: z.string().trim().url().max(2000).optional(),
+    heroImageUrl: z.string().trim().url().max(2000).optional(),
+    theme: z.record(z.any()).optional(),
+  });
+
+  // Create a coaching center. The authenticated caller becomes its owner. No
+  // tenant membership is required (the caller isn't a member of anything yet),
+  // only a valid auth context — mirrors the former client `createTenant`.
+  const syncInvitesSchema = z.object({
+    displayName: z.string().trim().max(120).optional(),
+  });
+
+  // Server-mediated (security-rules-hardening C1): mirror the caller's incoming
+  // tenant invites into their own `tenantMemberships/{tenantId}_{uid}` placeholder
+  // docs so the membership list shows a single row per coaching center. Only the
+  // invitee can perform this mapping because it requires their uid; the backend
+  // derives uid + email from the auth token and never trusts client-supplied ids.
+  app.post('/tenants/invites/sync-memberships', requireAuthContext, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const email = (await resolveAuthenticatedEmail(authContext))?.trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ error: 'email_unavailable' });
+    }
+    const parsed = syncInvitesSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    const userId = authContext.uid;
+    const displayName = (parsed.data.displayName || email.split('@')[0] || email).slice(0, 120);
+
+    const parseIsoTs = (value: unknown): number => {
+      if (typeof value !== 'string') return Number.NEGATIVE_INFINITY;
+      const p = Date.parse(value);
+      return Number.isNaN(p) ? Number.NEGATIVE_INFINITY : p;
+    };
+
+    try {
+      const db = getFirestoreImpl();
+      const invitesSnap = await db
+        .collection('tenantInvites')
+        .where('email', '==', email)
+        .limit(200)
+        .get();
+
+      const nowIso = new Date().toISOString();
+      const bestInviteByTenant = new Map<string, any>();
+      const bestSortKey = new Map<string, number>();
+      invitesSnap.docs.forEach((docSnap) => {
+        const invite = { id: docSnap.id, ...(docSnap.data() as any) };
+        const tenantId = typeof invite?.tenantId === 'string' ? invite.tenantId.trim() : '';
+        if (!tenantId) return;
+        const sortKey = Math.max(
+          parseIsoTs(invite.updatedAt),
+          parseIsoTs(invite.revokedAt),
+          parseIsoTs(invite.rejectedAt),
+          parseIsoTs(invite.acceptedAt),
+          parseIsoTs(invite.issuedAt)
+        );
+        const prev = bestSortKey.get(tenantId);
+        if (prev === undefined || sortKey >= prev) {
+          bestSortKey.set(tenantId, sortKey);
+          bestInviteByTenant.set(tenantId, invite);
+        }
+      });
+
+      let synced = 0;
+      for (const invite of bestInviteByTenant.values()) {
+        if (!invite?.tenantId) continue;
+        if (invite.status === 'accepted') continue;
+
+        const nextStatus =
+          invite.status === 'pending'
+            ? 'pending_invite'
+            : invite.status === 'rejected'
+              ? 'rejected'
+              : invite.status === 'revoked' || invite.status === 'expired'
+                ? 'revoked'
+                : null;
+        if (!nextStatus) continue;
+
+        const membershipRef = db
+          .collection('tenantMemberships')
+          .doc(membershipDocId(invite.tenantId, userId));
+        const snap = await membershipRef.get();
+        const existing = snap.exists ? (snap.data() as any) : null;
+        const existingStatus = existing?.status as string | undefined;
+
+        // Never let a stale invite overwrite an active membership.
+        if (existingStatus === 'active') continue;
+        // Don't synthesize revoked/rejected placeholders the user never saw as pending.
+        if (!snap.exists && nextStatus !== 'pending_invite') continue;
+
+        const existingRole = existing?.role as string | undefined;
+        const existingCreatedAt = typeof existing?.createdAt === 'string' ? existing.createdAt : nowIso;
+        const existingToken = typeof existing?.inviteToken === 'string' ? existing.inviteToken : undefined;
+        const existingExpiresAt = existing?.inviteExpiresAt;
+        const inviteAt =
+          nextStatus === 'pending_invite'
+            ? invite.issuedAt
+            : nextStatus === 'rejected'
+              ? invite.rejectedAt || invite.issuedAt || nowIso
+              : (invite.revokedAt as string | undefined) || invite.updatedAt || invite.issuedAt || nowIso;
+
+        const shouldUpdateStatus = existingStatus !== nextStatus;
+        const shouldUpdateToken = nextStatus === 'pending_invite' && existingToken !== invite.token;
+        const shouldUpdateExpiry =
+          nextStatus === 'pending_invite' &&
+          typeof invite.expiresAt === 'string' &&
+          (typeof existingExpiresAt !== 'string' || existingExpiresAt !== invite.expiresAt);
+        const shouldClearInviteFields =
+          (nextStatus === 'rejected' || nextStatus === 'revoked') &&
+          (typeof existingToken === 'string' ||
+            typeof existingExpiresAt === 'string' ||
+            typeof existing?.invitedBy === 'string');
+        const shouldUpdateRole = existingRole !== invite.role;
+
+        if (
+          !snap.exists ||
+          shouldUpdateStatus ||
+          shouldUpdateToken ||
+          shouldUpdateExpiry ||
+          shouldUpdateRole ||
+          shouldClearInviteFields
+        ) {
+          const statusEvent = stripUndefinedDeep({
+            status: nextStatus,
+            at: typeof inviteAt === 'string' ? inviteAt : nowIso,
+            actorId:
+              nextStatus === 'pending_invite'
+                ? invite.issuedBy
+                : nextStatus === 'rejected'
+                  ? userId
+                  : String((invite.revokedBy as string | undefined) || invite.issuedBy || 'system'),
+            actorEmail: nextStatus === 'rejected' ? email : undefined,
+            actorName: nextStatus === 'rejected' ? displayName : undefined,
+            reason:
+              nextStatus === 'pending_invite'
+                ? 'invite_received'
+                : nextStatus === 'rejected'
+                  ? 'invite_rejected_by_user'
+                  : invite.status === 'expired'
+                    ? 'invite_expired'
+                    : 'invite_revoked',
+          });
+
+          if (!snap.exists) {
+            const payload: Record<string, unknown> = {
+              tenantId: invite.tenantId,
+              userId,
+              email,
+              displayName,
+              role: invite.role,
+              status: nextStatus,
+              createdAt: existingCreatedAt,
+              updatedAt: nowIso,
+              statusHistory: [statusEvent],
+            };
+            if (nextStatus === 'pending_invite') {
+              payload.inviteToken = invite.token;
+              payload.inviteExpiresAt = invite.expiresAt;
+              payload.invitedBy = invite.issuedBy;
+            }
+            await membershipRef.set(stripUndefinedDeep(payload));
+          } else {
+            const updatePayload: Record<string, unknown> = { updatedAt: nowIso };
+            if (shouldUpdateStatus) updatePayload.status = nextStatus;
+            if (shouldUpdateRole) updatePayload.role = invite.role;
+            if (nextStatus === 'pending_invite') {
+              updatePayload.inviteToken = invite.token;
+              updatePayload.inviteExpiresAt = invite.expiresAt;
+              updatePayload.invitedBy = invite.issuedBy;
+            } else if (nextStatus === 'rejected' || nextStatus === 'revoked') {
+              updatePayload.inviteToken = admin.firestore.FieldValue.delete();
+              updatePayload.inviteExpiresAt = admin.firestore.FieldValue.delete();
+              updatePayload.invitedBy = admin.firestore.FieldValue.delete();
+            }
+            updatePayload.statusHistory = admin.firestore.FieldValue.arrayUnion(statusEvent);
+            await membershipRef.set(stripUndefinedDeep(updatePayload), { merge: true });
+          }
+          synced += 1;
+        }
+      }
+
+      return res.json({ ok: true, synced });
+    } catch (error) {
+      console.error('[tenant_invite_sync] failed', error);
+      return res.status(500).json({ error: 'invite_sync_failed' });
+    }
+  });
+
+  app.post('/tenants', requireAuthContext, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const parsed = createTenantSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const ownerEmail = await resolveAuthenticatedEmail(authContext);
+    if (!ownerEmail) {
+      return res.status(400).json({ error: 'owner_email_unavailable' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const nowIso = new Date().toISOString();
+      const tenantRef = db.collection('tenants').doc();
+      const tenantId = tenantRef.id;
+      const displayName = ownerEmail.split('@')[0];
+
+      const tenantData = stripUndefinedDeep({
+        name: parsed.data.name.trim(),
+        slug: slugifyTenantName(parsed.data.name),
+        code: generateTenantJoinCode(),
+        ownerUserId: authContext.uid,
+        ownerEmail,
+        defaultCurrency: parsed.data.defaultCurrency || 'INR',
+        contactEmail: parsed.data.contactEmail || ownerEmail,
+        contactPhone: parsed.data.contactPhone,
+        address: parsed.data.address,
+        timezone: parsed.data.timezone,
+        logoUrl: parsed.data.logoUrl,
+        heroImageUrl: parsed.data.heroImageUrl,
+        theme: parsed.data.theme,
+        status: 'active',
+        billingTier: 'free',
+        settings: { allowJoinRequests: true, notifyOnJoinRequest: true, notifyViaEmail: true },
+        notificationPreferences: { ...defaultTenantNotificationPreferences },
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      const membershipRef = db.collection('tenantMemberships').doc(membershipDocId(tenantId, authContext.uid));
+      const ownerStatusEvent = {
+        status: 'active',
+        at: nowIso,
+        actorId: authContext.uid,
+        actorEmail: ownerEmail,
+        actorName: displayName,
+        reason: 'tenant_owner_created',
+      };
+
+      await db.runTransaction(async (tx) => {
+        tx.set(tenantRef, tenantData);
+        tx.set(membershipRef, {
+          tenantId,
+          userId: authContext.uid,
+          email: ownerEmail,
+          displayName,
+          role: 'owner',
+          status: 'active',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          statusHistory: [ownerStatusEvent],
+        });
+      });
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId: authContext.uid,
+          actorEmail: ownerEmail,
+          action: 'tenant_created',
+          targetId: tenantId,
+          targetType: 'tenant',
+          createdAt: nowIso,
+        })
+      );
+
+      return res.json({ ok: true, tenant: { id: tenantId, ...tenantData } });
+    } catch (error) {
+      console.error('[tenant_create] failed', error);
+      return res.status(500).json({ error: 'tenant_create_failed' });
+    }
+  });
+
+  const updateTenantSchema = z
+    .object({
+      name: z.string().trim().min(1).max(160).optional(),
+      contactEmail: z.string().trim().email().optional(),
+      contactPhone: z.string().trim().max(40).optional(),
+      address: z.string().trim().max(500).optional(),
+      timezone: z.string().trim().max(60).optional(),
+      defaultCurrency: z.string().trim().max(10).optional(),
+      logoUrl: z.string().trim().max(2000).nullable().optional(),
+      heroImageUrl: z.string().trim().max(2000).nullable().optional(),
+      theme: z.record(z.any()).optional(),
+      branding: z.record(z.any()).optional(),
+      settings: z
+        .object({
+          allowJoinRequests: z.boolean().optional(),
+          notifyOnJoinRequest: z.boolean().optional(),
+          notifyViaEmail: z.boolean().optional(),
+          // H2: tenant-scoped visibility policies (moved off global appSettings).
+          allowNonAdminAllReminderHistory: z.boolean().optional(),
+          hideAuthorizedEmailsForNonAdmins: z.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      onboardingProgress: z.record(z.any()).optional(),
+    })
+    .strict();
+
+  // Update editable coaching-center fields (owner/admin only). Tenant identity,
+  // billing, quotas, code and membership counts are NOT settable here.
+  app.post('/tenants/:tenantId/update', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    const parsed = updateTenantSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+    if (!Object.keys(parsed.data).length) {
+      return res.status(400).json({ error: 'empty_update' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const tenantRef = db.collection('tenants').doc(tenantAccess.tenantId);
+      const snap = await tenantRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'tenant_not_found' });
+      }
+
+      // Merge the settings sub-map instead of overwriting it wholesale.
+      const nowIso = new Date().toISOString();
+      const { settings: settingsPatch, ...topLevel } = parsed.data;
+      const patch: Record<string, unknown> = { ...topLevel, updatedAt: nowIso };
+      if (settingsPatch && Object.keys(settingsPatch).length) {
+        const existingSettings = (snap.data()?.settings as Record<string, unknown> | undefined) || {};
+        patch.settings = { ...existingSettings, ...settingsPatch };
+      }
+
+      await tenantRef.set(stripUndefinedDeep(patch), { merge: true });
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: req.authContext?.uid || 'system',
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: 'tenant_updated',
+          targetId: tenantAccess.tenantId,
+          targetType: 'tenant',
+          metadata: { fields: Object.keys(parsed.data) },
+          createdAt: nowIso,
+        })
+      );
+      const updated = await tenantRef.get();
+      return res.json({ ok: true, tenant: { id: updated.id, ...(updated.data() || {}) } });
+    } catch (error) {
+      console.error('[tenant_update] failed', error);
+      return res.status(500).json({ error: 'tenant_update_failed' });
+    }
+  });
+
+  // Leave a coaching center (self-service). The caller may only revoke their OWN
+  // membership; owners must transfer/downgrade first. Also withdraws any pending
+  // join request for the caller.
+  app.post('/tenants/:tenantId/leave', requireAuthContext, async (req, res) => {
+    const authContext = req.authContext;
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const tenantId = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantId) {
+      return res.status(400).json({ error: 'tenant_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const membershipRef = db.collection('tenantMemberships').doc(membershipDocId(tenantId, authContext.uid));
+      const snap = await membershipRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'membership_not_found' });
+      }
+      const membership = snap.data() || {};
+      const role = String((membership as any).role || '').toLowerCase();
+      if (role === 'owner') {
+        return res.status(409).json({ error: 'owner_must_transfer_first' });
+      }
+      const nowIso = new Date().toISOString();
+      const actorEmail = (await resolveAuthenticatedEmail(authContext)) || (membership as any).email || undefined;
+      const wasPendingRequest = (membership as any).status === 'pending_request';
+
+      if ((membership as any).status === 'revoked') {
+        return res.json({ ok: true, alreadyLeft: true });
+      }
+
+      if (wasPendingRequest) {
+        // Withdrawing a pending request removes the membership placeholder entirely.
+        await membershipRef.delete();
+      } else {
+        await membershipRef.set(
+          {
+            status: 'revoked',
+            updatedAt: nowIso,
+            statusHistory: admin.firestore.FieldValue.arrayUnion({
+              status: 'revoked',
+              at: nowIso,
+              actorId: authContext.uid,
+              actorEmail,
+              reason: 'self_leave',
+            }),
+          },
+          { merge: true }
+        );
+      }
+
+      // Clean up any pending join requests for this user/tenant.
+      try {
+        const pending = await db
+          .collection('tenantJoinRequests')
+          .where('tenantId', '==', tenantId)
+          .where('userId', '==', authContext.uid)
+          .where('status', '==', 'pending')
+          .limit(10)
+          .get();
+        await Promise.all(pending.docs.map((d) => d.ref.delete()));
+      } catch (e) {
+        console.warn('[tenant_leave] join-request cleanup failed', e);
+      }
+
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId,
+          actorId: authContext.uid,
+          actorEmail,
+          action: 'membership_revoked',
+          targetId: membershipDocId(tenantId, authContext.uid),
+          targetType: 'membership',
+          metadata: { previousRole: (membership as any).role, previousStatus: (membership as any).status, reason: wasPendingRequest ? 'request_withdrawn' : 'self_leave' },
+          createdAt: nowIso,
+        })
+      );
+
+      // Notify tenant admins when an actual member leaves (skip pending-request
+      // withdrawals, which never represented an active member).
+      if (!wasPendingRequest) {
+        const targetRoleResult = tenantMembershipRoleSchema.safeParse(
+          typeof (membership as any).role === 'string' ? (membership as any).role : 'member'
+        );
+        void sendTeamMembershipChangeNotificationImpl({
+          tenantId,
+          tenantName: typeof (membership as any).tenantName === 'string' ? (membership as any).tenantName : undefined,
+          action: 'removed',
+          targetEmail: (membership as any).email,
+          targetRole: targetRoleResult.success ? targetRoleResult.data : 'member',
+          metadata: {
+            displayName: typeof (membership as any).displayName === 'string' ? (membership as any).displayName : undefined,
+            reason: 'self_leave',
+            initiatedFrom: 'system',
+          },
+        }).catch((error) => console.warn('[tenant_leave] notify failed', error));
+      }
+
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[tenant_leave] failed', error);
+      return res.status(500).json({ error: 'tenant_leave_failed' });
+    }
+  });
+
+  const tenantCodeCreateSchema = z.object({
+    expiresInDays: z.number().int().min(1).max(365).optional(),
+    usageCap: z.number().int().min(1).max(100000).nullable().optional(),
+  });
+
+  // Create a join code (owner/admin only), capped at MAX_ACTIVE_JOIN_CODES active.
+  app.post('/tenants/:tenantId/codes', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    const parsed = tenantCodeCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const activeSnap = await db
+        .collection('tenantCodes')
+        .where('tenantId', '==', tenantAccess.tenantId)
+        .where('status', '==', 'active')
+        .get();
+
+      // Self-heal: flip any active-but-expired codes to 'expired' so they don't
+      // count against the cap (the client no longer performs this write).
+      const nowMs = Date.now();
+      let liveActiveCount = 0;
+      const expireBatch: FirebaseFirestore.WriteBatch = db.batch();
+      let expiredPending = 0;
+      const flipIso = new Date().toISOString();
+      activeSnap.docs.forEach((docSnap) => {
+        const data = docSnap.data() as any;
+        const expiresAt = typeof data?.expiresAt === 'string' ? Date.parse(data.expiresAt) : NaN;
+        if (!Number.isNaN(expiresAt) && expiresAt <= nowMs) {
+          expireBatch.set(docSnap.ref, { status: 'expired', updatedAt: flipIso }, { merge: true });
+          expiredPending += 1;
+        } else {
+          liveActiveCount += 1;
+        }
+      });
+      if (expiredPending > 0) {
+        await expireBatch.commit();
+      }
+      if (liveActiveCount >= MAX_ACTIVE_JOIN_CODES) {
+        return res.status(409).json({ error: 'max_active_codes_reached', limit: MAX_ACTIVE_JOIN_CODES });
+      }
+
+      const nowIso = new Date().toISOString();
+      const expiresAt = parsed.data.expiresInDays
+        ? new Date(Date.now() + parsed.data.expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+        : undefined;
+      const codeData = stripUndefinedDeep({
+        tenantId: tenantAccess.tenantId,
+        code: generateTenantJoinCode(),
+        createdBy: req.authContext?.uid || 'system',
+        createdAt: nowIso,
+        expiresAt,
+        usageCount: 0,
+        usageCap: typeof parsed.data.usageCap === 'number' ? parsed.data.usageCap : null,
+        status: 'active',
+      });
+      const codeRef = await db.collection('tenantCodes').add(codeData);
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: req.authContext?.uid || 'system',
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: 'invite_regenerated',
+          targetId: codeRef.id,
+          targetType: 'code',
+          metadata: { code: (codeData as any).code },
+          createdAt: nowIso,
+        })
+      );
+      return res.json({ ok: true, code: { id: codeRef.id, ...codeData } });
+    } catch (error) {
+      console.error('[tenant_code_create] failed', error);
+      return res.status(500).json({ error: 'tenant_code_create_failed' });
+    }
+  });
+
+  // Revoke a join code (owner/admin only).
+  app.post('/tenants/:tenantId/codes/:codeId/revoke', requireParamsAdminTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (tenantAccess.role !== 'owner' && tenantAccess.role !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    const codeId = typeof req.params?.codeId === 'string' ? req.params.codeId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    if (!codeId) {
+      return res.status(400).json({ error: 'code_required' });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const codeRef = db.collection('tenantCodes').doc(codeId);
+      const snap = await codeRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'code_not_found' });
+      }
+      if ((snap.data() as any)?.tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
+      const nowIso = new Date().toISOString();
+      await codeRef.set({ status: 'revoked', updatedAt: nowIso }, { merge: true });
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: req.authContext?.uid || 'system',
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: 'invite_regenerated',
+          targetId: codeId,
+          targetType: 'code',
+          createdAt: nowIso,
+        })
+      );
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[tenant_code_revoke] failed', error);
+      return res.status(500).json({ error: 'tenant_code_revoke_failed' });
+    }
+  });
+
+  // Client-authored activity audit entries (attendance/fee operations). Security-
+  // relevant audit events (tenant/membership/code lifecycle) are written by their
+  // own endpoints via the Admin SDK and are NOT accepted here. The actor identity
+  // and tenant are derived from the verified token/guard, never from the body.
+  const tenantActivityAuditSchema = z.object({
+    action: z.enum([
+      'fee_record_created',
+      'fee_record_updated',
+      'fee_record_deleted',
+      'fee_payment_updated',
+      'fee_due_dates_updated',
+      'attendance_record_saved',
+      'attendance_records_batch_saved',
+      'attendance_record_deleted',
+    ]),
+    targetId: z.string().trim().max(240).optional(),
+    targetType: z.enum(['fee', 'attendance']).optional(),
+    metadata: z.record(z.any()).optional(),
+  });
+
+  app.post('/tenants/:tenantId/audit/log', requireParamsStaffTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const tenantIdParam = typeof req.params?.tenantId === 'string' ? req.params.tenantId.trim() : '';
+    if (!tenantIdParam || tenantIdParam !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    const parsed = tenantActivityAuditSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const nowIso = new Date().toISOString();
+      await db.collection('tenantAuditLogs').add(
+        stripUndefinedDeep({
+          tenantId: tenantAccess.tenantId,
+          actorId: req.authContext?.uid || 'system',
+          actorEmail: (await resolveAuthenticatedEmail(req.authContext)) || undefined,
+          action: parsed.data.action,
+          targetId: parsed.data.targetId,
+          targetType: parsed.data.targetType,
+          metadata: parsed.data.metadata,
+          createdAt: nowIso,
+        })
+      );
+      return res.json({ ok: true });
+    } catch (error) {
+      console.error('[tenant_audit_log] failed', error);
+      return res.status(500).json({ error: 'audit_log_failed' });
+    }
+  });
+
   app.post('/tenants/:tenantId/memberships/:userId/role', requireParamsAdminTenantAccess, async (req, res) => {
     const tenantAccess = req.tenantAccess;
     if (!tenantAccess) {
@@ -10427,6 +11307,36 @@ export function createApp(options: CreateAppOptions = {}){
     const recipientIsMember = await isTenantEmailActiveMemberImpl(tenantId, normalizedRecipient);
     if (!recipientIsMember) {
       return res.status(403).json({ error: 'recipient_not_in_tenant' });
+    }
+
+    // L7: constrain UPLOADED-file references to our own Storage bucket so a client
+    // can't attach an arbitrary external URL that the recipient's client renders /
+    // downloads. Only enforced when the bucket is configured (skipped in tests /
+    // when unconfigured); sticker/gif/thumbnail fields are left external by design.
+    {
+      let configuredBucket = '';
+      try {
+        ensureFirebase();
+        configuredBucket = typeof admin.app().options.storageBucket === 'string'
+          ? (admin.app().options.storageBucket as string)
+          : '';
+      } catch {
+        configuredBucket = '';
+      }
+      if (configuredBucket) {
+        const uploadedUrls: string[] = [];
+        if (typeof parsed.data.fileUrl === 'string' && parsed.data.fileUrl) uploadedUrls.push(parsed.data.fileUrl);
+        if (Array.isArray(parsed.data.attachments)) {
+          for (const att of parsed.data.attachments) {
+            if (att && typeof att.url === 'string' && att.url) uploadedUrls.push(att.url);
+          }
+        }
+        for (const u of uploadedUrls) {
+          if (!isOwnBucketStorageUrl(u, configuredBucket)) {
+            return res.status(400).json({ error: 'invalid_attachment_url' });
+          }
+        }
+      }
     }
 
     if (authContext.tokenType !== 'master') {
@@ -11829,6 +12739,15 @@ export function createApp(options: CreateAppOptions = {}){
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       const existing = snap.exists ? snap.data() || {} : null;
+      // L13: never overwrite a reminderHistory doc owned by a DIFFERENT tenant. The
+      // incoming write always carries the caller's tenantId in `data`; a client that
+      // supplies a historyId pointing at another tenant's doc must not be able to
+      // clobber it (or hijack it by rewriting tenantId).
+      const existingTenantId = existing && typeof (existing as any).tenantId === 'string' ? (existing as any).tenantId : '';
+      const incomingTenantId = typeof (data as any)?.tenantId === 'string' ? (data as any).tenantId : '';
+      if (existing && existingTenantId && incomingTenantId && existingTenantId !== incomingTenantId) {
+        return;
+      }
       const existingCreatedAt = existing ? (existing as any).createdAt : null;
 
       let createdAtWrite: any = undefined;
@@ -11931,7 +12850,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
-  app.post('/reminders/batch/send', requireStaffTenantAccess, async (req, res) => {
+  app.post('/reminders/batch/send', rateLimitMiddleware({ windowMs: 60_000, max: 60 }), requireStaffTenantAccess, async (req, res) => {
     const parsed = reminderBatchSendSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
@@ -12457,7 +13376,7 @@ export function createApp(options: CreateAppOptions = {}){
   });
 
   // ----- WhatsApp queue endpoints (light validation) -----
-  app.post('/whatsapp/queue/fee-reminder', requireStaffTenantAccess, async (req,res)=>{
+  app.post('/whatsapp/queue/fee-reminder', rateLimitMiddleware({ windowMs: 60_000, max: 600 }), requireStaffTenantAccess, async (req,res)=>{
     const { to, studentName, amount, dueDate, tenantId, quotaBatchId, historyId, history } = req.body||{};
     if(!to||!studentName||typeof amount!=='number'||!dueDate||typeof tenantId!=='string') {
       return res.status(400).json({error:'missing_fields'});
@@ -12533,7 +13452,7 @@ export function createApp(options: CreateAppOptions = {}){
     res.json({jobId:id});
   });
 
-  app.post('/whatsapp/queue/custom-message', requireStaffTenantAccess, async (req,res)=>{
+  app.post('/whatsapp/queue/custom-message', rateLimitMiddleware({ windowMs: 60_000, max: 600 }), requireStaffTenantAccess, async (req,res)=>{
     const { to, message, tenantId, quotaBatchId, historyId, history } = req.body||{};
     if(!to||!message||typeof tenantId!=='string') {
       return res.status(400).json({error:'missing_fields'});
@@ -12606,7 +13525,7 @@ export function createApp(options: CreateAppOptions = {}){
     res.json({jobId:id});
   });
 
-  app.post('/whatsapp/queue/payment-confirmation', requireStaffTenantAccess, async (req,res)=>{
+  app.post('/whatsapp/queue/payment-confirmation', rateLimitMiddleware({ windowMs: 60_000, max: 600 }), requireStaffTenantAccess, async (req,res)=>{
     const { to, studentName, amount, paymentDate, tenantId, quotaBatchId, historyId, history } = req.body||{};
     if(!to||!studentName||typeof amount!=='number'||!paymentDate||typeof tenantId!=='string') {
       return res.status(400).json({error:'missing_fields'});
@@ -12849,6 +13768,125 @@ export function createApp(options: CreateAppOptions = {}){
     });
   });
 
+  // Backend-mediated object delete (security-rules-hardening M1). Client
+  // `deleteObject` is disabled in storage.rules (`allow delete: if false`) so no
+  // signed-in user can delete arbitrary objects across tenants. Deletes are now
+  // routed here and authorized against the caller's tenant: every managed object
+  // is stored under `{category}/{tenantId}/…`, so we require the object's second
+  // path segment to equal the caller's tenant and the category to be one we own.
+  const STORAGE_TENANT_CATEGORIES = new Set([
+    'chat-files',
+    'tenant-branding',
+    'notices',
+    'student_profiles',
+    'receipts',
+    'profile-pictures',
+  ]);
+
+  function resolveManagedStorageObjectPath(target: string): string | null {
+    const raw = (target || '').trim();
+    if (!raw) return null;
+    // gs://bucket/objectPath
+    if (raw.startsWith('gs://')) {
+      const withoutScheme = raw.slice('gs://'.length);
+      const slash = withoutScheme.indexOf('/');
+      if (slash < 0) return null;
+      try {
+        return decodeURIComponent(withoutScheme.slice(slash + 1));
+      } catch {
+        return null;
+      }
+    }
+    // Firebase download URL: .../o/{ENCODED_OBJECT_PATH}?alt=media&token=…
+    if (raw.startsWith('http://') || raw.startsWith('https://')) {
+      const marker = '/o/';
+      const idx = raw.indexOf(marker);
+      if (idx < 0) return null;
+      let rest = raw.slice(idx + marker.length);
+      const q = rest.indexOf('?');
+      if (q >= 0) rest = rest.slice(0, q);
+      try {
+        return decodeURIComponent(rest);
+      } catch {
+        return null;
+      }
+    }
+    // Plain object path.
+    return raw.replace(/^\/+/, '');
+  }
+
+  const storageDeleteBodySchema = z.object({
+    target: z.string().trim().min(1).max(4000),
+  });
+
+  app.post('/storage/delete', requireStaffTenantAccessFromQuery, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    const providedTenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : '';
+    if (!providedTenantId || providedTenantId !== tenantAccess.tenantId) {
+      return res.status(403).json({ error: 'tenant_mismatch' });
+    }
+    const parsed = storageDeleteBodySchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const objectPath = resolveManagedStorageObjectPath(parsed.data.target);
+    if (!objectPath) {
+      return res.status(400).json({ error: 'invalid_object_path' });
+    }
+    const segments = objectPath.split('/');
+    const category = segments[0];
+    const pathTenantId = segments[1];
+    if (!STORAGE_TENANT_CATEGORIES.has(category) || pathTenantId !== tenantAccess.tenantId) {
+      // The object is not under this tenant's managed prefix — refuse so a caller
+      // can never delete another tenant's (or an unmanaged) object.
+      return res.status(403).json({ error: 'forbidden_object_path' });
+    }
+
+    ensureFirebase();
+    if (typeof admin.app().options.storageBucket !== 'string') {
+      return res.status(501).json({ error: 'storage_bucket_not_configured' });
+    }
+    const bucket = admin.storage().bucket();
+    const db = getFirestoreImpl();
+    const file = bucket.file(objectPath);
+
+    try {
+      let sizeBytes = 0;
+      try {
+        const [metadata] = await file.getMetadata();
+        sizeBytes = Number((metadata as any)?.size || 0);
+      } catch (metaErr: any) {
+        if (metaErr?.code === 404) {
+          return res.json({ ok: true, alreadyDeleted: true, path: objectPath });
+        }
+        throw metaErr;
+      }
+
+      await file.delete();
+
+      if (Number.isFinite(sizeBytes) && sizeBytes > 0) {
+        try {
+          await releaseTenantStorageBytes(db, tenantAccess.tenantId, sizeBytes);
+          invalidateLiveCount(`storageBytes:${tenantAccess.tenantId}`);
+        } catch (releaseErr) {
+          console.warn('[storage_delete] usage release failed', releaseErr);
+        }
+      }
+
+      return res.json({ ok: true, deleted: true, path: objectPath, bytes: sizeBytes });
+    } catch (error: any) {
+      if (error?.code === 404) {
+        return res.json({ ok: true, alreadyDeleted: true, path: objectPath });
+      }
+      console.error('[storage_delete] failed', error);
+      return res.status(500).json({ error: 'storage_delete_failed' });
+    }
+  });
+
   app.post('/storage/upload', requireStaffTenantAccessFromQuery, express.raw({ type: '*/*', limit: '55mb' }), async (req, res) => {
     const tenantAccess = req.tenantAccess;
     if (!tenantAccess) {
@@ -12895,6 +13933,28 @@ export function createApp(options: CreateAppOptions = {}){
     const db = getFirestoreImpl();
 
     const contentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : 'application/octet-stream';
+
+    // Security-hardening L4: reject script-capable content types. Uploaded objects
+    // are served via download URLs with the stored contentType; a file declared as
+    // HTML/XHTML/SVG/XML/JS could execute script if opened inline (stored-XSS
+    // surface). None of the upload purposes (images/audio/video/docs) need these
+    // types, so refuse them outright rather than trusting a client-set header.
+    const normalizedContentType = contentType.split(';')[0].trim().toLowerCase();
+    const DISALLOWED_UPLOAD_CONTENT_TYPES = new Set([
+      'text/html',
+      'application/xhtml+xml',
+      'image/svg+xml',
+      'application/xml',
+      'text/xml',
+      'application/javascript',
+      'text/javascript',
+      'application/ecmascript',
+      'text/ecmascript',
+    ]);
+    if (DISALLOWED_UPLOAD_CONTENT_TYPES.has(normalizedContentType)) {
+      return res.status(415).json({ error: 'unsupported_content_type', contentType: normalizedContentType });
+    }
+
     const body = req.body as Buffer;
     const bytes = Buffer.isBuffer(body) ? body.length : 0;
     if (!bytes) {
@@ -13187,15 +14247,22 @@ export function createApp(options: CreateAppOptions = {}){
 
   app.post(
     '/video/request-transcode',
-    requireAuthContext,
+    requireMemberTenantAccess,
     rateLimitMiddleware({ windowMs: 60_000, max: 10 }),
     async (req, res) => {
+      const tenantAccess = req.tenantAccess;
+      if (!tenantAccess) {
+        return res.status(500).json({ error: 'tenant_guard_missing' });
+      }
       const parsed = requestTranscodeSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
       }
 
       const { originalUrl, tenantId } = parsed.data;
+      if (tenantId !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'tenant_mismatch' });
+      }
 
       // Requirement 8: when transcoding is disabled, never schedule a job.
       // Report 'disabled' so the client surfaces the unsupported-video error.
@@ -13210,6 +14277,17 @@ export function createApp(options: CreateAppOptions = {}){
         storagePath = storagePathFromUrl(originalUrl);
       } catch {
         return res.status(400).json({ error: 'invalid_storage_url' });
+      }
+
+      // Enforce that the object belongs to the CALLER'S tenant and sits under a
+      // managed category prefix ({category}/{tenantId}/…). The transcoder reads the
+      // original via the Admin SDK (bypassing Storage rules) and then permanently
+      // DELETES it, so without this a member could point originalUrl at another
+      // tenant's video and destroy it / mis-attribute storage quota
+      // (security-rules-hardening H5).
+      const pathSegments = storagePath.split('/');
+      if (!STORAGE_TENANT_CATEGORIES.has(pathSegments[0]) || pathSegments[1] !== tenantAccess.tenantId) {
+        return res.status(403).json({ error: 'forbidden_object_path' });
       }
 
       const docId = transcodeDocId(storagePath);
@@ -13270,7 +14348,7 @@ export function createApp(options: CreateAppOptions = {}){
           bucketName: admin.storage().bucket().name,
           originalUrl,
           contentType: 'video/mp4',
-          tenantId,
+          tenantId: tenantAccess.tenantId,
         });
 
         return res.status(202).json({ status: 'processing' });
@@ -15403,8 +16481,10 @@ export function createApp(options: CreateAppOptions = {}){
       const planVariantId = typeof meta.planVariantId === 'string' ? meta.planVariantId.trim() : '';
       const successUrl = typeof data.successUrl === 'string' ? data.successUrl : undefined;
       const cancelUrl = typeof data.cancelUrl === 'string' ? data.cancelUrl : undefined;
-      const createdByEmail = typeof data.createdByEmail === 'string' ? data.createdByEmail : undefined;
 
+      // This endpoint is PUBLIC (no auth) — do NOT return the creator's email
+      // (security-rules-hardening L8); it isn't needed to render Razorpay checkout
+      // and a sessionId can leak via checkout-URL logs/referrers.
       return res.json({
         provider,
         sessionId,
@@ -15417,7 +16497,6 @@ export function createApp(options: CreateAppOptions = {}){
         },
         ...(successUrl ? { successUrl } : {}),
         ...(cancelUrl ? { cancelUrl } : {}),
-        ...(createdByEmail ? { createdByEmail } : {}),
       });
     } catch (error) {
       console.error('[billing_checkout_session_public] failed', error);
@@ -16032,11 +17111,14 @@ export function createApp(options: CreateAppOptions = {}){
         return res.status(409).json({ error: 'purchase_pending' });
       }
 
-      // Determine planVariantId from request OR catalog mapping by playProductId.
-      let resolvedVariantId = requestedPlanVariantId;
+      // Resolve the granted plan STRICTLY from the SKU actually purchased
+      // (productId → billingPlanVariants.playProductId), NEVER from the client-
+      // supplied planVariantId. Otherwise a tenant admin could buy the cheapest
+      // real SKU and claim an expensive plan (security-rules-hardening H6).
+      let resolvedVariantId = '';
       let resolvedPlanId: PlanId = 'pro';
       let resolvedPriceInr = 0;
-      if (!resolvedVariantId) {
+      {
         const configured = await listPlanVariants(db, { includeInactive: false });
         const match = configured.find((v) => typeof (v as any).playProductId === 'string' && (v as any).playProductId === productId);
         if (match) {
@@ -16045,19 +17127,52 @@ export function createApp(options: CreateAppOptions = {}){
           resolvedPriceInr = Number.isFinite(match.priceInr) ? Math.max(0, Math.trunc(match.priceInr)) : 0;
         }
       }
-      if (resolvedVariantId) {
-        const variant = await getPlanVariantById(db, resolvedVariantId);
-        if (variant) {
-          resolvedPlanId = variant.planId;
-          resolvedPriceInr = Number.isFinite(variant.priceInr) ? Math.max(0, Math.trunc(variant.priceInr)) : resolvedPriceInr;
-        }
-      }
 
       if (!resolvedVariantId) {
         return res.status(400).json({
-          error: 'plan_variant_required',
-          message: 'Missing planVariantId and no billingPlanVariants.playProductId mapping found for this productId.',
+          error: 'plan_variant_unresolved',
+          message: 'No billingPlanVariants.playProductId mapping found for this productId; configure the SKU→plan mapping.',
         });
+      }
+
+      // A client-supplied planVariantId is advisory only and MUST match the
+      // SKU-derived variant — a mismatch means the client is claiming a different
+      // plan than the one it actually purchased.
+      if (requestedPlanVariantId && requestedPlanVariantId !== resolvedVariantId) {
+        return res.status(409).json({ error: 'plan_variant_mismatch' });
+      }
+
+      // Bind this purchaseToken to a single tenant so one genuine purchase can't be
+      // replayed through /billing/play/verify to upgrade multiple tenants the same
+      // actor administers (security-rules-hardening H6-related).
+      const purchaseTokenClaimId = crypto.createHash('sha256').update(purchaseToken).digest('hex');
+      const purchaseTokenClaimRef = db.collection('playPurchaseTokenClaims').doc(purchaseTokenClaimId);
+      try {
+        await db.runTransaction(async (tx) => {
+          const claimSnap = await tx.get(purchaseTokenClaimRef);
+          if (claimSnap.exists) {
+            const owner = (claimSnap.data() as any)?.tenantId;
+            if (typeof owner === 'string' && owner && owner !== tenantAccess.tenantId) {
+              throw new Error('purchase_token_bound_to_other_tenant');
+            }
+          }
+          tx.set(
+            purchaseTokenClaimRef,
+            {
+              tenantId: tenantAccess.tenantId,
+              productId,
+              claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        });
+      } catch (error: any) {
+        if (error?.message === 'purchase_token_bound_to_other_tenant') {
+          return res.status(409).json({ error: 'purchase_token_bound_to_other_tenant' });
+        }
+        // Transient transaction failure: log and continue so a legitimate
+        // activation isn't blocked by a best-effort dedup write.
+        console.warn('[play_verify] purchase-token claim failed (continuing)', error?.message || error);
       }
 
       let limitsSnapshot: ReturnType<typeof toTenantBillingLimitsSnapshot> | null = null;
@@ -16307,21 +17422,26 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     const requiredAudience = (process.env.PLAY_RTDN_OIDC_AUDIENCE || '').trim();
-    if (requiredAudience) {
-      try {
-        const authHeader = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-        if (!token) {
-          return res.status(401).json({ error: 'missing_oidc_token' });
-        }
-
-        const { OAuth2Client } = await import('google-auth-library');
-        const client = new OAuth2Client();
-        await client.verifyIdToken({ idToken: token, audience: requiredAudience });
-      } catch (error) {
-        console.warn('[billing_play_notification] oidc verification failed', (error as any)?.message || error);
-        return res.status(401).json({ error: 'invalid_oidc_token' });
+    if (!requiredAudience) {
+      // Fail closed (security-rules-hardening M7-related): don't accept an
+      // UNVERIFIED Pub/Sub RTDN push. When store billing is enabled the operator
+      // MUST configure PLAY_RTDN_OIDC_AUDIENCE so the push token can be verified.
+      console.error('[billing_play_notification] PLAY_RTDN_OIDC_AUDIENCE not configured — refusing RTDN (fail closed)');
+      return res.status(503).json({ error: 'rtdn_oidc_not_configured' });
+    }
+    try {
+      const authHeader = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      if (!token) {
+        return res.status(401).json({ error: 'missing_oidc_token' });
       }
+
+      const { OAuth2Client } = await import('google-auth-library');
+      const client = new OAuth2Client();
+      await client.verifyIdToken({ idToken: token, audience: requiredAudience });
+    } catch (error) {
+      console.warn('[billing_play_notification] oidc verification failed', (error as any)?.message || error);
+      return res.status(401).json({ error: 'invalid_oidc_token' });
     }
 
     // Always respond 2xx quickly so Pub/Sub doesn't retry aggressively.
@@ -16907,7 +18027,15 @@ export function createApp(options: CreateAppOptions = {}){
     const webhookSecret = (process.env.RAZORPAY_WEBHOOK_SECRET || '').trim();
     const isTestMode = process.env.TEST_MODE === '1';
 
-    if (!isTestMode && webhookSecret) {
+    if (!isTestMode) {
+      if (!webhookSecret) {
+        // Fail closed (security-rules-hardening M7): webhooks are enabled but no
+        // secret is configured — refuse rather than process an UNVERIFIED payload
+        // that drives tenant plan/limit changes off attacker-controlled notes.
+        inc('billing_webhook_signature_failures_total', { provider: 'razorpay' });
+        console.error('[billing_razorpay_webhook] RAZORPAY_WEBHOOK_SECRET not configured — refusing to process (fail closed)');
+        return res.status(503).json({ error: 'webhook_secret_not_configured' });
+      }
       const ok = verifyRazorpayWebhookSignature({ rawBody: rawBodyBuffer, signatureHeader: signature, webhookSecret });
       if (!ok) {
         inc('billing_webhook_signature_failures_total', { provider: 'razorpay' });
@@ -17793,6 +18921,24 @@ export function createApp(options: CreateAppOptions = {}){
       name: actorEmail ?? undefined,
     };
 
+    // SECURITY (security-rules-hardening M6): the fan-out's `senderEmail` and
+    // `allowWhenDisabled` must be server-controlled, NOT taken from the client-
+    // supplied `notification.data`. Otherwise a tenant member could (a) spoof
+    // another `senderEmail` (which drives active-chat suppression) and (b) set
+    // `allowWhenDisabled:true` to push to recipients who disabled that
+    // notification type. senderEmail is forced to the authenticated actor;
+    // allowWhenDisabled is honored only for the master/system caller.
+    const clientNotificationData = (parsed.data.notification.data ?? {}) as Record<string, unknown>;
+    const sanitizedNotification = {
+      ...parsed.data.notification,
+      data: {
+        ...clientNotificationData,
+        senderEmail: actorEmail ?? undefined,
+        allowWhenDisabled:
+          req.authContext?.tokenType === 'master' ? clientNotificationData.allowWhenDisabled === true : false,
+      },
+    };
+
     // Delegate to the Server_Fanout. It resolves the recipient's devices through
     // the Admin SDK, applies the Delivery_Filter, delivers push, performs the
     // cross-user writes, and returns the counts-only Fanout_Result — it never
@@ -17800,7 +18946,7 @@ export function createApp(options: CreateAppOptions = {}){
     const result = await deviceFanoutImpl({
       tenantId: tenantAccess.tenantId,
       recipientEmail: parsed.data.recipientEmail.trim().toLowerCase(),
-      notification: parsed.data.notification,
+      notification: sanitizedNotification,
       onlineOnly: parsed.data.onlineOnly ?? true,
       // Single-device targeting (Part B): route the optional `deviceId` through
       // as the fan-out's `targetDeviceId`. Absent → recipient-wide fan-out.
@@ -18554,7 +19700,10 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     const authEmail = normalizeEmail(req.authContext?.email || '');
-    if (authEmail && authEmail !== normalizedEmail) {
+    // The caller must be the device owner. Only the raw master key (no email) is
+    // exempt; any other token MUST match rather than skipping the check when its
+    // email is absent (security-rules-hardening L5 — close the fail-open).
+    if (req.authContext?.tokenType !== 'master' && authEmail !== normalizedEmail) {
       return res.status(403).json({ error: 'email_mismatch' });
     }
 
@@ -18694,7 +19843,7 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(400).json({ error: 'invalid_conversation' });
     }
 
-    if (typeof tokenPayload.email === 'string' && normalizeEmail(tokenPayload.email) !== normalizedUser) {
+    if (!tokenPayload.master && normalizeEmail(tokenPayload.email ?? '') !== normalizedUser) {
       return res.status(401).json({ error: 'unauthorized' });
     }
 
@@ -18806,7 +19955,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     // Actor is derived from the TOKEN, never trusted from the query param.
-    if (typeof tokenPayload.email === 'string' && normalizeEmail(tokenPayload.email) !== normalizedUser) {
+    if (!tokenPayload.master && normalizeEmail(tokenPayload.email ?? '') !== normalizedUser) {
       return res.status(401).json({ error: 'unauthorized' });
     }
 
@@ -19806,7 +20955,7 @@ export function createApp(options: CreateAppOptions = {}){
     setTimeout(scheduleInviteExpirySweep, 12000).unref?.();
   }
 
-  app.post('/internal/join-requests/expire', async (_req, res) => {
+  app.post('/internal/join-requests/expire', requireOperatorAuth, async (_req, res) => {
     try {
       const result = await expireJoinRequestsOnce();
       res.json({ ok: true, ...result });
@@ -19815,7 +20964,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
-  app.post('/internal/invites/expire', async (_req, res) => {
+  app.post('/internal/invites/expire', requireOperatorAuth, async (_req, res) => {
     try {
       const result = await expireInvitesOnce();
       res.json({ ok: true, ...result });
@@ -19833,7 +20982,7 @@ export function createApp(options: CreateAppOptions = {}){
     setTimeout(scheduleJoinCodeExpirySweep, 14000).unref?.();
   }
 
-  app.post('/internal/join-codes/expire', async (_req, res) => {
+  app.post('/internal/join-codes/expire', requireOperatorAuth, async (_req, res) => {
     try {
       const result = await expireJoinCodesOnce();
       res.json({ ok: true, ...result });
@@ -19912,7 +21061,7 @@ export function createApp(options: CreateAppOptions = {}){
     setTimeout(() => { sweepPresenceOnce().catch((e)=>console.warn('[presence_sweeper] startup error', e?.message||e)); }, 5000).unref?.();
   }
 
-  app.post('/internal/presence/sweep', async (_req, res) => {
+  app.post('/internal/presence/sweep', requireOperatorAuth, async (_req, res) => {
     try {
       const { scanned, updates } = await sweepPresenceOnce();
       res.json({ ok: true, scanned, updates, thresholdMinutes: PRESENCE_STALE_MINUTES });

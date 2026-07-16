@@ -56,6 +56,9 @@ export function buildFeeReminderTemplate(p: FeeReminderTemplatePayload) {
   const rawHi = (p.customNotesHindi ?? p.customNotes) || '';
   const noteEn = rawEn.trim() ? rawEn.replace(/\n/g, ', ').trim() : 'No additional note';
   const noteHi = rawHi.trim() ? rawHi.replace(/\n/g, ', ').trim() : 'कोई अतिरिक्त नोट नहीं';
+  // Honor a caller-provided greeting for the English block (fallback "Dear");
+  // Hindi always uses "प्रिय". Matches buildPaymentConfirmationTemplate.
+  const greetEn = (p.greeting || 'Dear').trim() || 'Dear';
   // Use '-' when a specific signature line is disabled / not provided
   const teacher = p.teacherName ? p.teacherName : '-';
   const teacherHi = p.teacherName ? p.teacherName : '-';
@@ -64,7 +67,7 @@ export function buildFeeReminderTemplate(p: FeeReminderTemplatePayload) {
 
   function englishBlock(): string[] {
     // fee_due_reminder_extended (English) placeholders 1..8
-    return ['Dear', parentNameEn, studentName, amountTxt, dueDateFmt, noteEn, teacher, coaching];
+    return [greetEn, parentNameEn, studentName, amountTxt, dueDateFmt, noteEn, teacher, coaching];
   }
   function hindiBlock(): string[] {
     // fee_due_reminder_extended_hi (Hindi) placeholders 1..8
