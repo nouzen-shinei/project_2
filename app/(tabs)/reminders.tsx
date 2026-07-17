@@ -16,20 +16,15 @@ import {
   Dimensions,
 } from 'react-native';
 import {
-  Bell,
   Send,
   Users,
-  User,
   Mail,
   MessageSquare,
-  Phone,
   PhoneCall,
   CheckCircle,
   AlertCircle,
   Search,
-  Filter,
   X,
-  Edit3,
   ChevronLeft,
   ChevronRight,
   Settings,
@@ -591,7 +586,7 @@ export default function SendReminders() {
 
   // Helper functions to get appropriate custom messages based on language
   // Note: WhatsApp newline formatting is handled by backend (converts \n to commas)
-  const getCustomMessageForLanguage = useCallback((messageType: 'sms' | 'whatsapp' | 'voice' | 'email') => {
+  const getCustomMessageForLanguage = useCallback((_messageType: 'sms' | 'whatsapp' | 'voice' | 'email') => {
     if (!useCustomMessage) return null;
     
     if (selectedLanguage === 'both') {
@@ -3186,7 +3181,6 @@ export default function SendReminders() {
             ) : (
               displayedStudents.map(student => {
                 const cachedFeeInfo = feeInfoByStudentId.get(student.id);
-                const feeInfo = cachedFeeInfo?.feeInfo ?? getStudentFeeInfo(student);
                 const detailedFeeInfo = cachedFeeInfo?.detailedFeeInfo ?? getDetailedFeeInfo(student);
                 const isSelected = selectedStudents.has(student.id);
                 const trimmedParentEmail = (student.parentEmail || '').trim();

@@ -1,6 +1,6 @@
 import { logger } from '@/lib/logger';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
@@ -20,8 +20,7 @@ import {
 import { ScrollView as GHScrollView } from 'react-native-gesture-handler';
 import { useIsFocused } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Picker } from '@react-native-picker/picker';
-import { Calendar, DollarSign, CircleAlert as AlertCircle, CircleCheck as CheckCircle, Clock, Send, Filter, Download, Eye, EyeOff, Users, X, Trash2, Upload, FileText, Plus, ChevronDown, Info, Mail, MessageSquare, Phone, Bell, Check, Search, Camera } from 'lucide-react-native';
+import { Calendar, DollarSign, CircleAlert as AlertCircle, CircleCheck as CheckCircle, Clock, Send, Filter, Download, Eye, EyeOff, X, Trash2, Upload, Plus, ChevronDown, Info, Mail, MessageSquare, Phone, Bell, Check, Search, Camera } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as Linking from 'expo-linking';
@@ -32,10 +31,9 @@ import * as XLSX from 'xlsx';
 import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
 import { reconcileTenantStorageUsageViaBackend, uploadBlobViaBackend, deleteStorageObjectViaBackend } from '../../services/backendStorageUploadService';
 import { maybeShowStorageLimitReachedAlert } from '../../services/storageLimitAlert';
-import { getFirestore as getFirestoreClient, doc as docClient, setDoc as setDocClient, deleteDoc as deleteDocClient, collection as collectionClient } from 'firebase/firestore';
-import { storage } from '../../config/firebase';
+import { getFirestore as getFirestoreClient, doc as docClient, setDoc as setDocClient } from 'firebase/firestore';
 import { useRouter } from 'expo-router';
-import useFees, { type FeeRecord } from '../../hooks/useFees';
+import useFees from '../../hooks/useFees';
 import useStudents from '../../hooks/useStudents';
 import { useTheme } from '../../hooks/useTheme';
 import { useBirthdays } from '../../components/BirthdayProvider';
@@ -49,7 +47,6 @@ import { useTenant } from '../../hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { normalizePhoneNumber as normalizePhoneE164 } from '../../services/phoneUtil';
 import { reminderHistoryService } from '../../services/reminderHistoryService';
-import ReminderHistoryViewer from '../../components/ReminderHistoryViewer';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
 import FeeHistory from '../../components/FeeHistory';
@@ -289,7 +286,7 @@ export default function Fees() {
   const { activeTenant, loading: tenantLoading } = useTenant();
   const tenantId = activeTenant?.id ?? null;
   const tenantUnavailable = !tenantLoading && !tenantId;
-  const { fees, loading, error, markAsPaid, updateFeeRecord, addFeeRecord, deleteFeeRecord, deletePaymentRecord } = useFees();
+  const { fees, loading, error, updateFeeRecord, addFeeRecord, deleteFeeRecord, deletePaymentRecord } = useFees();
   
   const resolvedTeacherName = (user?.displayName && user.displayName.trim()) ? user.displayName.trim() : undefined;
   const resolvedCoachingName = useMemo(() => {
@@ -1169,8 +1166,6 @@ export default function Fees() {
 
   // Add fee modal states
   const [canEditAmount, setCanEditAmount] = useState(false);
-  const [showOverwriteWarning, setShowOverwriteWarning] = useState(false);
-  const [existingFee, setExistingFee] = useState<any>(null);
   
   // Confirmation modal states
   const [showConfirmationModal, setShowConfirmationModal] = useState(false);
@@ -1185,9 +1180,6 @@ export default function Fees() {
     cancelButtonText?: string | null;
     confirmButtonColor?: string;
   } | null>(null);
-
-  // Date picker states
-  const [datePickerMode, setDatePickerMode] = useState<'date' | 'time'>('date');
 
   // Form validation states
   const [formErrors, setFormErrors] = useState<{
@@ -2269,13 +2261,6 @@ export default function Fees() {
   const handleSelectDueMonth = (value: string) => {
     setAddFeeForm(prev => ({ ...prev, dueMonth: value }));
 
-    if (addFeeForm.studentId) {
-      const existing = checkExistingFee(addFeeForm.studentId, value);
-      setExistingFee(existing);
-    } else {
-      setExistingFee(null);
-    }
-
     if (addFeeForm.studentId && value) {
       const months = calculateMonthsToCreate(value, addFeeForm.studentId);
       initializeMonthFees(months, addFeeForm.amount);
@@ -2284,14 +2269,6 @@ export default function Fees() {
     }
 
     setShowDueMonthModal(false);
-  };
-
-  // Helper function to check for existing fee
-  const checkExistingFee = (studentId: string, month: string) => {
-    if (!studentId) return null;
-    
-    // Check if student has ANY existing fees, regardless of month
-    return fees.find(fee => fee.studentId === studentId);
   };
 
   // Helper function to calculate amount based on student's monthly fee
@@ -2320,12 +2297,6 @@ export default function Fees() {
       setMonthFeeAmounts({});
     }
 
-    if (value) {
-      const existing = checkExistingFee(value, addFeeForm.dueMonth);
-      setExistingFee(existing);
-    } else {
-      setExistingFee(null);
-    }
   };
 
   // Memoized helper functions to prevent unnecessary re-computations
@@ -3207,11 +3178,6 @@ export default function Fees() {
       default:
         return theme.textSecondary;
     }
-  };
-
-  const getFilterColor = (filterKey: string) => {
-    const filter = filters.find(f => f.key === filterKey);
-    return filter ? filter.color : theme.textSecondary;
   };
 
   const getStatusIcon = (status: string) => {
@@ -5564,7 +5530,7 @@ export default function Fees() {
     }
   };
 
-  const handleAddCurrentMonthToExisting = async (existingDueFees: any[], currentMonth: string, selectedStudent: any) => {
+  const handleAddCurrentMonthToExisting = async (existingDueFees: any[], currentMonth: string, _selectedStudent: any) => {
     try {
       // Find the most recent due fee (likely the consolidated one)
       const latestFee = existingDueFees.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
@@ -5790,7 +5756,7 @@ export default function Fees() {
     }
   };
 
-  const handleUpdateCurrentMonthFee = async (existingDueFees: any[], currentMonth: string, selectedStudent: any) => {
+  const handleUpdateCurrentMonthFee = async (existingDueFees: any[], currentMonth: string, _selectedStudent: any) => {
     try {
       // Find the fee that covers the current month
       const currentMonthFee = existingDueFees.find(fee => {
@@ -5906,8 +5872,6 @@ export default function Fees() {
     setCanEditAmount(false);
     setMonthFeeAmounts({});
     setShowIndividualMonthEditor(false);
-    setShowOverwriteWarning(false);
-    setExistingFee(null);
   };
 
   const createSingleFeeFromMonths = async (monthsToCreate: string[], selectedStudent: any, existingFeesToDelete: any[]) => {
@@ -6023,99 +5987,10 @@ export default function Fees() {
     }
   };
 
-  const createFeesFromSelectedMonth = async (monthsToCreate: string[], selectedStudent: any, existingFees: any[]) => {
-    try {
-      // Delete ALL existing fees for this student first
-      for (let i = 0; i < existingFees.length; i++) {
-        const existingFee = existingFees[i];
-        try {
-          const deletedBy = user?.displayName || user?.email?.split('@')[0] || 'Unknown User';
-          await deleteFeeRecord(existingFee.id, deletedBy, 'Creating new fee structure');
-        } catch (deleteError) {
-          logger.error(`Failed to delete fee ${existingFee.id}:`, deleteError);
-          throw deleteError;
-        }
-      }
-
-      // Create new fees for all months
-      const createdFees = [];
-      for (let i = 0; i < monthsToCreate.length; i++) {
-        const month = monthsToCreate[i];
-        
-        const dueDate = calculateDueDateFromMonth(month, addFeeForm.studentId);
-        const today = new Date();
-        const dueDateObj = new Date(dueDate);
-        const isPastDue = dueDateObj < today;
-
-        const newFeeData = {
-          studentId: addFeeForm.studentId,
-          studentName: selectedStudent.name,
-          amount: parseFloat(addFeeForm.amount),
-          dueDate: dueDate,
-          type: addFeeForm.type as 'tuition' | 'registration' | 'materials' | 'other',
-          description: addFeeForm.description || `Monthly tuition fee for ${month}`,
-          status: (isPastDue ? 'overdue' : 'pending') as 'pending' | 'paid' | 'overdue',
-          paidAmount: 0,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        
-        try {
-          // This is a manual fee creation, so use current user
-          const createdBy = user?.displayName || user?.email?.split('@')[0] || 'Unknown User';
-          await addFeeRecord(newFeeData, createdBy);
-          createdFees.push(month);
-        } catch (createError) {
-          logger.error(`Failed to create fee for month ${month}:`, createError);
-          throw createError;
-        }
-      }
-
-      // Close modal and reset form immediately after successful creation
-      setShowAddFeeModal(false);
-      setShowOverwriteWarning(false);
-      setExistingFee(null);
-      
-      // Reset form
-      setAddFeeForm({
-        studentId: '',
-        studentName: '',
-        amount: '',
-        dueMonth: getCurrentMonth(), // Use helper function consistently
-        type: 'tuition',
-        description: '',
-        isPastDue: false
-      });
-      setCanEditAmount(false);
-      setMonthFeeAmounts({});
-      setShowIndividualMonthEditor(false);
-      
-      // Show success message
-      const isMultipleMonths = createdFees.length > 1;
-      const monthLabel = generateMonthOptions.find(m => m.value === monthsToCreate[0])?.label;
-      const lastMonth = monthsToCreate[monthsToCreate.length - 1];
-      const lastMonthLabel = lastMonth ? generateMonthOptions.find(m => m.value === lastMonth)?.label : monthLabel;
-      
-      setTimeout(() => {
-        Alert.alert(
-          'Success!', 
-          isMultipleMonths 
-            ? `Created ${createdFees.length} fee records for ${selectedStudent.name} from ${monthLabel} to ${lastMonthLabel}.${existingFees.length > 0 ? ` Overwrote ${existingFees.length} existing fees.` : ''}`
-            : `Created fee record for ${selectedStudent.name} for ${monthLabel}.${existingFees.length > 0 ? ' Overwrote all existing fees.' : ''}`,
-          [{ text: 'OK' }]
-        );
-      }, 100);
-
-    } catch (error) {
-      logger.error('Error in createFeesFromSelectedMonth:', error);
-      Alert.alert('Error', 'Failed to create some fee records. Please try again.');
-    }
-  };
-
   // Removed duplicate getCorrectFeeAmount function - using the memoized version above
 
   // Optimized summary calculations with proper memoization
-  const { totalAmount, paidAmount, pendingAmount, collectedThisMonth } = useMemo(() => {
+  const { pendingAmount, collectedThisMonth } = useMemo(() => {
     const now = new Date();
     const isInCurrentMonth = (dateStr?: string | null) => {
       if (!dateStr) return false;
@@ -8993,7 +8868,7 @@ export default function Fees() {
                         showsVerticalScrollIndicator={true}
                         nestedScrollEnabled={true}
                       >
-                      {transactions.map((transaction, index) => (
+                      {transactions.map((transaction, _index) => (
                         <View key={transaction.id} style={[
                           styles.paymentTransactionCard, 
                           { 

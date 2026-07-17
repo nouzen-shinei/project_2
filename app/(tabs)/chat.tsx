@@ -31,7 +31,6 @@ import {
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import Toast from 'react-native-toast-message';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import * as Clipboard from 'expo-clipboard';
 import * as Haptics from 'expo-haptics';
@@ -43,7 +42,6 @@ import type { TeamMember } from '../../hooks/useAuthUnified';
 import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useChat } from '../../hooks/useChat';
 import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
-import { useEasedDownloadProgressPercent } from '@/hooks/useEasedDownloadProgressPercent';
 import { chatService, ChatRateLimitError, ChatMessageActionError, ChatUploadCanceledError } from '../../services/chatService';
 import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
 import { getProfileImageUrl } from '../../lib/profileImage';
@@ -51,8 +49,6 @@ import { FileDownloadUtil } from '../../lib/fileDownloadUtil';
 import {
   PendingMessage,
   PendingMessageStorage,
-  type PendingMediaMessage,
-  type PendingAttachmentMessage,
 } from '../../lib/pendingMessageStorage';
 import { normalizePendingMessageStatus } from '../../lib/pendingMessageState';
 import {
@@ -78,15 +74,11 @@ import {
   resolveChatPendingRowAnimationEntry,
 } from '../../lib/chatPendingAnimationState';
 import {
-  shouldFinalizeAttachmentCleanup,
   hasPendingAttachment,
   resolveChatAttachmentFinalizeDelayMs,
   resolveChatAttachmentCleanupPlan,
 } from '../../lib/chatAttachmentFinalizeState';
 import {
-  resolveChatComposerEffectiveHeight,
-  resolveChatComposerExtraHeight,
-  resolveChatComposerAdaptiveExtraHeight,
   resolveChatBottomVisibilityPadding,
   resolveChatAutoscrollToTopThreshold,
 } from '../../lib/chatComposerLayoutState';
@@ -103,27 +95,22 @@ import {
   resolveChatPendingActiveIdSet,
 } from '../../lib/chatPendingCleanupState';
 import {
-  EnhancedMessageRenderer,
-  MobileChatInput,
   type MobileChatInputRef,
   MessageStatusTicks,
   ChatProfileModal,
   StyledText,
-  FileViewer,
-  ShareModal,
   EnhancedEmojiPicker,
   OptionModal,
   ConfirmationModal,
 } from '../../components';
-import VideoPlayer, { pauseAllChatVideos } from '../../components/VideoPlayer';
+import { pauseAllChatVideos } from '../../components/VideoPlayer';
 import { StickerGifPickerMobile } from '../../components/StickerGifPickerMobile';
-import ProgressiveImage from '../../components/ui/ProgressiveImage';
-import { ArrowLeft, Search, X, Info, Paperclip, Smile, Play, Star, Clock, MessageCircle, Send, Heart, Eye, AlertCircle, Download, Share, Camera, Trash2, ChevronDown, RotateCcw, CheckCircle2, File as FileIcon, Image as ImageIcon, Edit3, Reply, Copy } from 'lucide-react-native';
+import { Search, X, Info, Star, Clock, MessageCircle, Eye, AlertCircle, Trash2, ChevronDown, RotateCcw, CheckCircle2, Edit3, Reply, Copy } from 'lucide-react-native';
 import { formatMessageTimestamp, getChatDateSeparator, formatOnlineStatus } from '../../lib/timeUtils';
 import { isImageFile, isVideoFile } from '../../lib/fileUtils';
 import { notificationService } from '../../services/notificationService';
 import { chatPreferencesService } from '../../services/chatPreferencesService';
-import type { FileAttachment , ConversationSummary, ChatReplyContext } from '../../services/chatService';
+import type { ConversationSummary, ChatReplyContext } from '../../services/chatService';
 import { chatCacheService } from '../../services/chatCacheService';
 import type { HydratedAttachment } from '../../services/chatCacheService';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
@@ -145,7 +132,6 @@ import {
   type ChatLoadOlderReason,
 } from '@/lib/chatLoadOlderState';
 import { clearDownloadState, setDownloadState } from '@/lib/downloadStateStore';
-import { resolveDownloadProgressLabel } from '@/lib/uploadProgressDisplayEasing';
 import { isSelfConversation, reconcileConversationUnreadCount, shouldRefreshChatSummariesOnForegroundResume } from '@/lib/chatReceiptState';
 import {
   applyChatReceiptRequestedReadMutation,
@@ -195,7 +181,7 @@ import {
 import { resolveChatTimestampMs } from '@/lib/chatTimestampState';
 import { resolveChatRealtimeOnline } from '@/lib/chatPresenceState';
 import { resolveChatReplyPreviewText } from '@/lib/chatReplyPreview';
-import { getEmojiName, normalizeReactions, areReactionsEqual, QUICK_REACTIONS, type ReactionPillDescriptor } from '@/lib/chatReactionUtils';
+import { getEmojiName, normalizeReactions, type ReactionPillDescriptor } from '@/lib/chatReactionUtils';
 import {
   clampChatConversationSearchIndex,
   type ChatConversationSearchScope,
@@ -339,7 +325,6 @@ import {
   claimOutboxConversation,
 } from '@/lib/outboxSelfHeal';
 import {
-  resolveChatPendingServerMatchVisibility,
   resolveChatPendingTextVisibilityState,
 } from '@/lib/chatPendingVisibilityState';
 import { resolveChatPendingRetryOutcomeSummary } from '@/lib/chatPendingRetryOutcomeState';
@@ -373,10 +358,6 @@ import {
   resolveChatPrunedMessagePositions,
 } from '@/lib/chatDisplayedMessagesState';
 import {
-  resolveChatPendingRecipientEmail,
-  resolveChatTeamMembersByRecipientKey,
-} from '@/lib/chatRecipientLookupState';
-import {
   resolveChatOptimisticReactionMap,
   shouldKeepChatOptimisticReactionUntil,
   resolveChatOptimisticReactionExpiryIds,
@@ -399,16 +380,9 @@ import { tenantService } from '@/services/tenantService';
 import { firestore } from '../../config/firebase';
 import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import TenantRoleBadge from '@/components/TenantRoleBadge';
-import { normalizeSharedFileName } from '@/services/sharedFileService';
-import { useDownloadState } from '@/hooks/useDownloadState';
 import { setEditingMessageId, setMessageReactionsForMessage } from '@/lib/messageUiStateStore';
-import { useMessageUiState } from '@/hooks/useMessageUiState';
-import AnimatedMessageWrapper from '@/components/chat/AnimatedMessageWrapper';
 import AnimatedChatDivider from '@/components/chat/AnimatedChatDivider';
 import MessageRow from '@/components/chat/MessageRow';
-import MessageReplySnippet from '@/components/chat/MessageReplySnippet';
-import MessageReactionPills from '@/components/chat/MessageReactionPills';
-import MessagePendingOverlay from '@/components/chat/MessagePendingOverlay';
 import { ChatAttachmentModal } from '@/components/chat/ChatAttachmentModal';
 import { ChatFilePreviewModal } from '@/components/chat/ChatFilePreviewModal';
 import { ChatImageViewerModal } from '@/components/chat/ChatImageViewerModal';
@@ -860,10 +834,6 @@ export default function Chat() {
     scale: Animated.Value;
     started: boolean;
   }>>(new Map());
-  const pendingOutboxHydratedRef = useRef(false);
-  const pendingTextSnapshotRef = useRef('');
-  const pendingMediaSnapshotRef = useRef('');
-  const pendingAttachmentSnapshotRef = useRef('');
   const clearAttachmentFinalizeTimer = useCallback((tempId: string) => {
     const timer = attachmentFinalizeTimers.current.get(tempId);
     if (timer) {
@@ -980,7 +950,6 @@ export default function Chat() {
   const userActivityTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const userActiveRef = useRef(false);
   const mobileInputRef = useRef<MobileChatInputRef | null>(null);
-  const [isLoadingChatInfo, setIsLoadingChatInfo] = useState(false);
   const [conversationSummaries, setConversationSummaries] = useState<Map<string, ConversationSummary>>(new Map());
   const isSmallScreen = screenData.width < 700;
   const showKeyboardShortcuts = Platform.OS === 'web' && !isSmallScreen;
@@ -1180,14 +1149,6 @@ export default function Chat() {
   // @/components/chat/ChatPendingMedia alongside the components that render
   // them, so the shape and the rendering logic can't drift apart.
 
-  // Helper to detect media type (gif vs sticker/image) from uri/mime
-  const detectMediaTypeFromUri = (uri?: string, mime?: string): 'gif' | 'sticker' => {
-    const m = (mime || '').toLowerCase();
-    const u = (uri || '').toLowerCase();
-    if (m.includes('gif') || /\.gif(\?|$)/.test(u)) return 'gif';
-    return 'sticker';
-  };
-
   // Chat data for selected member.
   // Keep the realtime subscription alive briefly after the app/tab is
   // backgrounded or the screen blurs, so a quick switch-away-and-back does not
@@ -1205,7 +1166,6 @@ export default function Chat() {
     warmNextPage,
     trimToRecentWindow,
     sendMessage,
-    sendMessageWithFile,
     sendMessageWithFiles,
     sendSticker,
     sendGif,
@@ -1379,22 +1339,6 @@ export default function Chat() {
   const sanitizeAttachmentFileName = resolveChatSanitizedAttachmentFileName;
   const sanitizeDateSeparatorLabel = resolveChatSanitizedDateSeparatorLabel;
   const getSafeDisplayInitial = resolveChatSafeDisplayInitial;
-
-  const teamMembersByRecipientKey = useMemo(() => {
-    return resolveChatTeamMembersByRecipientKey<TeamMember>({
-      teamMembersWithChatInfo: teamMembersWithChatInfo as TeamMember[],
-      teamMembers,
-      normalizeParticipantEmail,
-    });
-  }, [teamMembersWithChatInfo, teamMembers, normalizeParticipantEmail]);
-
-  const resolvePendingRecipientEmail = useCallback((recipientId?: string): string => {
-    return resolveChatPendingRecipientEmail({
-      recipientId,
-      teamMembersByRecipientKey,
-      normalizeParticipantEmail,
-    });
-  }, [teamMembersByRecipientKey, normalizeParticipantEmail]);
 
   const shouldKeepOptimisticReactions = useCallback(
     (messageId: string) => {
@@ -3627,7 +3571,6 @@ export default function Chat() {
   // New messages divider when user is away from bottom
   const [showNewDivider, setShowNewDivider] = useState(false);
   const [newDividerMessageId, setNewDividerMessageId] = useState<string | null>(null);
-  const [chatWasActiveWhenMessageArrived, setChatWasActiveWhenMessageArrived] = useState(false);
   const forceBottomAnchorChatKeyRef = useRef<string | null>(null);
   const hasAnchoredInitialScrollRef = useRef(false); // ensures we only snap to bottom once per chat load
   const pendingInitialAnchorRef = useRef(false); // tracks when we still need to align to the latest message
@@ -3774,14 +3717,10 @@ export default function Chat() {
 
   const {
     incomingConversationMessages,
-    incomingUnreadMessages,
     incomingUnreadMessageIds,
     firstUnreadMessageId,
     incomingUnreadCount,
-    latestIncomingMessageId,
-    unreadDividerSeedAnchorMessageId,
     unreadSeparatorAnchorMessageId,
-    unreadDividerDisplayCount,
     unreadDividerLabel,
   } = unreadDividerDerivedState;
 
@@ -4351,7 +4290,6 @@ export default function Chat() {
   const formatLastMessageTime = useCallback((timestamp: string): string => {
     try {
       const messageDate = new Date(timestamp);
-      const now = new Date();
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const messageDay = new Date(messageDate);
@@ -4401,19 +4339,12 @@ export default function Chat() {
     );
   }, [activeTenant?.id, effectiveUser?.email]);
 
-  const refreshChatSummaries = useCallback(async (options?: { silent?: boolean }) => {
-    const silent = Boolean(options?.silent);
+  const refreshChatSummaries = useCallback(async (_options?: { silent?: boolean }) => {
     if (!effectiveUser?.email || !activeTenant?.id) {
       setConversationSummaries(new Map());
-      if (!silent) {
-        setIsLoadingChatInfo(false);
-      }
       return;
     }
 
-    if (!silent) {
-      setIsLoadingChatInfo(true);
-    }
     try {
       await chatService.rebuildConversationSummariesForUser(effectiveUser.email).catch((error) => {
         logger.warn('Failed to rebuild conversation summaries before refresh', error);
@@ -4428,10 +4359,6 @@ export default function Chat() {
       setConversationSummaries(buildSummaryMap(records));
     } catch (error) {
       logger.warn('Failed to refresh conversation summaries', error);
-    } finally {
-      if (!silent) {
-        setIsLoadingChatInfo(false);
-      }
     }
   }, [effectiveUser?.email, activeTenant?.id, buildSummaryMap]);
 
@@ -4749,12 +4676,10 @@ export default function Chat() {
   useEffect(() => {
     if (!effectiveUser?.email || !activeTenant?.id) {
       setConversationSummaries(new Map());
-      setIsLoadingChatInfo(false);
       return;
     }
 
     let isActive = true;
-    setIsLoadingChatInfo(true);
 
     const bootstrap = async () => {
       try {
@@ -4773,10 +4698,6 @@ export default function Chat() {
       } catch (error) {
         if (isActive) {
           logger.warn('Failed to fetch conversation summaries', error);
-        }
-      } finally {
-        if (isActive) {
-          setIsLoadingChatInfo(false);
         }
       }
     };
@@ -9088,116 +9009,6 @@ export default function Chat() {
     }
   };
 
-  // Process keyboard-provided URI into a chat message (GIF/image/sticker)
-  const processKeyboardMediaUri = async (uri: string, mime?: string) => {
-    if (!selectedTeamMember || !effectiveUser?.email) return;
-    const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
-
-    try {
-      const kind = detectMediaTypeFromUri(uri, mime);
-
-      if (kind === 'gif') {
-        const isHttp = /^https?:\/\//i.test(uri) || uri.startsWith('content://');
-        let finalUrl = uri;
-        if (!isHttp) {
-          const name = `kb_${Date.now()}.gif`;
-          const uploaded = await chatService.uploadFile(
-            uri,
-            name,
-            mime || 'image/gif',
-            {
-              senderEmail: effectiveUser.email,
-              recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
-            }
-          );
-          finalUrl = uploaded.url;
-        }
-        const gif = { url: finalUrl, source: 'keyboard' } as const;
-        await sendGif(gif, selectedTeamMember.id, { replyTo: activeReplyContext });
-        if (activeReplyContext) {
-          setReplyingToMessage((current) =>
-            current && current.messageId === activeReplyContext.messageId ? null : current
-          );
-        }
-        await sendMessageNotification('Sent a GIF', false, undefined, gif as any);
-        return;
-      }
-
-      if (kind === 'sticker') {
-        const isHttp = /^https?:\/\//i.test(uri) || uri.startsWith('content://');
-        let finalUrl = uri;
-        if (!isHttp) {
-          const ext = (mime && mime.split('/')[1]) || 'png';
-          const name = `kb_${Date.now()}.${ext}`;
-          const uploaded = await chatService.uploadFile(
-            uri,
-            name,
-            mime || 'image/png',
-            {
-              senderEmail: effectiveUser.email,
-              recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
-            }
-          );
-          finalUrl = uploaded.url;
-        }
-        const sticker = { url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as const;
-        await sendSticker(sticker as any, selectedTeamMember.id, { replyTo: activeReplyContext });
-        if (activeReplyContext) {
-          setReplyingToMessage((current) =>
-            current && current.messageId === activeReplyContext.messageId ? null : current
-          );
-        }
-        await sendMessageNotification('Sent a sticker', false, sticker as any);
-        return;
-      }
-
-      const ext = (mime && mime.split('/')[1]) || 'jpg';
-      const name = `kb_${Date.now()}.${ext}`;
-      const isHttp = /^https?:\/\//i.test(uri) || uri.startsWith('content://');
-      let finalUrl = uri;
-      if (!isHttp) {
-        const uploaded = await chatService.uploadFile(
-          uri,
-          name,
-          mime || 'image/jpeg',
-          {
-            senderEmail: effectiveUser.email,
-            recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
-          }
-        );
-        finalUrl = uploaded.url;
-      }
-      const sticker = { url: finalUrl, name: 'Keyboard Sticker', pack: 'keyboard' } as const;
-      await sendSticker(sticker as any, selectedTeamMember.id, { replyTo: activeReplyContext });
-      if (activeReplyContext) {
-        setReplyingToMessage((current) =>
-          current && current.messageId === activeReplyContext.messageId ? null : current
-        );
-      }
-      await sendMessageNotification('Sent a sticker', false, sticker as any);
-    } catch (error) {
-      if (error instanceof ChatRateLimitError) {
-        const waitMs = Math.max(0, error.retryAfterMs || 0);
-        const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
-        logger.warn('Rate limited while sending keyboard media', { waitMs, blockedUntil: error.blockedUntil });
-        Toast.show({
-          type: 'error',
-          text1: 'Too Many Messages',
-          text2: `Please wait ${waitSeconds}s before sending more media.`,
-          position: 'top',
-        });
-      } else {
-        logger.error('Error processing keyboard media send:', error);
-        Toast.show({
-          type: 'error',
-          text1: 'Send Failed',
-          text2: 'Failed to send media. Please try again.',
-          position: 'top',
-        });
-      }
-    }
-  };
-
   // Check if a file URL is accessible (for web platform)
   const checkFileAvailability = async (fileUrl: string) => {
     if (Platform.OS !== 'web') return 'ok';
@@ -10724,12 +10535,6 @@ export default function Chat() {
     // union re-evaluates whenever a newly confirmed id is added to the ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayedMessages, normalizeMessageId, confirmedServerMessageIdsVersion]);
-
-  const buildPendingTextMatchKey = useCallback((
-    sender: string,
-    recipient: string,
-    text: string
-  ) => `${sender}|${recipient}|${text}`, []);
 
   const pendingTextMessageCandidatesByKey = useMemo(() => {
     return resolveChatPendingMessageCandidatesByKey({

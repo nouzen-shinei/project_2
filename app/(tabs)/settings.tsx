@@ -17,7 +17,7 @@ import {
   FlatList,
   ActivityIndicator,
 } from 'react-native';
-import { User, Bell, Shield, Palette, CircleHelp as HelpCircle, LogOut, ChevronRight, Moon, Sun, Mail, MessageSquare, Phone, Download, Trash2, Plus, X, UserCheck, Upload, Pencil, Save, Camera, FileText, ExternalLink, Settings as SettingsIcon, Monitor, Calendar, RefreshCw, CreditCard } from 'lucide-react-native';
+import { User, Bell, Shield, CircleHelp as HelpCircle, LogOut, ChevronRight, Moon, Sun, Mail, MessageSquare, Phone, Download, Trash2, X, UserCheck, Pencil, Save, Camera, FileText, ExternalLink, Settings as SettingsIcon, Monitor, Calendar, RefreshCw, CreditCard } from 'lucide-react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system';
@@ -203,7 +203,7 @@ type CacheClearSummary = {
 export default function Settings() {
   const router = useRouter();
   const params = useLocalSearchParams();
-  const { theme, isDarkMode, themeMode, setThemeMode } = useTheme();
+  const { theme, themeMode, setThemeMode } = useTheme();
   const { user, signOut, loading: authLoading } = useAuth();
   const { activeTenant, activeMembership, loading: tenantLoading } = useTenant();
   const { students } = useStudents();
@@ -1263,45 +1263,6 @@ export default function Settings() {
     setEditingProfile(true);
   };
 
-  const selectFromCamera = async () => {
-    try {
-      const result = await MediaPickerUtil.captureProfileImage() as any;
-      if (!result.canceled && result.assets && result.assets[0]) {
-        // Defer upload until Save; show local preview immediately
-        const asset = result.assets[0];
-        const uri = asset.uri;
-        setPendingProfilePictureUri(uri);
-        setCurrentProfilePictureURL(uri);
-        // Capture file metadata where possible
-        try {
-          const name = (asset.fileName as string | undefined) || (uri?.split('/')?.pop() ?? null);
-          let size: number | null = null;
-          if (typeof asset.fileSize === 'number') {
-            size = asset.fileSize as number;
-          } else if (uri) {
-            const info = await FileSystem.getInfoAsync(uri);
-            if (info && info.exists && typeof info.size === 'number') {
-              size = info.size as number;
-            }
-          }
-          setSelectedImageFileName(name || null);
-          setSelectedImageFileSize(size);
-        } catch (metaErr) {
-          logger.warn('Could not get camera image metadata:', metaErr);
-          setSelectedImageFileName((uri?.split('/')?.pop() ?? null));
-          setSelectedImageFileSize(null);
-        }
-      }
-    } catch (error) {
-      logger.error('Error capturing image:', error);
-      Alert.alert('Error', 'Failed to capture image');
-    } finally {
-      setShowImagePickerModal(false);
-      setUploadingProfilePicture(false);
-      setUploadProgress(0);
-    }
-  };
-
   const selectFromGallery = async () => {
     try {
       const result = await MediaPickerUtil.selectProfileImage() as any;
@@ -1394,7 +1355,7 @@ export default function Settings() {
   };
 
   // Helper function to get original Google photo URL from users collection
-  const getOriginalGooglePhotoURL = async (email: string): Promise<string> => {
+  const getOriginalGooglePhotoURL = async (_email: string): Promise<string> => {
     try {
       // Get the original Google photo from users collection (static) using current user's UID
       if (auth.currentUser?.uid) {
@@ -4455,7 +4416,7 @@ function DatePicker({ selectedDate, onSelect, theme, placeholder = 'Select date'
                   </View>
                   <FlatList
                     data={months}
-                    keyExtractor={(item, index) => index.toString()}
+                    keyExtractor={(_item, index) => index.toString()}
                     style={[datePickerStyles.pickerScrollView, { backgroundColor: theme.background }]}
                     contentContainerStyle={datePickerStyles.pickerScrollContent}
                     showsVerticalScrollIndicator={true}

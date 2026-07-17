@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
@@ -381,7 +381,7 @@ export default function AdminPanel() {
 
   // Check admin privileges strictly by role fetched from Firestore
   // Centralized offline-aware loading gate (prevents zeroed UI on cold offline start)
-  const { showLoading: showOfflineLoadingAdmin, offlineHint: offlineHintAdmin } = useOfflineDataGate(
+  const { showLoading: showOfflineLoadingAdmin } = useOfflineDataGate(
     [tenantMembers],
     [authLoading, tenantLoading]
   );
@@ -389,7 +389,6 @@ export default function AdminPanel() {
   const basePanelLoading = authLoading || showOfflineLoadingAdmin;
   const usageSkeletonActive = basePanelLoading || usageLoading;
   const joinRequestsSkeletonActive = basePanelLoading;
-  const teamSkeletonActive = basePanelLoading;
   
   const getRoleLabel = (role: TenantMembershipRole) => {
     switch (role) {
@@ -843,29 +842,6 @@ export default function AdminPanel() {
         </View>
       </View>
     ))
-  );
-
-  const renderJoinCodeSkeletonCard = () => (
-    <SkeletonCard
-      style={{
-        borderWidth: 1,
-        borderRadius: 12,
-        borderColor: theme.border,
-        backgroundColor: theme.surface,
-        padding: 16,
-      }}
-    >
-      <SkeletonRow
-        lines={[{ width: '50%', height: 14 }, { width: '70%', height: 12 }]}
-        baseColor={skeletonBaseColor}
-        highlightColor={skeletonHighlightColor}
-      />
-      <SkeletonBar
-        style={{ width: '100%', height: 36, borderRadius: 10, marginTop: 16 }}
-        baseColor={skeletonBaseColor}
-        highlightColor={skeletonHighlightColor}
-      />
-    </SkeletonCard>
   );
 
   const renderUserManagementSection = () => (

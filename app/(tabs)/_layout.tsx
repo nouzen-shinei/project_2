@@ -6,7 +6,6 @@ import { LayoutDashboard, Users, CreditCard, Settings, Bell, Shield } from 'luci
 import { useTheme } from '../../hooks/useTheme';
 import { useAuth } from '../../hooks/useAuthUnified';
 import { useTenant } from '../../hooks/useTenantContext';
-import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useUnreadChatCount } from '../../hooks/useUnreadChatCount';
 import AutoNetworkBanner from '../../components/AutoNetworkBanner';
 import BirthdayBanner from '../../components/BirthdayBanner';
@@ -15,13 +14,9 @@ import { ChatTabIcon } from '../../components/ChatTabIcon';
 export default function TabLayout() {
   const { theme } = useTheme();
   const { headerCompensation } = useBirthdays();
-  const { user, isOffline: authOffline } = useAuth();
+  const { user } = useAuth();
   const { activeMembership } = useTenant();
-  const { isOnline, isOffline: networkOffline, wasOffline, clearWasOffline, type, isInitialLoad } = useNetworkStatus();
   const insets = useSafeAreaInsets();
-  
-  // Use auth offline status as primary, with network status as fallback
-  const isOffline = authOffline || networkOffline;
   
   const tenantAdminRoles = new Set(['owner', 'admin']);
   const hasTenantAdminAccess = tenantAdminRoles.has(activeMembership?.role ?? 'member');

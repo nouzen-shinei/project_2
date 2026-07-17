@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -16,7 +16,7 @@ import {
   FlatList,
 } from 'react-native';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
-import { Plus, Search, MoveVertical as MoreVertical, User, Phone, Mail, MessageCircle, Calendar, BookOpen, TrendingUp, Clock, Camera, Upload, ChevronUp, ChevronDown, Users, Trash2, Download, Edit3 } from 'lucide-react-native';
+import { Plus, Search, User, Phone, Mail, MessageCircle, Calendar, TrendingUp, Camera, ChevronUp, ChevronDown, Trash2, Download, Edit3 } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import * as XLSX from 'xlsx';
@@ -106,7 +106,6 @@ export default function Students() {
   const studentIds = students.map(s => s.id);
   const { 
     attendanceRecords, 
-    loading: attendanceLoading, 
     saveAttendanceRecords,
     getAttendancePercentage,
     getDaysPresent,
@@ -602,24 +601,11 @@ export default function Students() {
       setIsDeletingStudent(true);
       logger.debug(`🗑️ Starting deletion process for: ${studentToDelete.name}`);
       
-      const results = await deleteStudentCompletely(studentToDelete.id, studentToDelete.name);
+      await deleteStudentCompletely(studentToDelete.id, studentToDelete.name);
       
       setShowDeleteModal(false);
       setStudentToDelete(null);
       
-      // Create detailed success message
-      const deletionSummary = [
-        `✅ Student record: ${results.student ? 'Deleted' : 'Failed'}`,
-        `📊 Attendance records: ${results.attendance} deleted`,
-        `💰 Fee records: ${results.fees} deleted`,
-        `🖼️ Profile image: ${results.profileImage ? 'Deleted' : 'None found'}`,
-        `🧾 Receipt files: ${results.receipts} deleted`
-      ];
-
-      const warningMessage = results.errors.length > 0 
-        ? `\n\n⚠️ Some issues occurred:\n${results.errors.join('\n')}`
-        : '';
-
       // Show success toast
       Toast.show({
         type: 'success',
@@ -2370,17 +2356,6 @@ function DatePicker({ selectedDate, onSelect, theme, placeholder = "Select date"
     setShowYearPicker(false);
   };
 
-  const scrollToCurrentYear = () => {
-    // This would ideally scroll to the current year in the picker
-    // Implementation would require ref to ScrollView
-    return currentMonth.getFullYear();
-  };
-
-  const monthYearLabel = currentMonth.toLocaleDateString('en-US', { 
-    month: 'long', 
-    year: 'numeric' 
-  });
-
   return (
     <View>
       <TouchableOpacity
@@ -2476,7 +2451,7 @@ function DatePicker({ selectedDate, onSelect, theme, placeholder = "Select date"
                   </View>
                   <FlatList
                     data={months}
-                    keyExtractor={(item, index) => index.toString()}
+                    keyExtractor={(_item, index) => index.toString()}
                     style={[styles.pickerScrollView, { backgroundColor: theme.background }]}
                     contentContainerStyle={styles.pickerScrollContent}
                     showsVerticalScrollIndicator={true}
