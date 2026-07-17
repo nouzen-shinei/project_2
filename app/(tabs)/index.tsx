@@ -1,6 +1,6 @@
 import { logger } from '@/lib/logger';
 import { isPermissionDeniedError } from '@/lib/firestoreErrors';
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -13,7 +13,7 @@ import {
   ActivityIndicator,
   Platform,
 } from 'react-native';
-import { Users, CreditCard, CircleAlert as AlertCircle, TrendingUp, Calendar, Plus, Bell, Mail, MessageSquare, Phone, CheckCircle, XCircle, Clock, Trash2, FileText } from 'lucide-react-native';
+import { Users, CreditCard, CircleAlert as AlertCircle, Plus, Bell, Mail, MessageSquare, Phone, CheckCircle, XCircle, Clock, Trash2, FileText } from 'lucide-react-native';
 import { router } from 'expo-router';
 import useStudents from '../../hooks/useStudents';
 import useFees from '../../hooks/useFees';
@@ -23,8 +23,6 @@ import { useNotices } from '../../hooks/useNotices';
 import type { Student } from '../../types';
 import { useTheme } from '../../hooks/useTheme';
 import { notificationService } from '../../services/notificationService';
-import Toast from 'react-native-toast-message';
-import OptionModal from '../../components/OptionModal';
 import NoticeModal from '../../components/NoticeModal';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -48,8 +46,8 @@ export default function Dashboard() {
   const { fees, loading: feesLoading } = useFees();
   // NOTE: the dashboard uses the hook's `loading` for section skeletons and its
   // `refresh` for pull-to-refresh, so autoload stays on here (fees.tsx opts out).
-  const { history: reminderHistory, loading: reminderLoading, getRecentReminders, refresh: refreshReminders, canViewAllReminders } = useReminderHistory();
-  const { notices, loading: noticesLoading } = useNotices();
+  const { loading: reminderLoading, getRecentReminders, refresh: refreshReminders, canViewAllReminders } = useReminderHistory();
+  const { notices } = useNotices();
   const { activeTenant, refreshTenants } = useTenant();
   const tenantId = activeTenant?.id;
 
@@ -84,9 +82,6 @@ export default function Dashboard() {
   const [todayStatsLoading, setTodayStatsLoading] = useState(true);
   
   // Reminder modal states
-  const [showReminderModal, setShowReminderModal] = useState(false);
-  const [selectedReminderStudent, setSelectedReminderStudent] = useState<any>(null);
-  const [selectedReminderFee, setSelectedReminderFee] = useState<any>(null);
   
   // Notice modal state
   const [showNoticeModal, setShowNoticeModal] = useState(false);
@@ -547,11 +542,10 @@ export default function Dashboard() {
 
   // Calculate stats from real data
   const totalStudents = students.length;
-  const paidFees = fees.filter(fee => fee.status === 'paid');
-  
-  // PERF (P6): memoize the O(fees) summary reductions so they don't re-run on
+
+  // PERF (P6): memoize the O(fees) summary reduction so it doesn't re-run on
   // every unrelated dashboard re-render (modal toggles, dimensions, reminder state).
-  const { totalAmount, paidAmount, pendingAmount } = useMemo(() => {
+  const { pendingAmount } = useMemo(() => {
     const total = fees.reduce((sum, fee) => sum + getCorrectFeeAmount(fee), 0);
     const paid = fees
       .filter(fee => fee.status === 'paid')
@@ -559,7 +553,7 @@ export default function Dashboard() {
       fees
       .filter(fee => fee.status !== 'paid' && (fee.paidAmount || 0) > 0) // Partial payments
       .reduce((sum, fee) => sum + (fee.paidAmount || 0), 0);
-    return { totalAmount: total, paidAmount: paid, pendingAmount: total - paid };
+    return { pendingAmount: total - paid };
   }, [fees, getCorrectFeeAmount]);
 
   // Helper: is date string in current month. Stable identity for the memos below.
@@ -602,22 +596,6 @@ export default function Dashboard() {
 
     return sum;
   }, 0), [fees, isInCurrentMonth, getCorrectFeeAmount]);
-  
-  // Calculate reminder stats
-  const todayReminders = recentReminders.filter(reminder => {
-    try {
-      const reminderDate = reminder.createdAt?.toDate ? reminder.createdAt.toDate() : new Date(reminder.createdAt);
-      const today = new Date();
-      return reminderDate.toDateString() === today.toDateString();
-    } catch (e) {
-      return false;
-    }
-  });
-
-  const todayFailedCount = todayReminders.filter(r => r.status === 'failed').length;
-  const todayPendingCount = todayReminders.filter(r => r.status === 'pending').length;
-  const successfulReminders = recentReminders.filter(reminder => reminder.status === 'success');
-  const reminderSuccessRate = recentReminders.length > 0 ? Math.round((successfulReminders.length / recentReminders.length) * 100) : 0;
   
   // Get current month name for better display
   const currentMonth = new Date().toLocaleDateString('en-IN', { month: 'long' });
@@ -799,228 +777,6 @@ export default function Dashboard() {
     }
   };
 
-  const sendBulkReminders = async () => {
-    try {
-      const pendingFeeRecords = fees.filter(fee => fee.status === 'pending' || fee.status === 'overdue');
-      let successCount = 0;
-      
-      for (const fee of pendingFeeRecords) {
-        const student = students.find(s => s.id === fee.studentId);
-        if (student && (student.parentEmail || student.parentContact || student.parentWhatsApp)) {
-          const correctAmount = getCorrectFeeAmount(fee);
-          const message = `Dear Parent, this is a reminder that ${student.name}'s tuition fee of ₹${correctAmount} is due on ${fee.dueDate}. Please make the payment at your earliest convenience. Thank you!`;
-          
-          // Try email first, then SMS, then WhatsApp
-          let sent = false;
-          if (student.parentEmail && !sent) {
-            sent = await notificationService.sendEmailReminder({
-              to_email: student.parentEmail,
-              to_name: 'Parent',
-              student_name: student.name,
-              amount: correctAmount.toString(),
-              due_date: fee.dueDate,
-              teacher_name: user?.displayName || 'Teacher',
-              teacher_email: user?.email || undefined,
-            });
-          }
-          
-          if (tenantId && student.parentContact && !sent) {
-            sent = await notificationService.sendSMSReminder({
-              tenantId,
-              to: student.parentContact,
-              message: message,
-            });
-          }
-          
-          if (tenantId && student.parentWhatsApp && !sent) {
-            sent = await notificationService.sendSmartWhatsAppFeeReminder({
-              tenantId,
-              to: student.parentWhatsApp,
-              studentName: student.name,
-              amount: correctAmount,
-              dueDate: fee.dueDate,
-              teacherName: user?.displayName || undefined,
-            });
-          }
-          
-          if (student.parentContact && !sent) {
-            sent = await notificationService.sendVoiceCall(
-              student.parentContact,
-              `This is a reminder that ${student.name}'s tuition fee of rupees ${correctAmount} is due on ${fee.dueDate}. Please make the payment at your earliest convenience. Thank you!`
-            );
-          }
-          
-          if (sent) successCount++;
-        }
-      }
-      
-      Toast.show({
-        type: 'success',
-        text1: '📋 Bulk Reminders Sent',
-        text2: `Successfully sent ${successCount} reminders out of ${pendingFeeRecords.length} pending fees.`,
-        position: 'top',
-        visibilityTime: 4000,
-      });
-    } catch (error) {
-      logger.error('Error sending bulk reminders:', error);
-      Toast.show({
-        type: 'error',
-        text1: '❌ Failed to Send Reminders',
-        text2: 'Please try again later',
-        position: 'top',
-        visibilityTime: 3000,
-      });
-    }
-  };
-
-  const handleIndividualReminder = async (due: any) => {
-    const fee = fees.find(f => f.studentName === due.name && f.status !== 'paid');
-    if (!fee) return;
-    
-    const student = students.find(s => s.id === fee.studentId);
-    if (!student) return;
-
-    setSelectedReminderStudent(student);
-    setSelectedReminderFee(fee);
-    setShowReminderModal(true);
-  };
-
-  const sendIndividualReminder = async (student: any, fee: any, type: string) => {
-    try {
-      let success = false;
-      const correctAmount = getCorrectFeeAmount(fee);
-      const message = `Dear Parent, this is a reminder that ${student.name}'s tuition fee of ₹${correctAmount} is due on ${fee.dueDate}. Please make the payment at your earliest convenience. Thank you!`;
-
-      switch (type) {
-        case 'Email':
-          if (student.parentEmail) {
-            success = await notificationService.sendEmailReminder({
-              to_email: student.parentEmail,
-              to_name: 'Parent',
-              student_name: student.name,
-              amount: correctAmount.toString(),
-              due_date: fee.dueDate,
-              teacher_name: user?.displayName || 'Teacher',
-              teacher_email: user?.email || undefined,
-            });
-          } else {
-            Toast.show({
-              type: 'error',
-              text1: '❌ Missing Information',
-              text2: 'Parent email not available for this student',
-              position: 'top',
-              visibilityTime: 3000,
-            });
-            return;
-          }
-          break;
-        case 'SMS':
-          if (!tenantId) {
-            Toast.show({
-              type: 'error',
-              text1: '❌ Cannot Send SMS',
-              text2: 'No active coaching center selected',
-              position: 'top',
-              visibilityTime: 3000,
-            });
-            return;
-          }
-          if (student.parentContact) {
-            success = await notificationService.sendSMSReminder({
-              tenantId,
-              to: student.parentContact,
-              message: message,
-            });
-          } else {
-            Toast.show({
-              type: 'error',
-              text1: '❌ Missing Information',
-              text2: 'Parent phone number not available for this student',
-              position: 'top',
-              visibilityTime: 3000,
-            });
-            return;
-          }
-          break;
-        case 'WhatsApp':
-          if (!tenantId) {
-            Toast.show({
-              type: 'error',
-              text1: '❌ Cannot Send WhatsApp',
-              text2: 'No active coaching center selected',
-              position: 'top',
-              visibilityTime: 3000,
-            });
-            return;
-          }
-          if (student.parentWhatsApp) {
-            success = await notificationService.sendSmartWhatsAppFeeReminder({
-              tenantId,
-              to: student.parentWhatsApp,
-              studentName: student.name,
-              amount: correctAmount,
-              dueDate: fee.dueDate,
-              teacherName: user?.displayName || undefined,
-            });
-          } else {
-            Toast.show({
-              type: 'error',
-              text1: '❌ Missing Information',
-              text2: 'Parent WhatsApp number not available for this student',
-              position: 'top',
-              visibilityTime: 3000,
-            });
-            return;
-          }
-          break;
-        case 'Voice Call':
-          if (student.parentContact) {
-            success = await notificationService.sendVoiceCall(
-              student.parentContact,
-              `This is a reminder that ${student.name}'s tuition fee of rupees ${correctAmount} is due on ${fee.dueDate}. Please make the payment at your earliest convenience. Thank you!`
-            );
-          } else {
-            Toast.show({
-              type: 'error',
-              text1: '❌ Missing Information',
-              text2: 'Parent phone number not available for this student',
-              position: 'top',
-              visibilityTime: 3000,
-            });
-            return;
-          }
-          break;
-      }
-
-      if (success) {
-        Toast.show({
-          type: 'success',
-          text1: '✅ Reminder Sent',
-          text2: `${type} reminder sent successfully to ${student.name}'s parent!`,
-          position: 'top',
-          visibilityTime: 3000,
-        });
-      } else {
-        Toast.show({
-          type: 'error',
-          text1: '❌ Failed to Send',
-          text2: `Failed to send ${type} reminder`,
-          position: 'top',
-          visibilityTime: 3000,
-        });
-      }
-    } catch (error) {
-      logger.error('Error sending reminder:', error);
-      Toast.show({
-        type: 'error',
-        text1: '❌ Reminder Failed',
-        text2: `Failed to send ${type} reminder`,
-        position: 'top',
-        visibilityTime: 3000,
-      });
-    }
-  };
-
   // Centralized offline-aware gate (prevents zero-valued UI on cold offline start)
   const { showLoading, offlineHint } = useOfflineDataGate(
     [students, fees, recentReminders],
@@ -1050,7 +806,7 @@ export default function Dashboard() {
   });
 
   // Dynamic style function for action cards
-  const getActionCardStyle = (screenWidth: number) => ({
+  const getActionCardStyle = () => ({
     flex: 1,
     padding: 20,
     borderRadius: 16,
@@ -1282,7 +1038,7 @@ export default function Dashboard() {
           <Text style={[styles.sectionTitle, { color: theme.text }]}>Quick Actions</Text>
           <View style={styles.actionsContainer}>
             <TouchableOpacity 
-              style={[getActionCardStyle(screenData.width), { backgroundColor: theme.surface }]}
+              style={[getActionCardStyle(), { backgroundColor: theme.surface }]}
               onPress={handleAddStudent}
             >
               <View style={[styles.actionIcon, { backgroundColor: `${theme.primary}15` }]}>
@@ -1291,7 +1047,7 @@ export default function Dashboard() {
               <Text style={[styles.actionText, { color: theme.text }]}>Add Student</Text>
             </TouchableOpacity>
             <TouchableOpacity 
-              style={[getActionCardStyle(screenData.width), { backgroundColor: theme.surface }]}
+              style={[getActionCardStyle(), { backgroundColor: theme.surface }]}
               onPress={handleRecordPayment}
             >
               <View style={[styles.actionIcon, { backgroundColor: `${theme.success}15` }]}>
@@ -1300,7 +1056,7 @@ export default function Dashboard() {
               <Text style={[styles.actionText, { color: theme.text }]}>Record Payment</Text>
             </TouchableOpacity>
             <TouchableOpacity 
-              style={[getActionCardStyle(screenData.width), { backgroundColor: theme.surface }]}
+              style={[getActionCardStyle(), { backgroundColor: theme.surface }]}
               onPress={handleSendBulkReminder}
             >
               <View style={[styles.actionIcon, { backgroundColor: `${theme.warning}15` }]}>
@@ -1606,43 +1362,6 @@ export default function Dashboard() {
           </View>
         </View>
       </Modal>
-
-      <OptionModal
-        visible={showReminderModal}
-        onClose={() => {
-          setShowReminderModal(false);
-          setSelectedReminderStudent(null);
-          setSelectedReminderFee(null);
-        }}
-        title="Send Reminder"
-        message={selectedReminderStudent ? `Send reminder to ${selectedReminderStudent.name}'s parents?` : ''}
-        actions={[
-          {
-            text: 'Email',
-            onPress: () => sendIndividualReminder(selectedReminderStudent, selectedReminderFee, 'Email'),
-            icon: <Mail size={20} color="#FFFFFF" />,
-            style: 'primary'
-          },
-          {
-            text: 'SMS',
-            onPress: () => sendIndividualReminder(selectedReminderStudent, selectedReminderFee, 'SMS'),
-            icon: <MessageSquare size={20} color="#FFFFFF" />,
-            style: 'primary'
-          },
-          {
-            text: 'WhatsApp',
-            onPress: () => sendIndividualReminder(selectedReminderStudent, selectedReminderFee, 'WhatsApp'),
-            icon: <MessageSquare size={20} color="#FFFFFF" />,
-            style: 'primary'
-          },
-          {
-            text: 'Voice Call',
-            onPress: () => sendIndividualReminder(selectedReminderStudent, selectedReminderFee, 'Voice Call'),
-            icon: <Phone size={20} color="#FFFFFF" />,
-            style: 'primary'
-          }
-        ]}
-      />
 
       <NoticeModal
         visible={showNoticeModal}

@@ -21,9 +21,21 @@ async function getCallbackUrl(): Promise<string | null> {
   return base.replace(/\/+$/, '') + '/internal/reminder-history/email-result';
 }
 
-function getCallbackAuthToken(): string | null {
-  const token = (process.env.BACKEND_RUNTIME_INTERNAL_KEY || process.env.INTERNAL_API_KEY || '').trim();
-  return token || null;
+// Resolve how to authenticate to backend-runtime for this callback.
+// Prefers a dedicated, least-privilege shared secret (REMINDER_CALLBACK_KEY)
+// sent via the x-reminder-callback-key header, so this service does NOT need to
+// hold backend-runtime's master operator key. Falls back to the master key as a
+// Bearer token for backward compatibility until the dedicated key is rolled out.
+function getCallbackAuthHeader(): { name: string; value: string } | null {
+  const dedicated = (process.env.REMINDER_CALLBACK_KEY || '').trim();
+  if (dedicated) {
+    return { name: 'x-reminder-callback-key', value: dedicated };
+  }
+  const bearer = (process.env.BACKEND_RUNTIME_INTERNAL_KEY || process.env.INTERNAL_API_KEY || '').trim();
+  if (bearer) {
+    return { name: 'authorization', value: `Bearer ${bearer}` };
+  }
+  return null;
 }
 
 function clampString(s: unknown, maxLen: number): string | undefined {
@@ -35,10 +47,10 @@ function clampString(s: unknown, maxLen: number): string | undefined {
 
 export async function notifyBackendRuntimeEmailResult(input: ReminderHistoryEmailCallbackPayload): Promise<void> {
   const url = await getCallbackUrl();
-  const token = getCallbackAuthToken();
+  const authHeader = getCallbackAuthHeader();
   const historyId = clampString(input.historyId, 240);
 
-  if (!url || !token || !historyId) return;
+  if (!url || !authHeader || !historyId) return;
 
   const payload: ReminderHistoryEmailCallbackPayload = {
     historyId,
@@ -55,12 +67,11 @@ export async function notifyBackendRuntimeEmailResult(input: ReminderHistoryEmai
   const timeout = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 3000);
 
   try {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    headers[authHeader.name] = authHeader.value;
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${token}`,
-      },
+      headers,
       body: JSON.stringify(payload),
       signal: controller.signal,
     });

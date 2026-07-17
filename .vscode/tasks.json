@@ -10,28 +10,6 @@
 			"problemMatcher": []
 		},
 		{
-			"label": "Start Development Server",
-			"type": "shell",
-			"command": "npm start",
-			"isBackground": true,
-			"group": "build"
-		},
-		{
-			"label": "Start Development Server",
-			"type": "shell",
-			"command": "npm start",
-			"isBackground": true,
-			"group": "build"
-		},
-		{
-			"label": "Start Development Server",
-			"type": "shell",
-			"command": "npm start",
-			"isBackground": true,
-			"problemMatcher": [],
-			"group": "build"
-		},
-		{
 			"label": "Check Email Templates Render",
 			"type": "shell",
 			"command": "cd email-backend && node scripts/check-email-templates.js",

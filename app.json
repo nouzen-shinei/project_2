@@ -63,7 +63,7 @@
         "RECEIVE_BOOT_COMPLETED",
         "WAKE_LOCK"
       ],
-      "versionCode": 20251114,
+      "versionCode": 20251115,
       "googleServicesFile": "./app/google-services.json"
     },
     "web": {

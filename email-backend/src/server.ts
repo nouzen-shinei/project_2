@@ -28,6 +28,19 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
 export const app = express();
 app.use(express.json({ limit: '256kb' }));
+// Surface wildcard CORS in production. Auth is bearer-token (not cookie) based,
+// so `*` is not directly exploitable, but a production deployment should pin an
+// explicit allowlist of trusted origins via CORS_ORIGINS (mirrors backend-runtime).
+{
+  const corsStartupConfig = (process.env.CORS_ORIGINS || '*').trim();
+  if (corsStartupConfig === '*' && process.env.NODE_ENV === 'production') {
+    logger.warn({
+      msg: 'cors_wildcard_in_production',
+      detail: 'CORS_ORIGINS is "*" in production. Set an explicit comma-separated allowlist of trusted origins.',
+    });
+  }
+}
+
 // Simple CORS (configure with CORS_ORIGINS, comma separated; default allow all)
 app.use((req, res, next) => {
   const configured = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
@@ -58,32 +71,47 @@ app.use((req,res,next)=>{
 });
 
 // === Backend-runtime style internal auth helpers ===
-function signInternalToken(sub: string, ttlSec=300){
+interface InternalTokenPayload { sub: string; exp: number; email?: string }
+
+function signInternalToken(sub: string, ttlSec=300, email?: string){
   const secret = process.env.INTERNAL_API_KEY;
   if(!secret) throw new Error('not_enabled');
   const exp = Math.floor(Date.now()/1000)+ttlSec;
-  const payload = Buffer.from(JSON.stringify({ sub, exp })).toString('base64url');
+  const payloadData: Record<string, unknown> = { sub, exp };
+  if(email) payloadData.email = email;
+  const payload = Buffer.from(JSON.stringify(payloadData)).toString('base64url');
   const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
   return `${payload}.${sig}`;
 }
-function verifyInternalToken(tok?: string){
+
+// Decode + verify an internal token, returning its payload (sub/exp/email) or
+// null if the signature is invalid, the token is malformed, or it has expired.
+// Signature comparison is constant-time and supports key rotation via
+// INTERNAL_API_KEY_PREV.
+function decodeInternalToken(tok?: string): InternalTokenPayload | null {
   try {
-    if(!tok) return false;
+    if(!tok) return null;
     const secrets = [process.env.INTERNAL_API_KEY, process.env.INTERNAL_API_KEY_PREV].filter(Boolean) as string[];
-    if(secrets.length===0) return false;
+    if(secrets.length===0) return null;
     const [p,s] = tok.split('.') as [string,string];
-    if(!p||!s) return false;
-    // Check signature against any allowed secret (supports rotation)
+    if(!p||!s) return null;
+    // Constant-time comparison to avoid leaking signature bytes via timing
+    // (mirrors backend-runtime decodeInternalToken hardening).
+    const providedSig = Buffer.from(s);
     let sigOk = false;
     for(const sec of secrets){
-      const expSig = crypto.createHmac('sha256', sec).update(p).digest('base64url');
-      if(expSig===s){ sigOk = true; break; }
+      const expSig = Buffer.from(crypto.createHmac('sha256', sec).update(p).digest('base64url'));
+      if(expSig.length === providedSig.length && crypto.timingSafeEqual(expSig, providedSig)){ sigOk = true; break; }
     }
-    if(!sigOk) return false;
-    const data = JSON.parse(Buffer.from(p,'base64url').toString('utf8')) as { exp?: number };
-    if(!data.exp || data.exp < Math.floor(Date.now()/1000)) return false;
-    return true;
-  } catch { return false; }
+    if(!sigOk) return null;
+    const data = JSON.parse(Buffer.from(p,'base64url').toString('utf8')) as Partial<InternalTokenPayload>;
+    if(typeof data.exp !== 'number' || data.exp < Math.floor(Date.now()/1000)) return null;
+    return { sub: typeof data.sub === 'string' ? data.sub : '', exp: data.exp, email: typeof data.email === 'string' ? data.email : undefined };
+  } catch { return null; }
+}
+
+function verifyInternalToken(tok?: string){
+  return decodeInternalToken(tok) !== null;
 }
 
 // Firebase Admin init (needed for /auth/bridge). Uses application default credentials + projectId.
@@ -223,8 +251,12 @@ app.post('/auth/bridge', async (req,res)=>{
     if(!idToken) idToken = (req.body && (req.body as any).firebaseIdToken) || undefined;
     if(!idToken) return res.status(400).json({ error:'missing_id_token' });
   ensureFirebase();
-  await getAuth().verifyIdToken(idToken);
-    const ttl=300; const token = signInternalToken('app', ttl);
+  const decoded = await getAuth().verifyIdToken(idToken);
+    // Bind the internal token to the verified caller (uid + email) so send
+    // routes can enforce tenant membership. Previously this always signed
+    // sub:'app', which made every authenticated user indistinguishable and
+    // allowed any signed-in account to send mail for any tenant.
+    const ttl=300; const token = signInternalToken(decoded.uid, ttl, decoded.email);
     return res.json({ token, expiresIn: ttl, expiresAt: Date.now()+ttl*1000 });
   } catch(e:any){ return res.status(401).json({ error:'invalid_id_token', details: e?.message }); }
 });
@@ -321,7 +353,20 @@ app.post('/webhook/resend', async (req,res)=>{
 // Public endpoints remain accessible (e.g., /email/send, /email/send-template, /metrics, /webhook/*, /health).
 app.use((req,res,next)=>{
   const internalKey = process.env.INTERNAL_API_KEY;
-  if(!internalKey) return next();
+  if(!internalKey){
+    // Fail closed in production: never serve the API unauthenticated when no
+    // key is configured (mirrors backend-runtime M4). In dev/test keep the
+    // pass-through so local/e2e setups without a configured key still run;
+    // liveness/metrics probes are always allowed so orchestrators can detect
+    // and surface the misconfiguration.
+    if(process.env.NODE_ENV === 'production'){
+      const p = req.path;
+      if(p === '/health' || p === '/metrics') return next();
+      logger.error({ msg:'auth_not_configured', path:req.path });
+      return res.status(503).json({ error: 'auth_not_configured' });
+    }
+    return next();
+  }
   const path = req.path;
   // Always allow these without INTERNAL_API_KEY
   const open = (
@@ -340,18 +385,50 @@ app.use((req,res,next)=>{
   next();
 });
 
+// Classifies the authenticated principal for a send request.
+//  - isMaster: the raw master key was presented (x-internal-key or bearer). This
+//    is a trusted system/operator caller (e.g. backend-runtime dispatching the
+//    bulk reminder batch). Such callers bypass tenant-membership checks.
+//  - otherwise: a bridge-minted user token, carrying the caller's Firebase uid
+//    (+ email). User callers are constrained to tenants they belong to.
+type SendAuthContext = { isMaster: boolean; uid?: string; email?: string };
+
 // Require backend-runtime style auth for sending endpoints
 function requireInternalAuth(req: express.Request, res: express.Response, next: express.NextFunction){
   const master = process.env.INTERNAL_API_KEY;
-  if(master && req.header('x-internal-key') === master) return next();
+  const headerKey = req.header('x-internal-key');
   const auth = req.header('authorization');
   const token = auth?.startsWith('Bearer ')? auth.slice(7): undefined;
-  if(master && token === master) return next();
-  if(verifyInternalToken(token)) return next();
+  if(master && (headerKey === master || token === master)){
+    (req as any).sendAuth = { isMaster: true } as SendAuthContext;
+    return next();
+  }
+  const payload = decodeInternalToken(token);
+  if(payload){
+    (req as any).sendAuth = { isMaster: false, uid: payload.sub || undefined, email: payload.email } as SendAuthContext;
+    return next();
+  }
   try {
   (req as any).rid && logger.warn({ msg:'auth_fail', rid:(req as any).rid, path:req.path, hasAuth: !!auth, kind:'internal_only' });
   } catch {}
   return res.status(401).json({ error:'unauthorized' });
+}
+
+// Authorizes a send request.
+//
+// The email-backend is intentionally credential-less (no Firebase/Firestore
+// access), so it CANNOT verify tenant membership on its own. User-initiated
+// email sends therefore go through backend-runtime (POST /reminders/email/send),
+// which enforces tenant membership where Firestore is available and then calls
+// us with the master key. As a result, only master-key callers may send here;
+// any other principal (e.g. a bridge-minted user token) is rejected. This closes
+// the open-relay without depending on Firestore access this service doesn't have.
+function enforceSendAuthorization(req: express.Request, res: express.Response): boolean {
+  const ctx = (req as any).sendAuth as SendAuthContext | undefined;
+  if(ctx?.isMaster) return true; // trusted system caller (backend-runtime)
+  logger.warn({ msg:'send_denied', reason:'direct_user_send_not_allowed', uid: ctx?.uid });
+  res.status(403).json({ error: 'direct_user_send_not_allowed' });
+  return false;
 }
 
 function resolveTenantFromRequest(req: express.Request): string {
@@ -427,6 +504,9 @@ app.post('/email/send', requireInternalAuth, async (req,res)=>{
     if((tenantRequired || poolsConfigured) && !tenant && !process.env.DEFAULT_TENANT){
       return res.status(400).json({ error:'missing_tenant' });
     }
+
+    // Authorization: only master-key (backend-runtime) callers may send here.
+    if(!enforceSendAuthorization(req, res)) return;
     // Per-key daily cap (optional). Enforced only when EMAIL_PER_KEY_DAILY_CAP is set.
     const perKeyCap = Number(process.env.EMAIL_PER_KEY_DAILY_CAP || '0');
     if(perKeyCap>0){
@@ -664,6 +744,11 @@ app.post('/email/send-template', requireInternalAuth, async (req,res)=>{
     // Optional: enforce reminder quota + persist reminder history when quotaBatchId is provided (crash-safe).
     const tenantIdForReminders = (b.tenant_id || tenant) ? String(b.tenant_id || tenant) : '';
 
+    // Authorization: only master-key (backend-runtime) callers may send. User
+    // sends are routed through backend-runtime, which enforces tenant membership
+    // (this service has no Firestore access to verify it itself).
+    if(!enforceSendAuthorization(req, res)) return;
+
     const sendReq = {
       to: b.to_email,
       kind: kind === 'fee_reminder' ? 'fee' : 'custom',
@@ -738,28 +823,11 @@ app.post('/email/send-template', requireInternalAuth, async (req,res)=>{
       });
     }
 
-    if (b.historyId && tenantIdForReminders) {
-      try {
-        ensureFirebase();
-        const db = getFirestore();
-        await db
-          .collection('reminderHistory')
-          .doc(b.historyId)
-          .set(
-            sanitizeForFirestore({
-              tenantId: tenantIdForReminders,
-              reminderType: 'email',
-              status: r.success ? 'success' : 'failed',
-              metadata: { emailId: r.success ? r.id : undefined, deliveryStatus: r.success ? 'sent' : 'failed' },
-              errorMessage: r.success ? undefined : (r as any)?.error || 'send_failed',
-              updatedAt: FieldValue.serverTimestamp(),
-            }),
-            { merge: true }
-          );
-      } catch (e) {
-        logger.warn({ msg: 'email_history_update_failed', err: (e as any)?.message || String(e) });
-      }
-    }
+    // NOTE: reminderHistory is written by backend-runtime (which owns Firestore),
+    // both from the batch handler and via the notifyBackendRuntimeEmailResult
+    // callback above. This service has no Firestore credentials, so we do NOT
+    // attempt a direct write here (it would always fail). The callback is the
+    // credential-less mechanism for reporting delivery status.
 
     if(idemKey) setIdempotent(idemKey, code, r);
     return res.status(code).json(r);

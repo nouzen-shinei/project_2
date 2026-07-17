@@ -108,7 +108,6 @@ jest.mock('../../services/chatReceiptSync', () => ({
   confirmInboundChatDeliveryFromNotificationData: jest.fn(async () => {}),
   flushPendingInboundChatDeliveryReceipts: jest.fn(async () => {}),
 }));
-jest.mock('../../services/emailService', () => ({ __esModule: true, emailService: { initialize: jest.fn(async () => {}) } }));
 jest.mock('../../services/quotesService', () => ({ __esModule: true, quotesService: {} }));
 jest.mock('../../types', () => ({ __esModule: true }));
 jest.mock('../../services/chatService', () => ({ __esModule: true, chatService: {} }));

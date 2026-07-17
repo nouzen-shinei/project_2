@@ -6456,6 +6456,10 @@ export function createApp(options: CreateAppOptions = {}){
       return next();
     }
     const p=req.path; if(p==='/health'||p==='/ready'||p.startsWith('/webhooks/whatsapp')||p==='/auth/bridge'||p.startsWith('/shared-files/public/')) return next();
+    // The email-backend reminder-history callback authenticates itself at the
+    // route level (requireReminderCallbackAuth) using a dedicated least-privilege
+    // key, so it bypasses the global bearer-token gate (same pattern as webhooks).
+    if(p==='/internal/reminder-history/email-result') return next();
     if(p==='/billing/stripe/webhook'||p==='/billing/razorpay/webhook'||p==='/billing/play/notifications'||p==='/billing/appstore/notifications') return next();
     if(p==='/billing/checkout/session-public') return next();
     if(p==='/chat/stream'||p==='/chat/inbox-stream'){
@@ -6944,6 +6948,38 @@ export function createApp(options: CreateAppOptions = {}){
     return res.status(403).json({ error: 'not_authorized' });
   }
 
+  // Auth for the email-backend -> backend-runtime reminder-history callback.
+  // Prefers a dedicated, least-privilege shared secret (REMINDER_CALLBACK_KEY)
+  // presented via the x-reminder-callback-key header, so the email-backend does
+  // NOT need to hold the master operator key. Falls back to the raw master key
+  // as a Bearer token for backward compatibility during rollout (before the
+  // dedicated key is configured on both services). This endpoint bypasses the
+  // global bearer gate, so this middleware fully owns its authentication.
+  function requireReminderCallbackAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const callbackKey = process.env.REMINDER_CALLBACK_KEY;
+    if (callbackKey) {
+      const provided = Buffer.from(req.header('x-reminder-callback-key') || '');
+      const expected = Buffer.from(callbackKey);
+      if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) {
+        req.authContext = { tokenType: 'internal', uid: 'system', isGlobalAdmin: false };
+        return next();
+      }
+    }
+    // Backward-compatible fallback: the raw master key as a Bearer token.
+    const master = process.env.INTERNAL_API_KEY;
+    const authz = req.headers['authorization'];
+    const token = authz?.startsWith('Bearer ') ? authz.slice(7) : undefined;
+    if (master && token) {
+      const provided = Buffer.from(token);
+      const expected = Buffer.from(master);
+      if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) {
+        req.authContext = { tokenType: 'master', uid: 'system', isGlobalAdmin: true };
+        return next();
+      }
+    }
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
   function requireGlobalAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
     const authContext = req.authContext;
     if (!authContext) {
@@ -6998,7 +7034,7 @@ export function createApp(options: CreateAppOptions = {}){
     errorMessage: z.string().min(1).max(2000).optional(),
   });
 
-  app.post('/internal/reminder-history/email-result', requireOperatorAuth, async (req, res) => {
+  app.post('/internal/reminder-history/email-result', requireReminderCallbackAuth, async (req, res) => {
     const parsed = internalReminderHistoryEmailResultSchema.safeParse(req.body || {});
     if (!parsed.success) {
       return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });

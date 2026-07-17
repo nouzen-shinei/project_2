@@ -15,9 +15,7 @@ import {
   confirmInboundChatDeliveryFromNotificationData,
   flushPendingInboundChatDeliveryReceipts,
 } from './chatReceiptSync';
-import { emailService } from './emailService';
 import { quotesService } from './quotesService';
-import { Student } from '../types';
 import { ChatMessage, chatService } from './chatService';
 import { adminNotificationHistoryService } from './adminNotificationHistoryService';
 import { router } from 'expo-router';
@@ -125,40 +123,6 @@ export interface NotificationData {
   data?: any;
 }
 
-export interface EmailData {
-  to_email: string;
-  to_name: string;
-  student_name: string;
-  amount: string;
-  due_date: string;
-  tenantId?: string;
-  quotaBatchId?: string;
-  historyId?: string;
-  history?: any;
-  teacher_name: string;
-  teacher_email?: string;
-  teacher_phone?: string;
-  school_name?: string;
-  coaching_name?: string;
-  show_coaching_name?: boolean;
-  show_teacher_name?: boolean;
-  from_name?: string;
-  from_email?: string;
-  reply_to?: string;
-  subject?: string;
-  message?: string;
-  custom_notes?: string;
-  payment_methods?: string;
-  late_fee_info?: string;
-  office_hours?: string;
-  website_url?: string;
-  custom_message_english?: string;
-  custom_message_hindi?: string;
-  selectedLanguage?: 'english' | 'hindi' | 'both';
-  languageOrder?: 'english-first' | 'hindi-first';
-  english_first?: boolean;
-}
-
 export interface SMSData {
   to: string;
   message: string;
@@ -168,7 +132,6 @@ export interface SMSData {
   history?: any;
 }
 
-const LEGACY_EMAIL_TENANT_ID = '__legacy_email__';
 
 class NotificationService {
   private expoPushToken: string | null = null;
@@ -348,7 +311,6 @@ class NotificationService {
 
     if (!this.notificationsEnabled) {
       logger.debug('Notifications disabled by preference; skipping initialization');
-      await emailService.initialize();
       this.isInitialized = true;
 
       if (userEmail) {
@@ -387,9 +349,6 @@ class NotificationService {
       await this.initializeWebNotifications();
     }
 
-    // Initialize email service (now uses backend; no direct EmailJS on frontend)
-    await emailService.initialize();
-    
     // Initialize device tracking if user email provided
     if (userEmail) {
       try {
@@ -925,80 +884,6 @@ class NotificationService {
     }
   }
 
-  async sendEmailReminder(emailData: EmailData): Promise<boolean> {
-    try {
-      // Create a proper student object for the email service
-      const student: Student = {
-        tenantId: LEGACY_EMAIL_TENANT_ID,
-        name: emailData.student_name,
-        id: '',
-        email: '',
-        phone: '',
-        grade: '',
-        enrolledCourses: [],
-        feesPaid: 0,
-        totalFees: 0,
-        enrollmentDate: '',
-        status: 'active',
-        createdAt: '',
-        updatedAt: ''
-      };
-
-      // Use a timeout wrapper to prevent any blocking behavior
-      const success = await Promise.race([
-        emailService.sendFeeReminder(
-          student, 
-          emailData.to_email, 
-          emailData.amount, 
-          emailData.due_date, 
-          emailData.from_name, 
-          emailData.custom_notes,
-          emailData.message,
-          emailData.coaching_name,
-          emailData.show_coaching_name,
-          emailData.show_teacher_name,
-          emailData.teacher_name,
-          emailData.teacher_email,
-          {
-            tenantId: emailData.tenantId,
-            quotaBatchId: emailData.quotaBatchId,
-            historyId: emailData.historyId,
-            history: emailData.history,
-          }
-        ),
-        new Promise<boolean>((_, reject) => 
-          setTimeout(() => reject(new Error('Email timeout')), 30000)
-        )
-      ]);
-      
-      return success;
-    } catch (error) {
-      logger.error('Error sending email reminder:', error);
-      // Don't let email errors break the entire flow
-      return false;
-    }
-  }
-
-  async sendPaymentConfirmation(emailData: EmailData): Promise<boolean> {
-    try {
-      const success = await emailService.sendPaymentConfirmation(emailData);
-      return success;
-    } catch (error) {
-      logger.error('Error sending payment confirmation email:', error);
-      return false;
-    }
-  }
-
-  async sendCustomEmail(emailData: EmailData): Promise<boolean> {
-    try {
-      const success = await emailService.sendCustomMessage(emailData);
-      return success;
-    } catch (error) {
-      logger.error('Error sending custom email:', error);
-      return false;
-    }
-  }
-
   async sendSMSReminder(smsData: SMSData): Promise<boolean> {
     try {
       const tenantId = (smsData.tenantId || '').trim();
@@ -1197,11 +1082,6 @@ class NotificationService {
       logger.error('Failed to refresh Expo push token:', error);
       return this.expoPushToken;
     }
-  }
-
-  // Get template configuration guide
-  getEmailTemplateGuide(): string {
-    return emailService.getTemplateConfigurationGuide();
   }
 
   // ===== ENHANCED CHAT NOTIFICATION METHODS =====
