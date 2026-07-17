@@ -415,7 +415,11 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
 
   const loading = initializing || loadingTenants;
 
-  const value: TenantContextValue = {
+  // Memoize the context value so `useTenant()` consumers (useFees, useStudents,
+  // useNotices, useReminderHistory, useAttendance, all tab screens, …) don't
+  // re-render every time the provider re-renders for an unrelated field change
+  // (e.g. a joinRequests realtime update or loading toggle). PERF audit finding.
+  const value: TenantContextValue = useMemo(() => ({
     memberships,
     tenants,
     activeTenant,
@@ -427,7 +431,19 @@ export const TenantProvider = ({ children }: { children: React.ReactNode }) => {
     selectTenant,
     refreshTenants,
     applyTenantNotificationPreferencesSnapshot,
-  };
+  }), [
+    memberships,
+    tenants,
+    activeTenant,
+    activeMembership,
+    loading,
+    error,
+    pendingMemberships,
+    joinRequests,
+    selectTenant,
+    refreshTenants,
+    applyTenantNotificationPreferencesSnapshot,
+  ]);
 
   return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;
 };

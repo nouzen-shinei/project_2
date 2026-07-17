@@ -576,6 +576,23 @@ async function runPlayBillingReconcileJob(options: { reason: 'startup' | 'interv
       }
     }
 
+    // PERF: load the plan catalog ONCE for the whole run and index it, instead of
+    // re-reading the entire billingPlanVariants collection (or a per-variant doc)
+    // inside the per-tenant loop below.
+    const planVariantsById = new Map<string, any>();
+    const planVariantByPlayProductId = new Map<string, any>();
+    try {
+      const catalog = await listPlanVariants(db, { includeInactive: false });
+      for (const v of catalog) {
+        const id = typeof (v as any).id === 'string' ? (v as any).id : '';
+        if (id) planVariantsById.set(id, v);
+        const ppid = typeof (v as any).playProductId === 'string' ? (v as any).playProductId : '';
+        if (ppid) planVariantByPlayProductId.set(ppid, v);
+      }
+    } catch {
+      // Non-fatal: the per-tenant fallbacks below still resolve correctly.
+    }
+
     for (const { tenantId, billing } of docsToProcess) {
       tenantsScanned++;
       const purchaseToken = typeof (billing as any).subscriptionId === 'string' ? (billing as any).subscriptionId.trim() : '';
@@ -608,14 +625,15 @@ async function runPlayBillingReconcileJob(options: { reason: 'startup' | 'interv
         let resolvedPriceInr = 0;
 
         if (resolvedVariantId) {
-          const variant = await getPlanVariantById(db, resolvedVariantId);
+          // Prefer the preloaded catalog; fall back to a direct read only if the
+          // (possibly inactive) variant isn't in the active catalog map.
+          const variant = planVariantsById.get(resolvedVariantId) ?? await getPlanVariantById(db, resolvedVariantId);
           if (variant) {
             resolvedPlanId = variant.planId;
             resolvedPriceInr = Number.isFinite(variant.priceInr) ? Math.max(0, Math.trunc(variant.priceInr)) : 0;
           }
         } else {
-          const configured = await listPlanVariants(db, { includeInactive: false });
-          const match = configured.find((v) => typeof (v as any).playProductId === 'string' && (v as any).playProductId === productId);
+          const match = planVariantByPlayProductId.get(productId);
           if (match) {
             resolvedVariantId = match.id;
             resolvedPlanId = match.planId;

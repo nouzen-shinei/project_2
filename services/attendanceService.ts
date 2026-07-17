@@ -76,24 +76,42 @@ class AttendanceService {
     }
   }
 
+  // Split ids into chunks of <=30 — Firestore's `in` operator rejects more than
+  // 30 values, so passing a whole roster (up to 200) would THROW. Chunking keeps
+  // it correct for any tenant size (for <=30 it's a single query, unchanged).
+  private chunkStudentIds(studentIds: string[], size = 30): string[][] {
+    const chunks: string[][] = [];
+    for (let i = 0; i < studentIds.length; i += size) {
+      chunks.push(studentIds.slice(i, i + size));
+    }
+    return chunks;
+  }
+
+  private sortByDateDesc(records: AttendanceRecord[]): AttendanceRecord[] {
+    return records.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  }
+
   // Get attendance records for multiple students
   async getMultipleStudentsAttendance(tenantId: string, studentIds: string[]): Promise<AttendanceRecord[]> {
     try {
       if (studentIds.length === 0) return [];
       this.ensureTenantId(tenantId);
-      
-      const q = query(
-        this.collectionRef,
-        where('tenantId', '==', tenantId),
-        where('studentId', 'in', studentIds),
-        orderBy('date', 'desc')
+
+      const snapshots = await Promise.all(
+        this.chunkStudentIds(studentIds).map((chunk) =>
+          getDocs(query(
+            this.collectionRef,
+            where('tenantId', '==', tenantId),
+            where('studentId', 'in', chunk),
+            orderBy('date', 'desc')
+          ))
+        )
       );
-      
-      const querySnapshot = await getDocs(q);
-      return querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as AttendanceRecord[];
+
+      const records = snapshots.flatMap((snap) =>
+        snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+      ) as AttendanceRecord[];
+      return this.sortByDateDesc(records);
     } catch (error) {
       logger.error('Error fetching multiple students attendance:', error);
       throw error;
@@ -110,21 +128,24 @@ class AttendanceService {
     try {
       if (studentIds.length === 0) return [];
       this.ensureTenantId(tenantId);
-      
-      const q = query(
-        this.collectionRef,
-        where('tenantId', '==', tenantId),
-        where('studentId', 'in', studentIds),
-        where('date', '>=', startDate),
-        where('date', '<=', endDate),
-        orderBy('date', 'desc')
+
+      const snapshots = await Promise.all(
+        this.chunkStudentIds(studentIds).map((chunk) =>
+          getDocs(query(
+            this.collectionRef,
+            where('tenantId', '==', tenantId),
+            where('studentId', 'in', chunk),
+            where('date', '>=', startDate),
+            where('date', '<=', endDate),
+            orderBy('date', 'desc')
+          ))
+        )
       );
-      
-      const querySnapshot = await getDocs(q);
-      return querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as AttendanceRecord[];
+
+      const records = snapshots.flatMap((snap) =>
+        snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+      ) as AttendanceRecord[];
+      return this.sortByDateDesc(records);
     } catch (error) {
       logger.error('Error fetching attendance by date range:', error);
       throw error;
@@ -209,25 +230,44 @@ class AttendanceService {
         studentIds: new Set<string>(),
         dates: new Set<string>(),
       };
-      
+
+      // PERF (P10): fetch existing records once per unique date (index-free
+      // 2-equality query, run in parallel) instead of one getDocs per record
+      // (N+1). Build a lookup keyed by `${studentId}_${date}` for local diffing.
+      const uniqueDates = Array.from(new Set(records.map((r) => r.date)));
+      const existingByKey = new Map<string, { id: string; tenantId: string }>();
+      await Promise.all(
+        uniqueDates.map(async (date) => {
+          const dateSnapshot = await getDocs(
+            query(
+              this.collectionRef,
+              where('tenantId', '==', tenantId),
+              where('date', '==', date),
+            ),
+          );
+          dateSnapshot.forEach((docSnap) => {
+            const data = docSnap.data() as any;
+            const sid = data?.studentId;
+            if (typeof sid === 'string') {
+              existingByKey.set(`${sid}_${date}`, {
+                id: docSnap.id,
+                tenantId: data?.tenantId,
+              });
+            }
+          });
+        }),
+      );
+
       for (const record of records) {
-        // Check if record already exists
-        const existingQuery = query(
-          this.collectionRef,
-          where('tenantId', '==', tenantId),
-          where('studentId', '==', record.studentId),
-          where('date', '==', record.date)
-        );
-        
-        const existingSnapshot = await getDocs(existingQuery);
-        
-        if (!existingSnapshot.empty) {
+        // Check if record already exists (local lookup, no per-record read)
+        const existing = existingByKey.get(`${record.studentId}_${record.date}`);
+
+        if (existing) {
           // Update existing record
-          const existingDoc = existingSnapshot.docs[0];
-          if (existingDoc.data()?.tenantId !== tenantId) {
+          if (existing.tenantId !== tenantId) {
             throw new Error('Attendance record belongs to another coaching center');
           }
-          batch.update(doc(db, this.collectionName, existingDoc.id), {
+          batch.update(doc(db, this.collectionName, existing.id), {
             tenantId,
             ...record,
             updatedAt: timestamp

@@ -30,11 +30,23 @@ function stripUndefinedDeep<T>(value: T): T {
   return value;
 }
 
-interface Job { id: string; type: 'fee'|'custom'|'payment'|'birthday'; payload: any; status: string; attempts: number; error?: string; enqueuedAt: number; startedAt?: number; durationMs?: number; tenantId: string; }
+interface Job { id: string; type: 'fee'|'custom'|'payment'|'birthday'; payload: any; status: string; attempts: number; error?: string; enqueuedAt: number; startedAt?: number; durationMs?: number; tenantId: string; terminalAt?: number; lastPolledAt?: number; }
 const LEGACY_TENANT_ID = 'legacy-unscoped';
 const JOBS: Record<string, Job> = loadPersisted();
 const PROCESSING = new Set<string>();
+// PERF (P13): FIFO index of queued job ids so drain() pops the next job without
+// scanning the whole JOBS map (which also holds terminal jobs) once per free slot.
+const QUEUED = new Set<string>();
 const CONCURRENCY = Number(process.env.WHATSAPP_QUEUE_CONCURRENCY||4);
+// PERF (P13): evict terminal (success/failed) jobs from the in-memory map once
+// they've been idle (no status poll) for this long, so the map can't grow
+// unbounded until restart. Generous default so status polls shortly after a send
+// still resolve; Firestore `reminderHistory` is the durable delivery record. The
+// on-disk audit snapshot mirrors the in-memory map, so terminal jobs also leave
+// the local audit file at this horizon (earlier than JOB_RETENTION_MS).
+const IN_MEMORY_RETENTION_MS = Number(process.env.JOB_IN_MEMORY_RETENTION_MS || 30*60*1000);
+const EVICT_INTERVAL_MS = Number(process.env.JOB_EVICT_INTERVAL_MS || 60*1000);
+let lastEvictAt = 0;
 let active = 0;
 let shuttingDown = false;
 
@@ -52,6 +64,11 @@ Object.values(JOBS).forEach((job) => {
     job.tenantId = deriveTenantId(job.payload);
     backfilledTenants = true;
   }
+  // PERF (P13): seed the queued index from any jobs persisted as 'queued' (e.g.
+  // enqueued right before a restart) so the next drain() picks them up in order.
+  if (job.status === 'queued') {
+    QUEUED.add(job.id);
+  }
 });
 if (backfilledTenants) {
   console.log('[queue] backfilled tenant metadata for existing jobs');
@@ -68,6 +85,7 @@ function enqueue(type: Job['type'], payload: any) {
   const tenantId = deriveTenantId(payload);
   if (!payload.tenantId) payload.tenantId = tenantId; // ensure downstream payloads include tenant
   JOBS[id] = { id, type, payload, status: 'queued', attempts: 0, enqueuedAt: Date.now(), tenantId };
+  QUEUED.add(id);
   console.log('[queue] enqueued', { id, type, tenantId, toMasked: maskRecipient(payload?.to), selectedLanguage: payload?.selectedLanguage, hasEnNote: !!payload?.customNotesEnglish, hasHiNote: !!payload?.customNotesHindi });
   inc(metricNames.enqueued, { type, tenantId });
   persistSnapshot(JOBS);
@@ -75,10 +93,35 @@ function enqueue(type: Job['type'], payload: any) {
   return id;
 }
 
+// PERF (P13): drop terminal jobs that have been idle (unpolled) past the
+// in-memory retention window so the JOBS map (and the drain scan / snapshot) stay
+// bounded. Throttled so it costs at most one pass per EVICT_INTERVAL_MS.
+function evictStaleTerminalJobs() {
+  const now = Date.now();
+  if (now - lastEvictAt < EVICT_INTERVAL_MS) return;
+  lastEvictAt = now;
+  for (const id of Object.keys(JOBS)) {
+    const job = JOBS[id];
+    if (job.status === 'success' || job.status === 'failed') {
+      const lastActivity = Math.max(job.lastPolledAt || 0, job.terminalAt || 0, job.startedAt || 0, job.enqueuedAt || 0);
+      if (now - lastActivity > IN_MEMORY_RETENTION_MS) {
+        delete JOBS[id];
+        QUEUED.delete(id);
+      }
+    }
+  }
+}
+
 function drain() {
+  evictStaleTerminalJobs();
   while (active < CONCURRENCY) {
-    const next = Object.values(JOBS).find(j => j.status==='queued' && !PROCESSING.has(j.id));
-    if (!next) break;
+    const nextId: string | undefined = QUEUED.values().next().value;
+    if (!nextId) break;
+    QUEUED.delete(nextId);
+    const next = JOBS[nextId];
+    // Skip stale index entries (job gone or no longer queued); the id is already
+    // removed from QUEUED so the loop just advances to the next candidate.
+    if (!next || next.status !== 'queued' || PROCESSING.has(nextId)) continue;
     PROCESSING.add(next.id); active++;
     run(next).finally(()=>{ PROCESSING.delete(next.id); active--; setTimeout(drain,0); });
   }
@@ -298,6 +341,7 @@ async function run(job: Job) {
     }
   }
   job.durationMs=Date.now()-job.startedAt!;
+  job.terminalAt = Date.now(); // PERF (P13): mark terminal time for in-memory eviction
   if(job.status==='failed') console.warn('[queue] failed', { id: job.id, error: job.error });
   observeDuration(job.durationMs!);
   if (job.status === 'success') {
@@ -398,6 +442,7 @@ function serializeJob(job: Job) {
 export function getJobStatus(id: string, tenantId?: string) {
   const job = JOBS[id];
   if (!matchesTenant(job, tenantId)) return undefined;
+  job!.lastPolledAt = Date.now(); // PERF (P13): keep polled jobs from being evicted
   return serializeJob(job!);
 }
 
@@ -406,7 +451,10 @@ export function listJobStatus(ids: string[], tenantId?: string) {
     .map((id) => {
       const candidate = JOBS[id];
       const job = matchesTenant(candidate, tenantId) ? candidate : undefined;
-      if (job) return { id, ...serializeJob(job) };
+      if (job) {
+        job.lastPolledAt = Date.now(); // PERF (P13): keep polled jobs from being evicted
+        return { id, ...serializeJob(job) };
+      }
       if (tenantId && candidate) return { id, status: 'unauthorized' as const };
       return { id, status: 'unknown' as const };
     })

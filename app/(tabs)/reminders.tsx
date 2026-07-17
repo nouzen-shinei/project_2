@@ -852,6 +852,10 @@ export default function SendReminders() {
     return counts;
   }, [students, searchQuery, fees, categorizeFee]);
 
+  // PERF: compute the category counts ONCE per render (memoized) instead of
+  // re-running the O(students × fees) scan once per filter chip (was 4×/render).
+  const categoryCounts = useMemo(() => getCategoryCounts(), [getCategoryCounts]);
+
   const getStudentFeeInfo = useCallback((student: Student) => {
     const studentFees = fees.filter((fee: FeeRecord) => {
       const category = categorizeFee(fee);
@@ -1062,6 +1066,25 @@ export default function SendReminders() {
     canSendToStudent,
     isValidParentEmail,
   ]);
+
+  // PERF (P15): precompute each displayed student's fee summary once per render
+  // (memoized on the inputs that actually affect it) instead of running two
+  // `fees.filter(...)` passes per row inside the roster `.map` — which re-ran the
+  // O(students × fees) scan on every unrelated re-render (selecting a student,
+  // opening a modal, typing a custom message).
+  const feeInfoByStudentId = useMemo(() => {
+    const map = new Map<
+      string,
+      { feeInfo: ReturnType<typeof getStudentFeeInfo>; detailedFeeInfo: ReturnType<typeof getDetailedFeeInfo> }
+    >();
+    for (const student of displayedStudents) {
+      map.set(student.id, {
+        feeInfo: getStudentFeeInfo(student),
+        detailedFeeInfo: getDetailedFeeInfo(student),
+      });
+    }
+    return map;
+  }, [displayedStudents, getStudentFeeInfo, getDetailedFeeInfo]);
 
   // Utility function to normalize phone numbers
   const normalizePhoneNumber = useCallback((phone: string): string => {
@@ -3091,7 +3114,7 @@ export default function SendReminders() {
               { id: 'partial', label: 'Partial', color: theme.warning },
               { id: 'overdue', label: 'Overdue', color: theme.error },
             ].map(filter => {
-              const counts = getCategoryCounts();
+              const counts = categoryCounts;
               const count = counts[filter.id as keyof typeof counts];
               
               return (
@@ -3162,8 +3185,9 @@ export default function SendReminders() {
               </View>
             ) : (
               displayedStudents.map(student => {
-                const feeInfo = getStudentFeeInfo(student);
-                const detailedFeeInfo = getDetailedFeeInfo(student);
+                const cachedFeeInfo = feeInfoByStudentId.get(student.id);
+                const feeInfo = cachedFeeInfo?.feeInfo ?? getStudentFeeInfo(student);
+                const detailedFeeInfo = cachedFeeInfo?.detailedFeeInfo ?? getDetailedFeeInfo(student);
                 const isSelected = selectedStudents.has(student.id);
                 const trimmedParentEmail = (student.parentEmail || '').trim();
                 const emailSelected = reminderTypes.has('email');

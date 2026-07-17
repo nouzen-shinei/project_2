@@ -376,7 +376,7 @@ export default function Fees() {
     const runtimeCoverage = runtimeCoverageRef.current.get(studentId);
     return runtimeCoverage?.has(normalizedMonth) ?? false;
   }, [feeCoverageMap]);
-  const { getStudentHistory, canViewAllReminders } = useReminderHistory();
+  const { getStudentHistory, canViewAllReminders } = useReminderHistory({ autoload: false });
   // Call all hooks at the top-level before any conditional returns
   const {
     headerCompensation,

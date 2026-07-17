@@ -259,6 +259,20 @@ const getPresenceThresholdMin = (): number => {
   return Number.isFinite(val) && val > 0 ? val : 0.5; // default 30s
 };
 
+// PERF (P8): derive the presence heartbeat from the online threshold instead of a
+// fixed 15s constant so the two can never desync. We refresh at half the threshold
+// (a 2x safety margin, so a member never flickers offline between beats) with a
+// sane floor. At the default 30s threshold this evaluates to exactly 15s (no
+// behaviour change); relaxing EXPO_PUBLIC_FIRESTORE_ONLINE_THRESHOLD_MIN therefore
+// *automatically* cuts presence write volume (and the tenant-wide presence read
+// amplification) with zero risk of a false-offline. Full structural fix (RTDB
+// onDisconnect) remains documented in docs/PERFORMANCE_AUDIT.md P8.
+const PRESENCE_HEARTBEAT_MIN_MS = 15000;
+const getPresenceHeartbeatMs = (): number => {
+  const thresholdMs = getPresenceThresholdMin() * 60 * 1000;
+  return Math.max(PRESENCE_HEARTBEAT_MIN_MS, Math.floor(thresholdMs / 2));
+};
+
 // Initialize Google Sign-In
 const initializeGoogleSignIn = () => {
   if (Platform.OS !== 'web') {
@@ -576,6 +590,7 @@ async function getCachedAuthorizedEmails(): Promise<string[]> {
 function resetRoleSyncTracking() {
   roleBaselineEstablished = false;
   lastSyncedRole = null;
+  clearCachedUserRole();
 }
 
 function primeRoleSyncTracking(role: 'user' | 'admin' | null | undefined) {
@@ -1152,7 +1167,10 @@ function setupPresenceSystem(userEmail: string) {
   // Set user online initially
   setUserOnline(userEmail, true);
   
-  // Update presence every 15 seconds to reduce stale online state across devices.
+  // Update presence on a heartbeat derived from the online threshold (see
+  // getPresenceHeartbeatMs — defaults to 15s) to reduce stale online state across
+  // devices while keeping write volume proportional to the configured threshold.
+  const presenceHeartbeatMs = getPresenceHeartbeatMs();
   presenceInterval = setInterval(() => {
     // Don't update presence if app is in background
     if (isAppInBackground) {
@@ -1183,7 +1201,7 @@ function setupPresenceSystem(userEmail: string) {
       logger.debug('❌ Presence interval mismatch - cleaning up for:', userEmail, 'Current auth user:', globalAuthState.user?.email, 'Current presence user:', currentPresenceUser);
       cleanupPresenceSystem();
     }
-  }, 15000);
+  }, presenceHeartbeatMs);
   
   // Define event handlers
   const setOffline = () => {
@@ -1426,24 +1444,57 @@ async function loadAuthorizedEmails(): Promise<void> {
   }
 }
 
-// Get user role
-async function getUserRole(email: string): Promise<'user' | 'admin'> {
-  try {
-    const normalizedEmail = email.toLowerCase();
+// PERF (P14): short-lived cache of the resolved role to dedupe bursty lookups
+// (sign-in flow + auth-state re-fires all resolve the role within a second or
+// two). Kept intentionally short so the ~60s role heartbeat still performs a
+// real read and can catch a change the realtime listener missed. The realtime
+// membership listener refreshes this cache directly from its delivered snapshot,
+// so steady-state role changes are still picked up in real time.
+let cachedUserRole: { email: string; role: 'user' | 'admin'; at: number } | null = null;
+const ROLE_CACHE_TTL_MS = 15000;
 
+// Derive the effective role from a set of active tenantMembership docs (owner or
+// admin in any tenant => admin). Pure so both the one-shot lookup and the
+// realtime listener can share the exact same logic without an extra read.
+function deriveRoleFromMembershipDocs(docs: Array<{ data: () => any }>): 'user' | 'admin' {
+  const hasAdminRole = docs.some((docSnap) => {
+    const role = String((docSnap.data() as any)?.role || '').toLowerCase();
+    return role === 'owner' || role === 'admin';
+  });
+  return hasAdminRole ? 'admin' : 'user';
+}
+
+function setCachedUserRole(email: string, role: 'user' | 'admin'): void {
+  cachedUserRole = { email: email.toLowerCase(), role, at: Date.now() };
+}
+
+function clearCachedUserRole(): void {
+  cachedUserRole = null;
+}
+
+// Get user role
+async function getUserRole(email: string, options?: { maxAgeMs?: number }): Promise<'user' | 'admin'> {
+  const normalizedEmail = email.toLowerCase();
+  const maxAgeMs = options?.maxAgeMs ?? ROLE_CACHE_TTL_MS;
+  if (
+    cachedUserRole &&
+    cachedUserRole.email === normalizedEmail &&
+    Date.now() - cachedUserRole.at <= maxAgeMs
+  ) {
+    return cachedUserRole.role;
+  }
+  try {
     const membershipQuery = query(
       collection(firestore, 'tenantMemberships'),
       where('email', '==', normalizedEmail),
       where('status', '==', 'active')
     );
     const membershipSnapshot = await getDocs(membershipQuery);
-    const hasAdminRole = membershipSnapshot.docs.some((docSnap) => {
-      const role = String((docSnap.data() as any)?.role || '').toLowerCase();
-      return role === 'owner' || role === 'admin';
-    });
-
-    return hasAdminRole ? 'admin' : 'user';
+    const role = deriveRoleFromMembershipDocs(membershipSnapshot.docs);
+    setCachedUserRole(normalizedEmail, role);
+    return role;
   } catch (error) {
+    // Don't cache failures — let the next caller retry.
     logger.error('Error getting user role:', error);
     return 'user';
   }
@@ -2275,7 +2326,12 @@ function initializeAuth() {
             );
             roleListenerUnsubscribe = onSnapshot(roleMembershipQuery, async (_snap) => {
               try {
-                const newRole = await getUserRole(authUser.email.toLowerCase());
+                // PERF (P14): derive the role from the snapshot already delivered
+                // here instead of issuing another getDocs for the identical query,
+                // and refresh the shared cache so the presence heartbeat can reuse
+                // this realtime-fresh value.
+                const newRole = deriveRoleFromMembershipDocs(_snap.docs);
+                setCachedUserRole(authUser.email, newRole);
                 await applyAuthoritativeRoleUpdate(newRole);
               } catch (e) {
                 logger.warn('Role change listener error:', e);

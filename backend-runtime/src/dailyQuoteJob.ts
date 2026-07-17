@@ -874,13 +874,66 @@ async function executeDailyQuoteJob(options: DailyQuoteJobOptions): Promise<Dail
       await processDeviceDocs(email, devicesSnap.docs);
     }
   } else {
-    const snapshot = await db.collection('user_devices').get();
-    stats.totalUserDocs = snapshot.size;
-    for (const doc of snapshot.docs) {
-      const userEmail = normalizeEmail(doc.id);
-      const devicesSnap = await doc.ref.collection('devices').get();
-      await processDeviceDocs(userEmail, devicesSnap.docs);
+    // PERF (P12): page a single `collectionGroup('devices')` ordered by document
+    // id instead of reading every `user_devices` parent doc and then issuing one
+    // `devices` subcollection get per user (the old 1 + N pattern — one parent
+    // scan plus a serial subcollection read per user). Ordering by `__name__`
+    // groups a user's device docs contiguously (they share the
+    // `user_devices/{email}/devices/...` path prefix), so we buffer the current
+    // user's docs and flush the group whenever the parent email changes. This
+    // preserves the exact per-user processing — the per-user preference sort AND
+    // the global cross-device token dedup — with no behaviour change, while
+    // dropping the N parent-doc reads and N extra round-trips.
+    const scanPageSize = normalizeNumericEnv(process.env.DAILY_QUOTES_DEVICE_SCAN_PAGE_SIZE, 500, 50, 2000);
+    let cursor: admin.firestore.QueryDocumentSnapshot<admin.firestore.DocumentData> | null = null;
+    let currentEmail: string | null = null;
+    let currentDocs: admin.firestore.QueryDocumentSnapshot<admin.firestore.DocumentData>[] = [];
+
+    const flushCurrentGroup = async () => {
+      if (currentEmail === null) return;
+      stats.totalUserDocs += 1;
+      await processDeviceDocs(currentEmail, currentDocs);
+      currentEmail = null;
+      currentDocs = [];
+    };
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      let query: admin.firestore.Query = db
+        .collectionGroup('devices')
+        .orderBy(admin.firestore.FieldPath.documentId())
+        .limit(scanPageSize);
+      if (cursor) {
+        query = query.startAfter(cursor);
+      }
+
+      const pageSnap = await query.get();
+      if (pageSnap.empty) {
+        break;
+      }
+
+      for (const deviceDoc of pageSnap.docs) {
+        // `devices` only ever lives under `user_devices/{email}` — the parent of
+        // the `devices` collection is the user doc whose id is the email.
+        const parentEmail = normalizeEmail(deviceDoc.ref.parent.parent?.id);
+        if (!parentEmail) {
+          continue;
+        }
+        if (parentEmail !== currentEmail) {
+          await flushCurrentGroup();
+          currentEmail = parentEmail;
+          currentDocs = [];
+        }
+        currentDocs.push(deviceDoc);
+      }
+
+      cursor = pageSnap.docs[pageSnap.docs.length - 1];
+      if (pageSnap.size < scanPageSize) {
+        break;
+      }
     }
+
+    await flushCurrentGroup();
   }
 
   if (suppressedMessageIndices.size > 0) {

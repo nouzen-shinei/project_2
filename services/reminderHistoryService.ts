@@ -541,33 +541,34 @@ class ReminderHistoryService {
   }> {
     try {
       const scopedTenantId = this.ensureTenantId(tenantId);
-      const constraints: any[] = [
-        where('tenantId', '==', scopedTenantId),
-        orderBy('createdAt', 'desc'),
-      ];
+      const whereClauses: any[] = [where('tenantId', '==', scopedTenantId)];
 
       if (days !== 'all') {
         const startDate = new Date();
         startDate.setDate(startDate.getDate() - (typeof days === 'number' ? days : 30));
-        constraints.unshift(where('createdAt', '>=', Timestamp.fromDate(startDate)));
+        whereClauses.push(where('createdAt', '>=', Timestamp.fromDate(startDate)));
       }
 
       if (userId) {
-        constraints.unshift(where('userId', '==', userId));
+        whereClauses.push(where('userId', '==', userId));
       }
 
       if (filters?.studentId) {
-        constraints.unshift(where('studentId', '==', filters.studentId));
+        whereClauses.push(where('studentId', '==', filters.studentId));
       }
 
       const effectiveType = filters?.reminderType && filters.reminderType !== 'all' ? filters.reminderType : undefined;
       if (effectiveType) {
-        constraints.unshift(where('reminderType', '==', effectiveType));
+        whereClauses.push(where('reminderType', '==', effectiveType));
       }
+
+      const searchQ = (filters?.searchQuery || '').trim().toLowerCase();
+      const statusFilter = filters?.status && filters.status !== 'all' ? filters.status : undefined;
 
       const q = query(
         collection(firestore, this.collectionName),
-        ...constraints
+        ...whereClauses,
+        orderBy('createdAt', 'desc')
       );
 
       const querySnapshot = await getDocs(q);
@@ -579,9 +580,6 @@ class ReminderHistoryService {
         remindersByType: {} as Record<string, number>,
         remindersByStatus: {} as Record<string, number>,
       };
-
-      const searchQ = (filters?.searchQuery || '').trim().toLowerCase();
-      const statusFilter = filters?.status && filters.status !== 'all' ? filters.status : undefined;
 
       const matchSearch = (rec: ReminderHistoryEntry) => {
         if (!searchQ) return true;
@@ -713,6 +711,8 @@ class ReminderHistoryService {
       const effectiveStatus = filters?.status && filters.status !== 'all' ? filters.status : undefined;
       if (effectiveStatus) whereClauses.push(where('status', '==', effectiveStatus));
 
+      const searchQ = (filters?.searchQuery || '').trim().toLowerCase();
+
       const q = query(collection(firestore, this.collectionName), ...whereClauses, orderBy('createdAt', 'desc'));
       const snapshot = await getDocs(q);
 
@@ -725,7 +725,6 @@ class ReminderHistoryService {
         remindersByStatus: {} as Record<string, number>,
       };
 
-      const searchQ = (filters?.searchQuery || '').trim().toLowerCase();
       const matchSearch = (rec: ReminderHistoryEntry) => {
         if (!searchQ) return true;
         const safe = (v: any) => (v ?? '').toString().toLowerCase();

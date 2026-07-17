@@ -1308,6 +1308,36 @@ async function persistUsageSnapshot(
   await usageDocRef.set(stripUndefinedDeep(payload), { merge: true });
 }
 
+// PERF (P16): bounded-concurrency map that preserves input order. A local copy of
+// the `deviceAdminService` worker-pool so this standalone rollup entrypoint stays
+// self-contained (no heavy cross-module import), used to overlap the independent
+// per-tenant work below.
+async function mapWithConcurrencyLocal<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  if (items.length === 0) {
+    return results;
+  }
+  const effectiveLimit = Math.max(1, Math.min(limit, items.length));
+  let nextIndex = 0;
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await fn(items[index], index);
+    }
+  }
+  const workers: Array<Promise<void>> = [];
+  for (let i = 0; i < effectiveLimit; i += 1) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  return results;
+}
+
 export async function runTenantUsageRollup(options: CliOptions): Promise<void> {
   initFirebase();
   const db = admin.firestore();
@@ -1328,20 +1358,39 @@ export async function runTenantUsageRollup(options: CliOptions): Promise<void> {
     return;
   }
 
+  const tenantConcurrency = Math.max(1, Number(process.env.USAGE_ROLLUP_TENANT_CONCURRENCY || 4));
+
   console.log(
     `[rollup] processing ${tenants.length} tenant(s) across ${months.length} month(s)${options.dryRun ? ' (dry-run)' : ''}`
   );
 
+  // PERF (P16): resolve each tenant's effective plan limits ONCE up front — they
+  // depend on billingTier/quotas, not on the month — instead of re-resolving them
+  // inside the month × tenant loop below.
+  const planLimitsByTenant = new Map<string, PlanLimits>();
+  await mapWithConcurrencyLocal(tenants, tenantConcurrency, async (tenant) => {
+    const limits = await resolveEffectivePlanLimitsForTenant(db, tenant.id, {
+      billingTier: tenant.billingTier,
+      quotas: tenant.quotas ?? null,
+    });
+    planLimitsByTenant.set(tenant.id, limits);
+  });
+
   for (const month of months) {
-    for (const tenant of tenants) {
+    // PERF (P16): process independent tenants with bounded concurrency instead of
+    // strictly serially — each tenant only reads its own collections and writes its
+    // own `tenantUsage/{tenant}/months/{month}` doc + alerts, so they don't conflict.
+    await mapWithConcurrencyLocal(tenants, tenantConcurrency, async (tenant) => {
       const usageDocRef = db.collection('tenantUsage').doc(tenant.id).collection('months').doc(month.id);
       const existingSnap = await usageDocRef.get();
       const existingData = existingSnap.exists ? existingSnap.data() : undefined;
 
-      const planLimits = await resolveEffectivePlanLimitsForTenant(db, tenant.id, {
-        billingTier: tenant.billingTier,
-        quotas: tenant.quotas ?? null,
-      });
+      const planLimits =
+        planLimitsByTenant.get(tenant.id) ??
+        (await resolveEffectivePlanLimitsForTenant(db, tenant.id, {
+          billingTier: tenant.billingTier,
+          quotas: tenant.quotas ?? null,
+        }));
       const { data, warnings } = await collectMetrics(db, realtimeDb, bucket, tenant, month, existingData, options.verbose);
 
       await persistUsageSnapshot(usageDocRef, tenant, month, planLimits.id, data, warnings, options.dryRun);
@@ -1360,7 +1409,7 @@ export async function runTenantUsageRollup(options: CliOptions): Promise<void> {
         `[rollup] tenant=${tenant.id} month=${month.id} students=${data.activeStudents} staff=${data.staffSeatsUsed} reminders=${data.remindersSent.total} storageMb=${((data.storageBytes ?? 0) / (1024 * 1024)).toFixed(2)}`
       );
       warnings.forEach((warning) => console.warn(`[rollup][${tenant.id}][${month.id}] ${warning}`));
-    }
+    });
   }
 }
 

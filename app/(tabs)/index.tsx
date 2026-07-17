@@ -1,6 +1,6 @@
 import { logger } from '@/lib/logger';
 import { isPermissionDeniedError } from '@/lib/firestoreErrors';
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -46,6 +46,8 @@ export default function Dashboard() {
   const { students: studentList, loading: studentsLoading } = useStudents();
   const students = studentList as Student[];
   const { fees, loading: feesLoading } = useFees();
+  // NOTE: the dashboard uses the hook's `loading` for section skeletons and its
+  // `refresh` for pull-to-refresh, so autoload stays on here (fees.tsx opts out).
   const { history: reminderHistory, loading: reminderLoading, getRecentReminders, refresh: refreshReminders, canViewAllReminders } = useReminderHistory();
   const { notices, loading: noticesLoading } = useNotices();
   const { activeTenant, refreshTenants } = useTenant();
@@ -531,8 +533,9 @@ export default function Dashboard() {
     return 'Good Evening!';
   };
 
-  // Helper function to get correct amount for a fee record
-  const getCorrectFeeAmount = (record: any): number => {
+  // Helper function to get correct amount for a fee record. Stable identity
+  // (useCallback[]) so the memoized derivations below don't churn every render.
+  const getCorrectFeeAmount = useCallback((record: any): number => {
     if (record.monthFeeAmounts && record.monthsCovered) {
       // Use sum of individual month amounts for consolidated fees
       return record.monthsCovered.reduce((sum: number, month: string) => 
@@ -540,33 +543,36 @@ export default function Dashboard() {
     }
     // Fallback to stored amount
     return record.amount || 0;
-  };
+  }, []);
 
   // Calculate stats from real data
   const totalStudents = students.length;
   const paidFees = fees.filter(fee => fee.status === 'paid');
   
-  // Calculate pending amount using the same method as fees page
-  const totalAmount = fees.reduce((sum, fee) => sum + getCorrectFeeAmount(fee), 0);
-  const paidAmount = fees
-    .filter(fee => fee.status === 'paid')
-    .reduce((sum, fee) => sum + getCorrectFeeAmount(fee), 0) +
-    fees
-    .filter(fee => fee.status !== 'paid' && (fee.paidAmount || 0) > 0) // Partial payments
-    .reduce((sum, fee) => sum + (fee.paidAmount || 0), 0);
-  const pendingAmount = totalAmount - paidAmount;
+  // PERF (P6): memoize the O(fees) summary reductions so they don't re-run on
+  // every unrelated dashboard re-render (modal toggles, dimensions, reminder state).
+  const { totalAmount, paidAmount, pendingAmount } = useMemo(() => {
+    const total = fees.reduce((sum, fee) => sum + getCorrectFeeAmount(fee), 0);
+    const paid = fees
+      .filter(fee => fee.status === 'paid')
+      .reduce((sum, fee) => sum + getCorrectFeeAmount(fee), 0) +
+      fees
+      .filter(fee => fee.status !== 'paid' && (fee.paidAmount || 0) > 0) // Partial payments
+      .reduce((sum, fee) => sum + (fee.paidAmount || 0), 0);
+    return { totalAmount: total, paidAmount: paid, pendingAmount: total - paid };
+  }, [fees, getCorrectFeeAmount]);
 
-  // Helper: is date string in current month
-  const isInCurrentMonth = (dateStr?: string) => {
+  // Helper: is date string in current month. Stable identity for the memos below.
+  const isInCurrentMonth = useCallback((dateStr?: string) => {
     if (!dateStr) return false;
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return false;
     const now = new Date();
     return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
-  };
+  }, []);
 
   // Calculate current-month revenue from actual payments, including partials
-  const monthlyRevenue = fees.reduce((sum, fee) => {
+  const monthlyRevenue = useMemo(() => fees.reduce((sum, fee) => {
     const details = fee.paymentDetails as any;
 
     // If there are structured payments (payment_*), sum those in current month
@@ -595,7 +601,7 @@ export default function Dashboard() {
     }
 
     return sum;
-  }, 0);
+  }, 0), [fees, isInCurrentMonth, getCorrectFeeAmount]);
   
   // Calculate reminder stats
   const todayReminders = recentReminders.filter(reminder => {
@@ -616,15 +622,15 @@ export default function Dashboard() {
   // Get current month name for better display
   const currentMonth = new Date().toLocaleDateString('en-IN', { month: 'long' });
 
-  const stats = [
+  const stats = useMemo(() => [
     { title: 'Total Students', value: totalStudents.toString(), icon: Users, color: theme.primary },
     { title: `${currentMonth} Revenue`, value: `₹${monthlyRevenue.toLocaleString()}`, icon: CreditCard, color: theme.success },
     { title: 'Pending Fees', value: `₹${pendingAmount.toLocaleString()}`, icon: AlertCircle, color: theme.warning },
     { title: 'Reminders Today', value: todayReminderTotals.total.toString(), icon: Bell, color: theme.primary, failed: todayReminderTotals.failed, pending: todayReminderTotals.pending },
-  ];
+  ], [totalStudents, currentMonth, monthlyRevenue, pendingAmount, todayReminderTotals, theme]);
 
   // Get upcoming dues from real data + projected next month dues
-  const upcomingDues = (() => {
+  const upcomingDues = useMemo(() => {
     // Get existing fees due from tomorrow onwards
     const existingUpcomingFees = fees
       .filter(fee => {
@@ -753,7 +759,7 @@ export default function Dashboard() {
       .filter((item): item is NonNullable<typeof item> => item !== null)
       .sort((a, b) => a.sortDate.getTime() - b.sortDate.getTime())
       .slice(0, 6);
-  })();
+  }, [students, fees, getCorrectFeeAmount]);
 
   const handleNotifications = () => {
     // Load all notifications (without filters) when opening modal

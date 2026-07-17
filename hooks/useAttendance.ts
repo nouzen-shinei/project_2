@@ -43,6 +43,40 @@ export function useAttendance(studentIds: string[] = []) {
     }
   }, [studentIdsKey, tenantId, tenantLoading]);
 
+  // PERF (P4): the initial load is bounded to the CURRENT month — that's all the
+  // per-student attendance % cards (students screen, reports, student profile)
+  // render. This avoids reading a student's entire ever-growing attendance
+  // history on every screen visit. The full history is loaded on demand only when
+  // the attendance calendar is opened (the sole view that navigates past months),
+  // via `fetchAttendance` above. Uses a `YYYY-MM-01`..`YYYY-MM-31` string range —
+  // `date` is stored as `YYYY-MM-DD`, so the string bound cleanly excludes other
+  // months (served by the same (tenantId, studentId, date) index as the all-time
+  // query, so no new index is required).
+  const fetchCurrentMonth = useCallback(async (ids: string[] = studentIds) => {
+    if (ids.length === 0) return;
+    if (!tenantId) {
+      setAttendanceRecords((prev) => (prev.length === 0 ? prev : []));
+      setError(tenantLoading ? null : 'No coaching center selected');
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      const now = new Date();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const startDate = `${now.getFullYear()}-${mm}-01`;
+      const endDate = `${now.getFullYear()}-${mm}-31`;
+      const records = await attendanceService.getAttendanceByDateRange(tenantId, ids, startDate, endDate);
+      setAttendanceRecords(records);
+    } catch (err) {
+      logger.error('Error fetching current-month attendance:', err);
+      setError('Failed to fetch attendance records');
+    } finally {
+      setLoading(false);
+    }
+  }, [studentIdsKey, tenantId, tenantLoading]);
+
   // Fetch attendance for a specific date range
   const fetchAttendanceByDateRange = useCallback(async (
     ids: string[],
@@ -121,6 +155,20 @@ export function useAttendance(studentIds: string[] = []) {
     }
   }, [ensureTenant, fetchAttendance]);
 
+  // PERF (P15): index records by `${studentId}_${date}` once per records change
+  // so per-row lookups are O(1). Previously getAttendancePercentage/getDaysPresent
+  // did an Array.find over ALL records for every day of the month, and were each
+  // called ~3× per student card → O(students × days × records) on the roster.
+  const attendanceStatusByKey = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const record of attendanceRecords) {
+      if (record?.studentId && record?.date) {
+        map.set(`${record.studentId}_${record.date}`, record.status);
+      }
+    }
+    return map;
+  }, [attendanceRecords]);
+
   // Calculate attendance percentage for a student
   const getAttendancePercentage = useCallback((studentId: string): number => {
     // Get all days from start of current month up to today (inclusive)
@@ -144,14 +192,13 @@ export function useAttendance(studentIds: string[] = []) {
     
     // Count present days using the same logic as the attendance calendar
     const presentCount = daysToCount.filter(date => {
-      const record = attendanceRecords.find(r => r.studentId === studentId && r.date === date);
       // If record exists, check its status; if not, it defaults to absent
-      const status = record ? record.status : 'absent';
+      const status = attendanceStatusByKey.get(`${studentId}_${date}`) ?? 'absent';
       return status === 'present' || status === 'late';
     }).length;
     
     return Math.round((presentCount / daysToCount.length) * 100);
-  }, [attendanceRecords]);
+  }, [attendanceStatusByKey]);
 
     // Get number of days present for a student
   const getDaysPresent = useCallback((studentId: string): { present: number, total: number } => {
@@ -176,14 +223,13 @@ export function useAttendance(studentIds: string[] = []) {
     
     // Count present days using the same logic as the attendance calendar
     const presentCount = daysToCount.filter(date => {
-      const record = attendanceRecords.find(r => r.studentId === studentId && r.date === date);
       // If record exists, check its status; if not, it defaults to absent
-      const status = record ? record.status : 'absent';
+      const status = attendanceStatusByKey.get(`${studentId}_${date}`) ?? 'absent';
       return status === 'present' || status === 'late';
     }).length;
     
     return { present: presentCount, total: daysToCount.length };
-  }, [attendanceRecords]);
+  }, [attendanceStatusByKey]);
 
   // Get attendance summary for all students
   const getAttendanceSummary = useCallback(async (ids: string[] = studentIds) => {
@@ -215,11 +261,11 @@ export function useAttendance(studentIds: string[] = []) {
     }
 
     if (studentIds.length > 0 && tenantId) {
-      fetchAttendance(studentIds);
+      fetchCurrentMonth(studentIds);
     } else if (!tenantId) {
       setAttendanceRecords([]);
     }
-  }, [studentIdsKey, tenantId, tenantLoading, fetchAttendance]);
+  }, [studentIdsKey, tenantId, tenantLoading, fetchCurrentMonth]);
 
   return {
     attendanceRecords,

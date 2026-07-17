@@ -142,9 +142,10 @@ function useFees() {
 
     const initializeFirestore = async () => {
       try {
-        // Wait a bit for Firebase to be ready
-        await new Promise(resolve => setTimeout(resolve, 1000));
-    
+        // PERF: subscribe immediately — the Firestore SDK handles readiness/queueing
+        // internally, so the previous artificial 1s delay only postponed fee data
+        // (and everything derived from it on the dashboard/fees/reminders screens)
+        // on every mount and every token-refresh re-init.
         const db = getFirestore();
         const feesRef = collection(db, 'fees');
         const q = query(feesRef, where('tenantId', '==', activeTenant.id));
@@ -530,6 +531,9 @@ function useFees() {
 
   const generateMonthlyFees = async () => {
     try {
+      // PERF (P10): skip if fees haven't finished loading so the in-memory
+      // duplicate check below acts on complete data (avoids creating duplicates).
+      if (loading) return;
       const tenantId = requireTenantId();
       // Use statically imported Firestore functions
       const db = getFirestore();
@@ -538,6 +542,20 @@ function useFees() {
         query(collection(db, 'students'), where('tenantId', '==', tenantId))
       );
       const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM format
+      // PERF (P10): derive which students already have a fee this month from the
+      // already-loaded in-memory `fees` snapshot (one live source of truth) instead
+      // of issuing one getDocs per student (N+1). Same dueDate-range semantics as
+      // the previous per-student query.
+      const monthStart = `${currentMonth}-01`;
+      const monthEnd = `${currentMonth}-31`;
+      const studentIdsWithMonthFee = new Set<string>();
+      for (const f of fees) {
+        const due = (f as any).dueDate;
+        const sid = (f as any).studentId;
+        if (typeof due === 'string' && due >= monthStart && due <= monthEnd && typeof sid === 'string') {
+          studentIdsWithMonthFee.add(sid);
+        }
+      }
       const promises = studentsSnapshot.docs.map(async (studentDoc: any) => {
         const student = studentDoc.data();
         const studentId = studentDoc.id;
@@ -545,16 +563,8 @@ function useFees() {
         if (student.status !== 'active') {
           return null;
         }
-        // Check if fee already exists for this student and month
-        const existingFeesQuery = query(
-          collection(db, 'fees'),
-          where('tenantId', '==', tenantId),
-          where('studentId', '==', studentId),
-          where('dueDate', '>=', `${currentMonth}-01`),
-          where('dueDate', '<=', `${currentMonth}-31`)
-        );
-        const existingFeesSnapshot = await getDocs(existingFeesQuery);
-        if (!existingFeesSnapshot.empty) {
+        // Skip students who already have a fee for this month
+        if (studentIdsWithMonthFee.has(studentId)) {
           return null;
         }
         // Calculate due date using student's preferred due date

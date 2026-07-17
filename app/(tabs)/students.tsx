@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -109,7 +109,8 @@ export default function Students() {
     loading: attendanceLoading, 
     saveAttendanceRecords,
     getAttendancePercentage,
-    getDaysPresent
+    getDaysPresent,
+    fetchAttendance
   } = useAttendance(studentIds);
   
   // Centralized offline-aware loading gate (prevents zeroed UI on cold offline start)
@@ -163,18 +164,27 @@ export default function Students() {
     setNewStudent((prev) => (prev.tenantId === tenantId ? prev : { ...prev, tenantId }));
   }, [tenantId]);
 
-  const filteredStudents = students.filter(student =>
-    student.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    student.grade.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (student.subjects || []).some(subject => 
-      subject.toLowerCase().includes(searchQuery.toLowerCase())
-    )
-  );
+  // PERF (P15): memoize the filter so we don't re-scan every student on every
+  // unrelated re-render (modal toggles, form keystrokes, image upload, …).
+  const filteredStudents = useMemo(() => {
+    const q = searchQuery.toLowerCase();
+    return students.filter(student =>
+      student.name.toLowerCase().includes(q) ||
+      student.grade.toLowerCase().includes(q) ||
+      (student.subjects || []).some(subject =>
+        subject.toLowerCase().includes(q)
+      )
+    );
+  }, [students, searchQuery]);
 
-  // FlatList re-renders visible cells only when one of these visual inputs
-  // changes, instead of rebuilding the whole roster on every unrelated state
-  // change (modals, form text, image upload, etc.).
-  const studentsListExtraData = { searchQuery, isDeletingStudent, attendanceRecords, theme };
+  // PERF (P15): memoize extraData so its identity only changes when a visual
+  // input actually changes. A fresh object literal every render defeated the
+  // FlatList cell bail-out, forcing the whole roster to re-render on every
+  // unrelated state change (modals, form text, image upload, etc.).
+  const studentsListExtraData = useMemo(
+    () => ({ searchQuery, isDeletingStudent, attendanceRecords, theme }),
+    [searchQuery, isDeletingStudent, attendanceRecords, theme]
+  );
 
   const performanceOptions = ['Excellent', 'Very Good', 'Good', 'Average', 'Needs Improvement'];
 
@@ -650,6 +660,11 @@ export default function Students() {
     setSelectedStudentForAttendance(student || null);
     setAttendanceMode(mode);
     setShowAttendanceModal(true);
+    // PERF (P4): the screen loads only the current month; the calendar is the one
+    // view that navigates past months, so load the full history on demand when it
+    // opens. Fetches all roster students (the "all" calendar view needs them; the
+    // list cards stay correct since all-time is a superset of the current month).
+    void fetchAttendance();
   };
 
   const handleCloseAttendanceModal = () => {

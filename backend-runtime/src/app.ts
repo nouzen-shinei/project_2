@@ -43,6 +43,7 @@ import {
   forceLogoutAll,
   bulkForceLogout,
   notify,
+  mapWithConcurrency,
   DeviceAdminError,
   ForceLogoutAllError,
   type DeviceAdminRecord,
@@ -12936,7 +12937,14 @@ export function createApp(options: CreateAppOptions = {}){
       return 'pending';
     };
 
-    for (const item of items) {
+    // PERF (P11): process items with bounded concurrency instead of a strictly
+    // serial loop. Each item's quota-token/history/idempotency logic is unchanged;
+    // only the outer iteration overlaps the (network-bound) SMS/voice/email sends
+    // and WhatsApp enqueues. Results are still keyed by studentId+type on the
+    // client, so completion order is irrelevant. Concurrency is kept modest so the
+    // per-batch reservation-token transactions don't contend excessively.
+    const REMINDER_BATCH_SEND_CONCURRENCY = 5;
+    const processItem = async (item: (typeof items)[number]): Promise<void> => {
       const studentId = item.studentId;
       const historyId = typeof (item as any).historyId === 'string' ? String((item as any).historyId).trim() : '';
       const rawHistory = (item as any).history;
@@ -12993,7 +13001,7 @@ export function createApp(options: CreateAppOptions = {}){
             }
             const st = deriveStatusFromHistory(existing.data() || {});
             results.push({ studentId, type: item.type, status: st });
-            continue;
+            return;
           }
         }
 
@@ -13043,7 +13051,7 @@ export function createApp(options: CreateAppOptions = {}){
             status: sendResult.success ? 'success' : 'failed',
             message: sendResult.success ? 'Sent successfully' : (sendResult as any)?.error || 'send_failed',
           });
-          continue;
+          return;
         }
 
         if (item.type === 'voice') {
@@ -13101,7 +13109,7 @@ export function createApp(options: CreateAppOptions = {}){
             status: sendResult.success ? 'success' : 'failed',
             message: sendResult.success ? 'Sent successfully' : (sendResult as any)?.error || 'send_failed',
           });
-          continue;
+          return;
         }
 
         if (item.type === 'whatsapp') {
@@ -13116,7 +13124,7 @@ export function createApp(options: CreateAppOptions = {}){
             if (!item.studentName || typeof item.amount !== 'number' || !item.dueDate) {
               await finalizeConsumedQuotaAsFailed('missing_fields');
               results.push({ studentId, type: 'whatsapp', status: 'failed', message: 'missing_fields' });
-              continue;
+              return;
             }
             jobId = enqueueReminderImpl({
               tenantId: normalizedTenantId,
@@ -13140,7 +13148,7 @@ export function createApp(options: CreateAppOptions = {}){
             if (!item.message) {
               await finalizeConsumedQuotaAsFailed('missing_fields');
               results.push({ studentId, type: 'whatsapp', status: 'failed', message: 'missing_fields' });
-              continue;
+              return;
             }
             jobId = enqueueCustomMessageImpl({
               tenantId: normalizedTenantId,
@@ -13190,7 +13198,7 @@ export function createApp(options: CreateAppOptions = {}){
           });
 
           results.push({ studentId, type: 'whatsapp', status: 'queued', jobId, message: 'Queued for send' });
-          continue;
+          return;
         }
 
         if (item.type === 'email') {
@@ -13209,7 +13217,7 @@ export function createApp(options: CreateAppOptions = {}){
               }
             }
             results.push({ studentId, type: 'email', status: 'failed', message: 'email_backend_not_configured' });
-            continue;
+            return;
           }
 
           // Create history entry + consume quota token before attempting send.
@@ -13352,10 +13360,11 @@ export function createApp(options: CreateAppOptions = {}){
           } finally {
             clearTimeout(timeout);
           }
-          continue;
+          return;
         }
 
         results.push({ studentId, type: (item as any).type, status: 'failed', message: 'unsupported_type' });
+        return;
       } catch (error) {
         await finalizeConsumedQuotaAsFailed('send_failed');
         if (error instanceof TenantAccessError) {
@@ -13365,12 +13374,14 @@ export function createApp(options: CreateAppOptions = {}){
             status: 'failed',
             message: typeof (error.body as any)?.error === 'string' ? (error.body as any).error : 'tenant_access_error',
           });
-          continue;
+          return;
         }
         console.warn('[reminders_batch_send] item failed', { type: (item as any)?.type, studentId }, error);
         results.push({ studentId, type: item.type, status: 'failed', message: 'send_failed' });
       }
-    }
+    };
+
+    await mapWithConcurrency(items, REMINDER_BATCH_SEND_CONCURRENCY, processItem);
 
     return res.json({ ok: true, tenantId: normalizedTenantId, batchId, monthId, results });
   });
@@ -21030,24 +21041,36 @@ export function createApp(options: CreateAppOptions = {}){
       const col = db.collection(PRESENCE_COLLECTION);
       const { snap, modeUsed } = await fetchPresenceSnapshot(col, PRESENCE_SWEEP_QUERY_MODE);
       const now = Date.now();
-      let updates = 0;
       let scanned = 0;
+      // PERF (P16): collect the docs that need flipping to offline, then commit the
+      // independent, idempotent `isOnline:false` updates in chunked writeBatches
+      // (≤400) instead of one awaited `update` per doc. Semantics are unchanged:
+      // an online doc is marked offline when it has no parseable lastSeen OR its
+      // lastSeen is older than the stale window; offline docs are never touched.
+      const staleRefs: admin.firestore.DocumentReference[] = [];
       for (const doc of snap.docs){
         const data = doc.data() as any;
-        const lastSeen = data.lastSeen;
         const isOnline = data.isOnline === true;
-        const parsed = parseAnyTimestamp(lastSeen);
+        const parsed = parseAnyTimestamp(data.lastSeen);
         scanned++;
-        if (!parsed) {
-          if (isOnline) { await doc.ref.update({ isOnline: false }); updates++; }
+        if (!isOnline) {
           continue;
         }
-        const isStale = now - parsed.getTime() > PRESENCE_STALE_WINDOW_MS;
-        if (isOnline && isStale) {
-          await doc.ref.update({ isOnline: false });
-          updates++;
+        if (!parsed || now - parsed.getTime() > PRESENCE_STALE_WINDOW_MS) {
+          staleRefs.push(doc.ref);
         }
       }
+
+      const PRESENCE_SWEEP_BATCH_LIMIT = 400;
+      for (let i = 0; i < staleRefs.length; i += PRESENCE_SWEEP_BATCH_LIMIT) {
+        const batch = db.batch();
+        for (const ref of staleRefs.slice(i, i + PRESENCE_SWEEP_BATCH_LIMIT)) {
+          batch.update(ref, { isOnline: false });
+        }
+        await batch.commit();
+      }
+      const updates = staleRefs.length;
+
       console.log(`[presence_sweeper] mode=${modeUsed} scanned ${scanned} docs, updated ${updates} stale presence flags`);
       return { scanned, updates };
     } catch(e:any) {

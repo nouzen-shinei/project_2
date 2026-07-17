@@ -224,12 +224,21 @@ export async function markPushTokensInvalid(
       lastPushTokenErrorCode: 'DeviceNotRegistered',
     };
 
-    for (const record of records) {
-      try {
-        await db.doc(record.deviceDocPath).set(updatePayload, { merge: true });
-      } catch (error) {
-        console.warn(`[${context}] failed to mark invalid push token`, record.deviceDocPath, error instanceof Error ? error.message : error);
-      }
+    // PERF (P16): write the independent per-device invalidations in bounded
+    // parallel chunks instead of strictly one-at-a-time. Per-record try/catch is
+    // preserved so one failed doc never aborts the rest (same best-effort
+    // semantics as the previous serial loop), the writes just overlap.
+    const MARK_INVALID_CONCURRENCY = 20;
+    for (const chunk of chunkArray(records, MARK_INVALID_CONCURRENCY)) {
+      await Promise.all(
+        chunk.map(async (record) => {
+          try {
+            await db.doc(record.deviceDocPath).set(updatePayload, { merge: true });
+          } catch (error) {
+            console.warn(`[${context}] failed to mark invalid push token`, record.deviceDocPath, error instanceof Error ? error.message : error);
+          }
+        })
+      );
     }
   } catch (error) {
     console.warn(`[${context}] markPushTokensInvalid error`, error instanceof Error ? error.message : error);

@@ -15,7 +15,11 @@ export interface ReminderHistoryStats {
   remindersByStatus: Record<string, number>;
 }
 
-export function useReminderHistory() {
+export function useReminderHistory(options?: { autoload?: boolean }) {
+  // PERF (P7): callers that only need getStudentHistory/getRecentReminders/
+  // canViewAllReminders (dashboard, fees) can pass { autoload: false } to skip the
+  // mount-time history + batches + stats fetches they never render.
+  const autoload = options?.autoload ?? true;
   const { user } = useAuth();
   const { activeTenant, activeMembership, refreshTenants } = useTenant();
 
@@ -371,8 +375,9 @@ export function useReminderHistory() {
     ]);
   }, [resetAndLoadHistory, loadBatches, loadStats]);
 
-  // Load initial data when user is available
+  // Load initial data when user is available (unless the caller opted out).
   useEffect(() => {
+    if (!autoload) return;
     if (user?.uid && activeTenant?.id) {
       refresh();
     } else if (!activeTenant?.id) {
@@ -388,7 +393,7 @@ export function useReminderHistory() {
       });
       setHasMore(false);
     }
-  }, [user?.uid, activeTenant?.id, refresh]);
+  }, [user?.uid, activeTenant?.id, refresh, autoload]);
 
   return {
     // Data
