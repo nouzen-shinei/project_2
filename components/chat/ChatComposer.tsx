@@ -2,6 +2,7 @@ import React, { useCallback } from 'react';
 import { View, Text, TouchableOpacity, ActivityIndicator, Platform, StyleSheet } from 'react-native';
 import { X, AlertCircle, RotateCcw, Reply, Edit3, FileIcon } from 'lucide-react-native';
 import MobileChatInput, { MobileChatInputRef } from '../MobileChatInput';
+import type { KeyboardMediaCandidate } from '../../lib/chatKeyboardMediaSend';
 import { TeamMember } from '@/hooks/useAuthUnified';
 
 const CHAT_MESSAGE_MAX_CHARS = 4000;
@@ -61,6 +62,9 @@ export interface ChatComposerProps {
   
   // Chat drop active
   isChatDropActive: boolean;
+
+  // Keyboard / clipboard media (web paste today; native bridge later)
+  onKeyboardMedia?: (candidate: KeyboardMediaCandidate) => void;
 }
 
 export function ChatComposer({
@@ -109,6 +113,7 @@ export function ChatComposer({
   messageWordCount,
   
   isChatDropActive,
+  onKeyboardMedia,
 }: ChatComposerProps) {
 
   const handleQuickFormatExtraBold = useCallback(() => {
@@ -406,6 +411,7 @@ export function ChatComposer({
         showCharacterCount={false}
         isSendingMessage={isSendingMessage}
         canSend={canAttemptSend}
+        onKeyboardMedia={onKeyboardMedia}
       />
 
       {showInputLimitCounter && (

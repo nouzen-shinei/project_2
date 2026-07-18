@@ -43,7 +43,14 @@ import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useChat } from '../../hooks/useChat';
 import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
 import { chatService, ChatRateLimitError, ChatMessageActionError, ChatUploadCanceledError } from '../../services/chatService';
-import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
+import { MediaPickerUtil, inferFileType } from '../../lib/mediaPickerUtil';
+import {
+  normalizeKeyboardMediaCandidate,
+  describeKeyboardMediaRejection,
+  resolveKeyboardMediaSendMode,
+  type KeyboardMediaCandidate,
+  type KeyboardMediaFile,
+} from '../../lib/chatKeyboardMediaSend';
 import { getProfileImageUrl } from '../../lib/profileImage';
 import { FileDownloadUtil } from '../../lib/fileDownloadUtil';
 import {
@@ -818,6 +825,14 @@ export default function Chat() {
   const [isCancelingAllPending, setIsCancelingAllPending] = useState(false);
   const attachmentUploadCancelMap = useRef<Map<string, () => void | Promise<void>>>(new Map());
   const attachmentFinalizeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Web only: retain the pasted Blob per pending-media id so the sticker/gif
+  // upload (initial send + retry) never depends on a possibly-revoked object
+  // URL. Native keyboard media are content:///file:// uris and don't need this.
+  const keyboardMediaBlobRef = useRef<Map<string, Blob>>(new Map());
+  // Latest closure that sends keyboard/clipboard media as a sticker/gif. Held in
+  // a ref so the (stable) handleKeyboardMedia callback can invoke it without an
+  // ordering cycle (the sender is declared later, alongside the picker handlers).
+  const sendKeyboardMediaAsStickerRef = useRef<((file: KeyboardMediaFile) => void) | null>(null);
   const tenantMembersRequestIdRef = useRef(0);
   const teamMembersVisibleLoadCountRef = useRef(0);
   const tenantRosterRef = useRef<TeamMember[]>([]);
@@ -7928,6 +7943,36 @@ export default function Chat() {
     }
   }, [MAX_SKIPPED_PREVIEW_ITEMS, getPreviewFileIdentity]);
 
+  // Media pasted/inserted from the keyboard or OS clipboard (the native
+  // commitContent bridge on Android — the Gboard GIF button / sticker keyboards —
+  // and web `paste`). We validate + normalize, then route:
+  //   • Keyboard commitContent (source === 'keyboard') → send IMMEDIATELY as a
+  //     sticker/gif message, the same one-shot flow as the StickerGifPicker.
+  //   • Clipboard paste (source === 'clipboard') → normal media PREVIEW, so the
+  //     user confirms before it's sent as a regular file.
+  //   • Unknown source (web paste, iOS, or a pasted web-image URL) → fall back to
+  //     FORMAT: GIF/WebP are effectively only ever stickers/GIFs → immediate;
+  //     everything else → preview (so a pasted screenshot never auto-sends).
+  // The source signal comes from the patched native module (patches/), which tags
+  // commitContent vs clipboard; format is only the fallback when it's absent.
+  // Video is never a sticker/gif, so it always uses the preview regardless.
+  const handleKeyboardMedia = useCallback((candidate: KeyboardMediaCandidate) => {
+    if (!selectedTeamMember) {
+      return;
+    }
+    const result = normalizeKeyboardMediaCandidate(candidate, { inferType: inferFileType });
+    if (!result.ok) {
+      const { title, message } = describeKeyboardMediaRejection(result.reason);
+      Toast.show({ type: 'error', text1: title, text2: message, position: 'top' });
+      return;
+    }
+    if (resolveKeyboardMediaSendMode(result.file) === 'sticker') {
+      sendKeyboardMediaAsStickerRef.current?.(result.file);
+    } else {
+      previewSelectedFiles([result.file]);
+    }
+  }, [selectedTeamMember, previewSelectedFiles]);
+
   const groupedSkippedPreviewFiles = useMemo(() => {
     const groups: {
       folder: string[];
@@ -9009,6 +9054,150 @@ export default function Chat() {
     }
   };
 
+  // Send keyboard/clipboard media (a sticker/GIF from the keyboard, or an image
+  // pasted from the OS clipboard) immediately as a sticker/gif message — the same
+  // one-shot, no-preview flow as the StickerGifPicker. Unlike picker items (which
+  // are permanent remote URLs sent as-is), keyboard media are LOCAL uris, so we
+  // upload first, then post it as a sticker/gif. The optimistic bubble, rendering,
+  // offline queue, and auto-retry-on-reconnect (via retryPendingMedia) are all
+  // shared with the picker path — no duplicate rendering/queue logic.
+  const sendKeyboardMediaAsSticker = async (file: KeyboardMediaFile) => {
+    if (!selectedTeamMember || !effectiveUser?.email) {
+      return;
+    }
+    const kind: 'gif' | 'sticker' = file.mimeType === 'image/gif' ? 'gif' : 'sticker';
+    const tempId = generatePendingId('pm');
+    const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
+    const nameOrTitle = file.fileName || (kind === 'gif' ? 'GIF' : 'Sticker');
+
+    // Web: stash the raw Blob so the upload doesn't rely on a revocable object URL.
+    if (file.webFile) {
+      keyboardMediaBlobRef.current.set(tempId, file.webFile);
+    }
+
+    setPendingMedia(prev => new Map(prev).set(tempId, {
+      id: tempId,
+      kind,
+      previewUri: file.uri,
+      nameOrTitle,
+      timestamp: new Date().toISOString(),
+      recipientId: selectedTeamMember.id,
+      sender: effectiveUser.email,
+      replyTo: activeReplyContext,
+      status: isOffline ? 'queued' : 'sending',
+      source: 'keyboard',
+      mime: file.mimeType,
+      progress: 0,
+    }));
+
+    // Snap to the bottom immediately so the sender sees the bubble land, matching
+    // the instant text/sticker behaviour.
+    clearNewMessageDivider();
+    clearUnreadDivider();
+    scheduleScrollToBottom({ animated: true, immediate: true });
+
+    // Offline: leave it 'queued' (not 'failed') — the auto-retry-on-reconnect
+    // effect resends it through retryPendingMedia, which uploads the local uri
+    // (reusing the stashed Blob on web) then posts the sticker/gif.
+    if (isOffline) {
+      Toast.show({
+        type: 'info',
+        text1: kind === 'gif' ? 'GIF Queued' : 'Sticker Queued',
+        text2: 'You are offline. It will be sent when you reconnect.',
+        position: 'top',
+      });
+      return;
+    }
+
+    try {
+      const { url } = await chatService.uploadFile(
+        file.uri,
+        file.fileName,
+        file.mimeType,
+        {
+          senderEmail: effectiveUser.email,
+          recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
+        },
+        (progress) => {
+          setPendingMedia(prev => {
+            const next = new Map(prev);
+            const cur = next.get(tempId);
+            if (cur && cur.status === 'sending') {
+              next.set(tempId, { ...cur, progress });
+            }
+            return next;
+          });
+        },
+        undefined,
+        keyboardMediaBlobRef.current.get(tempId),
+      );
+
+      // Warm the local cache so message reconciliation doesn't re-download it.
+      void chatCacheService.getMediaForDownload(url, nameOrTitle, undefined, 'low').catch(() => undefined);
+
+      const serverMessageId = kind === 'gif'
+        ? await sendGif({ url, source: 'keyboard' } as any, selectedTeamMember.id, { replyTo: activeReplyContext })
+        : await sendSticker({ url, name: nameOrTitle, pack: 'keyboard' } as any, selectedTeamMember.id, { replyTo: activeReplyContext });
+
+      keyboardMediaBlobRef.current.delete(tempId);
+      setPendingMedia(prev => {
+        const next = new Map(prev);
+        const cur = next.get(tempId);
+        if (cur) {
+          next.set(tempId, { ...cur, status: 'sent', serverMessageId, progress: 100 });
+        }
+        return next;
+      });
+
+      if (activeReplyContext) {
+        setReplyingToMessage((current) =>
+          current && current.messageId === activeReplyContext.messageId ? null : current
+        );
+      }
+
+      if (isAtBottomRef.current) {
+        scheduleScrollToBottom();
+      } else {
+        setShowScrollToBottomSafely(true);
+        incrementUnseenCount();
+      }
+    } catch (error) {
+      // Keep the stashed Blob so a manual/auto retry can re-upload it. Mark the
+      // bubble 'failed' so the user can tap to retry (same affordance as picker
+      // media / attachments).
+      setPendingMedia(prev => {
+        const cur = prev.get(tempId);
+        if (!cur) return prev;
+        const next = new Map(prev);
+        next.set(tempId, { ...cur, status: 'failed', progress: 0 });
+        return next;
+      });
+
+      if (error instanceof ChatRateLimitError) {
+        const waitSeconds = Math.max(1, Math.ceil(Math.max(0, error.retryAfterMs || 0) / 1000));
+        Toast.show({
+          type: 'error',
+          text1: 'Too Many Messages',
+          text2: `Please wait ${waitSeconds}s before sending another ${kind}.`,
+          position: 'top',
+        });
+      } else {
+        logger.error('Error sending keyboard media:', error);
+        Toast.show({
+          type: 'error',
+          text1: 'Send Failed',
+          text2: `Couldn't send that ${kind}. Tap it below to retry.`,
+          position: 'top',
+        });
+      }
+    }
+  };
+  // Keep the ref pointing at the latest closure so the stable handleKeyboardMedia
+  // callback (declared earlier) always invokes the current send logic.
+  useEffect(() => {
+    sendKeyboardMediaAsStickerRef.current = sendKeyboardMediaAsSticker;
+  });
+
   // Check if a file URL is accessible (for web platform)
   const checkFileAvailability = async (fileUrl: string) => {
     if (Platform.OS !== 'web') return 'ok';
@@ -9704,7 +9893,9 @@ export default function Chat() {
               }
               return next;
             });
-          }
+          },
+          undefined,
+          keyboardMediaBlobRef.current.get(tempId),
         );
         finalUrl = url;
       }
@@ -9751,6 +9942,7 @@ export default function Chat() {
           return next;
         });
       }
+      keyboardMediaBlobRef.current.delete(tempId);
       return true;
     } catch (err) {
       logger.error('Retry send failed:', err);
@@ -11538,6 +11730,9 @@ export default function Chat() {
       }
 
       if (mediaIdsToRemove.length > 0) {
+        // Release any retained keyboard-paste Blobs (web) so canceling a queued
+        // sticker/gif doesn't leak the object reference.
+        mediaIdsToRemove.forEach((id) => keyboardMediaBlobRef.current.delete(id));
         setPendingMedia((prev) => resolveChatPendingMapAfterRemovingIds(prev, mediaIdsToRemove));
       }
 
@@ -13384,6 +13579,7 @@ export default function Chat() {
         cancelEditingMessage={cancelEditingMessage}
         handleEditLastOwnMessageShortcut={handleEditLastOwnMessageShortcut}
         mobileInputRef={mobileInputRef}
+        onKeyboardMedia={handleKeyboardMedia}
         openAttachmentModal={openAttachmentModal}
         openStickerGifPicker={openStickerGifPicker}
         isComposingSpecial={isComposingSpecial}

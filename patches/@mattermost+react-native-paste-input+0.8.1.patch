@@ -1,0 +1,155 @@
+diff --git a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/IPasteInputListener.kt b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/IPasteInputListener.kt
+index b1a8533..85039bb 100644
+--- a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/IPasteInputListener.kt
++++ b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/IPasteInputListener.kt
+@@ -4,5 +4,5 @@ import android.net.Uri
+ import com.facebook.react.uimanager.events.EventDispatcher
+ 
+ interface IPasteInputListener {
+-  fun onPaste(itemUri: Uri, eventDispatcher: EventDispatcher?)
++  fun onPaste(itemUri: Uri, eventDispatcher: EventDispatcher?, source: String)
+ }
+diff --git a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputActionCallback.kt b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputActionCallback.kt
+index 9e60bd9..8314e89 100644
+--- a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputActionCallback.kt
++++ b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputActionCallback.kt
+@@ -29,7 +29,9 @@ class PasteInputActionCallback(editText: PasteInputEditText, disabled: Boolean,
+   override fun onActionItemClicked(mode: ActionMode?, item: MenuItem?): Boolean {
+     val uri = getUriInClipboard()
+     if (item?.itemId == android.R.id.paste && uri != null) {
+-      mEditText.getOnPasteListener().onPaste(uri, mEventDispatcher)
++      // Media pasted from the OS clipboard — tag "clipboard" so JS shows the
++      // normal media preview instead of an immediate sticker/gif send.
++      mEditText.getOnPasteListener().onPaste(uri, mEventDispatcher, "clipboard")
+       mode?.finish()
+     } else {
+       mEditText.onTextContextMenuItem(item!!.itemId)
+diff --git a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputEditText.kt b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputEditText.kt
+index 1794b53..66e565a 100644
+--- a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputEditText.kt
++++ b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputEditText.kt
+@@ -49,7 +49,9 @@ class PasteInputEditText(context: ThemedReactContext) : ReactEditText(context) {
+       }
+ 
+       if (!mDisabledCopyPaste) {
+-        getOnPasteListener().onPaste(inputContentInfo.contentUri, mPasteEventDispatcher)
++        // Rich content committed by the soft keyboard (GIF button / sticker
++        // keyboards) — tag "keyboard" so JS can send it immediately as a sticker/gif.
++        getOnPasteListener().onPaste(inputContentInfo.contentUri, mPasteEventDispatcher, "keyboard")
+       }
+ 
+       true
+diff --git a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputFileFromUrl.kt b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputFileFromUrl.kt
+index 83c9e05..ba44e01 100644
+--- a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputFileFromUrl.kt
++++ b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputFileFromUrl.kt
+@@ -8,11 +8,12 @@ import com.facebook.react.views.textinput.ReactEditText
+ import java.io.IOException
+ import java.net.URL
+ 
+-class PasteInputFileFromUrl(target: ReactEditText, uri: String, surfaceId: Int, eventDispatcher: EventDispatcher?): Runnable {
++class PasteInputFileFromUrl(target: ReactEditText, uri: String, surfaceId: Int, eventDispatcher: EventDispatcher?, source: String): Runnable {
+   private val mTarget = target
+   private val mUri = uri
+   private val mEventDispatcher = eventDispatcher
+   private val mSurfaceId = surfaceId
++  private val mSource = source
+ 
+   override fun run() {
+     var files: WritableArray? = null
+@@ -44,6 +45,7 @@ class PasteInputFileFromUrl(target: ReactEditText, uri: String, surfaceId: Int,
+     val event = Arguments.createMap()
+     event.putArray("data", files)
+     event.putMap("error", error)
++    event.putString("source", mSource)
+ 
+     mEventDispatcher?.dispatchEvent(PasteTextInputPasteEvent(mSurfaceId, mTarget.id, event))
+   }
+diff --git a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputListener.kt b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputListener.kt
+index 9afe1f0..373e2cd 100644
+--- a/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputListener.kt
++++ b/node_modules/@mattermost/react-native-paste-input/android/src/main/java/com/mattermost/pasteinputtext/PasteInputListener.kt
+@@ -17,7 +17,7 @@ class PasteInputListener(editText: PasteInputEditText, surfaceId: Int) : IPasteI
+   private val mEditText = editText
+   private val mSurfaceId = surfaceId
+ 
+-  override fun onPaste(itemUri: Uri, eventDispatcher: EventDispatcher?) {
++  override fun onPaste(itemUri: Uri, eventDispatcher: EventDispatcher?, source: String) {
+     val reactContext = mEditText.context as ReactContext
+     reactContext.contentResolver.getType(itemUri) ?: return
+ 
+@@ -44,7 +44,8 @@ class PasteInputListener(editText: PasteInputEditText, surfaceId: Int) : IPasteI
+         mEditText,
+         uriString,
+         mSurfaceId,
+-        eventDispatcher
++        eventDispatcher,
++        source
+       ))
+       pastImageFromUrlThread.start()
+       return
+@@ -78,6 +79,7 @@ class PasteInputListener(editText: PasteInputEditText, surfaceId: Int) : IPasteI
+     val event = Arguments.createMap()
+     event.putArray("data", files)
+     event.putMap("error", error)
++    event.putString("source", source)
+ 
+     eventDispatcher?.dispatchEvent(PasteTextInputPasteEvent(mSurfaceId, mEditText.id, event))
+   }
+diff --git a/node_modules/@mattermost/react-native-paste-input/src/PasteTextInput.tsx b/node_modules/@mattermost/react-native-paste-input/src/PasteTextInput.tsx
+index efb6dab..576620e 100644
+--- a/node_modules/@mattermost/react-native-paste-input/src/PasteTextInput.tsx
++++ b/node_modules/@mattermost/react-native-paste-input/src/PasteTextInput.tsx
+@@ -254,8 +254,15 @@ function InternalTextInput(props: PasteInputProps): React.ReactNode {
+ 
+     const _onPaste = (event: PasteEvent) => {
+         if (props.onPaste) {
+-            const { data, error } = event.nativeEvent;
+-            props.onPaste(error?.message, data);
++            const { data, error, source } = event.nativeEvent;
++            // Propagate the native paste origin ("keyboard" for soft-keyboard
++            // commitContent, "clipboard" for OS clipboard paste) by tagging each
++            // file, so consumers can distinguish stickers/GIFs from pasted media.
++            const files =
++                source && Array.isArray(data)
++                    ? data.map((file) => ({ ...file, source }))
++                    : data;
++            props.onPaste(error?.message, files);
+         }
+     };
+ 
+diff --git a/node_modules/@mattermost/react-native-paste-input/src/PasteTextInputNativeComponent.ts b/node_modules/@mattermost/react-native-paste-input/src/PasteTextInputNativeComponent.ts
+index a111ff1..f44685f 100644
+--- a/node_modules/@mattermost/react-native-paste-input/src/PasteTextInputNativeComponent.ts
++++ b/node_modules/@mattermost/react-native-paste-input/src/PasteTextInputNativeComponent.ts
+@@ -26,6 +26,9 @@ export interface PasteTextInputPasteEventData {
+     error?: Readonly<{
+         message: string;
+     }>;
++    // Android: "keyboard" for soft-keyboard commitContent (GIF/sticker buttons),
++    // "clipboard" for OS clipboard paste. Absent on iOS.
++    source?: string;
+ }
+ 
+ export type TargetedEvent = {
+diff --git a/node_modules/@mattermost/react-native-paste-input/src/types.ts b/node_modules/@mattermost/react-native-paste-input/src/types.ts
+index 0f312f2..dea8657 100644
+--- a/node_modules/@mattermost/react-native-paste-input/src/types.ts
++++ b/node_modules/@mattermost/react-native-paste-input/src/types.ts
+@@ -16,6 +16,8 @@ export interface PastedFile {
+     fileSize: Int32;
+     type: string;
+     uri: string;
++    // Android paste origin: "keyboard" (commitContent) or "clipboard". Absent on iOS.
++    source?: string;
+ }
+ 
+ export interface PasteEvent {
+@@ -24,6 +26,7 @@ export interface PasteEvent {
+         error?: {
+             message: string;
+         };
++        source?: string;
+     };
+ }
+ 

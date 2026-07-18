@@ -1,5 +1,5 @@
 import { logger } from '@/lib/logger';
-import React, { useState, useRef, useCallback, forwardRef, useImperativeHandle, memo, useMemo, useEffect } from 'react';
+import { useState, useRef, useCallback, forwardRef, useImperativeHandle, memo, useMemo, useEffect } from 'react';
 import {
   View,
   Text,
@@ -24,6 +24,8 @@ import {
 import { useTheme } from '../hooks/useTheme';
 import { resolveChatInputKeyboardCommand } from '../lib/chatInputKeyboardCommands';
 import StyledText from './StyledText';
+import type { KeyboardMediaCandidate } from '../lib/chatKeyboardMediaSend';
+import { PasteableTextInput } from './chat/PasteableTextInput';
 
 export interface MobileChatInputRef {
   clearInput: () => void;
@@ -74,6 +76,13 @@ interface MobileChatInputProps {
   showCharacterCount?: boolean;
   isSendingMessage: boolean;
   canSend?: boolean;
+  /**
+   * Fired when the user pastes/inserts media (image or video) via the keyboard
+   * or clipboard while the composer is focused. Currently sourced from the web
+   * clipboard `paste` event; a native `commitContent` bridge could feed the same
+   * callback later. The parent is responsible for validating + sending.
+   */
+  onKeyboardMedia?: (candidate: KeyboardMediaCandidate) => void;
 }
 
 const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputProps>(function MobileChatInput({
@@ -97,10 +106,12 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
   showCharacterCount = true,
   isSendingMessage,
   canSend = true,
+  onKeyboardMedia,
 }, ref) {
   const { theme } = useTheme();
   const { width } = useWindowDimensions();
   const textInputRef = useRef<TextInput>(null);
+  const isFocusedRef = useRef(false);
   const lastReportedInputHeightRef = useRef(COMPOSER_MIN_INPUT_HEIGHT);
   const [inputHeight, setInputHeight] = useState(COMPOSER_MIN_INPUT_HEIGHT);
   const isSmallScreen = width < 560;
@@ -147,6 +158,57 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
       if (__DEV__) logger.debug('MobileChatInput: syncNativeValue failed', { error });
     }
   }, []);
+
+  const handleInputFocus = useCallback(() => {
+    isFocusedRef.current = true;
+  }, []);
+
+  const handleInputBlur = useCallback(() => {
+    isFocusedRef.current = false;
+    onInputBlur?.();
+  }, [onInputBlur]);
+
+  // Web only: allow pasting an image/video (a GIF from the OS clipboard, a copied
+  // screenshot, etc.) directly into the composer. We extract the first media item
+  // from the clipboard and hand it to the parent for validation + send. Guarded by
+  // focus so a paste elsewhere on the page never hijacks the chat input, and by
+  // preventDefault so the browser doesn't also dump the binary into the text field.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined' || !onKeyboardMedia) {
+      return;
+    }
+    const handlePaste = (event: Event) => {
+      if (!isFocusedRef.current) return;
+      const clipboardData = (event as unknown as { clipboardData?: DataTransfer }).clipboardData;
+      const items = clipboardData?.items;
+      if (!items || items.length === 0) return;
+      for (let i = 0; i < items.length; i += 1) {
+        const item = items[i];
+        if (item.kind !== 'file') continue;
+        const type = (item.type || '').toLowerCase();
+        if (!type.startsWith('image/') && !type.startsWith('video/')) continue;
+        const file = item.getAsFile();
+        if (!file) continue;
+        event.preventDefault();
+        let objectUrl = '';
+        try {
+          objectUrl = URL.createObjectURL(file);
+        } catch {
+          objectUrl = '';
+        }
+        onKeyboardMedia({
+          uri: objectUrl || (file as { name?: string }).name || '',
+          mimeType: file.type || type,
+          fileName: (file as { name?: string }).name || undefined,
+          fileSize: typeof file.size === 'number' ? file.size : undefined,
+          webFile: file,
+        });
+        break; // one media item per paste
+      }
+    };
+    document.addEventListener('paste', handlePaste);
+    return () => document.removeEventListener('paste', handlePaste);
+  }, [onKeyboardMedia]);
 
   const handleAttachmentPress = useCallback(() => {
     if (!hasSelectedTeamMember) {
@@ -283,8 +345,9 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
         </TouchableOpacity>
 
         <View style={styles.textInputContainer}>
-          <TextInput
+          <PasteableTextInput
             ref={textInputRef}
+            onKeyboardMedia={onKeyboardMedia}
             style={[
               styles.textInput,
               {
@@ -296,7 +359,8 @@ const MobileChatInputComponent = forwardRef<MobileChatInputRef, MobileChatInputP
             value={safeMessage}
             testID="chat-input-field"
             onChangeText={handleTyping}
-            onBlur={onInputBlur}
+            onFocus={handleInputFocus}
+            onBlur={handleInputBlur}
             onContentSizeChange={handleInputSizeChange}
             placeholder={generatePlaceholder()}
             placeholderTextColor={isOffline ? theme.warning : theme.textSecondary}
@@ -437,7 +501,8 @@ const areMobileChatInputPropsEqual = (prev: MobileChatInputProps, next: MobileCh
     prev.maxLength === next.maxLength &&
     prev.showCharacterCount === next.showCharacterCount &&
     prev.isSendingMessage === next.isSendingMessage &&
-    prev.canSend === next.canSend
+    prev.canSend === next.canSend &&
+    prev.onKeyboardMedia === next.onKeyboardMedia
   );
 };
 
