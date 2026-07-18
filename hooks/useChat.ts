@@ -1676,7 +1676,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
               },
             }
           : undefined,
-        options?.replyTo
+        options?.replyTo,
+        options?.clientMsgId
       );
       const notificationText = resolveChatAttachmentAutoText({
         text,
@@ -1899,7 +1900,8 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         recipientId,
         undefined,
         undefined,
-        options?.replyTo
+        options?.replyTo,
+        options?.clientMsgId
       );
       const notificationText = resolveChatAttachmentAutoText({
         text,
@@ -1949,6 +1951,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       
       const messageId = await chatService.sendSticker(sticker, user.email, recipientId, {
         replyTo: options?.replyTo,
+        clientMsgId: options?.clientMsgId,
       });
 
       const timestamp = new Date().toISOString();
@@ -1994,6 +1997,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       
       const messageId = await chatService.sendGif(gif, user.email, recipientId, {
         replyTo: options?.replyTo,
+        clientMsgId: options?.clientMsgId,
       });
 
       const timestamp = new Date().toISOString();

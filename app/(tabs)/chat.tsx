@@ -51,10 +51,17 @@ import {
   type KeyboardMediaCandidate,
   type KeyboardMediaFile,
 } from '../../lib/chatKeyboardMediaSend';
+import {
+  stageOutboxMedia,
+  removeOutboxMedia,
+  sweepOutboxOrphans,
+} from '../../lib/chatMediaStaging';
 import { getProfileImageUrl } from '../../lib/profileImage';
 import { FileDownloadUtil } from '../../lib/fileDownloadUtil';
 import {
   PendingMessage,
+  PendingMediaMessage,
+  PendingAttachmentMessage,
   PendingMessageStorage,
 } from '../../lib/pendingMessageStorage';
 import { normalizePendingMessageStatus } from '../../lib/pendingMessageState';
@@ -677,6 +684,12 @@ const ChatMessagesListShell = React.memo(function ChatMessagesListShell({
   );
 });
 
+// Rehydrates the durable media outbox + sweeps staged orphans once per app
+// launch. Module scope (not a ref) so a chat-screen remount within the same
+// launch never re-hydrates or re-sweeps (which could delete a staged file a
+// still-in-flight upload is reading). Resets only on a fresh JS context.
+let didHydrateChatOutboxThisLaunch = false;
+
 export default function Chat() {
   const { theme, isDarkMode } = useTheme();
 
@@ -833,6 +846,140 @@ export default function Chat() {
   // a ref so the (stable) handleKeyboardMedia callback can invoke it without an
   // ordering cycle (the sender is declared later, alongside the picker handlers).
   const sendKeyboardMediaAsStickerRef = useRef<((file: KeyboardMediaFile) => void) | null>(null);
+  // Gates the debounced outbox-persist effect: never persist (and thus never
+  // overwrite the prior session's saved outbox) until hydration has read it.
+  const outboxHydratedRef = useRef(false);
+
+  // Rehydrate the durable media outbox once per launch: restore persisted
+  // sticker/gif/keyboard-media sends (offline-queued or interrupted mid-send) so
+  // they resume instead of being lost, then reclaim staged files orphaned by a
+  // previous session. Status normalization on load:
+  //   • 'sent'             -> drop (the server already has it),
+  //   • 'failed'           -> keep (user retries manually),
+  //   • 'queued'/'sending' -> 'queued' so the existing auto-retry re-drives it.
+  // Re-drives are idempotent (clientMsgId), so a send that actually completed
+  // before the kill never produces a duplicate.
+  useEffect(() => {
+    if (didHydrateChatOutboxThisLaunch) {
+      return;
+    }
+    didHydrateChatOutboxThisLaunch = true;
+    let cancelled = false;
+    (async () => {
+      let persistedMedia: Map<string, PendingMediaMessage> = new Map();
+      let persistedAttachments: Map<string, PendingAttachmentMessage> = new Map();
+      try {
+        [persistedMedia, persistedAttachments] = await Promise.all([
+          PendingMessageStorage.loadPendingMediaMessages(),
+          PendingMessageStorage.loadPendingAttachmentMessages(),
+        ]);
+      } catch (error) {
+        logger.warn('Outbox hydration load failed', error);
+      }
+      if (cancelled) {
+        return;
+      }
+      // Enable persistence now that the prior session's outbox has been read.
+      outboxHydratedRef.current = true;
+
+      // Media: sent -> drop, failed -> keep, queued/sending -> queued (auto-resume).
+      const hydratedMedia = new Map<string, PendingMediaItem>();
+      for (const [id, item] of persistedMedia) {
+        if (item.status === 'sent') {
+          continue;
+        }
+        const status: PendingMediaItem['status'] = item.status === 'failed' ? 'failed' : 'queued';
+        hydratedMedia.set(id, {
+          ...(item as unknown as PendingMediaItem),
+          status,
+          progress: status === 'queued' ? 0 : item.progress,
+        });
+      }
+
+      // Attachments: same normalization ('finalizing' = interrupted -> queued).
+      const hydratedAttachments = new Map<string, PendingAttachmentItem>();
+      for (const [id, item] of persistedAttachments) {
+        if (item.status === 'sent') {
+          continue;
+        }
+        const status: PendingAttachmentItem['status'] = item.status === 'failed' ? 'failed' : 'queued';
+        hydratedAttachments.set(id, {
+          ...(item as unknown as PendingAttachmentItem),
+          status,
+          progress: status === 'queued' ? 0 : item.progress,
+          cancelable: false,
+          cancelRequested: false,
+        });
+      }
+
+      if (hydratedMedia.size > 0) {
+        setPendingMedia((prev) => {
+          const next = new Map(prev);
+          for (const [id, item] of hydratedMedia) {
+            if (!next.has(id)) {
+              next.set(id, item);
+            }
+          }
+          return next;
+        });
+      }
+      if (hydratedAttachments.size > 0) {
+        setPendingAttachments((prev) => {
+          const next = new Map(prev);
+          for (const [id, item] of hydratedAttachments) {
+            if (!next.has(id)) {
+              next.set(id, item);
+            }
+          }
+          return next;
+        });
+      }
+
+      // Reclaim staged files not owned by any resumed item. On a fresh launch no
+      // live send has started yet, so the resumed ids are the full active set.
+      void sweepOutboxOrphans(
+        new Set<string>([...hydratedMedia.keys(), ...hydratedAttachments.keys()])
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist the media + attachment outboxes (debounced) so sends survive an app
+  // kill/restart. Suppressed until hydration completes so we never clobber the
+  // saved outbox with an empty map on first render.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!outboxHydratedRef.current) {
+        return;
+      }
+      // Media has no Blobs on this path, so it serializes directly.
+      void PendingMessageStorage.savePendingMediaMessages(
+        pendingMedia as unknown as Map<string, PendingMediaMessage>
+      );
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [pendingMedia]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!outboxHydratedRef.current) {
+        return;
+      }
+      // Strip the non-serializable Blob (web) before persisting attachment files.
+      const serializable = new Map<string, PendingAttachmentMessage>();
+      for (const [id, item] of pendingAttachments) {
+        serializable.set(id, {
+          ...item,
+          files: item.files.map(({ webFile, ...rest }) => rest),
+        } as unknown as PendingAttachmentMessage);
+      }
+      void PendingMessageStorage.savePendingAttachmentMessages(serializable);
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [pendingAttachments]);
   const tenantMembersRequestIdRef = useRef(0);
   const teamMembersVisibleLoadCountRef = useRef(0);
   const tenantRosterRef = useRef<TeamMember[]>([]);
@@ -8315,6 +8462,21 @@ export default function Chat() {
       fileSize: f.fileSize || f.size,
     }));
 
+    // Capture the file list once (selectedFiles is cleared on modal reset) and,
+    // on native, copy each file into durable app storage so a queued or
+    // interrupted attachment survives an app kill and can be re-uploaded on
+    // relaunch. Best-effort: a failed/unsupported stage keeps the original uri.
+    const preparedFiles = buildPendingAttachmentFiles();
+    const stageAttachmentFilesForUpload = async () =>
+      Promise.all(
+        preparedFiles.map(async (f, index) => {
+          const name = f.fileName || 'file';
+          const ext = (name.includes('.') ? name.split('.').pop() : f.fileType.split('/')[1]) || 'bin';
+          const stagedUri = await stageOutboxMedia(`${tempId}__${index}`, f.uri, ext);
+          return stagedUri ? { ...f, uri: stagedUri } : f;
+        })
+      );
+
     // Mirror the text-message offline flow: don't attempt the upload at all
     // while offline. Mark it 'queued' (not 'failed') so it's visually
     // distinct from a real send failure and gets picked up by auto-retry once
@@ -8324,7 +8486,7 @@ export default function Chat() {
         const next = new Map(prev);
         next.set(tempId, {
           id: tempId,
-          files: buildPendingAttachmentFiles(),
+          files: preparedFiles,
           messageText: message.trim(),
           timestamp: new Date().toISOString(),
           recipientId: selectedTeamMember.id,
@@ -8351,6 +8513,21 @@ export default function Chat() {
         text2: 'You are offline. They will be sent when you reconnect.',
         position: 'top',
       });
+
+      // Stage the queued files so they survive an app kill; point the persisted
+      // bubble at the durable copies once ready (auto-retry uploads from them).
+      void stageAttachmentFilesForUpload()
+        .then((staged) => {
+          setPendingAttachments(prev => {
+            const next = new Map(prev);
+            const cur = next.get(tempId);
+            if (cur) {
+              next.set(tempId, { ...cur, files: staged });
+            }
+            return next;
+          });
+        })
+        .catch(() => undefined);
       return;
     }
 
@@ -8362,7 +8539,7 @@ export default function Chat() {
         const next = new Map(prev);
         next.set(tempId, {
           id: tempId,
-          files: buildPendingAttachmentFiles(),
+          files: preparedFiles,
           messageText: message.trim(),
           timestamp: new Date().toISOString(),
           recipientId: selectedTeamMember.id,
@@ -8384,21 +8561,17 @@ export default function Chat() {
       clearUnreadDivider();
       scheduleScrollToBottom({ animated: true, immediate: true });
 
-      // Prepare files for batch upload
-      const filesToUpload = selectedFiles.map(file => ({
-        ...(() => {
-          const candidate = (file as any)?.webFile ?? (file as any)?.file;
-          const webFile =
-            Platform.OS === 'web' && typeof Blob !== 'undefined' && candidate instanceof Blob
-              ? candidate
-              : undefined;
-          return webFile ? { webFile } : {};
-        })(),
-        uri: file.uri,
-        fileName: file.fileName || file.name || 'file',
-        fileType: file.mimeType || 'application/octet-stream',
-        fileSize: file.fileSize || file.size,
-      }));
+      // Stage onto durable storage and point the optimistic bubble at the staged
+      // copies (so a mid-upload kill can resume from them), then upload.
+      const filesToUpload = await stageAttachmentFilesForUpload();
+      setPendingAttachments(prev => {
+        const next = new Map(prev);
+        const cur = next.get(tempId);
+        if (cur) {
+          next.set(tempId, { ...cur, files: filesToUpload });
+        }
+        return next;
+      });
 
       // Upload all files in a single message with progress tracking
       const serverMessageId = await sendMessageWithFiles(
@@ -8430,6 +8603,7 @@ export default function Chat() {
             });
           },
           replyTo: activeReplyContext,
+          clientMsgId: tempId,
         }
       );
       
@@ -8457,6 +8631,13 @@ export default function Chat() {
 
       scheduleAttachmentFinalizeCleanup(tempId);
       attachmentUploadCancelMap.current.delete(tempId);
+      // The server has the files now — drop the staged copies (no-op for
+      // non-staged/original uris, e.g. web).
+      filesToUpload.forEach((f) => {
+        if (f?.uri) {
+          void removeOutboxMedia(f.uri);
+        }
+      });
       
       Toast.show({
         type: 'success',
@@ -8844,6 +9025,7 @@ export default function Chat() {
 
       const serverMessageId = await sendSticker(sticker, selectedTeamMember.id, {
         replyTo: activeReplyContext,
+        clientMsgId: tempId,
       });
       setPendingMedia(prev => {
         const next = new Map(prev);
@@ -8990,6 +9172,7 @@ export default function Chat() {
 
       const serverMessageId = await sendGif(gif, selectedTeamMember.id, {
         replyTo: activeReplyContext,
+        clientMsgId: tempId,
       });
       setPendingMedia(prev => {
         const next = new Map(prev);
@@ -9096,6 +9279,23 @@ export default function Chat() {
     clearUnreadDivider();
     scheduleScrollToBottom({ animated: true, immediate: true });
 
+    // Copy the media into app-private storage so the upload (and any retry) reads
+    // from a stable source rather than a volatile content:// / cache uri (which
+    // can be evicted or lose its read grant). Best-effort + native-only: on web
+    // or on failure we keep the original uri and fall back to the stashed Blob.
+    const stagedExt =
+      (file.fileName.includes('.') ? file.fileName.split('.').pop() : file.mimeType.split('/')[1]) || 'bin';
+    const stagedUri = await stageOutboxMedia(tempId, file.uri, stagedExt);
+    if (stagedUri) {
+      setPendingMedia(prev => {
+        const next = new Map(prev);
+        const cur = next.get(tempId);
+        if (cur) next.set(tempId, { ...cur, previewUri: stagedUri });
+        return next;
+      });
+    }
+    const uploadUri = stagedUri || file.uri;
+
     // Offline: leave it 'queued' (not 'failed') — the auto-retry-on-reconnect
     // effect resends it through retryPendingMedia, which uploads the local uri
     // (reusing the stashed Blob on web) then posts the sticker/gif.
@@ -9111,7 +9311,7 @@ export default function Chat() {
 
     try {
       const { url } = await chatService.uploadFile(
-        file.uri,
+        uploadUri,
         file.fileName,
         file.mimeType,
         {
@@ -9136,10 +9336,13 @@ export default function Chat() {
       void chatCacheService.getMediaForDownload(url, nameOrTitle, undefined, 'low').catch(() => undefined);
 
       const serverMessageId = kind === 'gif'
-        ? await sendGif({ url, source: 'keyboard' } as any, selectedTeamMember.id, { replyTo: activeReplyContext })
-        : await sendSticker({ url, name: nameOrTitle, pack: 'keyboard' } as any, selectedTeamMember.id, { replyTo: activeReplyContext });
+        ? await sendGif({ url, source: 'keyboard' } as any, selectedTeamMember.id, { replyTo: activeReplyContext, clientMsgId: tempId })
+        : await sendSticker({ url, name: nameOrTitle, pack: 'keyboard' } as any, selectedTeamMember.id, { replyTo: activeReplyContext, clientMsgId: tempId });
 
       keyboardMediaBlobRef.current.delete(tempId);
+      if (stagedUri) {
+        void removeOutboxMedia(stagedUri);
+      }
       setPendingMedia(prev => {
         const next = new Map(prev);
         const cur = next.get(tempId);
@@ -9907,7 +10110,7 @@ export default function Chat() {
         const serverMessageId = await sendGif(
           { url: finalUrl, source: item.source || 'keyboard' } as any,
           selectedTeamMember.id,
-          { replyTo: item.replyTo }
+          { replyTo: item.replyTo, clientMsgId: tempId }
         );
         setPendingMedia(prev => {
           const next = new Map(prev);
@@ -9926,7 +10129,7 @@ export default function Chat() {
         const serverMessageId = await sendSticker(
           { url: finalUrl, name: item.nameOrTitle || 'Sticker', pack: 'keyboard' } as any,
           selectedTeamMember.id,
-          { replyTo: item.replyTo }
+          { replyTo: item.replyTo, clientMsgId: tempId }
         );
         setPendingMedia(prev => {
           const next = new Map(prev);
@@ -9943,6 +10146,7 @@ export default function Chat() {
         });
       }
       keyboardMediaBlobRef.current.delete(tempId);
+      void removeOutboxMedia(item.previewUri);
       return true;
     } catch (err) {
       logger.error('Retry send failed:', err);
@@ -10032,6 +10236,7 @@ export default function Chat() {
               });
             },
             replyTo: entry.replyTo,
+            clientMsgId: tempId,
           }
         );
 
@@ -10053,6 +10258,12 @@ export default function Chat() {
 
         scheduleAttachmentFinalizeCleanup(tempId);
         attachmentUploadCancelMap.current.delete(tempId);
+        // Server has the files now — drop the staged copies (no-op for non-staged).
+        entry.files.forEach((f) => {
+          if (f?.uri) {
+            void removeOutboxMedia(f.uri);
+          }
+        });
 
         if (!options?.silent) {
           Toast.show({ type: 'success', text1: 'Files Sent', text2: 'Attachment message delivered.', position: 'top' });
@@ -11733,7 +11944,17 @@ export default function Chat() {
         // Release any retained keyboard-paste Blobs (web) so canceling a queued
         // sticker/gif doesn't leak the object reference.
         mediaIdsToRemove.forEach((id) => keyboardMediaBlobRef.current.delete(id));
-        setPendingMedia((prev) => resolveChatPendingMapAfterRemovingIds(prev, mediaIdsToRemove));
+        setPendingMedia((prev) => {
+          // Delete staged outbox files for the removed items (idempotent; a
+          // non-staged/remote previewUri is ignored by removeOutboxMedia).
+          mediaIdsToRemove.forEach((id) => {
+            const stagedPreview = prev.get(id)?.previewUri;
+            if (stagedPreview) {
+              void removeOutboxMedia(stagedPreview);
+            }
+          });
+          return resolveChatPendingMapAfterRemovingIds(prev, mediaIdsToRemove);
+        });
       }
 
       if (attachmentIdsToRemove.length > 0) {
@@ -11741,7 +11962,17 @@ export default function Chat() {
           clearAttachmentFinalizeTimer(tempId);
           attachmentUploadCancelMap.current.delete(tempId);
         });
-        setPendingAttachments((prev) => resolveChatPendingMapAfterRemovingIds(prev, attachmentIdsToRemove));
+        setPendingAttachments((prev) => {
+          // Delete staged files for the canceled attachments (idempotent).
+          attachmentIdsToRemove.forEach((id) => {
+            prev.get(id)?.files?.forEach((f) => {
+              if (f?.uri) {
+                void removeOutboxMedia(f.uri);
+              }
+            });
+          });
+          return resolveChatPendingMapAfterRemovingIds(prev, attachmentIdsToRemove);
+        });
       }
 
       Toast.show({

@@ -47,6 +47,10 @@ export interface PendingMediaMessage {
   mime?: string;
   source?: 'keyboard' | 'picker';
   progress?: number;
+  // Stable client identity for idempotent re-drive after a restart (equals the
+  // pending tempId; the backend upserts by it so a resumed send never dupes).
+  clientMsgId?: string;
+  replyTo?: PendingMessageReplyContext;
 }
 
 export interface PendingAttachmentMessage {

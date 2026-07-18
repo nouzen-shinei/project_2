@@ -3786,7 +3786,8 @@ class ChatService {
     recipientId?: string,
     onProgress?: (progress: number) => void,
     options?: UploadSessionOptions,
-    replyTo?: ChatReplyContext
+    replyTo?: ChatReplyContext,
+    clientMsgId?: string
   ): Promise<string> {
     try {
       if (files.length === 0) {
@@ -3883,6 +3884,7 @@ class ChatService {
         isSpecial: false,
         attachments,
         replyTo: normalizeChatReplyContext(replyTo),
+        clientMsgId,
       });
     } catch (error) {
       if (error instanceof ChatUploadCanceledError) {
@@ -3907,7 +3909,7 @@ class ChatService {
     },
     sender: string,
     recipientId?: string,
-    options?: { replyTo?: ChatReplyContext }
+    options?: { replyTo?: ChatReplyContext; clientMsgId?: string }
   ): Promise<string> {
     try {
       return this.sendMessage({
@@ -3916,6 +3918,7 @@ class ChatService {
         recipientId: recipientId?.toLowerCase(),
         isSpecial: false,
         replyTo: normalizeChatReplyContext(options?.replyTo),
+        clientMsgId: options?.clientMsgId,
         sticker,
       });
     } catch (error) {
@@ -3936,7 +3939,7 @@ class ChatService {
     },
     sender: string,
     recipientId?: string,
-    options?: { replyTo?: ChatReplyContext }
+    options?: { replyTo?: ChatReplyContext; clientMsgId?: string }
   ): Promise<string> {
     try {
       return this.sendMessage({
@@ -3945,6 +3948,7 @@ class ChatService {
         recipientId: recipientId?.toLowerCase(),
         isSpecial: false,
         replyTo: normalizeChatReplyContext(options?.replyTo),
+        clientMsgId: options?.clientMsgId,
         gif,
       });
     } catch (error) {
