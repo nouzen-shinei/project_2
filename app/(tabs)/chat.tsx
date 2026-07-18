@@ -10057,7 +10057,11 @@ export default function Chat() {
     }
 
     const item = pendingMedia.get(tempId);
-    if (!item || !selectedTeamMember) return false;
+    // Recipient-agnostic: drive by the item's own recipient so the app-wide
+    // resume pass can heal queued media in ANY conversation, not just the open
+    // one. For the selected conversation item.recipientId === selectedTeamMember.id,
+    // so behavior there is unchanged.
+    if (!item || !item.recipientId) return false;
     // Guard against double-dispatch: manual "Retry all" and the
     // auto-retry-on-reconnect effect share this function, so a concurrent
     // call for the same item must be a no-op rather than firing a second
@@ -10085,7 +10089,7 @@ export default function Chat() {
           uploadMime,
           {
             senderEmail: item.sender || effectiveUser?.email,
-            recipientEmail: selectedTeamMember.email || selectedTeamMember.id,
+            recipientEmail: item.recipientId,
           },
           (progress) => {
             setPendingMedia(prev => {
@@ -10109,7 +10113,7 @@ export default function Chat() {
       if (item.kind === 'gif') {
         const serverMessageId = await sendGif(
           { url: finalUrl, source: item.source || 'keyboard' } as any,
-          selectedTeamMember.id,
+          item.recipientId,
           { replyTo: item.replyTo, clientMsgId: tempId }
         );
         setPendingMedia(prev => {
@@ -10128,7 +10132,7 @@ export default function Chat() {
       } else {
         const serverMessageId = await sendSticker(
           { url: finalUrl, name: item.nameOrTitle || 'Sticker', pack: 'keyboard' } as any,
-          selectedTeamMember.id,
+          item.recipientId,
           { replyTo: item.replyTo, clientMsgId: tempId }
         );
         setPendingMedia(prev => {
@@ -10176,7 +10180,9 @@ export default function Chat() {
       }
 
       const entry = pendingAttachments.get(tempId);
-      if (!entry || !selectedTeamMember || entry.recipientId !== selectedTeamMember.id) {
+      // Recipient-agnostic (drive any conversation's queued attachment, not just
+      // the selected one). The upload + send already use entry.recipientId.
+      if (!entry || !entry.recipientId) {
         return false;
       }
 
@@ -10369,6 +10375,36 @@ export default function Chat() {
   useEffect(() => {
     retryPendingAttachmentRef.current = retryPendingAttachment;
   }, [retryPendingAttachment]);
+
+  // Device-wide resume for media/attachments: the per-conversation auto-retry
+  // (retryAllQueuedPendingSends) only heals the OPEN conversation, so a sticker/
+  // GIF/attachment queued in a DIFFERENT conversation (e.g. restored from the
+  // durable outbox after an app kill) would otherwise wait until that
+  // conversation is reopened. This pass drives every OTHER conversation's queued
+  // items whenever the app is online (and re-runs on reconnect / after
+  // hydration). The open conversation stays owned by the per-conversation retry,
+  // so the two never drive the same item; re-drives are idempotent (clientMsgId)
+  // regardless. Debounced so it settles after hydration and doesn't fire on every
+  // upload-progress tick.
+  useEffect(() => {
+    if (isOffline) {
+      return;
+    }
+    const selectedId = selectedTeamMember?.id;
+    const timer = setTimeout(() => {
+      pendingMedia.forEach((item) => {
+        if (item.status === 'queued' && item.recipientId && item.recipientId !== selectedId) {
+          void retryPendingMediaRef.current(item.id, { silent: true });
+        }
+      });
+      pendingAttachments.forEach((item) => {
+        if (item.status === 'queued' && item.recipientId && item.recipientId !== selectedId) {
+          void retryPendingAttachmentRef.current(item.id, { silent: true });
+        }
+      });
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [isOffline, pendingMedia, pendingAttachments, selectedTeamMember?.id]);
 
   const cancelPendingAttachmentRef = useRef(cancelPendingAttachment);
   useEffect(() => {
