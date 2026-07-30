@@ -222,6 +222,36 @@ export class PendingMessageStorage {
     }
   }
 
+  /**
+   * Immediately persist a single pending-media item (read-modify-write of the
+   * stored map). Used to durably record a send the instant it starts — BEFORE the
+   * upload begins — so a mid-upload crash/kill can't lose it. The debounced
+   * whole-map save is the steady-state persister; this closes the window where
+   * frequent progress-tick re-renders keep resetting that debounce so a fast send
+   * that crashes was never written to disk.
+   */
+  static async upsertPendingMediaMessage(id: string, message: PendingMediaMessage): Promise<void> {
+    try {
+      const existing = await this.loadPendingMediaMessages();
+      existing.set(id, message);
+      await this.savePendingMediaMessages(existing);
+    } catch (error) {
+      logger.error('Error upserting pending media message:', error);
+    }
+  }
+
+  /** Immediately drop a single pending-media item from durable storage (on send success). */
+  static async removePendingMediaMessage(id: string): Promise<void> {
+    try {
+      const existing = await this.loadPendingMediaMessages();
+      if (existing.delete(id)) {
+        await this.savePendingMediaMessages(existing);
+      }
+    } catch (error) {
+      logger.error('Error removing pending media message:', error);
+    }
+  }
+
   static async savePendingAttachmentMessages(messages: Map<string, PendingAttachmentMessage>): Promise<void> {
     try {
       await this.saveMap(PENDING_ATTACHMENTS_KEY, messages);
@@ -236,6 +266,42 @@ export class PendingMessageStorage {
     } catch (error) {
       logger.error('Error loading pending attachment messages:', error);
       return new Map<string, PendingAttachmentMessage>();
+    }
+  }
+
+  /**
+   * Immediately persist a single pending-attachment item (read-modify-write of the
+   * stored map). Used to durably record a background-upload attachment the instant
+   * it starts — before the upload begins — so a mid-upload crash/kill can't lose it
+   * (the debounced whole-map save is starved by progress-tick re-renders). The
+   * non-serializable `webFile` Blob is stripped, mirroring the debounced save.
+   */
+  static async upsertPendingAttachmentMessage(
+    id: string,
+    message: PendingAttachmentMessage
+  ): Promise<void> {
+    try {
+      const existing = await this.loadPendingAttachmentMessages();
+      const sanitized = {
+        ...message,
+        files: (message.files || []).map(({ webFile, ...rest }: any) => rest),
+      } as PendingAttachmentMessage;
+      existing.set(id, sanitized);
+      await this.savePendingAttachmentMessages(existing);
+    } catch (error) {
+      logger.error('Error upserting pending attachment message:', error);
+    }
+  }
+
+  /** Immediately drop a single pending-attachment item from durable storage (on success). */
+  static async removePendingAttachmentMessage(id: string): Promise<void> {
+    try {
+      const existing = await this.loadPendingAttachmentMessages();
+      if (existing.delete(id)) {
+        await this.savePendingAttachmentMessages(existing);
+      }
+    } catch (error) {
+      logger.error('Error removing pending attachment message:', error);
     }
   }
 

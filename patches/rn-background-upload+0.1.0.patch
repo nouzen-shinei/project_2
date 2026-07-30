@@ -1,0 +1,35 @@
+diff --git a/node_modules/rn-background-upload/src/NativeBackgroundUpload.ts b/node_modules/rn-background-upload/src/NativeBackgroundUpload.ts
+index f4675b7..59d6023 100644
+--- a/node_modules/rn-background-upload/src/NativeBackgroundUpload.ts
++++ b/node_modules/rn-background-upload/src/NativeBackgroundUpload.ts
+@@ -1,6 +1,5 @@
+-import type { CodegenTypes } from 'react-native';
+ import { TurboModuleRegistry, type TurboModule } from 'react-native';
+-// import type { EventEmitter } from 'react-native/Libraries/Types/CodegenTypes';
++import type { EventEmitter } from 'react-native/Libraries/Types/CodegenTypes';
+ 
+ export type NotificationArgs = {
+   enabled: boolean;
+@@ -63,14 +62,14 @@ export interface Spec extends TurboModule {
+   addListener(eventName: string): void;
+   removeListeners(count: number): void;
+ 
+-  // NEW ARCHITECTURE WAY:
+-  // Codegen will create 'emitOnProgress' in your native base class
+-  readonly onProgress: CodegenTypes.EventEmitter<UploadProgressEvent>;
+-  // ✅ ALL events must use EventEmitter syntax:
+-  //  readonly onProgress: CodegenTypes.EventEmitter<UploadProgressEvent>;
+-  readonly onCompleted: CodegenTypes.EventEmitter<UploadCompletedEvent>;
+-  readonly onError: CodegenTypes.EventEmitter<UploadErrorEvent>;
+-  readonly onCancelled: CodegenTypes.EventEmitter<UploadCancelledEvent>;
++  // Event emitters. RN 0.79 codegen requires the DIRECTLY-imported `EventEmitter`
++  // type (from react-native/Libraries/Types/CodegenTypes); the qualified
++  // `CodegenTypes.EventEmitter<...>` form is parsed as a plain TSTypeReference and
++  // rejected ("must only contain FunctionTypeAnnotation's or nullable EventEmitter").
++  readonly onProgress: EventEmitter<UploadProgressEvent>;
++  readonly onCompleted: EventEmitter<UploadCompletedEvent>;
++  readonly onError: EventEmitter<UploadErrorEvent>;
++  readonly onCancelled: EventEmitter<UploadCancelledEvent>;
+ }
+ 
+ export default TurboModuleRegistry.getEnforcing<Spec>('BackgroundUpload');

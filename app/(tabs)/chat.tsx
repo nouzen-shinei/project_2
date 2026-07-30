@@ -51,11 +51,19 @@ import {
   type KeyboardMediaCandidate,
   type KeyboardMediaFile,
 } from '../../lib/chatKeyboardMediaSend';
+import { resolveChatAttachmentAutoText } from '../../lib/chatAttachmentMessage';
 import {
   stageOutboxMedia,
   removeOutboxMedia,
   sweepOutboxOrphans,
+  localMediaExists,
+  isMediaStagingSupported,
 } from '../../lib/chatMediaStaging';
+import {
+  isBackgroundUploadEnabled,
+  startChatBackgroundUpload,
+  cancelChatBackgroundUpload,
+} from '../../lib/chatBackgroundUpload';
 import { getProfileImageUrl } from '../../lib/profileImage';
 import { FileDownloadUtil } from '../../lib/fileDownloadUtil';
 import {
@@ -8447,6 +8455,9 @@ export default function Chat() {
     const activeReplyContext = replyingToMessage ? { ...replyingToMessage } : undefined;
 
     const tempId = generatePendingId('pa');
+    // When the send is handed to the native background uploader it outlives this
+    // function, so the finally block must NOT tear down its cancel registration.
+    let backgroundUploadStarted = false;
     const buildPendingAttachmentFiles = () => selectedFiles.map(f => ({
       ...(() => {
         const candidate = (f as any)?.webFile ?? (f as any)?.file;
@@ -8573,6 +8584,154 @@ export default function Chat() {
         return next;
       });
 
+      // Phase 2 — single-file attachments upload in the background (kill-safe),
+      // reusing the proven sticker/gif transport (one file -> one message created
+      // server-side, idempotent by clientMsgId). A multi-file send is ONE message
+      // with N files, which the single-file background endpoint can't reproduce,
+      // so only single-file sends take this path; multi-file falls through to the
+      // durable foreground path below. Gated on the app being foreground/active
+      // (Android 12 foreground-service start restriction) with transparent fallback.
+      // Reply context isn't carried by the background-upload message-create path,
+      // so a reply falls through to the foreground path (which preserves replyTo).
+      const singleBgFile = filesToUpload.length === 1 ? filesToUpload[0] : null;
+      if (
+        singleBgFile &&
+        !singleBgFile.webFile &&
+        !activeReplyContext &&
+        effectiveUser?.email &&
+        isMediaStagingSupported() &&
+        isBackgroundUploadEnabled() &&
+        AppState.currentState === 'active'
+      ) {
+        try {
+          const senderEmail = effectiveUser.email;
+          const attachmentText = resolveChatAttachmentAutoText({
+            text: message.trim(),
+            files: filesToUpload,
+          });
+          const request = await chatService.buildChatBackgroundUploadRequest({
+            fileName: singleBgFile.fileName,
+            fileType: singleBgFile.fileType,
+            senderEmail,
+            recipientEmail: selectedTeamMember.id,
+            mediaKind: 'attachment',
+            clientMsgId: tempId,
+            text: attachmentText || undefined,
+          });
+
+          // Durably record BEFORE starting so a crash/kill mid-upload can't lose it
+          // (the debounced whole-map save is starved by progress-tick re-renders).
+          // Hydration re-drives it on relaunch, idempotent by clientMsgId (= tempId).
+          void PendingMessageStorage.upsertPendingAttachmentMessage(tempId, {
+            id: tempId,
+            files: filesToUpload,
+            messageText: message.trim(),
+            timestamp: new Date().toISOString(),
+            recipientId: selectedTeamMember.id,
+            sender: senderEmail,
+            status: 'sending',
+            progress: 0,
+          } as unknown as PendingAttachmentMessage);
+
+          // Wire the bubble's cancel button to the native background upload BEFORE
+          // starting, so a fast completion can't race an un-registered cancel.
+          attachmentUploadCancelMap.current.set(tempId, async () => {
+            await cancelChatBackgroundUpload(tempId);
+          });
+          setPendingAttachments(prev => {
+            const next = new Map(prev);
+            const cur = next.get(tempId);
+            if (cur) {
+              next.set(tempId, { ...cur, cancelable: true, cancelRequested: false });
+            }
+            return next;
+          });
+
+          let unsubscribe: () => void = () => {};
+          const finalizeBgAttachment = (status: 'finalizing' | 'failed', serverMessageId?: string) => {
+            setPendingAttachments(prev => {
+              const next = new Map(prev);
+              const cur = next.get(tempId);
+              if (cur) {
+                next.set(
+                  tempId,
+                  status === 'finalizing'
+                    ? { ...cur, status: 'finalizing', progress: 100, cancelable: false, cancelRequested: false, serverMessageId }
+                    : { ...cur, status: 'failed', progress: 0, cancelable: false, cancelRequested: false, failureReason: 'error' }
+                );
+              }
+              return next;
+            });
+            attachmentUploadCancelMap.current.delete(tempId);
+            if (status === 'finalizing') {
+              void PendingMessageStorage.removePendingAttachmentMessage(tempId);
+              filesToUpload.forEach((f) => {
+                if (f?.uri) {
+                  void removeOutboxMedia(f.uri);
+                }
+              });
+              scheduleAttachmentFinalizeCleanup(tempId);
+            }
+            unsubscribe();
+          };
+
+          const started = await startChatBackgroundUpload({
+            uploadId: tempId,
+            filePath: singleBgFile.uri,
+            url: request.url,
+            headers: request.headers,
+            handlers: {
+              onProgress: (progress) => {
+                setPendingAttachments(prev => {
+                  const next = new Map(prev);
+                  const cur = next.get(tempId);
+                  if (cur && cur.status === 'sending') {
+                    next.set(tempId, { ...cur, progress });
+                  }
+                  return next;
+                });
+              },
+              onCompleted: (event) => {
+                if (event.responseCode >= 200 && event.responseCode < 300) {
+                  let serverMessageId: string | undefined;
+                  try {
+                    serverMessageId = JSON.parse(event.responseBody)?.messageId;
+                  } catch {
+                    // no id in body — the message still exists server-side (createMessage)
+                  }
+                  finalizeBgAttachment('finalizing', serverMessageId);
+                } else {
+                  logger.warn('[chat] background attachment upload non-2xx', { code: event.responseCode });
+                  finalizeBgAttachment('failed');
+                }
+              },
+              onError: (event) => {
+                logger.warn('[chat] background attachment upload error', event.error);
+                finalizeBgAttachment('failed');
+              },
+              onCancelled: () => {
+                finalizeBgAttachment('failed');
+              },
+            },
+          });
+          unsubscribe = started.unsubscribe;
+
+          clearInputField();
+          resetFilePreviewModal();
+          Toast.show({
+            type: 'success',
+            text1: 'Sending File',
+            text2: 'Uploading in the background.',
+            position: 'top',
+          });
+          backgroundUploadStarted = true;
+          return; // upload events reconcile the bubble; foreground path skipped
+        } catch (bgError) {
+          logger.warn('[chat] background attachment start failed; using foreground path', bgError);
+          // fall through to the foreground upload path
+        }
+      }
+
       // Upload all files in a single message with progress tracking
       const serverMessageId = await sendMessageWithFiles(
         message.trim(), // Send the message text with all files
@@ -8695,7 +8854,11 @@ export default function Chat() {
         });
       }
     } finally {
-      attachmentUploadCancelMap.current.delete(tempId);
+      // Keep the cancel registration alive for an in-flight background upload; it
+      // reconciles via events after this function returns and owns its own cleanup.
+      if (!backgroundUploadStarted) {
+        attachmentUploadCancelMap.current.delete(tempId);
+      }
       setIsUploading(false);
       setUploadProgress(0);
     }
@@ -9296,6 +9459,31 @@ export default function Chat() {
     }
     const uploadUri = stagedUri || file.uri;
 
+    // Durably persist this send RIGHT NOW — before any upload starts — so a crash
+    // or kill mid-upload can never lose it. The debounced whole-map outbox save is
+    // easily starved by the frequent progress-tick re-renders (each resets its
+    // 800ms timer), which is exactly how an in-flight sticker was lost when the
+    // foreground-service crash hit. This targeted write guarantees the item is on
+    // disk; hydration re-drives it on next launch, idempotent by clientMsgId so a
+    // send that actually completed never duplicates. Native only (no Blob here).
+    if (isMediaStagingSupported()) {
+      void PendingMessageStorage.upsertPendingMediaMessage(tempId, {
+        id: tempId,
+        kind,
+        previewUri: uploadUri,
+        nameOrTitle,
+        timestamp: new Date().toISOString(),
+        recipientId: selectedTeamMember.id,
+        sender: effectiveUser.email,
+        status: isOffline ? 'queued' : 'sending',
+        source: 'keyboard',
+        mime: file.mimeType,
+        progress: 0,
+        clientMsgId: tempId,
+        replyTo: activeReplyContext as unknown as PendingMediaMessage['replyTo'],
+      });
+    }
+
     // Offline: leave it 'queued' (not 'failed') — the auto-retry-on-reconnect
     // effect resends it through retryPendingMedia, which uploads the local uri
     // (reusing the stashed Blob on web) then posts the sticker/gif.
@@ -9307,6 +9495,120 @@ export default function Chat() {
         position: 'top',
       });
       return;
+    }
+
+    // Phase 2 — true background transfer (opt-in via EXPO_PUBLIC_ENABLE_BG_UPLOAD).
+    // Hand the staged file to the native background uploader, which POSTs it to
+    // /storage/upload?createMessage=1 so the transfer finishes AND the message is
+    // created server-side even if the app is killed mid-upload (idempotent by the
+    // clientMsgId = tempId). The optimistic bubble is reconciled from the upload
+    // events while the app is alive; if it dies, the server-created message loads
+    // normally on next launch and the durable outbox is the backstop. Any failure
+    // to START the background upload falls through to the foreground path below.
+    //
+    // Only START the native background upload while the app is foreground/active.
+    // gotev's UploadService is a foreground service; on Android 12+ starting one
+    // while the app is in the background throws ForegroundServiceStartNotAllowedException
+    // (an uncatchable native crash). Starting it while active gives the OS a grace
+    // window so the transfer safely continues after the app is later backgrounded.
+    // If not active, fall through to the foreground upload; either way the durable
+    // record persisted above guarantees resume-on-relaunch.
+    //
+    // Reply context isn't carried by the background-upload message-create path, so
+    // a reply falls through to the foreground path (which preserves replyTo).
+    const canStartForegroundService = AppState.currentState === 'active';
+    if (isBackgroundUploadEnabled() && canStartForegroundService && !activeReplyContext) {
+      try {
+        const request = await chatService.buildChatBackgroundUploadRequest({
+          fileName: file.fileName,
+          fileType: file.mimeType,
+          senderEmail: effectiveUser.email,
+          recipientEmail: selectedTeamMember.id,
+          mediaKind: kind,
+          clientMsgId: tempId,
+        });
+
+        let unsubscribe: () => void = () => {};
+        const finalize = (status: 'sent' | 'failed', serverMessageId?: string) => {
+          if (status === 'sent') {
+            keyboardMediaBlobRef.current.delete(tempId);
+            if (stagedUri) {
+              void removeOutboxMedia(stagedUri);
+            }
+            // Sent successfully — drop the durable record so relaunch won't re-drive it.
+            void PendingMessageStorage.removePendingMediaMessage(tempId);
+          }
+          setPendingMedia(prev => {
+            const next = new Map(prev);
+            const cur = next.get(tempId);
+            if (cur) {
+              next.set(
+                tempId,
+                status === 'sent'
+                  ? { ...cur, status: 'sent', serverMessageId, progress: 100 }
+                  : { ...cur, status: 'failed', progress: 0 }
+              );
+            }
+            return next;
+          });
+          unsubscribe();
+        };
+
+        const started = await startChatBackgroundUpload({
+          uploadId: tempId,
+          filePath: uploadUri,
+          url: request.url,
+          headers: request.headers,
+          handlers: {
+            onProgress: (progress) => {
+              setPendingMedia(prev => {
+                const next = new Map(prev);
+                const cur = next.get(tempId);
+                if (cur && cur.status === 'sending') {
+                  next.set(tempId, { ...cur, progress });
+                }
+                return next;
+              });
+            },
+            onCompleted: (event) => {
+              if (event.responseCode >= 200 && event.responseCode < 300) {
+                let serverMessageId: string | undefined;
+                try {
+                  serverMessageId = JSON.parse(event.responseBody)?.messageId;
+                } catch {
+                  // response body not JSON / no id — the message still exists
+                  // server-side (createMessage) and reconciles on next load.
+                }
+                finalize('sent', serverMessageId);
+              } else {
+                logger.warn('[chat] background upload completed non-2xx', { code: event.responseCode });
+                finalize('failed');
+              }
+            },
+            onError: (event) => {
+              logger.warn('[chat] background upload error', event.error);
+              finalize('failed');
+            },
+            onCancelled: () => {
+              finalize('failed');
+            },
+          },
+        });
+        unsubscribe = started.unsubscribe;
+
+        // No reply-context reset needed here: this branch only runs when there is
+        // no active reply (replies use the foreground path, which carries replyTo).
+        if (isAtBottomRef.current) {
+          scheduleScrollToBottom();
+        } else {
+          setShowScrollToBottomSafely(true);
+          incrementUnseenCount();
+        }
+        return;
+      } catch (bgError) {
+        logger.warn('[chat] background upload start failed; using foreground path', bgError);
+        // fall through to the foreground upload path
+      }
     }
 
     try {
@@ -9343,6 +9645,7 @@ export default function Chat() {
       if (stagedUri) {
         void removeOutboxMedia(stagedUri);
       }
+      void PendingMessageStorage.removePendingMediaMessage(tempId);
       setPendingMedia(prev => {
         const next = new Map(prev);
         const cur = next.get(tempId);
@@ -10081,6 +10384,35 @@ export default function Chat() {
       const guessedExt = (item.mime && item.mime.split('/')[1]) || (uri.split('?')[0].split('#')[0].split('.').pop() || 'bin');
       let finalUrl = uri;
       if (!isHttp) {
+        // Guard against a vanished local source. A staged outbox file can be gone
+        // by retry time (cache/dir wiped, or a copy that never actually landed);
+        // uploading it throws the "Directory doesn't exist" IOException, and because
+        // this same function powers the auto-retry-on-reconnect pass it would loop
+        // forever. Bail to 'failed' (a failed item is NOT auto-retried) so the loop
+        // stops and the user can resend. Skipped when a web Blob is stashed (that's
+        // the real source on web) or for non-file:// uris the uploader can resolve.
+        if (!keyboardMediaBlobRef.current.get(tempId)) {
+          const sourceExists = await localMediaExists(uri);
+          if (!sourceExists) {
+            logger.warn('[chat] retryPendingMedia: local source missing, marking failed', { tempId, uri });
+            setPendingMedia(prev => {
+              const cur = prev.get(tempId);
+              if (!cur) return prev;
+              const next = new Map(prev);
+              next.set(tempId, { ...cur, status: 'failed', progress: 0 });
+              return next;
+            });
+            if (!options?.silent) {
+              Toast.show({
+                type: 'error',
+                text1: 'Media Unavailable',
+                text2: 'This file is no longer available. Please resend it.',
+                position: 'top',
+              });
+            }
+            return false;
+          }
+        }
         const name = `${item.source === 'keyboard' ? 'kb' : 'pick'}_${Date.now()}.${guessedExt}`;
         const uploadMime = item.mime || (item.kind === 'gif' ? 'image/gif' : 'image/png');
         const { url } = await chatService.uploadFile(
@@ -10151,6 +10483,7 @@ export default function Chat() {
       }
       keyboardMediaBlobRef.current.delete(tempId);
       void removeOutboxMedia(item.previewUri);
+      void PendingMessageStorage.removePendingMediaMessage(tempId);
       return true;
     } catch (err) {
       logger.error('Retry send failed:', err);

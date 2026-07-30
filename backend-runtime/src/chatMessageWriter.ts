@@ -1154,6 +1154,47 @@ async function registerConversationForUsers(
   ]);
 }
 
+/**
+ * Run an RTDB `transaction` with bounded retry + jittered backoff.
+ *
+ * The conversation-summary node (`conversationSummaries/{owner}/{partner}`) is a
+ * write hotspot: every send increments the recipient's unread + rewrites
+ * `lastMessage`, and every read decrements it. Firebase RTDB aborts a transaction
+ * after ~25 internal collisions with `Error: maxretry`; under a burst (e.g. sending
+ * many stickers while the peer's read-marking runs) that limit is reached and the
+ * transaction throws. Re-attempting a *fresh* transaction after a short jittered
+ * pause lets the burst settle so the write lands, instead of the caller failing.
+ *
+ * Only `maxretry`-class contention aborts are retried; any other error propagates
+ * immediately. After the final attempt the last error is rethrown so callers that
+ * need to know (or already treat it best-effort) keep their existing behavior.
+ */
+async function runRtdbTransactionWithRetry(
+  ref: admin.database.Reference,
+  updateFn: (current: any) => any,
+  options?: { attempts?: number; label?: string }
+): Promise<Awaited<ReturnType<admin.database.Reference['transaction']>>> {
+  const maxAttempts = Math.max(1, options?.attempts ?? 4);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await ref.transaction(updateFn);
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const isContentionAbort = /maxretry/i.test(message);
+      if (!isContentionAbort || attempt === maxAttempts) {
+        throw error;
+      }
+      // Exponential backoff (50/100/200…ms) capped at 1s, plus up to 100ms jitter
+      // so concurrent callers don't resynchronize and re-collide.
+      const backoffMs = Math.min(1000, 50 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 100);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+  }
+  throw lastError;
+}
+
 async function updateConversationSummaryForMessage(
   db: admin.database.Database,
   tenantId: string,
@@ -1178,7 +1219,7 @@ async function updateConversationSummaryForMessage(
   const summaryRef = tenantChatRootRef(db, tenantId).child('conversationSummaries').child(`${ownerKey}/${partnerKey}`);
   const unreadAmount = options.unreadAmount ?? 1;
 
-  const result = await summaryRef.transaction((currentValue) => {
+  const result = await runRtdbTransactionWithRetry(summaryRef, (currentValue) => {
     const current: ConversationSummary = currentValue && typeof currentValue === 'object'
       ? {
           partnerEmail: normalizeEmail((currentValue as ConversationSummary).partnerEmail) || normalizedPartner,
@@ -2506,30 +2547,52 @@ async function reconcileOwnerConversationUnread(
     return false;
   }
 
+  // This convergence is best-effort: the messages have already been (or are being)
+  // marked read by the caller's primary path, and `trueUnread` is authoritative, so
+  // if the hot summary node is too contended to land the counter write right now
+  // (RTDB `maxretry`), we log and move on rather than failing the whole read — the
+  // next read/reconcile re-converges the badge. Retry-with-jitter first to absorb
+  // the common transient contention.
   let changed = false;
-  await summaryRef.transaction((current) => {
-    if (!current || typeof current !== 'object') {
-      return current;
-    }
-    if ((current as ConversationSummary).unreadCount === trueUnread) {
-      return current;
-    }
-    changed = true;
-    return { ...(current as ConversationSummary), unreadCount: trueUnread };
-  });
+  try {
+    await runRtdbTransactionWithRetry(summaryRef, (current) => {
+      if (!current || typeof current !== 'object') {
+        return current;
+      }
+      if ((current as ConversationSummary).unreadCount === trueUnread) {
+        return current;
+      }
+      changed = true;
+      return { ...(current as ConversationSummary), unreadCount: trueUnread };
+    }, { label: 'reconcile.summary' });
+  } catch (error) {
+    console.warn('[reconcileOwnerConversationUnread] summary counter converge skipped', {
+      tenantId,
+      conversationKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   const userConversationRef = tenantChatRootRef(db, tenantId)
     .child('userConversations')
     .child(`${ownerKey}/${conversationKey}`);
-  await userConversationRef.transaction((current) => {
-    if (!current || typeof current !== 'object') {
-      return current;
-    }
-    if ((current as Record<string, unknown>).unreadCount === trueUnread) {
-      return current;
-    }
-    return { ...(current as Record<string, unknown>), unreadCount: trueUnread };
-  });
+  try {
+    await runRtdbTransactionWithRetry(userConversationRef, (current) => {
+      if (!current || typeof current !== 'object') {
+        return current;
+      }
+      if ((current as Record<string, unknown>).unreadCount === trueUnread) {
+        return current;
+      }
+      return { ...(current as Record<string, unknown>), unreadCount: trueUnread };
+    }, { label: 'reconcile.userConversation' });
+  } catch (error) {
+    console.warn('[reconcileOwnerConversationUnread] userConversation counter converge skipped', {
+      tenantId,
+      conversationKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   return changed;
 }
@@ -2630,8 +2693,19 @@ export async function markChatConversationRead(
   }
 
   // Converge the stored counter to the true-unread value (belt-and-suspenders in
-  // case the stored count had drifted before this read).
-  await reconcileOwnerConversationUnread(db, tenantId, actorEmail, partnerEmail, conversationKey);
+  // case the stored count had drifted before this read). Best-effort: the read
+  // receipts above are the durable result of this call, so a convergence failure
+  // (e.g. transient hot-node contention) must not fail the request — the counter
+  // self-heals on the next read/reconcile.
+  try {
+    await reconcileOwnerConversationUnread(db, tenantId, actorEmail, partnerEmail, conversationKey);
+  } catch (error) {
+    console.warn('[markChatConversationRead] unread reconcile skipped', {
+      tenantId,
+      conversationKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   return {
     readMessageIds,

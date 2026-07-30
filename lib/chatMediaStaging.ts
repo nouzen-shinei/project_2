@@ -55,13 +55,23 @@ function safeIdToken(id: string): string {
 }
 
 async function ensureOutboxDir(dir: string): Promise<boolean> {
+  // Create unconditionally: makeDirectoryAsync with intermediates:true is
+  // idempotent (no throw if it already exists) and, unlike a getInfoAsync gate,
+  // can't be fooled into skipping creation by a stale "exists" result — which was
+  // leaving copyAsync writing into a non-existent directory on some devices.
   try {
-    const info = await FileSystem.getInfoAsync(dir);
-    if (!info.exists) {
-      await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-    }
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
     return true;
   } catch (error) {
+    // Tolerate "already exists"; only fail if the directory truly isn't there.
+    try {
+      const info = await FileSystem.getInfoAsync(dir);
+      if (info.exists) {
+        return true;
+      }
+    } catch {
+      // fall through
+    }
     logger.warn('[chatMediaStaging] ensureOutboxDir failed', error);
     return false;
   }
@@ -71,6 +81,36 @@ async function ensureOutboxDir(dir: string): Promise<boolean> {
 export function isStagedOutboxUri(uri?: string | null): boolean {
   const dir = outboxDir();
   return !!dir && typeof uri === 'string' && uri.startsWith(dir);
+}
+
+/**
+ * True when `uri` refers to a local file that is verified present (non-empty).
+ *
+ * Only `file://` paths (staged outbox files, cache paths) are cheaply and reliably
+ * stattable, so for any other scheme (`content://`, remote `http(s)://`), an empty
+ * uri, or on web we return `true` (assume present) and let the uploader deal with
+ * it. The guard's sole job is to catch a *known-missing* staged/local file before
+ * it triggers the "Directory doesn't exist" upload IOException — not to second-guess
+ * opaque uris the uploader can still resolve.
+ */
+export async function localMediaExists(uri?: string | null): Promise<boolean> {
+  if (!isMediaStagingSupported()) {
+    return true;
+  }
+  const value = typeof uri === 'string' ? uri.trim() : '';
+  if (!value) {
+    return true;
+  }
+  if (!value.startsWith('file://') && !isStagedOutboxUri(value)) {
+    return true;
+  }
+  try {
+    const info = await FileSystem.getInfoAsync(value, { size: true });
+    return info.exists && (info.size ?? 0) > 0;
+  } catch {
+    // A stat error shouldn't block a send — fall back to letting the upload try.
+    return true;
+  }
 }
 
 /**
@@ -110,11 +150,26 @@ export async function stageOutboxMedia(
       return null;
     }
     const dest = `${dir}${stagedFileName(id, ext)}`;
-    const existing = await FileSystem.getInfoAsync(dest);
-    if (existing.exists) {
+    const existing = await FileSystem.getInfoAsync(dest, { size: true });
+    if (existing.exists && (existing.size ?? 0) > 0) {
       return dest;
     }
     await FileSystem.copyAsync({ from: uri, to: dest });
+    // Verify the copy actually landed. On some devices copyAsync has been seen to
+    // resolve without throwing while the destination file/dir is still missing
+    // (the "Directory ... doesn't exist" upload IOException). Confirming here means
+    // a phantom staged path is never handed back to the uploader — the caller
+    // falls back to the original URI instead of failing on upload.
+    const verified = await FileSystem.getInfoAsync(dest, { size: true });
+    if (!verified.exists || (verified.size ?? 0) <= 0) {
+      logger.warn('[chatMediaStaging] stageOutboxMedia copy not verified', {
+        id,
+        dest,
+        exists: verified.exists,
+        size: verified.exists ? verified.size : undefined,
+      });
+      return null;
+    }
     return dest;
   } catch (error) {
     logger.warn('[chatMediaStaging] stageOutboxMedia failed', { id, error });

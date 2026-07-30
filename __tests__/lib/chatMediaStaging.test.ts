@@ -6,7 +6,11 @@ jest.mock('expo-file-system', () => {
   return {
     __paths: paths,
     documentDirectory: 'file:///doc/',
-    getInfoAsync: jest.fn(async (uri: string) => ({ exists: paths.has(uri), uri })),
+    // Existing files report a non-zero size so the copy-verify (size > 0) passes;
+    // missing files report exists:false. `{ size: true }` opt is accepted + ignored.
+    getInfoAsync: jest.fn(async (uri: string) =>
+      paths.has(uri) ? { exists: true, uri, size: 1 } : { exists: false, uri }
+    ),
     makeDirectoryAsync: jest.fn(async (uri: string) => {
       paths.add(uri.endsWith('/') ? uri : `${uri}/`);
     }),
@@ -41,6 +45,7 @@ import {
   stageOutboxMedia,
   removeOutboxMedia,
   sweepOutboxOrphans,
+  localMediaExists,
 } from '../../lib/chatMediaStaging';
 
 const FS = FileSystem as any;
@@ -164,5 +169,58 @@ describe('sweepOutboxOrphans', () => {
     (Platform as any).OS = 'web';
     await sweepOutboxOrphans(new Set());
     expect(FS.readDirectoryAsync).not.toHaveBeenCalled();
+  });
+});
+
+describe('stageOutboxMedia copy verification', () => {
+  it('returns null when the copy did not land (dest still missing)', async () => {
+    // Simulate copyAsync resolving without actually creating the file — the
+    // "Directory doesn't exist" class of failure the verify step guards against.
+    FS.copyAsync.mockImplementationOnce(async () => {
+      /* no-op: pretend the copy silently failed to write */
+    });
+    const staged = await stageOutboxMedia('pm_novrf', 'file:///cache/a.png', 'png');
+    expect(staged).toBeNull();
+  });
+
+  it('returns null when the copy landed but the file is empty (0 bytes)', async () => {
+    // getInfoAsync reports exists but size 0 -> treated as a failed/partial copy.
+    // Save/restore the impl since beforeEach only clears calls, not implementations.
+    const original = FS.getInfoAsync.getMockImplementation();
+    FS.getInfoAsync.mockImplementation(async (uri: string) =>
+      paths.has(uri) ? { exists: true, uri, size: 0 } : { exists: false, uri }
+    );
+    try {
+      const staged = await stageOutboxMedia('pm_empty', 'file:///cache/a.png', 'png');
+      expect(staged).toBeNull();
+    } finally {
+      FS.getInfoAsync.mockImplementation(original);
+    }
+  });
+});
+
+describe('localMediaExists', () => {
+  it('is true for a staged file that exists', async () => {
+    const staged = (await stageOutboxMedia('pm_le1', 'file:///cache/a.png', 'png'))!;
+    expect(await localMediaExists(staged)).toBe(true);
+  });
+
+  it('is false for a file:// path that does not exist', async () => {
+    expect(await localMediaExists('file:///doc/chat-outbox/gone.png')).toBe(false);
+  });
+
+  it('is true (assume present) for opaque schemes it cannot stat', async () => {
+    expect(await localMediaExists('content://media/1')).toBe(true);
+    expect(await localMediaExists('https://cdn/a.gif')).toBe(true);
+  });
+
+  it('is true for empty/undefined uris (never blocks a send)', async () => {
+    expect(await localMediaExists('')).toBe(true);
+    expect(await localMediaExists(undefined)).toBe(true);
+  });
+
+  it('is true on web (no reliable local stat)', async () => {
+    (Platform as any).OS = 'web';
+    expect(await localMediaExists('file:///cache/a.png')).toBe(true);
   });
 });

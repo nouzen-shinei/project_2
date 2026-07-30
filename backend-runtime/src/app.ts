@@ -81,6 +81,7 @@ import {
   rebuildChatSummariesForUser,
   ChatMessageActionError,
 } from './chatMessageWriter';
+import { buildBackgroundUploadChatMessageInput } from './lib/backgroundUploadMessage';
 import {
   sendTeamMembershipChangeNotification,
   sendTenantJoinRequestNotification,
@@ -13948,6 +13949,16 @@ export function createApp(options: CreateAppOptions = {}){
         feeId: z.string().optional(),
         email: z.string().optional(),
         filename: z.string().optional(),
+        // Phase 2 (kill-safe background uploads): when createMessage === '1' and
+        // purpose === 'chat', the endpoint ALSO creates the chat message after
+        // storing the file, so the message exists even if the app is killed before
+        // the (background) upload completes. Idempotent via clientMsgId. Absent on
+        // the normal foreground upload path, so existing callers are unaffected.
+        createMessage: z.string().optional(),
+        clientMsgId: z.string().trim().min(1).max(200).optional(),
+        recipientId: z.string().trim().min(1).max(320).optional(),
+        mediaKind: z.enum(['sticker', 'gif', 'attachment']).optional(),
+        messageText: z.string().max(5000).optional(),
       })
       .safeParse({
         tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
@@ -13956,6 +13967,11 @@ export function createApp(options: CreateAppOptions = {}){
         feeId: typeof req.query.feeId === 'string' ? req.query.feeId : undefined,
         email: typeof req.query.email === 'string' ? req.query.email : undefined,
         filename: typeof req.query.filename === 'string' ? req.query.filename : undefined,
+        createMessage: typeof req.query.createMessage === 'string' ? req.query.createMessage : undefined,
+        clientMsgId: typeof req.query.clientMsgId === 'string' ? req.query.clientMsgId : undefined,
+        recipientId: typeof req.query.recipientId === 'string' ? req.query.recipientId : undefined,
+        mediaKind: typeof req.query.mediaKind === 'string' ? req.query.mediaKind : undefined,
+        messageText: typeof req.query.messageText === 'string' ? req.query.messageText : undefined,
       });
 
     if (!parsed.success) {
@@ -14272,7 +14288,49 @@ export function createApp(options: CreateAppOptions = {}){
         });
       }
 
-      return res.json({ url, path: objectPath, bytes, contentType, ...(shareToken ? { shareToken } : {}) });
+      // Phase 2 (kill-safe background uploads): atomically create the chat message
+      // now that the file is stored, so a background upload that finishes while the
+      // app is killed still produces a delivered message. Idempotent by clientMsgId
+      // (sendChatMessage upserts). Best-effort + fail-open: any failure here never
+      // fails the upload response — the client's durable outbox re-drives the send
+      // idempotently on next launch, so no message is ever lost or duplicated.
+      let createdMessageId: string | undefined;
+      if (
+        parsed.data.createMessage === '1' &&
+        uploadPurpose === 'chat' &&
+        parsed.data.recipientId &&
+        req.authContext?.email
+      ) {
+        try {
+          const record = await sendChatMessage(
+            buildBackgroundUploadChatMessageInput({
+              mediaKind: parsed.data.mediaKind || 'attachment',
+              url,
+              filename,
+              contentType,
+              bytes,
+              safeExt,
+              senderEmail: req.authContext.email,
+              recipientId: parsed.data.recipientId,
+              tenantId: normalizedTenantId,
+              clientMsgId: parsed.data.clientMsgId,
+              text: parsed.data.messageText,
+            })
+          );
+          createdMessageId = record?.id;
+        } catch (error) {
+          console.warn('[storage_upload] background chat message create failed (client outbox will re-drive)', error);
+        }
+      }
+
+      return res.json({
+        url,
+        path: objectPath,
+        bytes,
+        contentType,
+        ...(shareToken ? { shareToken } : {}),
+        ...(createdMessageId ? { messageId: createdMessageId } : {}),
+      });
     } catch (error) {
       await releaseTenantStorageBytes(db, normalizedTenantId, bytes).catch(() => undefined);
       invalidateLiveCount(`storageBytes:${normalizedTenantId}`);

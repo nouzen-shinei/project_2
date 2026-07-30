@@ -7,6 +7,7 @@ import {
 } from '@/lib/chatUploadProgress';
 import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chatUploadUtils';
 import { sanitizeClientMsgId } from '@/lib/pendingId';
+import { buildBackgroundUploadUrl, type BackgroundUploadMediaKind } from '@/lib/chatBackgroundUpload';
 import { sharedFileService } from '@/services/sharedFileService';
 import { database, storage, auth } from '@/config/firebase';
 import { Alert, Platform } from 'react-native';
@@ -2893,6 +2894,54 @@ class ChatService {
     url.searchParams.set('tenantId', tenantId);
     url.searchParams.set('bytes', String(Math.max(0, Math.floor(bytes))));
     return url.toString();
+  }
+
+  /**
+   * Resolve the `/storage/upload` request (URL + auth headers) for a Phase-2
+   * background upload that ALSO creates its chat message server-side. Reuses the
+   * same base URL / tenant scope / token / conversation-folder resolution as the
+   * foreground `uploadFile`, and carries `createMessage=1` + `clientMsgId` so the
+   * server writes the message idempotently on upload completion (even if the app
+   * is killed). The actual transfer is performed by the native background uploader.
+   */
+  async buildChatBackgroundUploadRequest(params: {
+    fileName: string;
+    fileType: string;
+    senderEmail: string;
+    recipientEmail: string;
+    mediaKind: BackgroundUploadMediaKind;
+    clientMsgId: string;
+    text?: string;
+  }): Promise<{ url: string; headers: Record<string, string> }> {
+    const baseUrl = this.requireChatBackendBaseUrl();
+    const tenantId = await this.ensureTenantChatScope(params.senderEmail, params.recipientEmail);
+    internalTokenManager.setBaseUrl(baseUrl);
+    const token = await internalTokenManager.getToken(baseUrl);
+    if (!token) {
+      throw new Error('Authentication token missing. Please sign in again.');
+    }
+    const conversationFolder = resolveChatUploadFolder({
+      senderEmail: params.senderEmail,
+      recipientEmail: params.recipientEmail,
+    });
+    const sanitizedFileName = (params.fileName || 'file').replace(/[^a-zA-Z0-9.-]/g, '_') || 'file.bin';
+    const clientMsgId = sanitizeClientMsgId(params.clientMsgId) || params.clientMsgId;
+    const url = buildBackgroundUploadUrl(baseUrl, {
+      tenantId,
+      conversationFolder,
+      fileName: sanitizedFileName,
+      clientMsgId,
+      recipientId: params.recipientEmail,
+      mediaKind: params.mediaKind,
+      text: params.text,
+    });
+    return {
+      url,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': params.fileType || 'application/octet-stream',
+      },
+    };
   }
 
   private async ensureUploadPreflight(
