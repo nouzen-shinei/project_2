@@ -8,6 +8,12 @@ import {
 import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chatUploadUtils';
 import { sanitizeClientMsgId } from '@/lib/pendingId';
 import { buildBackgroundUploadUrl, type BackgroundUploadMediaKind } from '@/lib/chatBackgroundUpload';
+import {
+  UPLOAD_MAX_ATTEMPTS,
+  isTransientUploadStatus,
+  uploadRetryBackoffMs,
+  uploadRetryDelay,
+} from '@/lib/uploadRetry';
 import { sharedFileService } from '@/services/sharedFileService';
 import { database, storage, auth } from '@/config/firebase';
 import { Alert, Platform } from 'react-native';
@@ -3365,7 +3371,24 @@ class ChatService {
         await this.ensureUploadPreflight(baseUrl, tenantId, blob.size, 'chatService.uploadProfilePicture(preflight web)', token);
 
         return await new Promise<string>((resolve, reject) => {
-          let retried = false;
+          // `refreshedFor401`: one-shot token refresh per attempt (reset on a
+          // transient retry). `transientAttempt`: bounded transient-failure retries
+          // (network drop / 502-503-504), shared policy with the native path. The
+          // profilePicture object path is deterministic, so a retry overwrites — no orphan.
+          let refreshedFor401 = false;
+          let transientAttempt = 1;
+
+          const retryTransient = (): boolean => {
+            if (transientAttempt >= UPLOAD_MAX_ATTEMPTS) {
+              return false;
+            }
+            const backoff = uploadRetryBackoffMs(transientAttempt);
+            transientAttempt += 1;
+            refreshedFor401 = false; // allow a fresh 401 refresh on the retried attempt
+            void uploadRetryDelay(backoff).then(() => sendOnce(token));
+            return true;
+          };
+
           const sendOnce = async (authToken: string | null) => {
             const xhr = new XMLHttpRequest();
             xhr.open('POST', uploadUrl.toString());
@@ -3377,15 +3400,22 @@ class ChatService {
               if (!evt.lengthComputable) return;
               emitUploadProgressFromBytes(evt.loaded, evt.total);
             };
-            xhr.onerror = () => reject(new Error('upload_failed'));
+            // Network-level failure -> retry transiently if attempts remain.
+            xhr.onerror = () => {
+              if (retryTransient()) return;
+              reject(new Error('upload_failed'));
+            };
             xhr.onload = async () => {
-              if (xhr.status === 401 && !retried) {
-                retried = true;
+              if (xhr.status === 401 && !refreshedFor401) {
+                refreshedFor401 = true;
                 try {
                   await internalTokenManager.forceRefresh(baseUrl);
                 } catch {}
                 const retryToken = await internalTokenManager.getToken(baseUrl);
                 await sendOnce(retryToken ?? null);
+                return;
+              }
+              if (isTransientUploadStatus(xhr.status) && retryTransient()) {
                 return;
               }
               if (xhr.status !== 200) {
@@ -3451,34 +3481,58 @@ class ChatService {
         return await task.uploadAsync();
       };
 
-      let result = await uploadOnce(`Bearer ${token}`);
-      if (!result) {
-        throw new Error('upload_failed');
-      }
-      if (result.status === 401) {
-        await internalTokenManager.forceRefresh(baseUrl);
-        const retryToken = await internalTokenManager.getToken(baseUrl);
-        result = await uploadOnce(retryToken ? `Bearer ${retryToken}` : undefined);
-      }
+      // One full attempt including the (one-shot) 401 token refresh.
+      const runNativeAttempt = async () => {
+        let attemptResult = await uploadOnce(`Bearer ${token}`);
+        if (attemptResult && attemptResult.status === 401) {
+          await internalTokenManager.forceRefresh(baseUrl);
+          const retryToken = await internalTokenManager.getToken(baseUrl);
+          attemptResult = await uploadOnce(retryToken ? `Bearer ${retryToken}` : undefined);
+        }
+        return attemptResult;
+      };
 
-      if (!result) {
-        throw new Error('upload_failed');
-      }
+      // Retry transient failures (network drop / 502-503-504) with bounded backoff.
+      // The profile-picture object path is deterministic (email hash) so a retry
+      // overwrites the same object — no orphaned duplicate.
+      for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+        let result: Awaited<ReturnType<typeof uploadOnce>> | undefined;
+        try {
+          result = await runNativeAttempt();
+        } catch (networkError) {
+          if (attempt < UPLOAD_MAX_ATTEMPTS) {
+            await uploadRetryDelay(uploadRetryBackoffMs(attempt));
+            continue;
+          }
+          throw networkError;
+        }
 
-      if (result.status !== 200) {
-        const bodyText = typeof result.body === 'string' ? result.body : '';
-        maybeShowMaintenanceAlertFromRaw(result.status, bodyText);
-        maybeShowStorageLimitReachedAlert(bodyText, 'chatService.uploadProfilePicture(native)');
-        throw new Error(bodyText || `upload_failed_${result.status}`);
-      }
+        if (!result) {
+          throw new Error('upload_failed');
+        }
 
-      const parsed = JSON.parse((typeof result.body === 'string' ? result.body : '') || '{}');
-      const finalUrl = String(parsed.url || '');
-      if (!finalUrl) {
-        throw new Error('upload_failed_missing_url');
+        if (isTransientUploadStatus(result.status) && attempt < UPLOAD_MAX_ATTEMPTS) {
+          await uploadRetryDelay(uploadRetryBackoffMs(attempt));
+          continue;
+        }
+
+        if (result.status !== 200) {
+          const bodyText = typeof result.body === 'string' ? result.body : '';
+          maybeShowMaintenanceAlertFromRaw(result.status, bodyText);
+          maybeShowStorageLimitReachedAlert(bodyText, 'chatService.uploadProfilePicture(native)');
+          throw new Error(bodyText || `upload_failed_${result.status}`);
+        }
+
+        const parsed = JSON.parse((typeof result.body === 'string' ? result.body : '') || '{}');
+        const finalUrl = String(parsed.url || '');
+        if (!finalUrl) {
+          throw new Error('upload_failed_missing_url');
+        }
+        progressEmitter.emit(100, { force: true });
+        return finalUrl;
       }
-      progressEmitter.emit(100, { force: true });
-      return finalUrl;
+      // Unreachable: the final iteration always returns or throws.
+      throw new Error('upload_failed');
     } catch (error) {
       logger.error('Error uploading profile picture:', error);
       throw error;
