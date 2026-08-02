@@ -5,7 +5,23 @@ export type BackgroundUploadMediaKind = 'sticker' | 'gif' | 'attachment';
 export interface BuildBackgroundUploadChatMessageArgs {
   mediaKind: BackgroundUploadMediaKind;
   url: string;
+  /**
+   * The STORAGE name (the `filename` query param, sanitized). Used as the display
+   * name only when `displayName` is absent, which is what keeps every
+   * already-deployed caller byte-identical.
+   */
   filename: string;
+  /**
+   * The human-visible name, from the `displayName` query param (upload-idempotency
+   * spec). Present when the caller sends a DETERMINISTIC `filename` for the object
+   * path — the native background transport derives its filename from the send's
+   * `clientMsgId`, so without this the recipient would see `pick_pm_…_a1b2c3.jpg`
+   * instead of the file they picked.
+   *
+   * Absent/blank ⇒ `filename` is used, so this parameter cannot change the output
+   * for a caller that does not send it.
+   */
+  displayName?: string;
   contentType: string;
   bytes: number;
   safeExt: string;
@@ -37,8 +53,14 @@ export function buildBackgroundUploadChatMessageInput(
     text: args.text || '',
   };
 
+  // The one user-visible name for this upload: `displayName` when the caller sent
+  // one, else the storage name. `||` (not `??`) so an empty-string `displayName`
+  // behaves exactly like an absent one and still reaches the `'Sticker'` /
+  // `file.{ext}` fallbacks below.
+  const visibleName = args.displayName || args.filename;
+
   if (args.mediaKind === 'sticker') {
-    return { ...base, sticker: { url: args.url, name: args.filename || 'Sticker' } };
+    return { ...base, sticker: { url: args.url, name: visibleName || 'Sticker' } };
   }
   if (args.mediaKind === 'gif') {
     return { ...base, gif: { url: args.url } };
@@ -48,7 +70,7 @@ export function buildBackgroundUploadChatMessageInput(
     attachments: [
       {
         url: args.url,
-        fileName: args.filename || `file.${args.safeExt}`,
+        fileName: visibleName || `file.${args.safeExt}`,
         fileType: args.contentType,
         fileSize: args.bytes,
       },

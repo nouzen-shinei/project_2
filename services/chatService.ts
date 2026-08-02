@@ -9,6 +9,13 @@ import { resolveChatUploadFolder, type ChatUploadParticipants } from '@/lib/chat
 import { sanitizeClientMsgId } from '@/lib/pendingId';
 import { buildBackgroundUploadUrl, type BackgroundUploadMediaKind } from '@/lib/chatBackgroundUpload';
 import {
+  newUploadKey,
+  stableIdForFileIndex,
+  uploadKeyForFileIndex,
+  uploadKeyFromStableId,
+} from '@/lib/uploadKey';
+import { deriveStableUploadFileName } from '@/lib/uploadFileName';
+import {
   UPLOAD_MAX_ATTEMPTS,
   isTransientUploadStatus,
   uploadRetryBackoffMs,
@@ -386,6 +393,33 @@ export class ChatUploadCanceledError extends Error {
 
 export interface UploadSessionOptions {
   registerCancel?: (cancel: () => void | Promise<void>) => void;
+  /**
+   * Optional idempotency key for `POST /storage/upload` (see `lib/uploadKey.ts`).
+   * When present the backend resolves a DETERMINISTIC object path, so a retry after
+   * a lost response overwrites the first attempt's object instead of orphaning a
+   * second one.
+   *
+   * The CALLER owns minting: the key must be stable for one logical user action
+   * (one chat send, including a foreground fallback after a failed background
+   * start) and fresh for the next, which is knowledge only the call site has.
+   * `uploadFile` therefore never mints one itself — it only forwards what it is
+   * given, and omits the query parameter entirely when it is not.
+   */
+  uploadKey?: string;
+  /**
+   * The human-visible name for this upload, when it differs from the storage
+   * filename (`POST /storage/upload`'s `displayName` param — see
+   * `backend-runtime/src/app.ts`).
+   *
+   * A caller that sends a DETERMINISTIC storage filename to get a stable object
+   * path (`lib/uploadFileName.ts`) passes the OS-supplied name here, so every
+   * user-visible label the backend writes from an upload — the pre-created
+   * `sharedFiles` doc's `file.fileName`, and the client-side
+   * `ensureSmartShareLink` fallback below — keeps showing the real name instead of
+   * the machine one. Omitted ⇒ the query parameter is absent and the backend falls
+   * back to `filename`, byte-identical to before this option existed.
+   */
+  displayName?: string;
 }
 
 // chat-production-hardening (Task 9, finding P2-1). A single, ref-counted RTDB
@@ -2918,6 +2952,20 @@ class ChatService {
     mediaKind: BackgroundUploadMediaKind;
     clientMsgId: string;
     text?: string;
+    /**
+     * The pending item's `source` marker (`'keyboard'` | `'picker'`), passed
+     * straight through to `deriveStableUploadFileName` so the storage filename
+     * this builds matches the one the FOREGROUND path derives for the same send.
+     * The marker only picks the `kb_`/`pick_` prefix, but a mismatch there is
+     * enough to resolve a different object, which is the whole thing this closes.
+     */
+    source?: string;
+    /**
+     * The staged local uri, used only as the extension fallback when `fileType`
+     * carries no mime subtype — again the same input the foreground call passes,
+     * so the two derivations cannot diverge on a degenerate mime type.
+     */
+    localUri?: string;
   }): Promise<{ url: string; headers: Record<string, string> }> {
     const baseUrl = this.requireChatBackendBaseUrl();
     const tenantId = await this.ensureTenantChatScope(params.senderEmail, params.recipientEmail);
@@ -2930,16 +2978,61 @@ class ChatService {
       senderEmail: params.senderEmail,
       recipientEmail: params.recipientEmail,
     });
-    const sanitizedFileName = (params.fileName || 'file').replace(/[^a-zA-Z0-9.-]/g, '_') || 'file.bin';
     const clientMsgId = sanitizeClientMsgId(params.clientMsgId) || params.clientMsgId;
+    // The OS-supplied name, reduced to the same charset it has always been sent in.
+    // It is no longer the storage name — it is the DISPLAY name (below), so what the
+    // recipient sees is unchanged by this transport going deterministic.
+    const sanitizedFileName = (params.fileName || 'file').replace(/[^a-zA-Z0-9.-]/g, '_') || 'file.bin';
+    // Storage filename derived from the SAME `clientMsgId` the `uploadKey` below is
+    // derived from (`lib/uploadFileName.ts`). Both halves of the object's identity
+    // matter: the backend's deterministic chat path is
+    // `chat-files/{tenant}/{folder}/k_{hash(uploadKey)}_{safeName}`, so a stable key
+    // with an OS-supplied name still resolves to a different object than a
+    // foreground attempt for the same send. Sending `file.fileName` here was the
+    // last orphan source in the chat media path: a background upload that
+    // TRANSFERRED bytes and then failed, followed by a foreground retry, wrote a
+    // second blob (the message stayed deduped by `clientMsgId`, so the surplus blob
+    // was a pure orphan). Now both transports derive the same pair from the same
+    // `tempId`/`clientMsgId` and land on one object.
+    //
+    // Seeded through `stableIdForFileIndex(clientMsgId, 0)` — byte-identical to the
+    // bare `clientMsgId` — so this single-file transport and the foreground
+    // multi-file fan-out (`sendMessageWithMultipleFiles`, which seeds file i with
+    // `stableIdForFileIndex(clientMsgId, i)`) read the SAME convention from the same
+    // helper. A single file is just file 0, and if that convention ever moves, both
+    // transports move with it instead of silently drifting apart.
+    const fileStableId = stableIdForFileIndex(clientMsgId, 0);
+    const storageFileName = deriveStableUploadFileName({
+      stableId: fileStableId,
+      source: params.source,
+      mime: params.fileType,
+      uri: params.localUri || params.fileName,
+    });
     const url = buildBackgroundUploadUrl(baseUrl, {
       tenantId,
       conversationFolder,
-      fileName: sanitizedFileName,
+      fileName: storageFileName,
+      // Carries the real name through to every user-visible label the backend
+      // writes (the created sticker's `name` / attachment's `fileName`, and the
+      // pre-created `sharedFiles` doc), so the deterministic storage name above
+      // never reaches a bubble or a share sheet.
+      displayName: sanitizedFileName,
       clientMsgId,
       recipientId: params.recipientEmail,
       mediaKind: params.mediaKind,
       text: params.text,
+      // The highest-value uploadKey in the app. The native uploader retries
+      // internally, outside JS control, replaying exactly this URL — so without a
+      // stable key each internal retry would land on a fresh timestamped path and
+      // store a separate object. Derived from the SAME `clientMsgId` value sent
+      // above (post-sanitization) so the key and the message identity can never
+      // disagree, and from the same id the foreground path uses, so a foreground
+      // fallback after a failed background start targets that one object too —
+      // whether that fallback is the sticker/GIF path (`chatService.uploadFile` with
+      // `uploadKeyFromStableId(tempId)`, which this equals) or the attachment path
+      // (`sendMessageWithMultipleFiles` file 0, which derives the same value from
+      // the same seed).
+      uploadKey: uploadKeyFromStableId(fileStableId),
     });
     return {
       url,
@@ -3041,6 +3134,18 @@ class ChatService {
     try {
       const conversationFolder = resolveChatUploadFolder(participants);
       const sanitizedFileName = (fileName || 'file').replace(/[^a-zA-Z0-9.-]/g, '_') || 'file.bin';
+      // The human-visible name, when the caller sends a deterministic STORAGE name
+      // as `fileName` (see `UploadSessionOptions.displayName`). Same client-side
+      // reduction the outgoing name has always had, plus the endpoint's 255-char
+      // bound so an unusually long OS name can never turn into a
+      // `400 validation_failed`. Empty ⇒ the parameter is omitted entirely and the
+      // backend keeps deriving every visible label from `filename`, as before.
+      const sanitizedDisplayName = (options?.displayName || '')
+        .trim()
+        .replace(/[^a-zA-Z0-9.-]/g, '_')
+        .slice(0, 255);
+      // What a share sheet / the shared-files list should render for this upload.
+      const shareDisplayName = sanitizedDisplayName || sanitizedFileName;
 
       const baseUrl = this.requireChatBackendBaseUrl();
 
@@ -3065,11 +3170,22 @@ class ChatService {
         progressEmitter.emit(progressPercent);
       };
 
+      // Built ONCE here, before every send/retry/token-refresh path below: the web
+      // XHR's 401 re-open and the native `createUploadTask` 401 retry both reuse
+      // this same `uploadUrl.toString()`, so an `uploadKey` set here is guaranteed
+      // identical on every attempt. Minting or mutating it per attempt would defeat
+      // the idempotency it exists for.
       const uploadUrl = new URL(`${baseUrl}/storage/upload`);
       uploadUrl.searchParams.set('tenantId', tenantId);
       uploadUrl.searchParams.set('purpose', 'chat');
       uploadUrl.searchParams.set('conversationFolder', conversationFolder);
       uploadUrl.searchParams.set('filename', sanitizedFileName);
+      if (options?.uploadKey) {
+        uploadUrl.searchParams.set('uploadKey', options.uploadKey);
+      }
+      if (sanitizedDisplayName) {
+        uploadUrl.searchParams.set('displayName', sanitizedDisplayName);
+      }
 
       // Web: XHR for progress support
       if (Platform.OS === 'web') {
@@ -3158,7 +3274,7 @@ class ChatService {
                       void sharedFileService.recordUploadShareToken({ tenantId, fileUrl: url, shareToken });
                     } else if (url && tenantId) {
                       // Best-effort: ensure a cached share link exists for later.
-                      void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: sanitizedFileName, fileType, fileSize: size, tenantId });
+                      void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: shareDisplayName, fileType, fileSize: size, tenantId });
                     }
                     progressEmitter.emit(100, { force: true });
                     resolve({ url, size });
@@ -3190,7 +3306,7 @@ class ChatService {
                 if (shareToken && tenantId) {
                   void sharedFileService.recordUploadShareToken({ tenantId, fileUrl: url, shareToken });
                 } else if (url && tenantId) {
-                  void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: sanitizedFileName, fileType, fileSize: size, tenantId });
+                  void sharedFileService.ensureSmartShareLink({ fileUrl: url, fileName: shareDisplayName, fileType, fileSize: size, tenantId });
                 }
                 progressEmitter.emit(100, { force: true });
                 resolve({ url, size });
@@ -3309,7 +3425,7 @@ class ChatService {
       if (shareToken && tenantId) {
         void sharedFileService.recordUploadShareToken({ tenantId, fileUrl: finalUrl, shareToken });
       } else if (tenantId) {
-        void sharedFileService.ensureSmartShareLink({ fileUrl: finalUrl, fileName: sanitizedFileName, fileType, fileSize: finalSize, tenantId });
+        void sharedFileService.ensureSmartShareLink({ fileUrl: finalUrl, fileName: shareDisplayName, fileType, fileSize: finalSize, tenantId });
       }
 
       progressEmitter.emit(100, { force: true });
@@ -3886,11 +4002,27 @@ class ChatService {
       webFile?: Blob;
     }[],
     sender: string,
-    recipientId?: string,
-    onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions,
-    replyTo?: ChatReplyContext,
-    clientMsgId?: string
+    // upload-idempotency (Requirement 7.1/7.4, follow-up F7): `clientMsgId` below is
+    // REQUIRED, because it is the only thing that makes this fan-out idempotent
+    // ACROSS invocations. TypeScript forbids a required parameter after an optional
+    // one (TS1016), so the four parameters between `sender` and it are declared as
+    // required-but-`undefined`-able instead of optional. That keeps every argument
+    // POSITION exactly where it was — no call site's arguments shift — while
+    // omitting the id becomes a compile error rather than a silent downgrade to the
+    // degraded path below.
+    recipientId: string | undefined,
+    onProgress: ((progress: number) => void) | undefined,
+    options: UploadSessionOptions | undefined,
+    replyTo: ChatReplyContext | undefined,
+    /**
+     * The caller's DURABLE, re-drive-stable id for this one logical send — the chat
+     * `tempId`, which is both the `pendingAttachments` map key and the key of the
+     * persisted outbox record (`PendingMessageStorage`), so the user-tapped retry,
+     * the auto-retry-on-reconnect pass and the resume-on-relaunch pass all re-drive
+     * with the identical value. Non-empty is not sufficient: a freshly minted id per
+     * attempt would type-check and still orphan.
+     */
+    clientMsgId: string
   ): Promise<string> {
     try {
       if (files.length === 0) {
@@ -3944,11 +4076,95 @@ class ChatService {
         });
       }
 
+      // upload-idempotency (Requirements 7.1–7.3, 7.7): one DISTINCT, retry-stable
+      // object identity per attachment — BOTH halves of it, the `uploadKey` and the
+      // storage filename, derived from the same `(clientMsgId, index)` seed
+      // (`stableIdForFileIndex`).
+      //
+      // DISTINCTNESS is mandatory, not cosmetic. The backend's deterministic chat
+      // path is `chat-files/{tenant}/{folder}/k_{hash(uploadKey)}_{safeName}`
+      // (`backend-runtime/src/lib/uploadObjectPath.ts`), so N files sharing ONE key
+      // would resolve to paths differing only by filename — and two attachments
+      // carrying the same filename in one send would collapse onto a single object,
+      // silently losing a file. The per-index key is what keeps them apart; the
+      // filename difference is not something this may lean on.
+      //
+      // STABILITY is what makes a re-drive idempotent. `clientMsgId` is the chat
+      // `tempId`: minted once per send, used as the `pendingAttachments` map key,
+      // and passed back UNCHANGED by the user-tapped retry, the
+      // auto-retry-on-reconnect pass and the outbox re-drive
+      // (`app/(tabs)/chat.tsx` `retryPendingAttachment`, which re-sends the same
+      // `entry.files` array in the same order). So file i of a re-driven send
+      // derives the same key and overwrites its own first attempt instead of
+      // orphaning it. The base is captured HERE, outside the map, and
+      // `uploadFile` builds its URL once before its own retry/401-refresh paths, so
+      // no attempt can ever see a re-minted key.
+      //
+      // Two separate user actions get two different `tempId`s and therefore two
+      // disjoint key sets, so deliberately sending the same file twice still
+      // produces two objects (Requirement 7.3) — this is retry dedupe, not
+      // content-addressed dedupe.
+      //
+      // BLANK `clientMsgId` — the DEGRADED path, and no longer reachable from a
+      // type-checked caller. The parameter is required (see the signature), so a
+      // TypeScript call site cannot omit it; this branch exists only for a JS caller
+      // or an `any`-typed call, and for a caller that passes an empty/whitespace
+      // string. It mints ONE random base for this invocation and indexes that, which
+      // keeps the N files distinct from one another and still gives the transport's
+      // own retries (the 401 re-open, the native task retry) one object apiece — but
+      // it provides NO dedupe across invocations, so a re-drive writes new objects
+      // and orphans the first attempt's. That lost guarantee is what the warning
+      // below names: the weak path is unreachable by construction and loud if it
+      // somehow happens anyway, rather than a crash that would cost the user their
+      // send. Omitting `uploadKey` entirely would give up the within-invocation win
+      // and gain nothing, and a single shared key for all N files is unsafe for the
+      // same-filename reason above.
+      const stableBase = typeof clientMsgId === 'string' ? clientMsgId.trim() : '';
+      if (!stableBase) {
+        logger.warn('chat.upload.multi_file_missing_client_msg_id', {
+          fileCount: files.length,
+          lostGuarantee:
+            'no cross-invocation upload dedupe: a re-drive of this send will write new objects and orphan this attempt\'s',
+        });
+      }
+      const uploadKeyBase = stableBase || newUploadKey('chat_multi');
+
       // Upload all files with individual progress tracking
-      const uploadPromises = files.map((file, index) =>
-        this.uploadFile(
+      const uploadPromises = files.map((file, index) => {
+        // The seed for file `index` of this send. BOTH halves of the stored
+        // object's identity come from it: the `uploadKey` below and the storage
+        // filename beside it. The backend's deterministic chat path is
+        // `chat-files/{tenant}/{folder}/k_{hash(uploadKey)}_{safeName}`, so a
+        // stable key paired with the OS-supplied name is only half-stable — which
+        // is precisely how this path used to disagree with the native background
+        // transport for a SINGLE-file send: background keyed on the bare
+        // `clientMsgId` with a `clientMsgId`-derived filename, foreground keyed on
+        // `uploadKeyForFileIndex(clientMsgId, 0)` with `file.fileName`. Both halves
+        // differed, so a background attachment that TRANSFERRED bytes and then
+        // failed, followed by a foreground re-drive of the same send, wrote a
+        // second object — a pure orphan, since the message stays deduped by
+        // `clientMsgId`. `stableIdForFileIndex` returns the bare base for
+        // `index === 0`, so the two transports now derive the identical pair.
+        const fileStableId = stableIdForFileIndex(uploadKeyBase, index);
+        return this.uploadFile(
           file.uri,
-          file.fileName,
+          // The STORAGE name, not the display name. Deterministic in
+          // `(clientMsgId, index)` — index participates, so two attachments that
+          // share an OS filename still resolve to different objects, and a
+          // re-driven send overwrites its own first attempt instead of orphaning
+          // it. `file.fileName` rides along as `displayName` below, and the
+          // `attachments` array built after these uploads carries it verbatim, so
+          // nothing user-visible moves (this path builds its own message payload;
+          // it does not use the server's `createMessage=1` path).
+          deriveStableUploadFileName({
+            stableId: fileStableId,
+            // Not `'keyboard'`: these files come from the picker/share sheet, which
+            // is also what the background attachment request passes, so the
+            // `pick_` marker matches on both transports.
+            source: 'picker',
+            mime: file.fileType,
+            uri: file.uri,
+          }),
           file.fileType,
           { senderEmail: sender, recipientEmail: recipientId },
           (progress: number) => {
@@ -3958,15 +4174,26 @@ class ChatService {
             registerCancel: (fn: () => void | Promise<void>) => {
               cancelFns[index] = fn;
             },
+            uploadKey: uploadKeyForFileIndex(uploadKeyBase, index),
+            // Keeps the real name on every label the upload writes server-side
+            // (the pre-created `sharedFiles` doc) and client-side
+            // (`ensureSmartShareLink`), unchanged by the storage name above.
+            displayName: file.fileName,
           },
           file.webFile
-        )
-      );
+        );
+      });
       
       const uploadResults = await Promise.all(uploadPromises);
       progressEmitter.emit(100, { force: true });
       
-      // Create attachments array
+      // Create attachments array.
+      //
+      // `fileName` is the OS-supplied name, taken straight from the input `files`
+      // and INDEPENDENT of the storage filename sent above — this client builds the
+      // message payload itself rather than relying on the server's
+      // `createMessage=1` path, so making the upload filename deterministic has
+      // zero effect on what the recipient sees.
       const attachments: FileAttachment[] = files.map((file, index) => ({
         url: uploadResults[index].url,
         fileName: file.fileName,

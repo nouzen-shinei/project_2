@@ -30,6 +30,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as XLSX from 'xlsx';
 import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
 import { reconcileTenantStorageUsageViaBackend, uploadBlobViaBackend, deleteStorageObjectViaBackend } from '../../services/backendStorageUploadService';
+import { newUploadKey } from '@/lib/uploadKey';
 import { maybeShowStorageLimitReachedAlert } from '../../services/storageLimitAlert';
 import { getFirestore as getFirestoreClient, doc as docClient, setDoc as setDocClient } from 'firebase/firestore';
 import { useRouter } from 'expo-router';
@@ -3480,6 +3481,25 @@ export default function Fees() {
         logger.warn('Failed to preflight storage quota; proceeding with upload attempt.', quotaError);
       }
       
+      // Idempotency key for THIS ONE receipt file (upload-idempotency spec, Req
+      // 7.1/7.3). Minted here — per invocation — rather than hoisted into the
+      // callers, because one call of this function is exactly one logical upload
+      // action: one file. The batch callers (`confirmUploadFiles`,
+      // `handleAddMoreReceipts`) loop over several selected files and call this
+      // once per file, so each file gets its OWN key and therefore its own
+      // deterministic object path. Sharing one key across the loop would make
+      // every file in the batch resolve to the same path and clobber the
+      // previous one, leaving a single object for N receipts.
+      //
+      // Nothing above this line is a retry loop (the blob read and the quota
+      // preflight run once), and the transport's transient retries live inside
+      // `uploadBlobViaBackend`, which builds its URL once and reuses this key on
+      // every attempt. A user re-tapping upload after a failure re-enters this
+      // function and mints a fresh key — correct, since that is a new user
+      // action and must not overwrite whatever the failed attempt may have
+      // stored.
+      const uploadKey = newUploadKey('receipt');
+
       const result = await uploadBlobViaBackend({
         tenantId,
         purpose: 'receipt',
@@ -3487,6 +3507,7 @@ export default function Fees() {
         contentType: blob.type || 'application/octet-stream',
         filename: fileName,
         feeId,
+        uploadKey,
         suppressStorageLimitAlert: true,
         onProgress: (p) => {
           try {

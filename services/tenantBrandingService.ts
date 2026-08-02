@@ -1,5 +1,6 @@
 import { logger } from '@/lib/logger';
 import { uploadBlobViaBackend, deleteStorageObjectViaBackend } from './backendStorageUploadService';
+import { newUploadKey } from '@/lib/uploadKey';
 import { tryExtractStorageLimitReachedInfo } from './storageLimitAlert';
 
 export interface TenantLogoAsset {
@@ -56,12 +57,21 @@ export async function uploadTenantLogo(tenantId: string, asset: TenantLogoAsset)
   try {
     const extension = inferExtension(asset);
     const filename = asset.fileName || `logo.${extension}`;
+    // Idempotency key for this one logo upload (upload-idempotency spec, Req
+    // 7.1/7.3). `uploadTenantLogo` is invoked once per settings save / tenant
+    // create with a pending asset and has no retry loop of its own, so one call
+    // is one logical upload action; `uploadBlobViaBackend` reuses this key for
+    // every transient retry it makes. Picking a new logo later mints a fresh key
+    // so it lands as a new object (the previous one is removed explicitly via
+    // `deleteTenantLogoByUrl`) instead of silently replacing the old bytes.
+    const uploadKey = newUploadKey('tenant_logo');
     const result = await uploadBlobViaBackend({
       tenantId: normalizedTenantId,
       purpose: 'tenantLogo',
       blob,
       contentType: asset.mimeType || blob.type,
       filename,
+      uploadKey,
       suppressStorageLimitAlert: true,
     });
     return { url: result.url, skippedBecauseStorageLimit: false, failed: false };

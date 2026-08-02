@@ -30,6 +30,19 @@ interface SendChatTextMessageOptions {
   clientMsgId?: string;
 }
 
+/**
+ * upload-idempotency (Requirement 7.1/7.4, follow-up F7). The ATTACHMENT send
+ * wrappers require `clientMsgId`, because it is the seed for both halves of every
+ * uploaded object's identity (`uploadKey` + storage filename) and therefore the only
+ * thing that makes a re-driven send overwrite its own first attempt instead of
+ * orphaning it. It must be the caller's DURABLE id for the send — the pending
+ * `tempId`, which keys the outbox record that survives an app kill — not a value
+ * minted per attempt.
+ */
+interface SendChatAttachmentOptions extends Omit<SendChatTextMessageOptions, 'clientMsgId'> {
+  clientMsgId: string;
+}
+
 function normalizeChatEmail(value?: string | null): string {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
@@ -1637,9 +1650,14 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       fileSize?: number;
       webFile?: Blob;
     }[],
-    recipientId?: string,
-    onProgress?: (progress: number) => void,
-    options?: UploadSessionOptions & SendChatTextMessageOptions
+    // `options` carries a REQUIRED `clientMsgId` (upload-idempotency F7), and
+    // TypeScript forbids a required parameter after an optional one, so the two
+    // parameters before it are declared required-but-`undefined`-able. Argument
+    // positions are unchanged; both `app/(tabs)/chat.tsx` call sites already pass
+    // all five arguments with `clientMsgId: tempId` inside the options object.
+    recipientId: string | undefined,
+    onProgress: ((progress: number) => void) | undefined,
+    options: UploadSessionOptions & SendChatAttachmentOptions
   ): Promise<string> => {
     try {
       setError(null);
@@ -1648,7 +1666,7 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       }
 
       const cancelFns: ((() => void | Promise<void>) | undefined)[] = [];
-      if (options?.registerCancel) {
+      if (options.registerCancel) {
         options.registerCancel(async () => {
           const executions = cancelFns
             .filter((fn): fn is (() => void | Promise<void>) => typeof fn === 'function')
@@ -1669,15 +1687,16 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         user.email,
         recipientId,
         onProgress,
-        options?.registerCancel
+        options.registerCancel
           ? {
               registerCancel: (fn) => {
                 cancelFns.push(fn);
               },
             }
           : undefined,
-        options?.replyTo,
-        options?.clientMsgId
+        options.replyTo,
+        // Forwarded, never defaulted: the durable id belongs to the caller.
+        options.clientMsgId
       );
       const notificationText = resolveChatAttachmentAutoText({
         text,
@@ -1878,8 +1897,11 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
       fileName: string;
       detectedType?: string;
     }[],
-    recipientId?: string,
-    options?: SendChatTextMessageOptions
+    // Same required-`clientMsgId` contract as `sendMessageWithFiles` above
+    // (upload-idempotency F7): this wrapper hits the same multi-file fan-out, so it
+    // cannot be the one that quietly reintroduces the keyless path.
+    recipientId: string | undefined,
+    options: SendChatAttachmentOptions
   ) => {
     try {
       setError(null);
@@ -1900,8 +1922,9 @@ export function useChat(recipientId?: string, options?: { live?: boolean }) {
         recipientId,
         undefined,
         undefined,
-        options?.replyTo,
-        options?.clientMsgId
+        options.replyTo,
+        // Forwarded, never defaulted: the durable id belongs to the caller.
+        options.clientMsgId
       );
       const notificationText = resolveChatAttachmentAutoText({
         text,

@@ -129,6 +129,14 @@ export const metricNames = {
   storageUploadRejected: 'storage_upload_rejected_total',
   storageUploadQuotaCheckFailed: 'storage_upload_quota_check_failed_total',
   storageUploadAccepted: 'storage_upload_accepted_total',
-  storageUploadFailed: 'storage_upload_failed_total'
+  storageUploadFailed: 'storage_upload_failed_total',
+  storageUploadIdempotentOverwrite: 'storage_upload_idempotent_overwrite_total',
+  storageUploadOverwriteProbeFailed: 'storage_upload_overwrite_probe_failed_total',
+  // upload-idempotency follow-up F9: a conditional write lost a same-uploadKey race
+  // (Storage answered 412), so the sibling's object stands and this request released
+  // its reservation instead of double-counting it. Labelled by `purpose` ONLY — the
+  // uploadKey, its hash, the filename and the object path are unbounded-cardinality
+  // label values and a leak surface (Req 6.4, 8.4).
+  storageUploadConcurrentRaceLost: 'storage_upload_concurrent_race_lost_total'
 };
 export { successCount, failedCount };

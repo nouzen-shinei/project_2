@@ -40,6 +40,7 @@ import { Student } from '../../types';
 import { studentService } from '../../services/studentService';
 import { MediaPickerUtil } from '../../lib/mediaPickerUtil';
 import { uploadBlobViaBackend } from '../../services/backendStorageUploadService';
+import { newUploadKey } from '../../lib/uploadKey';
 import { tryExtractStorageLimitReachedInfo } from '../../services/storageLimitAlert';
 import { formatDateToString } from '../../lib/utils';
 import { chatService } from '../../services/chatService';
@@ -220,12 +221,22 @@ export default function StudentProfile() {
         blob = await response.blob();
       }
       
+      // Idempotency key for this one photo pick (upload-idempotency spec, Req
+      // 7.1/7.3). `uploadProfileImage` is called once per Save with a newly
+      // selected image and contains no retry loop, so one call is one logical
+      // upload action; `uploadBlobViaBackend` reuses this key across its
+      // transient retries. Saving again later picks a fresh key, so the new photo
+      // becomes its own object rather than overwriting the previous one (the old
+      // object is removed explicitly above via `deleteProfilePicture`).
+      const uploadKey = newUploadKey('student_profile');
+
       const result = await uploadBlobViaBackend({
         tenantId,
         purpose: 'studentProfile',
         blob,
         contentType: blob.type || 'image/jpeg',
         filename: fileName,
+        uploadKey,
         suppressStorageLimitAlert: true,
       });
 

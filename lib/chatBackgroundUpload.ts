@@ -102,12 +102,42 @@ export interface BackgroundUploadUrlParams {
   recipientId: string;
   mediaKind: BackgroundUploadMediaKind;
   text?: string;
+  /**
+   * Optional idempotency key (see `lib/uploadKey.ts`). It matters most on THIS
+   * transport: the native uploader (`rn-background-upload` / gotev) runs its own
+   * internal retries entirely outside JS control, so we cannot mint or reuse a key
+   * per attempt the way the foreground loops do — whatever URL we hand the native
+   * layer is the URL every one of its retries replays. Without a stable `uploadKey`
+   * the server derives a fresh timestamped path per attempt, so each internal retry
+   * stores a separate object: the single largest source of duplicate objects in the
+   * app. With it, the server resolves one deterministic path and the retries
+   * overwrite instead of accumulating. Derived from the `clientMsgId`, which is
+   * already stable for the whole send.
+   */
+  uploadKey?: string;
+  /**
+   * Optional human-visible name for the upload, split out of `fileName`.
+   *
+   * `fileName` becomes the `filename` query param, which seeds the deterministic
+   * object path — so on this transport it has to be a value that is IDENTICAL on
+   * every attempt (derived from the send's `clientMsgId`), not the OS-supplied
+   * name. The backend used to reuse that same param as the display name of the
+   * chat message it creates and of the `sharedFiles` doc, so `displayName` carries
+   * the real name the user picked and the backend prefers it for every
+   * user-visible label. Omitted ⇒ the backend falls back to `filename`, exactly as
+   * before this parameter existed.
+   */
+  displayName?: string;
 }
 
 /**
  * Build the `/storage/upload` URL (with the Phase-2 `createMessage` params) that
  * the backend understands. Pure + exported so the query-param contract with the
  * server route is unit-tested without any native/auth dependency.
+ *
+ * `uploadKey` and `displayName` are appended only when present, so a caller that
+ * supplies neither produces a byte-identical URL to before those parameters
+ * existed.
  */
 export function buildBackgroundUploadUrl(baseUrl: string, params: BackgroundUploadUrlParams): string {
   const url = new URL(`${baseUrl.replace(/\/+$/, '')}/storage/upload`);
@@ -121,6 +151,12 @@ export function buildBackgroundUploadUrl(baseUrl: string, params: BackgroundUplo
   url.searchParams.set('mediaKind', params.mediaKind);
   if (params.text) {
     url.searchParams.set('messageText', params.text);
+  }
+  if (params.uploadKey) {
+    url.searchParams.set('uploadKey', params.uploadKey);
+  }
+  if (params.displayName) {
+    url.searchParams.set('displayName', params.displayName);
   }
   return url.toString();
 }

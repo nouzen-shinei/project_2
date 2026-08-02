@@ -357,6 +357,8 @@ import { resolveChatPendingRetryDispatchPromises } from '@/lib/chatPendingRetryD
 import { resolveChatPendingAutoRetryPlan } from '@/lib/chatPendingAutoRetryState';
 import { resolveChatPendingConversationDerivedState } from '@/lib/chatPendingConversationDerived';
 import { generatePendingId } from '@/lib/pendingId';
+import { uploadKeyFromStableId } from '@/lib/uploadKey';
+import { deriveStableUploadFileName } from '@/lib/uploadFileName';
 import { resolveChatPendingFooterSignature } from '@/lib/chatPendingFooterSignature';
 import { resolveChatNearBottomState } from '@/lib/chatNearBottomState';
 import {
@@ -8617,6 +8619,13 @@ export default function Chat() {
             mediaKind: 'attachment',
             clientMsgId: tempId,
             text: attachmentText || undefined,
+            // Derivation inputs for the deterministic storage filename (the request
+            // builder keys it on `clientMsgId`); `fileName` above is carried through
+            // as the DISPLAY name, so the attachment bubble still shows the real
+            // name. A picked attachment is `pick_`-prefixed, matching the marker the
+            // pending-media re-drive path uses for non-keyboard sources.
+            source: 'picker',
+            localUri: singleBgFile.uri,
           });
 
           // Durably record BEFORE starting so a crash/kill mid-upload can't lose it
@@ -9526,6 +9535,14 @@ export default function Chat() {
           recipientEmail: selectedTeamMember.id,
           mediaKind: kind,
           clientMsgId: tempId,
+          // The request builder derives the storage `filename` from `clientMsgId`
+          // (= `tempId`) with these same inputs, so it matches the name the
+          // foreground path below derives for this same send — a background upload
+          // that transfers bytes and then fails no longer leaves the foreground
+          // retry writing a second object. `file.fileName` rides along as
+          // `displayName`, so the sticker the server creates keeps its real name.
+          source: 'keyboard',
+          localUri: uploadUri,
         });
 
         let unsubscribe: () => void = () => {};
@@ -9614,7 +9631,26 @@ export default function Chat() {
     try {
       const { url } = await chatService.uploadFile(
         uploadUri,
-        file.fileName,
+        // Storage filename derived from `tempId`, NOT `file.fileName` (see
+        // `lib/uploadFileName.ts`). The backend's deterministic chat path is
+        // `k_{hash(uploadKey)}_{safeName}`, so the object's identity is the PAIR
+        // (uploadKey, filename) — a stable key with an unstable name still resolves to a
+        // new object. `file.fileName` is not recoverable at retry time: for keyboard /
+        // clipboard media it is itself `keyboard_{Date.now()}.{ext}`
+        // (`lib/chatKeyboardMediaSend.ts`) and only its DISPLAY form survives, as
+        // `nameOrTitle` with a `'Sticker'`/`'GIF'` fallback. Deriving both halves from
+        // `tempId` instead makes this send and every later re-drive by
+        // `retryPendingMedia` agree on one object, so a retry after a lost response
+        // overwrites the first attempt rather than orphaning it.
+        //
+        // Display is untouched: the bubble and the sticker/gif payload below still use
+        // `nameOrTitle` (= `file.fileName` when the OS supplied one).
+        deriveStableUploadFileName({
+          stableId: tempId,
+          source: 'keyboard',
+          mime: file.mimeType,
+          uri: uploadUri,
+        }),
         file.mimeType,
         {
           senderEmail: effectiveUser.email,
@@ -9630,7 +9666,28 @@ export default function Chat() {
             return next;
           });
         },
-        undefined,
+        // Idempotency key derived from `tempId` — NOT freshly minted (upload-idempotency
+        // spec, Req 7.1/7.4). `tempId` IS this send's `clientMsgId`: it is generated once
+        // at the top of this function, persisted in the durable outbox above, and is
+        // stable for the life of the pending item — including across a relaunch. So:
+        //   - Every transport-level attempt inside `uploadFile` (its 401 re-open, the
+        //     native task's retry) reuses this one key, so a retry after a lost response
+        //     overwrites the first attempt's object instead of orphaning a second one.
+        //   - `retryPendingMedia` derives the same key AND the same filename from the same
+        //     `tempId`, so every later re-drive of this item (manual "Retry all",
+        //     auto-retry-on-reconnect, resume-on-relaunch) overwrites this attempt's
+        //     object instead of adding one per attempt.
+        //
+        // Aligned with the native background transport too: the background branch
+        // above hands `buildChatBackgroundUploadRequest` the same `clientMsgId`,
+        // `source` and mime/uri, and it derives BOTH halves of the object identity from
+        // them — the same `uploadKey` and the same `deriveStableUploadFileName` value
+        // used here. So a background upload that transfers bytes and then fails, and
+        // this foreground retry, land on ONE object. The OS-supplied `file.fileName`
+        // still rides along as the backend's `displayName` param, so the server-created
+        // sticker keeps its real name (`backend-runtime/src/lib/backgroundUploadMessage.ts`
+        // prefers `displayName` over `filename` for every user-visible label).
+        { uploadKey: uploadKeyFromStableId(tempId) },
         keyboardMediaBlobRef.current.get(tempId),
       );
 
@@ -10381,7 +10438,6 @@ export default function Chat() {
 
       const uri = item.previewUri;
       const isHttp = /^https?:\/\//i.test(uri);
-      const guessedExt = (item.mime && item.mime.split('/')[1]) || (uri.split('?')[0].split('#')[0].split('.').pop() || 'bin');
       let finalUrl = uri;
       if (!isHttp) {
         // Guard against a vanished local source. A staged outbox file can be gone
@@ -10413,8 +10469,28 @@ export default function Chat() {
             return false;
           }
         }
-        const name = `${item.source === 'keyboard' ? 'kb' : 'pick'}_${Date.now()}.${guessedExt}`;
+        // Deterministic upload filename, NOT a fresh `Date.now()` one (see
+        // `lib/uploadFileName.ts`). The backend's deterministic chat path is
+        // `k_{hash(uploadKey)}_{safeName}`, so a stable key alone is not enough —
+        // a re-minted name resolves to a different object and re-orphans a blob on
+        // every re-drive of this item (a second "Retry all" tap, the
+        // auto-retry-on-reconnect pass, the resume-on-relaunch pass). Derived from
+        // the same `tempId` the `uploadKey` below is derived from, so the whole
+        // path is a function of the pending item's identity. The extension keeps the
+        // original mime-then-uri derivation. Display is untouched: the bubble and
+        // the sticker/gif payload still use `item.nameOrTitle`.
+        //
+        // Fed `uploadMime` rather than raw `item.mime` so the extension matches the
+        // content type actually sent, which is the same value the original send in
+        // `sendKeyboardMediaAsSticker` derives from — making the two agree even for a
+        // hydrated item whose `mime` is missing.
         const uploadMime = item.mime || (item.kind === 'gif' ? 'image/gif' : 'image/png');
+        const name = deriveStableUploadFileName({
+          stableId: tempId,
+          source: item.source,
+          mime: uploadMime,
+          uri,
+        });
         const { url } = await chatService.uploadFile(
           uri,
           name,
@@ -10433,7 +10509,21 @@ export default function Chat() {
               return next;
             });
           },
-          undefined,
+          // Same derivation as the original send (upload-idempotency spec, Req 7.1/7.4):
+          // `tempId` is this function's parameter, it IS the item's `clientMsgId`, and it
+          // survives in the durable outbox across a relaunch — so every attempt this
+          // invocation makes, including `uploadFile`'s internal 401 re-open and the
+          // native task's retry, targets one object instead of orphaning one per attempt.
+          //
+          // Cross-invocation dedupe holds too, because the backend's deterministic chat
+          // path is keyed on (uploadKey, filename) and BOTH halves are now functions of
+          // `tempId`: `name` above is `deriveStableUploadFileName({ stableId: tempId, … })`.
+          // So a second "Retry all" tap, the auto-retry-on-reconnect pass and the
+          // resume-on-launch pass all re-drive this item onto the one object the first
+          // attempt wrote, and the foreground original send in
+          // `sendKeyboardMediaAsSticker` derives the same pair — so a retry after a lost
+          // response overwrites that first attempt rather than orphaning it.
+          { uploadKey: uploadKeyFromStableId(tempId) },
           keyboardMediaBlobRef.current.get(tempId),
         );
         finalUrl = url;

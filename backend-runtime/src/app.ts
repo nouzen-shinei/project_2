@@ -83,6 +83,13 @@ import {
 } from './chatMessageWriter';
 import { buildBackgroundUploadChatMessageInput } from './lib/backgroundUploadMessage';
 import {
+  computeUploadQuotaDelta,
+  deriveUploadKeyHash,
+  resolveUploadObjectPath,
+  sanitizeStorageSegment,
+  type StorageUploadPurpose,
+} from './lib/uploadObjectPath';
+import {
   sendTeamMembershipChangeNotification,
   sendTenantJoinRequestNotification,
   sendTenantJoinRequestOutcomeNotification,
@@ -1356,7 +1363,13 @@ class TenantStudentLimitError extends Error {
   }
 }
 
-class TenantStorageLimitError extends Error {
+/**
+ * Thrown by `reserveTenantStorageBytes` when the tenant's allowance cannot
+ * accommodate an increment. Exported so a test can drive `reserveUploadQuotaBytes`
+ * with the same value the real reservation transaction rejects with, rather than an
+ * approximation of it.
+ */
+export class TenantStorageLimitError extends Error {
   limitBytes: number;
   usedBytes: number;
   incrementBytes: number;
@@ -1512,33 +1525,806 @@ function tryExtractTenantStorageLimitError(input: unknown): TenantStorageLimitEr
   return null;
 }
 
-type StorageUploadPurpose =
-  | 'chat'
-  | 'tenantLogo'
-  | 'noticeImage'
-  | 'noticeAudio'
-  | 'studentProfile'
-  | 'receipt'
-  | 'profilePicture';
+// `StorageUploadPurpose`, `sanitizeStorageSegment`, `inferExtensionFromContentType`,
+// `hashStorageKey`, `normalizeConversationFolder`, `resolveUploadObjectPath` and
+// `computeUploadQuotaDelta` all live in `./lib/uploadObjectPath` (pure,
+// unit-tested) — see the import near the top of this file. There is exactly one
+// implementation of each; `POST /storage/upload` calls `resolveUploadObjectPath`,
+// which owns every per-purpose path format.
 
-function sanitizeStorageSegment(value: string): string {
-  const trimmed = (value ?? '').trim();
-  if (!trimmed) return '';
-  return trimmed.replace(/[^a-zA-Z0-9._-]/g, '_');
+/**
+ * Query-parameter schema for `POST /storage/upload`.
+ *
+ * Lifted out of the route handler to module scope (upload-idempotency spec, task
+ * 4.6) so the accept/reject boundary of `uploadKey` is testable against the REAL
+ * schema the endpoint parses with. A test that re-declared this shape would prove
+ * nothing about the endpoint.
+ *
+ * A failure here is what produces the route's `400 { error: 'validation_failed',
+ * issues }` response, so an out-of-bounds `uploadKey` is a hard rejection and
+ * never a silent downgrade to a legacy timestamped path (Req 2.8, 6.8).
+ */
+export const storageUploadQuerySchema = z.object({
+  tenantId: z.string().min(1),
+  purpose: z.enum(['chat', 'tenantLogo', 'noticeImage', 'noticeAudio', 'studentProfile', 'receipt', 'profilePicture']),
+  conversationFolder: z.string().optional(),
+  feeId: z.string().optional(),
+  email: z.string().optional(),
+  filename: z.string().optional(),
+  // upload-idempotency spec (background-transport gap): the human-visible name
+  // for this upload, split OUT of `filename`.
+  //
+  // `filename` used to do two unrelated jobs — it seeded the `safeName` segment
+  // of the object path AND it became the display name of the server-created chat
+  // message (the sticker's `name`, the attachment's `fileName`) plus the
+  // `sharedFiles` doc's `file.fileName`. Those two jobs pull in opposite
+  // directions: the path wants a value that is DETERMINISTIC across every retry
+  // of one logical action, the display wants the REAL name the user picked. With
+  // one parameter, making the native background transport's path deterministic
+  // would have renamed what the recipient sees.
+  //
+  // So: `filename` now drives the object path only, and `displayName` (when
+  // present) drives every user-visible name. Absent ⇒ every consumer falls back
+  // to `filename`, i.e. behavior is byte-identical to before this parameter
+  // existed, which is what makes this safe for already-deployed clients.
+  //
+  // Bound: 255 characters, the single-path-component limit on every filesystem
+  // this app's clients run on (ext4 / APFS / NTFS all cap a path component at
+  // 255), so no real OS-supplied filename can exceed it — while still bounding
+  // what a caller can write into a chat message doc and a `sharedFiles` doc.
+  // Deliberately NO `.min()`: a blank/whitespace-only value must degrade to the
+  // `filename` fallback exactly as an absent one does, not 400.
+  displayName: z.string().trim().max(255).optional(),
+  // Phase 2 (kill-safe background uploads): when createMessage === '1' and
+  // purpose === 'chat', the endpoint ALSO creates the chat message after
+  // storing the file, so the message exists even if the app is killed before
+  // the (background) upload completes. Idempotent via clientMsgId. Absent on
+  // the normal foreground upload path, so existing callers are unaffected.
+  createMessage: z.string().optional(),
+  clientMsgId: z.string().trim().min(1).max(200).optional(),
+  recipientId: z.string().trim().min(1).max(320).optional(),
+  mediaKind: z.enum(['sticker', 'gif', 'attachment']).optional(),
+  messageText: z.string().max(5000).optional(),
+  // upload-idempotency spec (task 4.2): optional, opaque, UNTRUSTED
+  // idempotency key that a client keeps stable across every retry of one
+  // logical upload action. Length-bounded here so an under/over-length
+  // value falls out of the existing `400 validation_failed` branch in the
+  // route (Req 2.8, 6.8). Never logged, never used as a metric label, never
+  // interpolated into an object path — only the 20-hex hash
+  // `deriveUploadKeyHash` derives from it can reach a path (Req 6.3, 6.4).
+  //
+  // `.trim()` runs BEFORE the length checks, so padding cannot buy a key its
+  // way past the minimum and the value the route hashes is the trimmed one.
+  uploadKey: z.string().trim().min(8).max(200).optional(),
+});
+
+/**
+ * An object already stored at a deterministic upload path, as seen by
+ * `probeExistingUploadObject`. Every field is normalized: `bytes` is always a
+ * finite non-negative number, and `downloadToken` / `generation` are always either
+ * a non-empty string or `null`, whatever shape the raw Storage metadata arrived in.
+ */
+export interface ExistingUploadObject {
+  bytes: number;
+  /** First value of `metadata.firebaseStorageDownloadTokens`, if any. */
+  downloadToken: string | null;
+  /**
+   * The object's Storage `generation` as a DECIMAL STRING, or `null` when the read
+   * carried none in a usable shape (upload-idempotency follow-up F9).
+   *
+   * Kept as a string on purpose: a GCS generation is an int64 and is serialized as
+   * a string precisely because it does not fit a JS `number` — coercing it would
+   * silently round, and a rounded generation sent as `ifGenerationMatch` would
+   * either never match (breaking every conditional write) or, far worse, match a
+   * DIFFERENT object version. It is only ever compared and echoed, never
+   * arithmetic, so a string is the right carrier.
+   */
+  generation: string | null;
 }
 
-function inferExtensionFromContentType(contentType?: string | null, fallback = 'bin'): string {
-  const ct = (contentType ?? '').trim().toLowerCase();
-  if (ct === 'image/png') return 'png';
-  if (ct === 'image/jpeg' || ct === 'image/jpg') return 'jpg';
-  if (ct === 'image/webp') return 'webp';
-  if (ct === 'image/svg+xml') return 'svg';
-  if (ct === 'audio/mpeg' || ct === 'audio/mp3') return 'mp3';
-  if (ct === 'audio/wav') return 'wav';
-  if (ct === 'audio/ogg') return 'ogg';
-  if (ct === 'audio/mp4' || ct === 'audio/m4a') return 'm4a';
-  if (ct === 'application/pdf') return 'pdf';
-  return fallback;
+/**
+ * Read the HTTP-ish status codes a Storage rejection can carry, from each of the
+ * four places the SDK is known to put one. Reads are individually guarded because
+ * the value can be anything a rejected promise can carry — including an object
+ * whose property access itself throws.
+ *
+ * Shared by `isStorageObjectNotFound` and `isStoragePreconditionFailed` so the two
+ * classifiers can never drift in WHERE they look; they differ only in the status
+ * they look for.
+ */
+function readStorageErrorStatusCodes(error: unknown): (number | null)[] {
+  const readNumeric = (read: () => unknown): number | null => {
+    try {
+      const raw = read();
+      if (typeof raw === 'number') return raw;
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const candidate = error as any;
+  return [
+    readNumeric(() => candidate?.code),
+    readNumeric(() => candidate?.statusCode),
+    readNumeric(() => candidate?.status),
+    readNumeric(() => candidate?.response?.status),
+  ];
+}
+
+/** Is this rejection Storage's "object does not exist"? */
+function isStorageObjectNotFound(error: unknown): boolean {
+  return readStorageErrorStatusCodes(error).some((value) => value === 404);
+}
+
+/**
+ * Is this rejection Storage's "your write precondition did not hold"?
+ * (upload-idempotency follow-up F9.)
+ *
+ * `412 Precondition Failed` is what a conditional `file.save()` gets back when the
+ * object's generation is not what `ifGenerationMatch` claimed — i.e. when a
+ * concurrent sibling attempt of the SAME logical upload action wrote first.
+ *
+ * THIS IS THE HIGHEST-RISK CLASSIFIER ON THE UPLOAD PATH. A 412 that is not
+ * recognized here becomes a `500 upload_failed` for a request whose file is, in
+ * fact, correctly stored — turning a quota-counter improvement into an availability
+ * regression. So it mirrors `isStorageObjectNotFound` exactly: the same four
+ * locations, the same per-property guarding, and total for every rejection value
+ * (a string, a number, `null`, an object with a throwing getter). Anything it
+ * cannot read is simply "not a 412", which falls through to the pre-existing
+ * `500` path — the same outcome as before preconditions existed.
+ */
+export function isStoragePreconditionFailed(error: unknown): boolean {
+  return readStorageErrorStatusCodes(error).some((value) => value === 412);
+}
+
+/** Normalize a raw Storage `size` (absent, string, negative, NaN…) to bytes. */
+function normalizeProbedObjectBytes(raw: unknown): number {
+  const numeric =
+    typeof raw === 'number'
+      ? raw
+      : typeof raw === 'string' && raw.trim() !== ''
+        ? Number(raw)
+        : typeof raw === 'bigint'
+          ? Number(raw)
+          : NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return numeric;
+}
+
+/**
+ * `firebaseStorageDownloadTokens` can hold several comma-joined tokens; the URL
+ * Firebase serves resolves with any of them, and the first is the one this
+ * endpoint wrote. Anything that is not a non-empty string yields `null`.
+ */
+function extractFirstDownloadToken(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const first = raw.split(',')[0]?.trim() ?? '';
+  return first.length > 0 ? first : null;
+}
+
+/**
+ * A real GCS generation, or `null` (upload-idempotency follow-up F9).
+ *
+ * Normalized in the same defensive style as `normalizeProbedObjectBytes` /
+ * `extractFirstDownloadToken`, because this value is fed straight back to Storage as
+ * `ifGenerationMatch` and a wrong value there is not a no-op:
+ *
+ * - Kept as a DECIMAL STRING. A generation is an int64 (`1712345678901234567`),
+ *   which is why the API serializes it as a string; `Number()` would round it and
+ *   the precondition would then reference a version that never existed.
+ * - `0` and anything with a leading zero are rejected. `ifGenerationMatch: 0` is
+ *   Storage's "the object must NOT exist" — the exact OPPOSITE of "match the object
+ *   I probed" — so letting a bogus `0` through would turn an intended overwrite
+ *   into a create-only write that always 412s.
+ * - More than 20 digits cannot be an int64, so it is treated as unparseable.
+ *
+ * Anything unusable yields `null`, and the caller then sends NO precondition, i.e.
+ * today's last-writer-wins behavior. Degrade, never fail.
+ */
+function normalizeProbedObjectGeneration(raw: unknown): string | null {
+  const text =
+    typeof raw === 'string'
+      ? raw.trim()
+      : typeof raw === 'number'
+        ? Number.isSafeInteger(raw) && raw > 0
+          ? String(raw)
+          : ''
+        : typeof raw === 'bigint'
+          ? raw > 0n
+            ? raw.toString()
+            : ''
+          : '';
+  return /^[1-9][0-9]{0,19}$/.test(text) ? text : null;
+}
+
+/**
+ * What a probe of a deterministic upload path learned (upload-idempotency follow-up
+ * F10).
+ *
+ * THE BUG THIS SHAPE FIXES. `probeExistingUploadObject` reports absence and failure
+ * with the same value (`null`), so the write-precondition resolver could not tell
+ * "the object is genuinely not there" from "I could not read the object state". It
+ * mapped both to `ifGenerationMatch: 0` — an assertion about state the request never
+ * observed — and a degraded probe against an object that DOES exist then 412'd, was
+ * reported as a lost race, and the caller's bytes were silently dropped while the
+ * response carried the pre-existing object's url. Req 9.13 forbids exactly that:
+ * where the observed state cannot be read, send NO condition and complete the upload.
+ *
+ * Shape rationale: a discriminated union whose `object` field is present on EVERY
+ * member. `state` adds the one genuinely new fact, while `object` keeps its old type
+ * (`ExistingUploadObject | null`) and stays readable without narrowing — so every
+ * downstream consumer (quota delta, token reuse, share-doc reuse, the overwrite
+ * metric) is byte-identical for all three states and the new state cannot leak into
+ * them. `{ object, stateKnown }` would have carried the same two bits, but it makes
+ * "absent" and "unreadable" a derived combination rather than a named case, and it
+ * cannot express "found ⇒ object is non-null" in the type.
+ */
+export type UploadObjectProbeResult =
+  /** The metadata read succeeded and an object is stored at the path. */
+  | { state: 'found'; object: ExistingUploadObject }
+  /** The metadata read said 404: the path is genuinely empty. */
+  | { state: 'absent'; object: null }
+  /**
+   * The object state could NOT be read — a non-404 read failure, or metadata whose
+   * normalization itself threw. Nothing is known, so nothing may be asserted about
+   * it in a write precondition (Req 9.13).
+   */
+  | { state: 'unreadable'; object: null };
+
+/**
+ * The probe result for a path that was never probed — an unkeyed legacy or
+ * `profilePicture` path (Req 9.7: no probe runs there at all).
+ *
+ * `absent` rather than a fourth state on purpose: those paths are timestamped or
+ * randomized, so nothing is expected to be there, and `resolveUploadSavePrecondition`
+ * short-circuits on `keyed: false` before it ever reads `state`. Adding a
+ * `not_probed` member would put a case in the union that no branch can act on.
+ */
+export const UPLOAD_OBJECT_PROBE_SKIPPED: UploadObjectProbeResult = Object.freeze({
+  state: 'absent',
+  object: null,
+} as const);
+
+/**
+ * Read the object currently stored at a deterministic upload path
+ * (upload-idempotency spec, task 4.1; three-state result added in follow-up F10).
+ *
+ * Reports `absent` when the object does not exist (404) and `unreadable` when the
+ * metadata read fails for any other reason. Both carry `object: null`, so a failed
+ * probe still degrades to "treat as a new object" for quota purposes, which
+ * over-reserves at worst and can never under-count (Req 9.2, 9.4). The difference is
+ * consumed by exactly one caller — `resolveUploadSavePrecondition` — which must not
+ * assert a condition on state this request never observed (Req 9.13).
+ *
+ * TOTALITY (design Property 13): this runs on every opted-in upload, so an escaped
+ * exception would turn a would-be-successful upload into a `500`. The promise
+ * therefore always resolves — never rejects — for any rejection value and any
+ * malformed metadata shape. Read-only: it calls `getMetadata()` and nothing else,
+ * so it never writes and never mutates the probed object (Req 9.3).
+ *
+ * Also called a SECOND time, by `saveUploadObjectWithPrecondition`, after a `412`
+ * (upload-idempotency follow-up F9): the totality contract is what lets that
+ * recovery treat a re-probe as "found / not found" without a third failure mode.
+ * That re-probe deliberately does NOT consume `state` — "absent" and "unreadable"
+ * both correctly lead to the one unconditioned fallback write with the reservation
+ * kept, so it keeps using the `ExistingUploadObject | null` adapter below.
+ *
+ * The raw `uploadKey` is deliberately not a parameter, so it cannot reach a log
+ * line from here (Req 6.4); the warning below carries no client-supplied value —
+ * not even `objectPath`, whose trailing segment embeds a caller-supplied filename.
+ *
+ * `purpose` is a parameter solely so the probe-failure counter can carry it as its
+ * only label (Req 8.2). It is a closed seven-member union, so it is the one piece
+ * of request context here with bounded cardinality and no leak surface — which is
+ * exactly why it is the only label allowed (Req 6.4, 8.4).
+ *
+ * Only called for a deterministic path, so a caller that sends no `uploadKey`
+ * adds zero Storage round trips (Req 2.5, 9.7).
+ */
+export async function probeUploadObjectState(
+  bucket: ReturnType<admin.storage.Storage['bucket']>,
+  objectPath: string,
+  purpose: StorageUploadPurpose
+): Promise<UploadObjectProbeResult> {
+  try {
+    let metadata: any;
+    try {
+      const result: unknown = await bucket.file(objectPath).getMetadata();
+      // The Admin SDK resolves `[metadata, apiResponse]`; tolerate a bare object.
+      metadata = Array.isArray(result) ? result[0] : result;
+    } catch (error) {
+      if (isStorageObjectNotFound(error)) {
+        return { state: 'absent', object: null };
+      }
+      // Non-404: warn, count, and degrade to "no existing object" (Req 9.2).
+      try {
+        console.warn(
+          '[storage_upload] existing-object probe failed; treating upload as a new object',
+          error instanceof Error ? error.message : typeof error
+        );
+      } catch {
+        // Even logging must not break the upload.
+      }
+      // Probe-failure counter (task 6.2, Req 8.2): exactly one increment per
+      // non-404 failure, and none for a 404 or a successful read — the two branches
+      // above and below this one both return without passing through here.
+      //
+      // Labelled by `purpose` ONLY. The raw `uploadKey`, its hash, the filename and
+      // `objectPath` are all either unbounded-cardinality label values or a leak
+      // surface, so none of them may become a label (Req 6.4, 8.4).
+      //
+      // Inside the failure-safety envelope on purpose: this whole function is
+      // documented as total (design Property 13) because an escaped exception would
+      // turn a would-be-successful upload into a 500. A metrics write is a plain
+      // in-memory map update, but it is not worth betting the upload path on that,
+      // so it gets the same treatment as the warning above.
+      try {
+        inc(metricNames.storageUploadOverwriteProbeFailed, { purpose });
+      } catch {
+        // Metrics are never worth failing an upload for.
+      }
+      return { state: 'unreadable', object: null };
+    }
+
+    return {
+      state: 'found',
+      object: {
+        bytes: normalizeProbedObjectBytes(metadata?.size),
+        downloadToken: extractFirstDownloadToken(metadata?.metadata?.firebaseStorageDownloadTokens),
+        // Top-level `generation`, NOT `metadata.metadata.*`: it is object state Storage
+        // maintains, not custom metadata (upload-idempotency follow-up F9).
+        generation: normalizeProbedObjectGeneration(metadata?.generation),
+      },
+    };
+  } catch {
+    // Backstop: normalization reading a hostile metadata shape must not escape
+    // either. The read itself may well have succeeded, but nothing usable came out
+    // of it, so the state is UNKNOWN — the same conclusion as a failed read, and the
+    // same consequence: no write condition may be asserted (Req 9.13). Deliberately
+    // NOT counted by the probe-failure counter, which stays "exactly one increment
+    // per non-404 read failure, zero for a 404 or a successful read" (Req 8.2).
+    return { state: 'unreadable', object: null };
+  }
+}
+
+/**
+ * `probeUploadObjectState` reduced to the object it found, or `null`.
+ *
+ * Retained as the shape the `412` re-probe and every existing caller use: that
+ * recovery treats "absent" and "unreadable" identically — both lead to one
+ * unconditioned fallback write with the reservation kept — so widening it to the
+ * three-state result would add a distinction it has no branch for.
+ *
+ * Total for the same reason its delegate is: it only reads a field off a value
+ * `probeUploadObjectState` always resolves with.
+ */
+export async function probeExistingUploadObject(
+  bucket: ReturnType<admin.storage.Storage['bucket']>,
+  objectPath: string,
+  purpose: StorageUploadPurpose
+): Promise<ExistingUploadObject | null> {
+  return (await probeUploadObjectState(bucket, objectPath, purpose)).object;
+}
+
+/**
+ * Mint a fresh Firebase download token. This is the generator `POST
+ * /storage/upload` has always used, factored out unchanged so the fresh branch of
+ * `selectUploadDownloadToken` and the legacy (no `uploadKey`) path keep producing
+ * exactly the same shape of value as today.
+ */
+function mintUploadDownloadToken(): string {
+  return typeof (crypto as any).randomUUID === 'function'
+    ? (crypto as any).randomUUID()
+    : crypto.randomBytes(16).toString('hex');
+}
+
+/**
+ * Choose the download token for an upload write (upload-idempotency spec, task
+ * 4.4, Req 4.1–4.4).
+ *
+ * The token is a capability: the returned `url` embeds it, so a retry that
+ * rotated it would hand back a DIFFERENT url and silently break whatever the lost
+ * first response's url was already persisted against (a fee's `receiptUrl`, a
+ * notice image, a chat bubble). Reusing the token the probe read off the stored
+ * object is what makes the retry's url byte-identical (Req 4.2).
+ *
+ * - Probe found an object carrying a non-blank token ⇒ reuse it (Req 4.1).
+ * - Probe returned `null` (legacy path, 404, or a degraded probe), or the stored
+ *   object carries no usable token ⇒ mint a fresh one (Req 4.3). A caller that
+ *   sends no `uploadKey` never probes, so `existing` is always `null` there and
+ *   this is byte-for-byte today's behavior (Req 2.4).
+ *
+ * The value is always read from the STORED OBJECT's metadata and is never derived
+ * from `uploadKey` or any other client-supplied input (Req 4.4), so a client
+ * cannot steer a capability token.
+ *
+ * `probeExistingUploadObject` already reduced a comma-joined
+ * `firebaseStorageDownloadTokens` list to its first entry, which is the one this
+ * endpoint wrote; no further splitting happens here, so whatever normalization the
+ * probe applied is the single source of truth for the token's shape.
+ *
+ * Total by construction: every input shape (including a hand-built object with a
+ * non-string `downloadToken`) falls through to a freshly minted token rather than
+ * throwing — this runs on the critical path of every upload.
+ */
+export function selectUploadDownloadToken(existing: ExistingUploadObject | null): string {
+  return resolveUploadDownloadToken(existing).token;
+}
+
+/**
+ * The token an upload write will carry, together with WHERE it came from
+ * (upload-idempotency follow-up F10).
+ *
+ * `reused` is `true` only when `token` was read off the probed object rather than
+ * freshly minted. `saveUploadObjectWithPrecondition` needs exactly that fact to
+ * attribute a `412`: a fresh UUID found stored can only be this request's own write,
+ * whereas a reused token is what BOTH racers wrote, so attribution is undecidable.
+ */
+export interface UploadDownloadTokenDecision {
+  token: string;
+  reused: boolean;
+}
+
+/**
+ * Choose the download token AND report whether it was reused (upload-idempotency
+ * follow-up F10). `selectUploadDownloadToken` is a thin projection of this.
+ *
+ * WHY THIS EXISTS. The route used to re-derive the reuse flag by raw string
+ * comparison — `(existing?.downloadToken ?? null) === attemptedDownloadToken` — which
+ * only agreed with this function because both sides happened to trim identically.
+ * That is a silent coupling between two normalizations: if either side's trimming
+ * ever diverged, the flag would flip to `false`, a lost race would be mis-attributed
+ * as `outcome: 'written'`, and the route would then perform the shrink release the
+ * winner already performed — a double credit, i.e. the UNDER-count Req 9.4 forbids.
+ * The reuse decision is made here, once, and handed to the caller as data.
+ */
+export function resolveUploadDownloadToken(existing: ExistingUploadObject | null): UploadDownloadTokenDecision {
+  const reusable = typeof existing?.downloadToken === 'string' ? existing.downloadToken.trim() : '';
+  return reusable.length > 0 ? { token: reusable, reused: true } : { token: mintUploadDownloadToken(), reused: false };
+}
+
+/**
+ * Build the download URL the upload response returns. Extracted verbatim from the
+ * route so the token-selection seam and the url it feeds are testable together
+ * (design Property 12): url stability across retries is a property of the token
+ * AND the path, and only this function combines them.
+ */
+export function buildUploadDownloadUrl(bucketName: string, objectPath: string, downloadToken: string): string {
+  return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(objectPath)}?alt=media&token=${downloadToken}`;
+}
+
+/**
+ * The write precondition a conditional upload sends to Storage
+ * (`SaveOptions.preconditionOpts`, @google-cloud/storage 7.x).
+ *
+ * `ifGenerationMatch: 0` is Storage's "only if no live object exists"; a decimal
+ * generation string is "only if the live object is exactly this version".
+ */
+export type UploadSavePrecondition = { ifGenerationMatch: string | number };
+
+export type UploadSavePreconditionReason =
+  /** Probe read a genuine 404 ⇒ create-only, so a concurrent creator is detected. */
+  | 'create_if_absent'
+  /** Probe found an object with a usable generation ⇒ overwrite exactly that one. */
+  | 'match_probed_generation'
+  /** Deterministic path, but the probe carried no usable generation ⇒ degrade. */
+  | 'generation_unavailable'
+  /**
+   * The probe could not read the object state at all (F10) ⇒ degrade. Asserting
+   * anything here would condition the write on state the request never observed,
+   * which Req 9.13 forbids.
+   */
+  | 'probe_unreadable'
+  /** Legacy timestamped/random path: byte-for-byte unchanged, never conditioned. */
+  | 'unkeyed_path';
+
+export interface UploadSavePreconditionDecision {
+  precondition: UploadSavePrecondition | null;
+  reason: UploadSavePreconditionReason;
+}
+
+/**
+ * Decide the write precondition for an upload (upload-idempotency follow-up F9,
+ * Req 9.5, 9.12, 9.13).
+ *
+ * WHAT THIS FIXES. Two attempts of one logical action can be in flight at once —
+ * most plausibly the native background uploader's internal retry firing while the
+ * first attempt is still connected. Both probe before either writes, so both see no
+ * existing object and both reserve the FULL file size, and recorded usage is
+ * over-counted by one file size per racing pair until a reconcile. A generation
+ * precondition turns "was I first?" into an atomic, lock-free, STATELESS question
+ * that Storage itself answers, so the loser can release its reservation instead.
+ *
+ * WHY NOT A LEASE. A Firestore lease keyed on the key hash was rejected on purpose
+ * and must not be reintroduced: a stale lease (holder crashed, expiry not yet
+ * reached) blocks a legitimate retry, i.e. it breaks the exact flow this feature
+ * exists to enable. A precondition has no such failure mode — there is nothing to
+ * hold, nothing to expire and nothing to clean up.
+ *
+ * The branches:
+ *
+ * - `state: 'absent'` (a genuine 404) ⇒ `ifGenerationMatch: 0`. Create-only. A
+ *   sibling that got there first turns this into a `412` instead of a silent second
+ *   full write. This is the branch that closes the concurrency bug, and it applies
+ *   ONLY to an observed 404 — never to a probe that failed.
+ * - `state: 'found'` with a generation ⇒ `ifGenerationMatch: <generation>`. Overwrite
+ *   exactly the version that was probed, so the quota delta computed from that
+ *   version's byte count is the delta actually applied.
+ * - `state: 'found'` without a usable generation ⇒ NO precondition, i.e. today's
+ *   last-writer-wins. Degrade, never fail: a metadata shape we cannot read must not
+ *   cost the user their upload.
+ * - `state: 'unreadable'` ⇒ NO precondition (F10, Req 9.13). The request never
+ *   observed the object state, so it may not assert one. Sending
+ *   `ifGenerationMatch: 0` here was a real regression, not a performance nit: on an
+ *   object that DOES exist it 412s, the recovery re-probe then finds the existing
+ *   object, the `412` is attributed to a sibling, and the caller's bytes are silently
+ *   dropped while the response hands back the pre-existing object's url. Before
+ *   conditional writes existed this same request wrote its bytes correctly and merely
+ *   over-counted usage until the next reconcile — which is precisely the degradation
+ *   Req 9.2/9.4/9.13 ask for.
+ *
+ * `keyed` is `uploadKeyHash !== null`, and it is the gate rather than
+ * `resolved.deterministic` for a substantive reason, not tidiness. The whole "a lost
+ * race is a SUCCESS" semantics rests on the racers being attempts of ONE logical
+ * action, which is exactly what a key hash certifies (it binds tenant + purpose +
+ * actor + the client's stable key). `profilePicture` WITHOUT an `uploadKey` also
+ * resolves a deterministic path, but two concurrent writes there may be two
+ * genuinely different avatar picks; handing the second one the first one's URL and
+ * dropping its bytes would be wrong. That path therefore keeps today's
+ * last-writer-wins. Legacy timestamped/random paths are likewise never conditioned:
+ * a collision there would be two UNRELATED uploads, so "return the winner's URL"
+ * would hand back a different file.
+ */
+export function resolveUploadSavePrecondition(args: {
+  /** `true` when the resolved path carries an upload-key hash. */
+  keyed: boolean;
+  /**
+   * The probe result, NOT a bare `ExistingUploadObject | null` (F10). Taking the
+   * union means "absent" and "unreadable" cannot arrive here as the same value, and
+   * the contradictory pair "unreadable, but here is the object" is unrepresentable.
+   * For an unkeyed path — where no probe runs — the route passes
+   * `UPLOAD_OBJECT_PROBE_SKIPPED` and the `keyed` short-circuit below decides first.
+   */
+  probe: UploadObjectProbeResult;
+}): UploadSavePreconditionDecision {
+  if (!args.keyed) {
+    return { precondition: null, reason: 'unkeyed_path' };
+  }
+  if (args.probe.state === 'unreadable') {
+    return { precondition: null, reason: 'probe_unreadable' };
+  }
+  if (args.probe.state === 'absent') {
+    return { precondition: { ifGenerationMatch: 0 }, reason: 'create_if_absent' };
+  }
+  const generation = normalizeProbedObjectGeneration(args.probe.object.generation);
+  if (!generation) {
+    return { precondition: null, reason: 'generation_unavailable' };
+  }
+  return { precondition: { ifGenerationMatch: generation }, reason: 'match_probed_generation' };
+}
+
+export type UploadObjectWriteResult =
+  /**
+   * This request's bytes are stored at the path, so it keeps its reservation.
+   * `unconditioned` is true when the write that landed carried no precondition —
+   * either because none was sent to begin with, or because a `412` was followed by
+   * the object vanishing and the fallback write ran.
+   */
+  | { outcome: 'written'; unconditioned: boolean }
+  /**
+   * A sibling attempt of the same logical action won; this request wrote nothing.
+   *
+   * `downloadToken` is the WINNER's, so the URL the caller builds is byte-identical
+   * to the one the winning request returned (Req 4.1, 4.2) — which is the whole
+   * point: a URL already persisted against a fee, notice or message keeps
+   * resolving.
+   *
+   * `releaseReservation` is false only when attribution is ambiguous (see below), in
+   * which case holding the bytes over-counts rather than under-counts (Req 9.4).
+   */
+  | { outcome: 'lost_race'; downloadToken: string; releaseReservation: boolean };
+
+export interface SaveUploadObjectWithPreconditionArgs {
+  /** From `resolveUploadSavePrecondition`; `null` means "write as today". */
+  precondition: UploadSavePrecondition | null;
+  /** The download token this request put in the object's metadata. */
+  attemptedDownloadToken: string;
+  /**
+   * Whether `attemptedDownloadToken` was REUSED from the probe rather than freshly
+   * minted. This is what makes write attribution decidable — see below.
+   */
+  reusedProbedToken: boolean;
+  /** Perform the write. The route wires this to `bucket.file(path).save(...)`. */
+  save: (precondition: UploadSavePrecondition | null) => Promise<void>;
+  /** Re-read the path. The route wires this to `probeExistingUploadObject`. */
+  reprobe: () => Promise<ExistingUploadObject | null>;
+}
+
+/**
+ * Write the object, and turn a lost precondition race into a SUCCESS
+ * (upload-idempotency follow-up F9, Req 4.1, 4.2, 9.4, 9.5, 9.9–9.13).
+ *
+ * A `412` means a sibling attempt of the same logical action wrote first. That is
+ * not an error — the file the user asked to store IS stored, byte-for-byte, because
+ * the sibling is the same logical action. It MUST NEVER reach the client as a `4xx`
+ * or `5xx`: an inflated usage counter is a reporting blemish, while a failed upload
+ * is a broken feature. Guarding that is this function's entire job.
+ *
+ * The order below is not negotiable:
+ *
+ * 1. RE-PROBE first. Probing before releasing means bytes that are still ours are
+ *    never released, and bytes we do not hold are never written. Reversing the two
+ *    introduces an under-count.
+ * 2. Object found with a usable token ⇒ the sibling won. The caller releases its
+ *    reservation and returns the WINNER's URL. If instead the stored object carries
+ *    the token this request minted, the winner is *this* request: a fresh UUID
+ *    cannot have been written by anyone else, so the storage client's own retry
+ *    landed after a lost acknowledgement, and the reservation must be KEPT
+ *    (`outcome: 'written'`). When the token was reused from the probe, both racers
+ *    wrote the same token and attribution is undecidable — reported as a lost race
+ *    (the URL is identical either way) but with `releaseReservation: false`, because
+ *    an over-count self-heals at the next reconcile and an under-count does not.
+ * 3. Object NOT found — it vanished, or the re-probe degraded ⇒ keep the reservation
+ *    and retry the write ONCE with NO precondition, i.e. exactly today's behavior.
+ *
+ * Non-412 save failures propagate untouched, so the route's existing rollback and
+ * `500 upload_failed` are reached exactly as before. A `null` precondition
+ * short-circuits the classifier entirely, which is what keeps the legacy path
+ * byte-for-byte unchanged: one `save()` call, and any error propagates.
+ *
+ * A re-probe that somehow rejects is treated as "not found" rather than allowed to
+ * escape, because escaping would convert the 412 into the `500` this function
+ * exists to prevent. (`probeExistingUploadObject` is documented total, so in the
+ * route this is unreachable; it is guarded because the seam is injectable.)
+ */
+export async function saveUploadObjectWithPrecondition(
+  args: SaveUploadObjectWithPreconditionArgs
+): Promise<UploadObjectWriteResult> {
+  try {
+    await args.save(args.precondition);
+    return { outcome: 'written', unconditioned: args.precondition === null };
+  } catch (error) {
+    if (args.precondition === null || !isStoragePreconditionFailed(error)) {
+      throw error;
+    }
+
+    // 1. Re-probe BEFORE any release.
+    let winner: ExistingUploadObject | null = null;
+    try {
+      winner = await args.reprobe();
+    } catch {
+      winner = null;
+    }
+    const winnerToken = typeof winner?.downloadToken === 'string' ? winner.downloadToken.trim() : '';
+
+    // 3. Vanished, or the re-probe could not give us a usable URL. Without the
+    //    winner's token there is no valid URL to hand back — a freshly minted one
+    //    would not authorize against bytes we did not write — so fall back to
+    //    today's unconditioned write, still holding the reservation.
+    if (!winner || !winnerToken) {
+      await args.save(null);
+      return { outcome: 'written', unconditioned: true };
+    }
+
+    // 2. Someone's bytes are at the path. Whose?
+    const carriesOurToken = winnerToken === args.attemptedDownloadToken.trim();
+    if (carriesOurToken && !args.reusedProbedToken) {
+      // Freshly minted token, and it is what is stored ⇒ our own write landed.
+      return { outcome: 'written', unconditioned: false };
+    }
+    return {
+      outcome: 'lost_race',
+      downloadToken: winnerToken,
+      releaseReservation: !carriesOurToken,
+    };
+  }
+}
+
+/**
+ * The purposes whose uploads receive a pre-created `sharedFiles` document. Kept as
+ * a set purely so `resolveShareTokenForUpload` owns the filter; the membership is
+ * unchanged from the inline `shouldPrecreateShareToken` chain it replaces —
+ * `tenantLogo` and `profilePicture` still get no share doc, which keeps the user's
+ * shared-files list free of records nobody ever shares.
+ */
+const UPLOAD_SHARE_TOKEN_PURPOSES: ReadonlySet<StorageUploadPurpose> = new Set<StorageUploadPurpose>([
+  'chat',
+  'receipt',
+  'noticeImage',
+  'noticeAudio',
+  'studentProfile',
+]);
+
+export interface ResolveShareTokenForUploadArgs {
+  purpose: StorageUploadPurpose;
+  /** Tenant-guard-resolved id, never the query string value (Req 6.6). */
+  tenantId: string;
+  /** Authenticated actor uid; anything blank means "unknown actor" ⇒ no share doc. */
+  actorUid: string | null | undefined;
+  /** `quotaDelta.isOverwrite`: true only when the probe found an existing object. */
+  isOverwrite: boolean;
+  /** The url this write returns, already built from the (possibly reused) token. */
+  fileUrl: string;
+  /**
+   * Latest ACTIVE share token for `(tenantId, uid, fileUrl)`, or `null` when there
+   * is none. Only invoked on the overwrite path. The route wires this to
+   * `findLatestActiveShareForFile`, which already skips revoked/expired docs via
+   * `isActiveSharedFileDoc`, so a stale token can never be handed back.
+   */
+  findExistingShareToken: (input: { tenantId: string; uid: string; fileUrl: string }) => Promise<string | null>;
+  /** Mint a token and persist its `sharedFiles` doc; `null` when unusable. */
+  createShareToken: (input: { tenantId: string; uid: string; fileUrl: string }) => Promise<string | null>;
+}
+
+/**
+ * Decide the `shareToken` a successful upload returns (upload-idempotency spec,
+ * task 4.5, Req 5.1–5.3, 5.6).
+ *
+ * Only the OVERWRITE path changes. Because the download token was reused
+ * (`selectUploadDownloadToken`), a retry's `fileUrl` is byte-identical to the one
+ * the lost first response returned, so the existing `sharedFiles` doc for
+ * `(tenant, actor, url)` is findable and reusable — one logical action leaves at
+ * most one active share doc and does not leak a second live capability token
+ * (Req 5.1, 5.2). When `isOverwrite` is false — which is every caller that sends
+ * no `uploadKey`, since no probe runs for a legacy path — this mints and writes
+ * exactly as it does today, with the same per-purpose filter and the same
+ * unknown-actor early return (Req 5.3).
+ *
+ * Best effort in both directions, because the bytes are already stored by the time
+ * this runs and failing the request would make the client re-upload an object that
+ * is already correct:
+ * - A failed REUSE LOOKUP (missing composite index, transient Firestore error)
+ *   falls open to minting, matching `/shared-files/resolve-or-create`. At worst
+ *   that leaves the extra share doc today's code would have created anyway.
+ * - A failed MINT or WRITE resolves to `undefined`, so the response simply omits
+ *   `shareToken` and still reports the successful upload (Req 5.6). The client
+ *   handles an absent token by calling `ensureSmartShareLink`, which
+ *   resolves-or-creates by url.
+ *
+ * The token is never derived from `uploadKey` or any other client-supplied value:
+ * it is either read back from an existing doc or freshly minted (Req 4.4).
+ */
+export async function resolveShareTokenForUpload(args: ResolveShareTokenForUploadArgs): Promise<string | undefined> {
+  if (!UPLOAD_SHARE_TOKEN_PURPOSES.has(args.purpose)) {
+    return undefined;
+  }
+  const uid = typeof args.actorUid === 'string' ? args.actorUid.trim() : '';
+  if (!uid) {
+    return undefined;
+  }
+
+  const lookupInput = { tenantId: args.tenantId, uid, fileUrl: args.fileUrl };
+
+  try {
+    if (args.isOverwrite) {
+      let reused: string | null = null;
+      try {
+        reused = await args.findExistingShareToken(lookupInput);
+      } catch (error) {
+        // Fail OPEN to minting rather than omitting the token: the upload already
+        // succeeded, and a missing index must not cost the client its share link.
+        console.warn('[storage_upload] share reuse lookup failed; minting a new share token', error);
+        reused = null;
+      }
+      const reusableToken = typeof reused === 'string' ? reused.trim() : '';
+      if (reusableToken) {
+        return reusableToken;
+      }
+      // No active doc found (never created, or revoked/expired) ⇒ mint fresh.
+    }
+
+    const minted = await args.createShareToken(lookupInput);
+    const mintedToken = typeof minted === 'string' ? minted.trim() : '';
+    return mintedToken || undefined;
+  } catch (error) {
+    console.warn('[storage_upload] unable to precreate share token', error);
+    return undefined;
+  }
 }
 
 async function sumStoragePrefixBytes(
@@ -1583,6 +2369,12 @@ async function estimateTenantStorageBytes(
   // proceed with the full sum (temporarily inflated until next reconciliation).
   let excludePaths = new Set<string>();
   if (db) {
+    // Cleared in the `finally` below once the race settles. Without that the
+    // 5s guard timer stays pending for its full duration after the query has
+    // already answered, keeping the event loop alive — invisible in the
+    // long-lived server, but it holds a short-lived process (a job script, a
+    // test run) open for five seconds after its work is done.
+    let excludeQueryTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const EXCLUDE_QUERY_TIMEOUT_MS = 5000;
       const deletedQueryPromise = db
@@ -1590,9 +2382,12 @@ async function estimateTenantStorageBytes(
         .where('tenantId', '==', normalizedTenantId)
         .where('originalDeleted', '==', true)
         .get();
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('videoTranscodes exclusion query timed out')), EXCLUDE_QUERY_TIMEOUT_MS)
-      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        excludeQueryTimeout = setTimeout(
+          () => reject(new Error('videoTranscodes exclusion query timed out')),
+          EXCLUDE_QUERY_TIMEOUT_MS
+        );
+      });
       const deletedSnap = await Promise.race([deletedQueryPromise, timeoutPromise]);
       deletedSnap.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
         const originalPath: unknown = doc.data().originalPath;
@@ -1606,6 +2401,10 @@ async function estimateTenantStorageBytes(
         err instanceof Error ? err.message : err
       );
       excludePaths = new Set<string>(); // reset to empty — full sum
+    } finally {
+      if (excludeQueryTimeout !== undefined) {
+        clearTimeout(excludeQueryTimeout);
+      }
     }
   }
 
@@ -1690,6 +2489,182 @@ async function releaseTenantStorageBytes(
       { merge: true }
     );
   });
+}
+
+/**
+ * What the reservation step of `POST /storage/upload` decided, as data.
+ *
+ * Every non-`reserved` outcome carries the exact HTTP status, response body and
+ * metric stage label the route has always returned for that case, so the route's
+ * job is a single forward — `res.status(result.status).json(result.body)` — and
+ * there is no second place where a status code or a stage label could drift.
+ */
+export type UploadQuotaReservationResult =
+  /** The bytes are held. The caller now owes a release if the write fails. */
+  | { outcome: 'reserved' }
+  | {
+      outcome: 'rejected';
+      status: 409;
+      /** `metricNames.storageUploadRejected`. */
+      metric: string;
+      stage: 'reserve_reconcile' | 'reserve_retry' | 'last_chance';
+      body: {
+        error: 'storage_limit_reached';
+        limitBytes: number;
+        /** May be `undefined` on the retry path, exactly as before; JSON drops it. */
+        usedBytes: number | undefined;
+        incrementBytes: number;
+      };
+    }
+  | {
+      outcome: 'check_failed';
+      status: 503;
+      /** `metricNames.storageUploadQuotaCheckFailed`. */
+      metric: string;
+      stage: 'reserve_unknown';
+      body: { error: 'storage_quota_check_failed' };
+      /** The original reserve failure, for the route's warning log. */
+      error: unknown;
+    };
+
+export interface ReserveUploadQuotaBytesArgs {
+  /** `quotaDelta.reserveBytes`; the caller only invokes this when it is `> 0`. */
+  reserveBytes: number;
+  /** `0` means "no plan limit", matching the route's `limitBytes` convention. */
+  limitBytes: number;
+  /**
+   * Hold `reserveBytes` against the tenant's recorded usage, rejecting with a
+   * `TenantStorageLimitError` (or anything `tryExtractTenantStorageLimitError`
+   * can classify) when the allowance cannot accommodate them. The route wires
+   * this to `reserveTenantStorageBytes` PLUS its `invalidateLiveCount` call, so
+   * the cache invalidation stays paired with the reservation and happens on the
+   * first attempt and the retry alike, exactly as it does today (Req 3.10).
+   *
+   * Must be atomic: on rejection it holds nothing, which is what lets every
+   * failure outcome below return without a release.
+   */
+  reserve: () => Promise<void>;
+  /** Recompute recorded usage from bucket truth and return the new total. */
+  reconcileUsageBytes: () => Promise<number>;
+}
+
+/**
+ * Reserve an upload's quota delta, with the reconcile-and-retry recovery the
+ * endpoint has always attempted (upload-idempotency spec follow-up).
+ *
+ * Extracted from the route body so the control flow below is assertable without an
+ * Express or Firebase harness — the same seam pattern as
+ * `probeExistingUploadObject`, `selectUploadDownloadToken` and
+ * `resolveShareTokenForUpload`.
+ *
+ * The paths, in order:
+ * 1. The reservation succeeds ⇒ `reserved`.
+ * 2. It fails with a classifiable limit error ⇒ reconcile once (deletions may have
+ *    happened since the counter was last trued up) and either reject with
+ *    `reserve_reconcile` (still over limit) or retry the reservation. A SUCCESSFUL
+ *    retry ⇒ `reserved`. A failing reconcile or a failing retry ⇒ `reserve_retry`.
+ * 3. It fails with something unclassifiable ⇒ the last-chance deterministic check:
+ *    reject with `last_chance` when reconciled usage proves the tenant is over
+ *    limit, otherwise report `reserve_unknown` (the route's `503`).
+ *
+ * FIXED BUG, do not reintroduce: this used to be inlined in the route as a
+ * `try/catch` whose limit-error branch fell THROUGH after a successful retry —
+ * into the last-chance check and then unconditionally into
+ * `503 storage_quota_check_failed`. Two consequences: the caller got a spurious
+ * `503` although its bytes were reserved and the upload could have proceeded
+ * (making this entire recovery path dead code), and the route's `reservedBytes`
+ * was still `0`, so the rollback released nothing and the reservation leaked until
+ * the next reconcile — a direct violation of Requirement 3.7. Returning
+ * `{ outcome: 'reserved' }` from the retry branch is the fix; the last-chance
+ * check below is reached only when the retry did NOT happen or did NOT succeed.
+ */
+export async function reserveUploadQuotaBytes(
+  args: ReserveUploadQuotaBytesArgs
+): Promise<UploadQuotaReservationResult> {
+  const { reserveBytes, limitBytes } = args;
+
+  try {
+    await args.reserve();
+    return { outcome: 'reserved' };
+  } catch (error) {
+    const limitError =
+      error instanceof TenantStorageLimitError
+        ? {
+            limitBytes: error.limitBytes,
+            usedBytes: error.usedBytes,
+            incrementBytes: error.incrementBytes,
+          }
+        : tryExtractTenantStorageLimitError(error);
+
+    if (limitError) {
+      // Reconcile once (deletions might have happened) and retry.
+      try {
+        const reconciled = await args.reconcileUsageBytes();
+        if (limitBytes > 0 && reconciled + reserveBytes > limitBytes) {
+          return {
+            outcome: 'rejected',
+            status: 409,
+            metric: metricNames.storageUploadRejected,
+            stage: 'reserve_reconcile',
+            body: {
+              error: 'storage_limit_reached',
+              limitBytes,
+              usedBytes: reconciled,
+              incrementBytes: reserveBytes,
+            },
+          };
+        }
+        await args.reserve();
+        // The recovery worked: the bytes are held, so the request continues to the
+        // write instead of falling through to the last-chance check and the 503.
+        return { outcome: 'reserved' };
+      } catch (reconcileOrRetryError) {
+        const retryLimitError = tryExtractTenantStorageLimitError(reconcileOrRetryError);
+        return {
+          outcome: 'rejected',
+          status: 409,
+          metric: metricNames.storageUploadRejected,
+          stage: 'reserve_retry',
+          body: {
+            error: 'storage_limit_reached',
+            limitBytes: retryLimitError?.limitBytes ?? limitError.limitBytes ?? limitBytes,
+            usedBytes: retryLimitError?.usedBytes ?? limitError.usedBytes,
+            incrementBytes: retryLimitError?.incrementBytes ?? limitError.incrementBytes ?? reserveBytes,
+          },
+        };
+      }
+    }
+
+    // Last-chance deterministic check for unclassified reserve failures.
+    try {
+      const reconciled = await args.reconcileUsageBytes();
+      if (limitBytes > 0 && reconciled + reserveBytes > limitBytes) {
+        return {
+          outcome: 'rejected',
+          status: 409,
+          metric: metricNames.storageUploadRejected,
+          stage: 'last_chance',
+          body: {
+            error: 'storage_limit_reached',
+            limitBytes,
+            usedBytes: reconciled,
+            incrementBytes: reserveBytes,
+          },
+        };
+      }
+    } catch {
+      // Keep original 503 fallback when reconciliation itself is unavailable.
+    }
+
+    return {
+      outcome: 'check_failed',
+      status: 503,
+      metric: metricNames.storageUploadQuotaCheckFailed,
+      stage: 'reserve_unknown',
+      body: { error: 'storage_quota_check_failed' },
+      error,
+    };
+  }
 }
 
 function stripUndefinedDeep<T>(value: T): T {
@@ -6360,7 +7335,7 @@ export function createApp(options: CreateAppOptions = {}){
 
     try {
       ensureFirebase();
-      const userRecord = await admin.auth().getUser(authContext.uid);
+      const userRecord = await getAuthUserByUidImpl(authContext.uid);
       return normalizeEmail(userRecord.email || undefined) || null;
     } catch (error) {
       // This can happen if a user was deleted while an old/stale token is still being used.
@@ -6406,8 +7381,7 @@ export function createApp(options: CreateAppOptions = {}){
     const actorId = options.authContext?.uid || options.authContext?.tokenType || 'system';
     const actorEmail = await resolveAuthenticatedEmail(options.authContext);
     try {
-      ensureFirebase();
-      await admin.firestore().collection('tenantAuditLogs').add(
+      await getFirestoreImpl().collection('tenantAuditLogs').add(
         stripUndefinedDeep({
           tenantId: options.tenantId,
           actorId,
@@ -8602,8 +9576,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const tenantId = parsed.data.tenantId.trim();
       const tenantRef = db.collection('tenants').doc(tenantId);
       const tenantSnap = await tenantRef.get();
@@ -8671,8 +9644,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const tenantId = parsed.data.tenantId.trim();
       const planVariantId = parsed.data.planVariantId.trim();
       const cancelMode = parsed.data.cancelExistingSubscription ?? 'none';
@@ -9650,7 +10622,7 @@ export function createApp(options: CreateAppOptions = {}){
         return res.status(400).json({ error: 'email_required' });
       }
 
-      const alreadyMember = await isTenantEmailActiveMember(tenantAccess.tenantId, inviteeEmail);
+      const alreadyMember = await isTenantEmailActiveMemberImpl(tenantAccess.tenantId, inviteeEmail);
       if (alreadyMember) {
         return res.status(409).json({ error: 'membership_exists_for_email' });
       }
@@ -11658,8 +12630,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const userEmail = await resolveAuthenticatedEmail(authContext);
       const validation = await validateJoinCode(db, normalizedCode);
       if (!validation.ok) {
@@ -11749,8 +12720,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const userEmail = await resolveAuthenticatedEmail(authContext);
       if (!userEmail) {
         return res.status(400).json({ error: 'email_required' });
@@ -12123,8 +13093,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const codeQuery = await db.collection('tenantCodes').where('code', '==', normalizedCode).limit(1).get();
       if (codeQuery.empty) {
         return res.status(404).json({ error: 'code_not_found' });
@@ -12654,8 +13623,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const adminDb = admin.firestore();
+      const adminDb = getFirestoreImpl();
       const policy = await getEffectiveReminderChannelPolicy(adminDb, normalizedTenantId);
       const disabled = computeDisabledReminderChannels(policy.enabled, parsed.data.counts as any);
       if (disabled.length) {
@@ -13274,7 +14242,7 @@ export function createApp(options: CreateAppOptions = {}){
           const timeout = setTimeout(() => controller.abort(), 12_000);
           let emailResp: any;
           try {
-            const response = await fetch(emailBackend.url, {
+            const response = await fetchImpl(emailBackend.url, {
               method: 'POST',
               signal: controller.signal,
               headers: {
@@ -13941,38 +14909,24 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(500).json({ error: 'tenant_guard_missing' });
     }
 
-    const parsed = z
-      .object({
-        tenantId: z.string().min(1),
-        purpose: z.enum(['chat', 'tenantLogo', 'noticeImage', 'noticeAudio', 'studentProfile', 'receipt', 'profilePicture']),
-        conversationFolder: z.string().optional(),
-        feeId: z.string().optional(),
-        email: z.string().optional(),
-        filename: z.string().optional(),
-        // Phase 2 (kill-safe background uploads): when createMessage === '1' and
-        // purpose === 'chat', the endpoint ALSO creates the chat message after
-        // storing the file, so the message exists even if the app is killed before
-        // the (background) upload completes. Idempotent via clientMsgId. Absent on
-        // the normal foreground upload path, so existing callers are unaffected.
-        createMessage: z.string().optional(),
-        clientMsgId: z.string().trim().min(1).max(200).optional(),
-        recipientId: z.string().trim().min(1).max(320).optional(),
-        mediaKind: z.enum(['sticker', 'gif', 'attachment']).optional(),
-        messageText: z.string().max(5000).optional(),
-      })
-      .safeParse({
-        tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
-        purpose: typeof req.query.purpose === 'string' ? req.query.purpose : '',
-        conversationFolder: typeof req.query.conversationFolder === 'string' ? req.query.conversationFolder : undefined,
-        feeId: typeof req.query.feeId === 'string' ? req.query.feeId : undefined,
-        email: typeof req.query.email === 'string' ? req.query.email : undefined,
-        filename: typeof req.query.filename === 'string' ? req.query.filename : undefined,
-        createMessage: typeof req.query.createMessage === 'string' ? req.query.createMessage : undefined,
-        clientMsgId: typeof req.query.clientMsgId === 'string' ? req.query.clientMsgId : undefined,
-        recipientId: typeof req.query.recipientId === 'string' ? req.query.recipientId : undefined,
-        mediaKind: typeof req.query.mediaKind === 'string' ? req.query.mediaKind : undefined,
-        messageText: typeof req.query.messageText === 'string' ? req.query.messageText : undefined,
-      });
+    // Schema lives at module scope (`storageUploadQuerySchema`) so its
+    // accept/reject boundary — notably `uploadKey`'s — is unit-testable against
+    // the exact shape this route parses with.
+    const parsed = storageUploadQuerySchema.safeParse({
+      tenantId: typeof req.query.tenantId === 'string' ? req.query.tenantId : '',
+      purpose: typeof req.query.purpose === 'string' ? req.query.purpose : '',
+      conversationFolder: typeof req.query.conversationFolder === 'string' ? req.query.conversationFolder : undefined,
+      feeId: typeof req.query.feeId === 'string' ? req.query.feeId : undefined,
+      email: typeof req.query.email === 'string' ? req.query.email : undefined,
+      filename: typeof req.query.filename === 'string' ? req.query.filename : undefined,
+      displayName: typeof req.query.displayName === 'string' ? req.query.displayName : undefined,
+      createMessage: typeof req.query.createMessage === 'string' ? req.query.createMessage : undefined,
+      clientMsgId: typeof req.query.clientMsgId === 'string' ? req.query.clientMsgId : undefined,
+      recipientId: typeof req.query.recipientId === 'string' ? req.query.recipientId : undefined,
+      mediaKind: typeof req.query.mediaKind === 'string' ? req.query.mediaKind : undefined,
+      messageText: typeof req.query.messageText === 'string' ? req.query.messageText : undefined,
+      uploadKey: typeof req.query.uploadKey === 'string' ? req.query.uploadKey : undefined,
+    });
 
     if (!parsed.success) {
       return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
@@ -14029,6 +14983,154 @@ export function createApp(options: CreateAppOptions = {}){
       return res.status(413).json({ error: 'file_too_large', maxBytes: MAX_BYTES });
     }
 
+    // ── Object path derivation (upload-idempotency spec, task 3.1) ────────────
+    // Hoisted ABOVE the quota block: the resolved path must be known before any
+    // reservation so a later revision can probe it and reserve only the delta.
+    // `resolveUploadObjectPath` (./lib/uploadObjectPath, pure + unit-tested) is
+    // the single source of truth for every purpose's path format; when
+    // `uploadKeyHash` is `null` (no `uploadKey` sent) it reproduces today's
+    // timestamped/randomized paths character-for-character.
+    const purpose = uploadPurpose;
+    // Kept route-local because downstream consumers (`hasProvidedName`, the video
+    // detection regex and the background chat-message input) need this exact
+    // value, including the empty-string case a whitespace-only `filename`
+    // produces. `resolved.safeName` substitutes a fallback there, so it is not a
+    // drop-in replacement.
+    const filename = sanitizeStorageSegment(parsed.data.filename || 'file');
+    // ── Display name, split out of `filename` (upload-idempotency spec) ───────
+    // `filename` above drives the OBJECT PATH only. Every user-visible name (the
+    // share doc's `file.fileName` below, and the server-created chat message's
+    // sticker `name` / attachment `fileName`) prefers this value when the caller
+    // sent one, so a transport that must send a DETERMINISTIC `filename` to get a
+    // stable object path can still show the recipient the real file name.
+    //
+    // Sanitized with the same helper as `filename`, so the new parameter cannot
+    // introduce characters the old one could not: today's display name is already
+    // a `sanitizeStorageSegment`'d value, and this keeps a chat message doc / a
+    // `sharedFiles` doc inside `[A-Za-z0-9._-]`. For the client this is the
+    // identity — `chatService` already applies the same reduction before the value
+    // reaches the query string.
+    //
+    // `''` for an absent OR whitespace-only value, and every consumer below falls
+    // back to `filename` on a falsy value, so a caller that sends no
+    // `displayName` is byte-identical to before this parameter existed.
+    const displayName = sanitizeStorageSegment(parsed.data.displayName || '');
+    // ── Upload-key scoping (upload-idempotency spec, task 4.2) ────────────────
+    // The client value is bound to server-derived scope before hashing, so the
+    // same literal key from another tenant, another purpose or another actor can
+    // never resolve to the same object (Req 6.1, 6.2).
+    //
+    // `tenantId` is deliberately `normalizedTenantId` (= `req.tenantAccess
+    // .tenantId`, the guard's resolved value) and NOT `parsed.data.tenantId`:
+    // taking it from the query string would make a cross-tenant overwrite a
+    // matter of editing a query parameter (Req 6.6).
+    //
+    // Absent-uid decision: when `req.authContext?.uid` is missing we derive
+    // `null` — i.e. we ignore the key entirely and fall back to a legacy
+    // timestamped path — rather than hashing with an empty actor scope. Hashing
+    // with `actorUid: ''` would put every uid-less caller into ONE shared actor
+    // scope, so two unrelated callers that happened to pick the same key would
+    // silently overwrite each other's object. Degrading to a legacy path costs at
+    // most one orphan on retry (today's behavior) instead, which is strictly the
+    // safer failure. In practice this branch is unreachable for the flows this
+    // feature targets: `requireStaffTenantAccessFromQuery` runs first and the
+    // share/chat-message blocks below already treat a missing uid as "no actor".
+    const uploadActorUid = req.authContext?.uid;
+    const uploadKeyHash = uploadActorUid
+      ? deriveUploadKeyHash({
+          uploadKey: parsed.data.uploadKey,
+          tenantId: normalizedTenantId,
+          purpose: uploadPurpose,
+          actorUid: uploadActorUid,
+        })
+      : null;
+    const resolved = resolveUploadObjectPath({
+      purpose,
+      tenantId: normalizedTenantId,
+      filename: parsed.data.filename,
+      contentType,
+      conversationFolder: parsed.data.conversationFolder,
+      feeId: parsed.data.feeId,
+      email: parsed.data.email,
+      // `null` when no `uploadKey` was sent (or no authenticated uid): the path
+      // stays on the legacy branch, byte-for-byte as today (Req 2.1).
+      uploadKeyHash,
+      now: Date.now(),
+      randomSuffix: crypto.randomBytes(3).toString('hex'),
+    });
+    if (!resolved.ok) {
+      // Same status code and body as before; raised before any reservation, so
+      // the previous reserve-then-release-then-400 round trips are gone.
+      return res.status(400).json({ error: resolved.error });
+    }
+    const objectPath = resolved.objectPath;
+    const safeExt = resolved.safeExt;
+
+    // ── Existing-object probe (upload-idempotency spec, task 4.1) ─────────────
+    // One read of the resolved path, and only when that path is deterministic, so
+    // a caller that sends no `uploadKey` adds zero Storage round trips (Req 9.7).
+    // `probeUploadObjectState` never throws: a non-404 failure resolves to
+    // `state: 'unreadable'` with `object: null`, i.e. "treat as a new object" for
+    // everything downstream (Req 9.2).
+    //
+    // This one probe result drives the quota delta below; download-token reuse and
+    // share-doc reuse consume it in tasks 4.4/4.5.
+    const probe: UploadObjectProbeResult = resolved.deterministic
+      ? await probeUploadObjectState(bucket, objectPath, uploadPurpose)
+      : UPLOAD_OBJECT_PROBE_SKIPPED;
+    // `existing` is `null` for BOTH "genuinely absent" and "could not read"
+    // (F10) — deliberately, so the quota delta, the download-token decision, the
+    // share-doc reuse decision and the idempotent-overwrite metric are all
+    // byte-identical to what a 404 produces. The only consumer of the difference is
+    // the write precondition below (Req 9.13).
+    const existing: ExistingUploadObject | null = probe.object;
+
+    // ── Delta-based quota accounting (upload-idempotency spec, task 4.3) ──────
+    // Recorded usage must move by the REAL change in stored bytes, not by the
+    // full body size (Req 3.1). `existingBytes` is 0 for every caller that sends
+    // no `uploadKey` (no probe ⇒ `existing === null`) and 0 when a probe failed
+    // or 404'd, so a legacy caller still reserves the full size exactly as today
+    // (Req 2.3) and a degraded probe over-reserves rather than under-counting
+    // (Req 9.4).
+    const quotaDelta = computeUploadQuotaDelta({ newBytes: bytes, existingBytes: existing?.bytes ?? 0 });
+    // Total amount this request currently holds against the tenant's recorded
+    // usage. Every rollback path releases exactly this, never the raw body size
+    // and never `shrinkBytes` (Req 3.7).
+    let reservedBytes = 0;
+
+    // CONCURRENT UPLOADS WITH THE SAME uploadKey (Req 9.5, 9.9–9.14, design
+    // "Concurrent uploads with the same uploadKey"; upload-idempotency follow-up F9).
+    //
+    // Two attempts of one logical action can be in flight at once — most plausibly
+    // the native background uploader's internal retry firing while the first
+    // attempt is still connected, i.e. a common case for this feature rather than
+    // an exotic one. Both reach the probe above before either writes, so both see
+    // no existing object and both compute `reserveBytes = full size`.
+    //
+    // That USED to be accepted: last-writer-wins left exactly one object (the file
+    // outcome was always correct) but recorded usage was over-counted by one file
+    // size per racing pair until a reconcile. It is now closed by a Storage write
+    // PRECONDITION (`resolveUploadSavePrecondition` +
+    // `saveUploadObjectWithPrecondition` below), which makes "was I first?" an
+    // atomic, lock-free, stateless question Storage itself answers: the loser gets
+    // a `412`, releases exactly what it reserved, and returns the winner's URL —
+    // so exactly one object AND exactly one net reservation. As a second win the
+    // loser also skips a redundant multi-megabyte write entirely, rather than
+    // merely un-doing its share of the double count.
+    //
+    // Still NO lease/lock, deliberately: a Firestore lease keyed on the key hash
+    // would add a transaction to the critical upload path and a new failure mode —
+    // a stale lease (holder crashed, clock skew, expiry not yet reached) would
+    // block a legitimate retry, i.e. it would break the very flow this feature
+    // exists to make work. A precondition has none of that: there is nothing to
+    // hold, nothing to expire and nothing to clean up.
+    //
+    // A residual, bounded discrepancy remains where the outcome cannot be
+    // attributed — a probe that carried no usable generation or could not be read at
+    // all (no precondition sent, F10), or a 412 whose winner carries the same token
+    // this request reused so the writer is undecidable. All are resolved toward
+    // OVER-counting and left to the existing reconciliation path (Req 9.4, 9.8).
+
     const planLimits = await resolveTenantPlanLimitsForEnforcement(db, normalizedTenantId);
     const limitBytes =
       typeof planLimits.storageBytes === 'number' && Number.isFinite(planLimits.storageBytes)
@@ -14049,224 +15151,339 @@ export function createApp(options: CreateAppOptions = {}){
       return reconciled;
     };
 
-    // Initialize usage doc from live bucket estimate on first use.
-    let knownUsedBytes = 0;
-    try {
-      knownUsedBytes = await loadOrInitTenantStorageUsage(db, bucket, normalizedTenantId);
-    } catch (error) {
-      console.warn('[storage_upload] unable to init storage usage; failing closed', error);
-      inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'init_usage' });
-      return res.status(503).json({ error: 'storage_quota_check_failed' });
-    }
-
-    // Deterministic pre-check: if definitely over-limit, return 409 directly.
-    if (limitBytes > 0 && knownUsedBytes + bytes > limitBytes) {
+    // The ENTIRE reservation path is skipped when the delta is zero — no usage
+    // load, no reservation transaction, and therefore no way to reach a `409`
+    // (Req 3.6, 3.8). That is the same-size-retry case: a retry of an upload that
+    // already succeeded stores the same bytes over itself, consumes no additional
+    // allowance, and must never be rejected for quota even when the tenant is
+    // already at its limit. It is also cheaper than today, since it skips a
+    // Firestore read and a transaction.
+    //
+    // A shrink (`shrinkBytes > 0`) also lands here with `reserveBytes === 0`:
+    // freeing space needs no allowance, and the release happens only AFTER the
+    // write succeeds (below), so a failed write can never credit bytes that are
+    // still stored.
+    if (quotaDelta.reserveBytes > 0) {
+      // Initialize usage doc from live bucket estimate on first use.
+      let knownUsedBytes = 0;
       try {
-        knownUsedBytes = await reconcileUsageBytes();
+        knownUsedBytes = await loadOrInitTenantStorageUsage(db, bucket, normalizedTenantId);
       } catch (error) {
-        console.warn('[storage_upload] precheck reconcile failed', error);
-        inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'precheck_reconcile' });
+        console.warn('[storage_upload] unable to init storage usage; failing closed', error);
+        inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'init_usage' });
         return res.status(503).json({ error: 'storage_quota_check_failed' });
       }
 
-      if (knownUsedBytes + bytes > limitBytes) {
-        inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'precheck' });
-        return res.status(409).json({
-          error: 'storage_limit_reached',
-          limitBytes,
-          usedBytes: knownUsedBytes,
-          incrementBytes: bytes,
-        });
-      }
-    }
-
-    // Reserve bytes transactionally to avoid concurrency overruns.
-    try {
-      await reserveTenantStorageBytes(db, normalizedTenantId, bytes, limitBytes);
-      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
-    } catch (error) {
-      const limitError =
-        error instanceof TenantStorageLimitError
-          ? {
-              limitBytes: error.limitBytes,
-              usedBytes: error.usedBytes,
-              incrementBytes: error.incrementBytes,
-            }
-          : tryExtractTenantStorageLimitError(error);
-
-      if (limitError) {
-        // Reconcile once (deletions might have happened) and retry.
+      // Deterministic pre-check: if definitely over-limit, return 409 directly.
+      // Enforced against the DELTA, so an overwrite is judged on the additional
+      // bytes it needs, not on the full body size (Req 3.5). `incrementBytes` in
+      // the 409 body is likewise the delta — the same key with the honest number;
+      // for any caller that sends no `uploadKey` it still equals `bytes`.
+      if (limitBytes > 0 && knownUsedBytes + quotaDelta.reserveBytes > limitBytes) {
         try {
-          const reconciled = await reconcileUsageBytes();
-          if (limitBytes > 0 && reconciled + bytes > limitBytes) {
-            inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'reserve_reconcile' });
-            return res.status(409).json({
-              error: 'storage_limit_reached',
-              limitBytes,
-              usedBytes: reconciled,
-              incrementBytes: bytes,
-            });
-          }
-          await reserveTenantStorageBytes(db, normalizedTenantId, bytes, limitBytes);
-          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
-        } catch (reconcileOrRetryError) {
-          const retryLimitError = tryExtractTenantStorageLimitError(reconcileOrRetryError);
-          inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'reserve_retry' });
-          return res.status(409).json({
-            error: 'storage_limit_reached',
-            limitBytes: retryLimitError?.limitBytes ?? limitError.limitBytes ?? limitBytes,
-            usedBytes: retryLimitError?.usedBytes ?? limitError.usedBytes,
-            incrementBytes: retryLimitError?.incrementBytes ?? limitError.incrementBytes ?? bytes,
-          });
+          knownUsedBytes = await reconcileUsageBytes();
+        } catch (error) {
+          console.warn('[storage_upload] precheck reconcile failed', error);
+          inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'precheck_reconcile' });
+          return res.status(503).json({ error: 'storage_quota_check_failed' });
         }
-      }
 
-      // Last-chance deterministic check for unclassified reserve failures.
-      try {
-        const reconciled = await reconcileUsageBytes();
-        if (limitBytes > 0 && reconciled + bytes > limitBytes) {
-          inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'last_chance' });
+        if (knownUsedBytes + quotaDelta.reserveBytes > limitBytes) {
+          inc(metricNames.storageUploadRejected, { ...uploadMetricLabels, stage: 'precheck' });
           return res.status(409).json({
             error: 'storage_limit_reached',
             limitBytes,
-            usedBytes: reconciled,
-            incrementBytes: bytes,
+            usedBytes: knownUsedBytes,
+            incrementBytes: quotaDelta.reserveBytes,
           });
         }
-      } catch {
-        // Keep original 503 fallback when reconciliation itself is unavailable.
       }
 
-      console.warn('[storage_upload] reserve failed', error);
-      inc(metricNames.storageUploadQuotaCheckFailed, { ...uploadMetricLabels, stage: 'reserve_unknown' });
-      return res.status(503).json({ error: 'storage_quota_check_failed' });
-    }
-
-    const timestamp = Date.now();
-    const filename = sanitizeStorageSegment(parsed.data.filename || 'file');
-    const extFallback = filename.split('.').pop() || 'bin';
-    const ext = inferExtensionFromContentType(contentType, extFallback);
-    const safeExt = sanitizeStorageSegment(ext) || 'bin';
-
-    const hashStorageKey = (value: string): string => {
-      return crypto.createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 20);
-    };
-
-    const normalizeConversationFolder = (value: string): string => {
-      const trimmed = value.trim();
-      if (!trimmed) return 'unassigned';
-      if (trimmed.startsWith('c_') && trimmed.length >= 10) return trimmed;
-      return `c_${hashStorageKey(trimmed)}`;
-    };
-
-    let objectPath = '';
-    const purpose = uploadPurpose;
-    if (purpose === 'chat') {
-      const rawConversationFolder = sanitizeStorageSegment(parsed.data.conversationFolder || 'unassigned') || 'unassigned';
-      const conversationFolder = normalizeConversationFolder(rawConversationFolder);
-      const safeName = filename || `file.${safeExt}`;
-      objectPath = `chat-files/${normalizedTenantId}/${conversationFolder}/${timestamp}_${safeName}`;
-    } else if (purpose === 'tenantLogo') {
-      objectPath = `tenant-branding/${normalizedTenantId}/logo_${timestamp}.${safeExt}`;
-    } else if (purpose === 'noticeImage') {
-      objectPath = `notices/${normalizedTenantId}/notice_${timestamp}_${crypto.randomBytes(3).toString('hex')}.${safeExt}`;
-    } else if (purpose === 'noticeAudio') {
-      objectPath = `notices/${normalizedTenantId}/audio/notice_audio_${timestamp}_${crypto.randomBytes(3).toString('hex')}.${safeExt}`;
-    } else if (purpose === 'studentProfile') {
-      objectPath = `student_profiles/${normalizedTenantId}/${timestamp}_profile.${safeExt}`;
-    } else if (purpose === 'receipt') {
-      const feeId = sanitizeStorageSegment(parsed.data.feeId || 'unknown') || 'unknown';
-      const safeName = filename || `receipt.${safeExt}`;
-      objectPath = `receipts/${normalizedTenantId}/${feeId}/${timestamp}_${safeName}`;
-    } else if (purpose === 'profilePicture') {
-      const emailKeyRaw = sanitizeStorageSegment((parsed.data.email || '').toLowerCase().replace(/\s+/g, ''));
-      if (!emailKeyRaw) {
-        await releaseTenantStorageBytes(db, normalizedTenantId, bytes);
-        invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
-        return res.status(400).json({ error: 'missing_email' });
-      }
-      const emailKey = hashStorageKey(emailKeyRaw);
-      objectPath = `profile-pictures/${normalizedTenantId}/${emailKey}.jpg`;
-    }
-
-    if (!objectPath) {
-      await releaseTenantStorageBytes(db, normalizedTenantId, bytes);
-      invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
-      return res.status(400).json({ error: 'invalid_upload_purpose' });
-    }
-
-    const downloadToken = typeof (crypto as any).randomUUID === 'function' ? (crypto as any).randomUUID() : crypto.randomBytes(16).toString('hex');
-    try {
-      const file = bucket.file(objectPath);
-      await file.save(body, {
-        resumable: false,
-        contentType,
-        metadata: {
-          metadata: {
-            firebaseStorageDownloadTokens: downloadToken,
-          },
+      // Reserve bytes transactionally to avoid concurrency overruns.
+      //
+      // The reserve → classify → reconcile-and-retry → last-chance sequence lives in
+      // `reserveUploadQuotaBytes` (module scope, exported, injectable) so it is
+      // assertable without an Express/Firebase harness. It returns the decision as
+      // DATA — status, body and metric stage — and everything below is a forward.
+      //
+      // It also fixes a fall-through this block used to have: a successful
+      // reconcile-and-retry reservation continued into the last-chance check and then
+      // unconditionally into `503 storage_quota_check_failed`, so the recovery could
+      // never actually let an upload through, and the bytes it had just reserved
+      // leaked (`reservedBytes` was still 0, so the rollback released nothing —
+      // Req 3.7). `outcome: 'reserved'` now covers both the first attempt and the
+      // retry, and only that outcome reaches the write.
+      const reservation = await reserveUploadQuotaBytes({
+        reserveBytes: quotaDelta.reserveBytes,
+        limitBytes,
+        // `invalidateLiveCount` stays paired with the reservation here in the route,
+        // on the first attempt and the retry alike, exactly as before (Req 3.10).
+        reserve: async () => {
+          await reserveTenantStorageBytes(db, normalizedTenantId, quotaDelta.reserveBytes, limitBytes);
+          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
         },
+        reconcileUsageBytes,
       });
 
-      const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(objectPath)}?alt=media&token=${downloadToken}`;
+      if (reservation.outcome !== 'reserved') {
+        if (reservation.outcome === 'check_failed') {
+          console.warn('[storage_upload] reserve failed', reservation.error);
+        }
+        // `uploadMetricLabels` is `{ purpose }`; the stage comes from the seam, so
+        // every existing label pair (`reserve_reconcile`, `reserve_retry`,
+        // `last_chance`, `reserve_unknown`) is preserved verbatim.
+        inc(reservation.metric, { ...uploadMetricLabels, stage: reservation.stage });
+        return res.status(reservation.status).json(reservation.body);
+      }
+
+      // The reservation above succeeded — on the first attempt or on the retry — so
+      // this request now holds exactly `quotaDelta.reserveBytes`.
+      reservedBytes = quotaDelta.reserveBytes;
+    }
+    // Invariant from here on: `reservedBytes === quotaDelta.reserveBytes`, i.e.
+    // the rollback below releases exactly what this request took, and releases
+    // nothing when it took nothing.
+
+    // ── Download-token reuse (upload-idempotency spec, task 4.4) ──────────────
+    // Same probe result that drove the quota delta: when it found an object with a
+    // token, that token is reused so this write's `url` is byte-identical to the
+    // one the first (possibly lost) response returned (Req 4.1, 4.2). `existing`
+    // is always `null` for a caller that sends no `uploadKey`, so that path mints
+    // a fresh token exactly as today (Req 2.4, 4.3).
+    //
+    // `reused` comes back from the same call that chose the token (F10), so the
+    // write-attribution flag below is read from the decision rather than
+    // re-derived by comparing strings the two sides normalized separately.
+    const downloadTokenDecision = resolveUploadDownloadToken(existing);
+    const attemptedDownloadToken = downloadTokenDecision.token;
+    // ── Conditional write (upload-idempotency follow-up F9) ───────────────────
+    // `null` for every legacy (unkeyed) path, whenever the probe carried no usable
+    // generation, and whenever the probe could not read the object state at all
+    // (F10, Req 9.13) — in which case the write below is byte-for-byte today's.
+    const savePrecondition = resolveUploadSavePrecondition({
+      keyed: uploadKeyHash !== null,
+      probe,
+    });
+    try {
+      const file = bucket.file(objectPath);
+      const write = await saveUploadObjectWithPrecondition({
+        precondition: savePrecondition.precondition,
+        attemptedDownloadToken,
+        // True ⇒ both racers would write the same token, so a 412 winner carrying it
+        // does not prove who wrote. The seam needs that to attribute the write.
+        //
+        // Taken from the token decision itself (F10). It used to be re-derived here
+        // as `(existing?.downloadToken ?? null) === attemptedDownloadToken`, which
+        // was correct only because `extractFirstDownloadToken` and the selector
+        // trimmed identically — if either normalization had ever diverged the flag
+        // would read `false`, a lost race would be mis-attributed as `written`, and
+        // the shrink release the winner already performed would run a second time:
+        // the double credit / under-count Req 9.4 forbids.
+        reusedProbedToken: downloadTokenDecision.reused,
+        save: (precondition) =>
+          file.save(body, {
+            resumable: false,
+            contentType,
+            metadata: {
+              metadata: {
+                firebaseStorageDownloadTokens: attemptedDownloadToken,
+              },
+            },
+            // Omitted entirely when there is no precondition, so the options object
+            // a legacy upload passes is identical to the pre-F9 one.
+            ...(precondition ? { preconditionOpts: precondition } : {}),
+          }),
+        reprobe: () => probeExistingUploadObject(bucket, objectPath, uploadPurpose),
+      });
+
+      // A lost race is a SUCCESS: the sibling attempt of this same logical action
+      // stored the identical bytes, so the file the user asked for IS stored. The
+      // response continues down the normal success path (share doc, chat message,
+      // 200) and is byte-identical to the winner's, because the url below is built
+      // from the WINNER's download token (Req 4.1, 4.2).
+      const lostRace = write.outcome === 'lost_race';
+      const downloadToken = write.outcome === 'lost_race' ? write.downloadToken : attemptedDownloadToken;
+
+      if (write.outcome === 'lost_race' && write.releaseReservation && reservedBytes > 0) {
+        // Order matters and is asserted by the seam: the re-probe already happened,
+        // so these bytes are provably not ours to hold. Release exactly
+        // `reservedBytes` and zero it, so the outer rollback cannot double-release.
+        try {
+          await releaseTenantStorageBytes(db, normalizedTenantId, reservedBytes);
+          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+          reservedBytes = 0;
+        } catch (error) {
+          // `reservedBytes` deliberately stays as it is: the release did not happen,
+          // so this request still holds those bytes and the invariant
+          // "`reservedBytes` is what is currently held" must keep holding. Usage is
+          // over-counted until the next reconcile (Req 9.8) — never under-counted.
+          console.warn(
+            '[storage_upload] lost-race reservation release failed; usage over-counted until the next reconcile',
+            error
+          );
+        }
+      }
+      if (lostRace) {
+        // Labelled by `purpose` only (Req 6.4, 8.4), and wrapped because a metrics
+        // write must never be able to fail an upload that already succeeded.
+        try {
+          inc(metricNames.storageUploadConcurrentRaceLost, uploadMetricLabels);
+        } catch {
+          // Metrics are never worth failing an upload for.
+        }
+      }
+
+      // Built from the selected token, so a retry's url matches the first write's
+      // character-for-character (Req 4.2). Same format as before this task.
+      const url = buildUploadDownloadUrl(bucket.name, objectPath, downloadToken);
+
+      // ── Post-write true-up for a smaller replacement (task 4.3) ─────────────
+      // Only AFTER the write succeeded: until `save()` returns, the larger object
+      // is still the one stored, so crediting the difference earlier would
+      // under-count usage (Req 3.4). `releaseTenantStorageBytes` no-ops on `<= 0`,
+      // so guarding on `> 0` is about skipping the transaction, not correctness.
+      //
+      // Best effort: a failure here warns and STILL returns 200 (Req 3.8, 9.6).
+      // The file is stored and the URL is valid; failing the request would be
+      // strictly worse, because the client would retry and re-upload an object
+      // that is already correct. Usage stays over-counted by `shrinkBytes` until
+      // the next reconcile — the same self-healing discrepancy a degraded probe
+      // produces. Note `reservedBytes` is 0 whenever `shrinkBytes > 0` (the delta
+      // never has both non-zero), so the outer rollback below can never turn this
+      // release into a double credit.
+      //
+      // Skipped on a lost race (F9): this request wrote nothing, so the shrink it
+      // computed was either already credited by the winner — releasing it again
+      // would UNDER-count, the one direction Req 9.4 forbids — or has not happened
+      // at all. Not releasing over-counts at worst, which reconciles away.
+      if (!lostRace && quotaDelta.shrinkBytes > 0) {
+        try {
+          await releaseTenantStorageBytes(db, normalizedTenantId, quotaDelta.shrinkBytes);
+          invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
+        } catch (error) {
+          console.warn(
+            '[storage_upload] shrink release failed after a successful write; usage over-counted until the next reconcile',
+            error
+          );
+        }
+      }
 
       // Best-effort: create a share token at upload time for shareable uploads.
       // This makes ShareModal instant later and avoids exposing raw Storage URLs.
+      //
+      // ── Share-doc reuse on overwrite (upload-idempotency spec, task 4.5) ─────
+      // The per-purpose eligibility filter and the unknown-actor early return now
+      // live inside `resolveShareTokenForUpload`; the only behavior change is that
+      // an OVERWRITE reuses the existing active doc for this `(tenant, uid, url)`
+      // instead of minting a second token (Req 5.1, 5.2). `quotaDelta.isOverwrite`
+      // is only ever true for a deterministic path whose probe found an object, so
+      // a caller that sends no `uploadKey` takes the mint-and-write branch exactly
+      // as today (Req 5.3). The outer try/catch is retained so nothing in this
+      // block — including the filename derivation — can fail the stored upload.
       let shareToken: string | undefined;
       try {
-        // Avoid creating share tokens for non-share UX uploads (keeps shared list clean).
-        const shouldPrecreateShareToken =
-          purpose === 'chat' ||
-          purpose === 'receipt' ||
-          purpose === 'noticeImage' ||
-          purpose === 'noticeAudio' ||
-          purpose === 'studentProfile';
+        const authContext = req.authContext;
+        // Unchanged derivation, hoisted out of the eligibility branch (pure string
+        // work; it is simply unused for the two purposes that get no share doc).
+        const hasProvidedName = Boolean((parsed.data.filename || '').trim()) && filename !== 'file';
+        // DECISION (upload-idempotency spec): `displayName` wins here, ahead of
+        // `filename`. This name is what a share sheet and the `sharedFiles` list
+        // render, so it must be the human-meaningful one. Now that the native
+        // background transport sends a deterministic `filename` derived from the
+        // send's `clientMsgId`, keeping this on `filename` would put
+        // `pick_pm_1712…_a1b2c3d4e5f6g7.jpg` in the share sheet — a user-visible
+        // regression, and precisely the thing splitting the parameter exists to
+        // avoid. The `hasProvidedName` chain is retained UNCHANGED behind it, so a
+        // caller that sends only `filename` gets the identical name it gets today.
+        const shareFileName =
+          displayName ||
+          (hasProvidedName ? filename : '') ||
+          (purpose === 'receipt'
+            ? `receipt.${safeExt}`
+            : purpose === 'noticeAudio'
+              ? `notice_audio.${safeExt}`
+              : purpose === 'noticeImage'
+                ? `notice.${safeExt}`
+                : purpose === 'studentProfile'
+                  ? `student_profile.${safeExt}`
+                  : `file.${safeExt}`);
 
-        if (shouldPrecreateShareToken) {
-          const authContext = req.authContext;
-          if (authContext?.uid) {
-            const nowIso = new Date().toISOString();
+        shareToken = await resolveShareTokenForUpload({
+          purpose,
+          tenantId: normalizedTenantId,
+          actorUid: authContext?.uid,
+          // `|| lostRace` (F9): a lost race means an object — and therefore possibly
+          // an active share doc for this exact url — already exists at the path, so
+          // the reuse lookup must run for the same reason an overwrite runs it: one
+          // logical action must leave at most one active share doc (Req 5.2).
+          isOverwrite: quotaDelta.isOverwrite || lostRace,
+          // Built from the reused download token above, so a retry's url matches
+          // the first write's byte-for-byte and the lookup below can find the doc
+          // that write created.
+          fileUrl: url,
+          findExistingShareToken: async (input) => {
+            // Already-deployed composite index (also used by
+            // `/shared-files/resolve-or-create`); returns only ACTIVE docs, since
+            // it filters through `isActiveSharedFileDoc` — a revoked or expired
+            // doc yields `null` here and the mint branch runs instead.
+            const found = await findLatestActiveShareForFile(db, input);
+            return found?.token || null;
+          },
+          createShareToken: async (input) => {
             const token = normalizeShareToken(mintShareToken());
-            const hasProvidedName = Boolean((parsed.data.filename || '').trim()) && filename !== 'file';
-            const shareFileName =
-              (hasProvidedName ? filename : '') ||
-              (purpose === 'receipt'
-                ? `receipt.${safeExt}`
-                : purpose === 'noticeAudio'
-                  ? `notice_audio.${safeExt}`
-                  : purpose === 'noticeImage'
-                    ? `notice.${safeExt}`
-                    : purpose === 'studentProfile'
-                      ? `student_profile.${safeExt}`
-                      : `file.${safeExt}`);
-
-            if (token) {
-              await db
-                .collection('sharedFiles')
-                .doc(token)
-                .set(
-                  stripUndefinedDeep({
-                    token,
-                    tenantId: normalizedTenantId,
-                    createdAt: nowIso,
-                    createdByUid: authContext.uid,
-                    createdByEmail: authContext.email || undefined,
-                    file: {
-                      url,
-                      fileName: shareFileName,
-                      fileType: contentType || undefined,
-                      fileSize: bytes,
-                    },
-                  }),
-                );
-              shareToken = token;
-            }
-          }
-        }
+            if (!token) return null;
+            await db
+              .collection('sharedFiles')
+              .doc(token)
+              .set(
+                stripUndefinedDeep({
+                  token,
+                  tenantId: input.tenantId,
+                  createdAt: new Date().toISOString(),
+                  createdByUid: input.uid,
+                  createdByEmail: authContext?.email || undefined,
+                  file: {
+                    url: input.fileUrl,
+                    fileName: shareFileName,
+                    fileType: contentType || undefined,
+                    fileSize: bytes,
+                  },
+                }),
+              );
+            return token;
+          },
+        });
       } catch (error) {
         console.warn('[storage_upload] unable to precreate share token', error);
       }
 
+      // ── Idempotent-overwrite counter (upload-idempotency spec, task 6.2) ──────
+      // Counted on the SUCCESS path, after `save()` returned, because an Overwrite
+      // is by definition a *successful* write to a deterministic path at which an
+      // object already existed (Req 8.1). A request that failed at the write takes
+      // the outer catch below and never reaches here, and a request that overwrote
+      // nothing has `isOverwrite === false` — `quotaDelta.isOverwrite` is only ever
+      // true when the probe of a deterministic path actually found an object, so a
+      // caller that sends no `uploadKey` (no probe ⇒ `existing === null`) can never
+      // increment it.
+      //
+      // This is the number that says how many orphans the feature prevented: it
+      // rising while tenant byte totals stay flat across reconciles is the rollout
+      // signal (Req 11.8).
+      //
+      // `uploadMetricLabels` is `{ purpose }` and nothing else. The `uploadKey`, its
+      // hash, the filename and the object path are deliberately absent: they are
+      // unbounded cardinality and a leak surface (Req 6.4, 8.4).
+      //
+      // `&& !lostRace` (F9): an Overwrite is by definition a successful WRITE at a
+      // path that already held an object, and a request that lost the precondition
+      // race wrote nothing. It is counted by `storage_upload_concurrent_race_lost_total`
+      // instead, which keeps the three success counters disjoint — accepted =
+      // fresh + overwrite + race lost — so neither number has to be read with a
+      // caveat.
+      if (quotaDelta.isOverwrite && !lostRace) {
+        inc(metricNames.storageUploadIdempotentOverwrite, uploadMetricLabels);
+      }
       inc(metricNames.storageUploadAccepted, uploadMetricLabels);
 
       // Fire async video transcode for chat video uploads.
@@ -14274,6 +15491,34 @@ export function createApp(options: CreateAppOptions = {}){
       // written to Firestore (videoTranscodes collection) when ready.
       // This fixes HEVC/H.265 videos from iPhone/VN-editor that won't play
       // in Android mobile browsers (Chrome/Edge lack an HEVC decoder).
+      //
+      // ── Transcode dedupe, CONFIRMED (upload-idempotency spec, task 4.5) ──────
+      // No change needed here (Req 5.4). `runTranscodeJob` keys its Firestore doc
+      // on `sha256(originalPath)` (`videoTranscoder.ts`, also exported as
+      // `transcodeDocId`), and a deterministic `objectPath` is identical across
+      // every retry of one logical action, so N retries all target ONE
+      // `videoTranscodes/{sha256(path)}` doc — never a second job. The job also
+      // returns early when that doc already carries a `transcodedUrl`, so a retry
+      // that lands while the first job is finishing cannot transcode twice.
+      //
+      // KNOWN GAP, deliberately not fixed under this task (design: "Transcode of
+      // an already-transcoded original"): once a job has completed it DELETES the
+      // original and stores `originalDeleted: true`. If the same `uploadKey` were
+      // reused long after that, the new bytes would land at the same path but the
+      // early return on `transcodedUrl` means they would never be transcoded, and
+      // `/video/request-transcode` would keep returning the OLD `transcodedUrl`
+      // (it returns any existing `transcodedUrl` regardless of status, by design,
+      // to avoid 404ing on the deleted original). Bounded and out of normal
+      // operation: a retry window is seconds while a transcode takes far longer,
+      // and the client contract mints a new key for a new logical action.
+      // Deliberately reads the STORAGE `filename`, never `displayName`: this decides
+      // what to do with the stored bytes, so it must follow the value that named
+      // them. A deterministic client-derived name still carries an extension —
+      // `deriveStableUploadFileName` (`lib/uploadFileName.ts`) appends the mime
+      // subtype, so `video/mp4` produces a `.mp4` suffix and this regex fires. The
+      // `contentType.startsWith('video/')` arm covers the mime types whose subtype
+      // is not itself a container extension (`video/quicktime` gives `.quicktime`),
+      // so a background video upload is detected either way.
       const isVideoUpload =
         uploadPurpose === 'chat' &&
         (contentType.startsWith('video/') ||
@@ -14294,6 +15539,18 @@ export function createApp(options: CreateAppOptions = {}){
       // (sendChatMessage upserts). Best-effort + fail-open: any failure here never
       // fails the upload response — the client's durable outbox re-drives the send
       // idempotently on next launch, so no message is ever lost or duplicated.
+      //
+      // ── Chat-message dedupe, CONFIRMED (upload-idempotency spec, task 4.5) ────
+      // No change needed here (Req 5.5). `sendChatMessage` sanitizes the supplied
+      // `clientMsgId`, looks the conversation up by it
+      // (`findChatMessageByClientMsgId`) and returns the EXISTING record when one
+      // is found, then claims `conversationClientMsgIndex/{conv}/{clientMsgId}`
+      // through an RTDB transaction and defers to the winning claim — so it is an
+      // upsert under retries and under concurrency alike. The client derives the
+      // `uploadKey` from this same `clientMsgId` (`uploadKeyFromStableId`), so a
+      // retried upload re-drives ONE message; and because the download token was
+      // reused above, that one message carries the SAME url it carried the first
+      // time rather than a rotated one that would 403.
       let createdMessageId: string | undefined;
       if (
         parsed.data.createMessage === '1' &&
@@ -14302,11 +15559,16 @@ export function createApp(options: CreateAppOptions = {}){
         req.authContext?.email
       ) {
         try {
-          const record = await sendChatMessage(
+          const record = await sendChatMessageImpl(
             buildBackgroundUploadChatMessageInput({
               mediaKind: parsed.data.mediaKind || 'attachment',
               url,
               filename,
+              // Preferred over `filename` for the sticker `name` / attachment
+              // `fileName` the recipient sees; `''` here (no `displayName` sent)
+              // leaves the builder on its existing `filename` fallback chain,
+              // including `'Sticker'` and `file.{ext}`.
+              displayName,
               contentType,
               bytes,
               safeExt,
@@ -14332,7 +15594,16 @@ export function createApp(options: CreateAppOptions = {}){
         ...(createdMessageId ? { messageId: createdMessageId } : {}),
       });
     } catch (error) {
-      await releaseTenantStorageBytes(db, normalizedTenantId, bytes).catch(() => undefined);
+      // Release exactly what was reserved for this request — `bytes` for a new
+      // object, the delta for a growing overwrite, and nothing at all for a
+      // same-size retry or a shrink — so the rollback can never over- or
+      // under-release (Req 3.7).
+      //
+      // `quotaDelta.shrinkBytes` is deliberately NOT released here: the write
+      // failed, so the previous, LARGER object is still stored and still owes its
+      // full byte count. The client's retry re-derives the same deterministic path
+      // and tries again.
+      await releaseTenantStorageBytes(db, normalizedTenantId, reservedBytes).catch(() => undefined);
       invalidateLiveCount(`storageBytes:${normalizedTenantId}`);
       console.error('[storage_upload] upload failed', error);
       inc(metricNames.storageUploadFailed, { ...uploadMetricLabels, stage: 'save' });
@@ -14400,7 +15671,7 @@ export function createApp(options: CreateAppOptions = {}){
       let db: admin.firestore.Firestore;
       try {
         ensureFirebase();
-        db = admin.firestore();
+        db = getFirestoreImpl();
       } catch (err) {
         console.error('[request_transcode] firestore init failed', err);
         return res.status(500).json({ error: 'internal_error' });
@@ -19169,8 +20440,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const deviceRef = db.collection('user_devices').doc(actorEmail).collection('devices').doc(parsed.data.deviceId);
       const userRef = db.collection('user_devices').doc(actorEmail);
 
@@ -19226,8 +20496,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const deviceRef = db.collection('user_devices').doc(actorEmail).collection('devices').doc(parsed.data.deviceId);
       await deviceRef.set({
         webPushSubscription: admin.firestore.FieldValue.delete(),
@@ -19256,8 +20525,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const usersSnap = await db.collection('user_devices').where('tenantIds', 'array-contains', tenantAccess.tenantId).get();
       let matchedDevice: { ref: admin.firestore.DocumentReference<admin.firestore.DocumentData>; data: admin.firestore.DocumentData } | null = null;
 
@@ -19351,8 +20619,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const usersSnap = await db.collection('user_devices').where('tenantIds', 'array-contains', tenantAccess.tenantId).get();
       let matchedDevice: { ref: admin.firestore.DocumentReference<admin.firestore.DocumentData>; data: admin.firestore.DocumentData } | null = null;
 
@@ -19818,8 +21085,7 @@ export function createApp(options: CreateAppOptions = {}){
     }
 
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const deviceRef = db.collection('user_devices').doc(normalizedEmail).collection('devices').doc(deviceId);
       const userRef = db.collection('user_devices').doc(normalizedEmail);
       const pingType = parsed.data.pingType;
@@ -20303,8 +21569,7 @@ export function createApp(options: CreateAppOptions = {}){
       const reportBody:any = req.body || {};
       const payload = reportBody['csp-report'] || reportBody?.cspReport || reportBody?.body || reportBody;
       const entries = Array.isArray(payload)? payload : [payload];
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const batch = db.batch();
       let count = 0;
       for (const entry of entries.slice(0,25)) {
@@ -20340,8 +21605,7 @@ export function createApp(options: CreateAppOptions = {}){
   async function pruneCspViolations(){
     if (CSP_RETENTION_DAYS <= 0) return;
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const cutoff = Date.now() - CSP_RETENTION_DAYS*24*60*60*1000;
       const snap = await db.collection('security_csp_violations')
         .where('receivedAt','<', cutoff)
@@ -20850,8 +22114,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   async function expireJoinRequestsOnce() {
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const nowIso = new Date().toISOString();
       let expired = 0;
       while (true) {
@@ -20899,8 +22162,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   async function expireInvitesOnce() {
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const nowIso = new Date().toISOString();
       const nowTs = admin.firestore.Timestamp.now();
       let expired = 0;
@@ -20977,8 +22239,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   async function expireJoinCodesOnce() {
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const nowIso = new Date().toISOString();
       const nowTs = admin.firestore.Timestamp.now();
       let expired = 0;
@@ -21130,8 +22391,7 @@ export function createApp(options: CreateAppOptions = {}){
 
   async function sweepPresenceOnce(){
     try {
-      ensureFirebase();
-      const db = admin.firestore();
+      const db = getFirestoreImpl();
       const col = db.collection(PRESENCE_COLLECTION);
       const { snap, modeUsed } = await fetchPresenceSnapshot(col, PRESENCE_SWEEP_QUERY_MODE);
       const now = Date.now();

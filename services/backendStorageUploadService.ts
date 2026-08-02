@@ -63,6 +63,7 @@ function buildUploadUrl(
     conversationFolder?: string;
     feeId?: string;
     email?: string;
+    uploadKey?: string;
   },
 ): string {
   const url = new URL(`${baseUrl}/storage/upload`);
@@ -73,6 +74,14 @@ function buildUploadUrl(
   if (args.conversationFolder) url.searchParams.set('conversationFolder', args.conversationFolder);
   if (args.feeId) url.searchParams.set('feeId', args.feeId);
   if (args.email) url.searchParams.set('email', args.email);
+
+  // Optional idempotency key (upload-idempotency spec). Set ONLY when a caller
+  // actually supplied one, so a caller that passes nothing produces a
+  // byte-identical URL to before this parameter existed. Trimmed to match the
+  // endpoint's `z.string().trim().min(8).max(200)`, and a blank-after-trim value
+  // is treated as absent rather than sent as an instant validation failure.
+  const uploadKey = typeof args.uploadKey === 'string' ? args.uploadKey.trim() : '';
+  if (uploadKey) url.searchParams.set('uploadKey', uploadKey);
 
   return url.toString();
 }
@@ -251,6 +260,13 @@ export async function uploadBlobViaBackend(args: {
   conversationFolder?: string;
   feeId?: string;
   email?: string;
+  /**
+   * Optional idempotency key for this ONE logical upload action
+   * (upload-idempotency spec, Req 7.1/7.2). The caller owns minting — the key
+   * must be stable per USER ACTION, not per transport call, so it is never
+   * minted here. Omit it and the request is byte-identical to legacy behavior.
+   */
+  uploadKey?: string;
   onProgress?: (progress: number) => void;
   suppressStorageLimitAlert?: boolean;
 }): Promise<BackendStorageUploadResponse> {
@@ -260,6 +276,11 @@ export async function uploadBlobViaBackend(args: {
   }
 
   const baseUrl = resolveBackendBaseUrl();
+  // Built ONCE, before both retry loops below, so every attempt (web XHR and
+  // native fetch alike) targets the identical URL and therefore carries the
+  // identical `uploadKey`. Never rebuild this inside a loop: re-minting or
+  // re-deriving the key mid-loop would orphan an object per attempt, which is
+  // exactly what the idempotency key exists to prevent.
   const url = buildUploadUrl(baseUrl, {
     tenantId,
     purpose: args.purpose,
@@ -267,6 +288,7 @@ export async function uploadBlobViaBackend(args: {
     conversationFolder: args.conversationFolder,
     feeId: args.feeId,
     email: args.email,
+    uploadKey: args.uploadKey,
   });
 
   const contentType = (args.contentType || (args.blob as any)?.type || 'application/octet-stream').toString();

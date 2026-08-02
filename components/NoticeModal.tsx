@@ -40,6 +40,7 @@ import { Notice, NoticeFormData } from '../types/notice';
 import Toast from 'react-native-toast-message';
 import { tenantService } from '../services/tenantService';
 import { uploadBlobViaBackend } from '../services/backendStorageUploadService';
+import { newUploadKey } from '../lib/uploadKey';
 import { maybeShowStorageLimitReachedAlert } from '../services/storageLimitAlert';
 import type { TenantMembershipRole } from '../types/tenant';
 import {
@@ -1304,12 +1305,26 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
           const response = await fetch(selectedImageUri);
           imageBlob = await response.blob();
 
+          // Idempotency key for the notice IMAGE (upload-idempotency spec, Req
+          // 7.1/7.3). One submit can attach both an image and an audio clip, and
+          // those are two separate uploads of two different files — so each mints
+          // its OWN key (see the `notice_audio` key below). Sharing one key across
+          // both would resolve both to the same deterministic path and the audio
+          // would overwrite the image.
+          //
+          // Minted here, immediately before the call and outside any loop, so the
+          // transport's transient retries reuse it. Re-posting after a failure
+          // re-enters handleSubmit and mints a fresh key: a new user action, a new
+          // object.
+          const uploadKey = newUploadKey('notice_image');
+
           const result = await uploadBlobViaBackend({
             tenantId,
             purpose: 'noticeImage',
             blob: imageBlob,
             contentType: imageBlob.type || 'image/jpeg',
             filename,
+            uploadKey,
             suppressStorageLimitAlert: true,
           });
 
@@ -1348,12 +1363,20 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
           const extension = selectedAudio.name?.split('.')?.pop()?.replace(/[^a-zA-Z0-9]/g, '') || 'mp3';
           const filename = `notice_audio_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${extension}`;
 
+          // Idempotency key for the notice AUDIO — deliberately a second, distinct
+          // key from the image's above (upload-idempotency spec, Req 7.1/7.3).
+          // Two uploads within one submit are two logical upload actions, so they
+          // must not share a key. Scoped to this block so it cannot be confused
+          // with the image's key.
+          const uploadKey = newUploadKey('notice_audio');
+
           const result = await uploadBlobViaBackend({
             tenantId,
             purpose: 'noticeAudio',
             blob: audioBlob,
             contentType: selectedAudio.mimeType || audioBlob.type || 'audio/mpeg',
             filename,
+            uploadKey,
             suppressStorageLimitAlert: true,
           });
 

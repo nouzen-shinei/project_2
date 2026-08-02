@@ -38,6 +38,7 @@ import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
 import { useTenant } from '@/hooks/useTenantContext';
 import TenantSelectionEmptyState from '@/components/TenantSelectionEmptyState';
 import { uploadBlobViaBackend, deleteStorageObjectViaBackend } from '../../services/backendStorageUploadService';
+import { newUploadKey } from '@/lib/uploadKey';
 import { tryExtractStorageLimitReachedInfo } from '../../services/storageLimitAlert';
 import UsageAlertInlineBanner from '@/components/UsageAlertInlineBanner';
 import { useActiveUsageAlerts } from '@/hooks/useActiveUsageAlerts';
@@ -223,12 +224,21 @@ export default function Students() {
 
       const timestamp = Date.now();
       const filename = `student_profile_${timestamp}.jpg`;
+      // Idempotency key for this one photo pick (upload-idempotency spec, Req
+      // 7.1/7.3). One call of `uploadProfileImage` is one logical upload action
+      // — it is invoked once per "Add student" submit, and this function holds no
+      // retry loop of its own — so minting here gives exactly one key per action
+      // and `uploadBlobViaBackend` reuses it across its transient retries. A
+      // later submit (or a re-submit after a failure) is a new action and mints a
+      // fresh key, so it stores a new object instead of overwriting this one.
+      const uploadKey = newUploadKey('student_profile');
       const result = await uploadBlobViaBackend({
         tenantId,
         purpose: 'studentProfile',
         blob,
         contentType: blob.type || 'image/jpeg',
         filename,
+        uploadKey,
         suppressStorageLimitAlert: true,
       });
 
