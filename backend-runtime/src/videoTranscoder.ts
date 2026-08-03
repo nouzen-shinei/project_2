@@ -25,6 +25,23 @@ export interface TranscodeJob {
   contentType: string;
   /** Tenant identifier — required for quota operations and document attribution. */
   tenantId: string;
+  /**
+   * Content identity of the bytes stored at `originalPath` by the request that
+   * scheduled this job (`videoContentIdentity(body)`), or `undefined` when the
+   * scheduler does not have the bytes.
+   *
+   * This is the discriminator that separates "the same logical upload retried"
+   * from "different bytes written to the same deterministic path" — see
+   * `decideTranscodeReuse`. `POST /video/request-transcode` deliberately passes
+   * nothing here: it holds no bytes, and the original may already be deleted, so
+   * there is nothing it could hash.
+   *
+   * Object `generation` is NOT usable for this: every write bumps it, including a
+   * byte-identical retry, so comparing generations would classify an ordinary
+   * retry as a content change and re-transcode it — destroying exactly the
+   * idempotency the upload-idempotency feature exists to provide.
+   */
+  originalContentHash?: string;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -52,6 +69,99 @@ function buildTranscodeStoragePath(originalPath: string): string {
 
 function buildDownloadUrl(bucketName: string, storagePath: string, token: string): string {
   return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(storagePath)}?alt=media&token=${token}`;
+}
+
+// ─── Content identity (stale-transcode-record discriminator, F21) ─────────────
+
+/**
+ * The content identity of an uploaded video body: an algorithm-tagged SHA-256 of
+ * the exact bytes that were stored.
+ *
+ * Computed over the in-memory request body rather than read back from Storage
+ * metadata on purpose. GCS does expose `md5Hash` and `crc32c` on the object, and
+ * `POST /storage/upload` writes with `file.save({ resumable: false })` — a simple,
+ * never-composed upload — so `md5Hash` *is* present for these objects. But reading
+ * it would add a Storage round trip on the upload path, and `md5Hash` is absent for
+ * composite objects, so depending on it would make the discriminator conditional on
+ * a property of how the bytes happened to be written. The body is already in memory
+ * and is definitionally the bytes that were stored, so hashing it is both cheaper
+ * and exact.
+ *
+ * The `sha256:` prefix is part of the stored value so a future change of algorithm
+ * is self-describing rather than a silent mismatch.
+ *
+ * Total: any `Buffer` (including empty) yields a string; never throws.
+ */
+export function videoContentIdentity(bytes: Buffer): string {
+  return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+}
+
+/**
+ * What `runTranscodeJob` should do about an existing `videoTranscodes` document.
+ *
+ * `reuse` carries its reason because the two reasons are NOT the same claim:
+ * `content_unchanged` is a positive match, while `content_identity_unknown` is the
+ * migration posture — no content identity was recorded (or none was supplied), so
+ * nothing is known and today's behaviour is preserved.
+ */
+export type TranscodeReuseDecision =
+  | { action: 'transcode'; reason: 'no_existing_output' }
+  | { action: 'reuse'; reason: 'content_unchanged' | 'content_identity_unknown' }
+  | { action: 'retranscode'; reason: 'content_changed' };
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Decide whether an existing `videoTranscodes` document may be reused, or whether
+ * the bytes at the original path have changed underneath it and the recorded
+ * transcode is now STALE (upload-idempotency follow-up F21).
+ *
+ * WHY THIS EXISTS. `docId` is `sha256(originalPath)` and the upload path is
+ * deterministic per `uploadKey`, so every write for one `uploadKey` targets one
+ * document. `runTranscodeJob` used to return early on *any* existing
+ * `transcodedUrl`, which is right for a retry and wrong for a genuinely different
+ * video written to the same path: the new bytes were never transcoded, and both
+ * `ChatCacheService` and `POST /video/request-transcode` kept handing out the
+ * PREVIOUS video's `transcodedUrl` — which lives at a different object path
+ * (`{base}_h264.mp4`) and therefore still exists and still plays. The viewer got
+ * the wrong video, indefinitely, with no self-healing path.
+ *
+ * THE INVARIANT THIS MUST NOT BREAK. An ordinary retry of one logical upload —
+ * same `uploadKey`, same bytes, first response lost — must still DEDUPE. That is
+ * why the discriminator is content identity and not object `generation`: a retry
+ * bumps the generation while storing byte-identical content, so a generation
+ * comparison would re-transcode every retry.
+ *
+ * MIGRATION POSTURE. Documents written before F21 carry no `originalContentHash`,
+ * and jobs scheduled by `POST /video/request-transcode` supply none. When either
+ * side is absent this returns `reuse` — the pre-F21 behaviour — because the honest
+ * answer is "unknown" and guessing "changed" would retroactively re-transcode every
+ * existing video the first time it was touched: a self-inflicted load spike, and one
+ * that would delete originals and rewrite URLs for videos that were fine. New
+ * documents get the protection; old ones keep the documented gap.
+ *
+ * Total by construction: `existing` is Firestore data, so every field is `unknown`
+ * as far as this function is concerned, and every shape falls into one branch.
+ */
+export function decideTranscodeReuse(
+  existing: Record<string, unknown> | null | undefined,
+  jobContentHash: string | undefined
+): TranscodeReuseDecision {
+  if (!readNonEmptyString(existing?.transcodedUrl)) {
+    return { action: 'transcode', reason: 'no_existing_output' };
+  }
+
+  const recorded = readNonEmptyString(existing?.originalContentHash);
+  const incoming = readNonEmptyString(jobContentHash);
+  if (!recorded || !incoming) {
+    return { action: 'reuse', reason: 'content_identity_unknown' };
+  }
+
+  return recorded === incoming
+    ? { action: 'reuse', reason: 'content_unchanged' }
+    : { action: 'retranscode', reason: 'content_changed' };
 }
 
 type VideoProbeInfo = {
@@ -523,7 +633,13 @@ export function scheduleVideoTranscode(job: TranscodeJob): void {
   });
 }
 
-async function runTranscodeJob(job: TranscodeJob): Promise<void> {
+/**
+ * Exported so the reuse/stale guard above can be asserted directly, without the
+ * `setImmediate` + semaphore indirection `scheduleVideoTranscode` adds. Production
+ * callers should keep using `scheduleVideoTranscode`, which is what enforces the
+ * concurrency cap.
+ */
+export async function runTranscodeJob(job: TranscodeJob): Promise<void> {
   const { originalPath, bucketName, originalUrl, contentType, tenantId } = job;
   const docId = sha256(originalPath);
   const db = admin.firestore();
@@ -536,15 +652,24 @@ async function runTranscodeJob(job: TranscodeJob): Promise<void> {
   // transcode wrote it before the original was deleted), do NOT re-transcode.
   // Just repair the status field and return — prevents 404 download attempts on the
   // already-deleted original file.
+  //
+  // …UNLESS the bytes at `originalPath` have changed since that transcode ran
+  // (upload-idempotency follow-up F21). `docId` is `sha256(originalPath)` and the
+  // upload path is deterministic per `uploadKey`, so a later upload that reuses the
+  // key writes NEW bytes at the SAME path while this document still claims the work
+  // is done. `decideTranscodeReuse` separates that from an ordinary same-bytes retry
+  // by comparing content identity; see its doc comment for why `generation` cannot
+  // serve as the discriminator and for the migration posture when no identity is
+  // recorded.
   const existingSnap = await db.collection(TRANSCODE_COLLECTION).doc(docId).get();
   if (existingSnap.exists) {
-    const existingData = existingSnap.data() as Record<string, any>;
-    const existingTranscodedUrl: string | undefined =
-      typeof existingData?.transcodedUrl === 'string' && existingData.transcodedUrl.length > 0
-        ? existingData.transcodedUrl
-        : undefined;
-    if (existingTranscodedUrl) {
-      console.log(`[videoTranscoder] already transcoded, repairing status: ${originalPath}`);
+    const existingData = (existingSnap.data() ?? {}) as Record<string, unknown>;
+    const decision = decideTranscodeReuse(existingData, job.originalContentHash);
+
+    if (decision.action === 'reuse') {
+      console.log(
+        `[videoTranscoder] already transcoded (${decision.reason}), repairing status: ${originalPath}`
+      );
       await db.collection(TRANSCODE_COLLECTION).doc(docId).set({
         status: 'done',
         error: admin.firestore.FieldValue.delete(),
@@ -552,11 +677,51 @@ async function runTranscodeJob(job: TranscodeJob): Promise<void> {
       }, { merge: true });
       return;
     }
+
+    if (decision.action === 'retranscode') {
+      // Stale record. Clear every field that describes the PREVIOUS video before
+      // falling through to a fresh transcode, so nothing keeps serving it in the
+      // meantime: `ChatCacheService` reads `transcodedUrl` with no status filter, and
+      // `/video/request-transcode` returns any `transcodedUrl` it finds regardless of
+      // status. Leaving them in place would keep the wrong video playing for the whole
+      // re-transcode window.
+      //
+      // `outputFileSizeBytes` of the previous output is deliberately NOT released from
+      // the tenant's quota here. The new output overwrites the old one at the same
+      // deterministic `{base}_h264.mp4` path, so the reserve below double-counts it
+      // until the next reconcile — an OVER-count. That is the direction this module
+      // already errs in (see the reserve-before-upload ordering below): an over-count
+      // is a reporting blemish the reconciler clears, whereas releasing bytes for an
+      // object that still exists would under-count if this transcode then failed.
+      console.warn(
+        `[videoTranscoder] stale transcode record for ${originalPath} — original bytes changed since the recorded transcode; re-transcoding`
+      );
+      await db.collection(TRANSCODE_COLLECTION).doc(docId).set({
+        transcodedUrl: admin.firestore.FieldValue.delete(),
+        transcodedPath: admin.firestore.FieldValue.delete(),
+        originalDeleted: admin.firestore.FieldValue.delete(),
+        originalDeletedAt: admin.firestore.FieldValue.delete(),
+        originalDeleteError: admin.firestore.FieldValue.delete(),
+        originalDeleteErrorMessage: admin.firestore.FieldValue.delete(),
+        outputCodec: admin.firestore.FieldValue.delete(),
+        outputPixFmt: admin.firestore.FieldValue.delete(),
+        outputFileSizeBytes: admin.firestore.FieldValue.delete(),
+        quotaDecrementError: admin.firestore.FieldValue.delete(),
+        completedAt: admin.firestore.FieldValue.delete(),
+      }, { merge: true });
+    }
   }
 
   await db.collection(TRANSCODE_COLLECTION).doc(docId).set({
     originalPath, originalUrl, tenantId, status: 'processing',
     startedAt: admin.firestore.FieldValue.serverTimestamp(),
+    // Recorded at the START of the job, not the end: this is the identity of the
+    // bytes this job is about to transcode, and it is what the NEXT job compares
+    // against. Written only when the scheduler supplied one — `merge: true` plus a
+    // conditional spread leaves any previously recorded identity intact rather than
+    // erasing it, which is what keeps a later `/video/request-transcode` re-run from
+    // wiping the protection off an existing document.
+    ...(job.originalContentHash ? { originalContentHash: job.originalContentHash } : {}),
   }, { merge: true });
 
   try {

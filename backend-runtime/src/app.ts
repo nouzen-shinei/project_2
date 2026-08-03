@@ -5,7 +5,7 @@ import crypto from 'crypto';
 import fetch from 'node-fetch';
 import { createGzip } from 'node:zlib';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { scheduleVideoTranscode, transcodeDocId, isVideoTranscodeEnabled } from './videoTranscoder';
+import { scheduleVideoTranscode, transcodeDocId, isVideoTranscodeEnabled, videoContentIdentity } from './videoTranscoder';
 import { enqueueReminder, enqueueCustomMessage, enqueuePaymentConfirmation, getJobStatus, listJobStatus, getInMemoryQueueSnapshot, shutdownQueue } from './queueProvider';
 import { sendSMS as backendSendSMS, sendVoiceCall as backendSendVoiceCall } from './twilio';
 import { metricsText, inc, metricNames, getFailureRate, getWindowCount } from './metrics';
@@ -15501,16 +15501,21 @@ export function createApp(options: CreateAppOptions = {}){
       // returns early when that doc already carries a `transcodedUrl`, so a retry
       // that lands while the first job is finishing cannot transcode twice.
       //
-      // KNOWN GAP, deliberately not fixed under this task (design: "Transcode of
-      // an already-transcoded original"): once a job has completed it DELETES the
-      // original and stores `originalDeleted: true`. If the same `uploadKey` were
-      // reused long after that, the new bytes would land at the same path but the
-      // early return on `transcodedUrl` means they would never be transcoded, and
-      // `/video/request-transcode` would keep returning the OLD `transcodedUrl`
-      // (it returns any existing `transcodedUrl` regardless of status, by design,
-      // to avoid 404ing on the deleted original). Bounded and out of normal
-      // operation: a retry window is seconds while a transcode takes far longer,
-      // and the client contract mints a new key for a new logical action.
+      // GAP NOW CLOSED (upload-idempotency follow-up F21; design: "Transcode of an
+      // already-transcoded original"). Once a job has completed it DELETES the
+      // original and stores `originalDeleted: true`. If the same `uploadKey` was
+      // reused long after that, the new bytes landed at the same path but the early
+      // return on `transcodedUrl` meant they were never transcoded, and both
+      // `ChatCacheService` and `/video/request-transcode` kept handing out the OLD
+      // `transcodedUrl` — which lives at a DIFFERENT path (`{base}_h264.mp4`) and so
+      // still exists and still plays. The viewer got the previous video, indefinitely.
+      //
+      // The job now carries `originalContentHash`, the identity of the bytes this
+      // request stored, and `decideTranscodeReuse` uses it to tell "same bytes again"
+      // (dedupe, unchanged) from "different bytes at the same path" (reset the record
+      // and transcode). The hash is computed from `body`, which is already in memory,
+      // and only for a video upload — a plain SHA-256 pass whose cost is invisible
+      // next to the transcode it gates.
       // Deliberately reads the STORAGE `filename`, never `displayName`: this decides
       // what to do with the stored bytes, so it must follow the value that named
       // them. A deterministic client-derived name still carries an extension —
@@ -15530,6 +15535,12 @@ export function createApp(options: CreateAppOptions = {}){
           originalUrl: url,
           contentType,
           tenantId: normalizedTenantId,
+          // Identity of the bytes THIS request stored (F21). A retry of one logical
+          // upload stores byte-identical content and so produces the same value,
+          // which is what keeps the transcode deduped; a different video reusing the
+          // same `uploadKey` produces a different value, which is what makes the
+          // stale record self-heal. Never `generation` — that changes on every write.
+          originalContentHash: videoContentIdentity(body),
         });
       }
 
