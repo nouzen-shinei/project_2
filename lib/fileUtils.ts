@@ -12,9 +12,29 @@ export interface FileInfo {
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif', 'tif', 'tiff', 'ico'];
 const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'avi', 'wmv', 'flv', 'webm', 'mkv', '3gp'];
 
-export const getFileTypeInfo = (mimeType: string, fileName?: string): FileInfo => {
-  const type = mimeType.toLowerCase();
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
+/**
+ * Attachment metadata (`fileType`, `fileName`) is read back from Firestore /
+ * RTDB documents. The TypeScript types describe what writers are supposed to
+ * store, not what the stored documents actually contain: an attachment written
+ * without a `fileType`, or with a non-string one, arrives here as
+ * undefined/null/number. Every classifier below therefore normalises its
+ * inputs instead of calling string methods on them directly, so a single
+ * malformed document cannot throw and take out attachment rendering.
+ *
+ * Normalising an absent mime type to '' deliberately keeps the filename
+ * extension fallback in play — a `clip.mp4` with no stored mime type is still
+ * a video. Behaviour for a valid mime type is unchanged.
+ */
+const normalizeMimeType = (mimeType: string | null | undefined): string =>
+  typeof mimeType === 'string' ? mimeType : '';
+
+/** Lowercased extension of `fileName`, or '' when it is absent/not a string. */
+const normalizeExtension = (fileName: string | null | undefined): string =>
+  typeof fileName === 'string' ? fileName.split('.').pop()?.toLowerCase() || '' : '';
+
+export const getFileTypeInfo = (mimeType: string | null | undefined, fileName?: string | null): FileInfo => {
+  const type = normalizeMimeType(mimeType).toLowerCase();
+  const ext = normalizeExtension(fileName);
 
   // Images
   if (type.startsWith('image/') || IMAGE_EXTENSIONS.includes(ext)) {
@@ -188,59 +208,59 @@ export const formatFileSize = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 };
 
-export const isImageFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.startsWith('image/') || IMAGE_EXTENSIONS.includes(ext);
+export const isImageFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).startsWith('image/') || IMAGE_EXTENSIONS.includes(ext);
 };
 
-export const isVideoFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.startsWith('video/') || VIDEO_EXTENSIONS.includes(ext);
+export const isVideoFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).startsWith('video/') || VIDEO_EXTENSIONS.includes(ext);
 };
 
-export const isAudioFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.startsWith('audio/') || ['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'wma'].includes(ext);
+export const isAudioFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).startsWith('audio/') || ['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg', 'wma'].includes(ext);
 };
 
-export const isPdfFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.includes('pdf') || ext === 'pdf';
+export const isPdfFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).includes('pdf') || ext === 'pdf';
 };
 
-export const isCodeFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.includes('text/') || 
+export const isCodeFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).includes('text/') || 
     ['js', 'ts', 'jsx', 'tsx', 'py', 'java', 'cpp', 'c', 'html', 'css', 'json', 'xml', 'md', 'yml', 'yaml', 'php', 'rb', 'go', 'rs', 'swift', 'kt'].includes(ext);
 };
 
-export const isPresentationFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.includes('presentation') || ['ppt', 'pptx', 'odp', 'key'].includes(ext);
+export const isPresentationFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).includes('presentation') || ['ppt', 'pptx', 'odp', 'key'].includes(ext);
 };
 
-export const isSpreadsheetFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
-  return mimeType.includes('spreadsheet') || ['xls', 'xlsx', 'ods', 'csv', 'numbers'].includes(ext);
+export const isSpreadsheetFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
+  return normalizeMimeType(mimeType).includes('spreadsheet') || ['xls', 'xlsx', 'ods', 'csv', 'numbers'].includes(ext);
 };
 
-export const isEbookFile = (mimeType: string, fileName?: string): boolean => {
-  const ext = fileName?.split('.').pop()?.toLowerCase() || '';
+export const isEbookFile = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
+  const ext = normalizeExtension(fileName);
   return ['epub', 'mobi', 'azw', 'azw3', 'fb2'].includes(ext);
 };
 
-export const canPreview = (mimeType: string, fileName?: string): boolean => {
+export const canPreview = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
   const fileInfo = getFileTypeInfo(mimeType, fileName);
   return fileInfo.canPreview;
 };
 
-export const canPlay = (mimeType: string, fileName?: string): boolean => {
+export const canPlay = (mimeType: string | null | undefined, fileName?: string | null): boolean => {
   const fileInfo = getFileTypeInfo(mimeType, fileName);
   return fileInfo.canPlay;
 };
 
-export const getMimeTypeFromFileName = (fileName: string): string => {
-  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+export const getMimeTypeFromFileName = (fileName: string | null | undefined): string => {
+  const ext = normalizeExtension(fileName);
   
   const mimeMap: Record<string, string> = {
     // Images

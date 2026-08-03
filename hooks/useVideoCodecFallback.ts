@@ -23,7 +23,12 @@ import { internalTokenManager } from '@/services/internalTokenManager';
  * polling    → waiting for Firestore videoTranscodes status: 'done'
  * done       → swap completed successfully
  * timeout    → 60s elapsed without a 'done' document arriving
- * error      → transcodedUrl also failed, or no transcodedUri and codec unsupported
+ * error      → the transcoded URL also failed (Requirement 1.7), or transcoding
+ *              is disabled and the browser reported it cannot decode the source
+ *
+ * Note: an unsupported codec detected on mount does NOT reach 'error'. See the
+ * mount effect below — capability detection is advisory, so the hook stays
+ * 'idle' and waits for a real UnsupportedCodecError from the <video> element.
  */
 export type FallbackPhase =
   | 'idle'
@@ -59,9 +64,21 @@ export interface UseVideoCodecFallbackOptions {
 // ─── Firestore collection ─────────────────────────────────────────────────────
 
 const VIDEO_TRANSCODES_COLLECTION = 'videoTranscodes';
-// 120 seconds: large HEVC videos on a shared 1-CPU server can take >60s to
-// transcode. The extra time prevents premature timeout for legitimate jobs.
-const POLL_TIMEOUT_MS = 120_000;
+/**
+ * Hard cap on a single polling session, fixed by requirements — do not change
+ * this without changing requirements.md first.
+ *
+ * Requirement 1.2: "poll the `videoTranscodes` Firestore collection at
+ *   3-second intervals for up to 60 seconds".
+ * Requirement 1.5: "WHEN an active polling session reaches the 60-second
+ *   timeout ... render a retry button that ... starts a new 60-second polling
+ *   session from the beginning".
+ *
+ * This was previously 120_000 to give slow single-CPU transcodes more headroom.
+ * That drifted from both criteria above; the retry button (Requirement 1.5) is
+ * the sanctioned way to grant a slow job more time, not a longer first session.
+ */
+const POLL_TIMEOUT_MS = 60_000;
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
@@ -71,7 +88,8 @@ const POLL_TIMEOUT_MS = 120_000;
  * Phase transitions:
  *   idle
  *     → (mount, canPlayCodec('h265') === false, transcodedUri present) → swapping → done
- *     → (mount, canPlayCodec('h265') === false, no transcodedUri) → error
+ *     → (mount, canPlayCodec('h265') === false, no transcodedUri) → idle (stays put;
+ *        the reactive onCodecError path below drives any transition)
  *     → (onCodecError, transcodedUri present) → swapping → done
  *     → (onCodecError, no transcodedUri) → requesting → polling → done | timeout
  *     → (timeout, retry()) → polling (fresh 60s)
@@ -171,7 +189,13 @@ export function useVideoCodecFallback(options: UseVideoCodecFallbackOptions): {
         limit(1),
       );
 
-      // 60-second hard timeout.
+      // Note on Requirement 1.2's "3-second intervals": there is no interval
+      // constant here by design. This uses a Firestore realtime listener
+      // (onSnapshot) instead of a fixed-cadence re-query, so updates arrive as
+      // soon as the document changes — never later than a 3-second poll would
+      // have delivered them. Only the 60-second cap below is a real constant.
+
+      // 60-second hard timeout (Requirement 1.2 / 1.5 — see POLL_TIMEOUT_MS).
       const timeoutHandle = setTimeout(() => {
         cancelPolling();
         setPhase('timeout');

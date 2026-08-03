@@ -69,8 +69,12 @@ const resolveBufferedPercent = (el: HTMLVideoElement): number | null => {
 /**
  * Manages a web `<video>` element for a given resolved URI.
  *
- * - The `videoRef.current` DOM element is stable across state-only re-renders;
- *   a new element is created only when `resolvedUri` changes.
+ * - React owns the element. `components/VideoPlayer.tsx` renders
+ *   `<video ref={webVideoRef}>` with NO `key`, so React creates and commits that
+ *   node once and never replaces it. This hook never creates an element; it only
+ *   wires the element React committed to a source. A `resolvedUri` change
+ *   re-wires that SAME element to the new source — it does not produce a new
+ *   element. See the "WHY no document.createElement" note below.
  * - Event listeners are attached/detached cleanly on URI changes.
  * - UnsupportedCodecError is detected via zero videoWidth/videoHeight after
  *   `loadedmetadata` (with duration > 0) or MediaError code 3 / 4.
@@ -79,7 +83,7 @@ const resolveBufferedPercent = (el: HTMLVideoElement): number | null => {
  */
 export function useWebVideoPlayer(options: UseWebVideoPlayerOptions): {
   state: WebPlayerState;
-  /** Stable ref — same HTMLVideoElement across state-only re-renders. */
+  /** Ref to attach to React's `<video>`; the same element for the hook's lifetime. */
   videoRef: React.MutableRefObject<HTMLVideoElement | null>;
   play: () => void;
   pause: () => void;
@@ -101,8 +105,10 @@ export function useWebVideoPlayer(options: UseWebVideoPlayerOptions): {
 
   const [state, setState] = useState<WebPlayerState>(buildInitialState);
 
-  // The video element ref is stable per resolvedUri — it is created once and
-  // mutated in-place for mute/speed/position changes.
+  // Populated by React with the DOM element it commits for <video ref={...}>.
+  // That element is the same one for the hook's lifetime — including across a
+  // resolvedUri change, which re-wires it rather than replacing it — and is
+  // mutated in-place for src/mute/speed/position changes.
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   // Keep callback refs stable so event listeners don't capture stale closures.

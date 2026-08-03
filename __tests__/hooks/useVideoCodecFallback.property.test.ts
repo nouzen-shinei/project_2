@@ -690,18 +690,26 @@ describe('useVideoCodecFallback — Property 7: Non-empty transcodedUri prop is 
  *
  * When the VideoPlayer (via useVideoCodecFallback) receives a `transcodedUri`
  * that is non-null but contains only whitespace characters (e.g., " ", "\t",
- * "\n"), the hook SHALL treat it as absent. Because no valid transcodedUri is
- * available and `canPlayCodec('h265')` returns false, the hook SHALL reach
- * the `error` phase and SHALL NOT call `onSourceResolved` with a whitespace
- * string as the URI.
+ * "\n"), the hook SHALL treat it as absent: no swap SHALL occur on mount and
+ * `onSourceResolved` SHALL NOT be called with a whitespace string as the URI.
  *
  * (The hook computes `effectiveTranscodedUri = transcodedUri?.trim() || undefined`;
- * a whitespace-only value becomes `undefined`, so the proactive path falls
- * into the "no transcodedUri" branch → error state.)
+ * a whitespace-only value becomes `undefined`, so the proactive path falls into
+ * the "no transcodedUri" branch, which leaves the phase at `idle`.)
+ *
+ * CORRECTED EXPECTATION — the first test below previously asserted
+ * `phase === 'error'` and that `onPermanentError` had fired on mount. That was
+ * wrong for the same reason as Property 20 (see the note there): `canPlayType`
+ * returning "" is advisory, not a veto, so an unsupported-codec reading on mount
+ * must not produce a permanent error. Requirement 2.7 — the criterion this
+ * property actually validates — only says a whitespace `transcodedUri` is
+ * treated as absent; it says nothing about entering an error phase. Asserting
+ * `idle` is the faithful reading and is strictly more precise than the old
+ * assertion, since it also rules out a spurious `done`/`swapping`.
  *
  * Generator: `fc.string().filter(s => s.trim() === '')` for transcodedUri;
- * `fc.webUrl()` for uri; assert phase is `error` and `onSourceResolved`
- * is never called with a whitespace-only URI.
+ * `fc.webUrl()` for uri; assert phase is `idle`, no permanent error, and
+ * `onSourceResolved` is never called with a whitespace-only URI.
  */
 
 describe('useVideoCodecFallback — Property 8: Whitespace-only transcodedUri is treated as absent', () => {
@@ -722,7 +730,7 @@ describe('useVideoCodecFallback — Property 8: Whitespace-only transcodedUri is
   });
 
   it(
-    'whitespace-only transcodedUri results in error phase (treated as absent)',
+    'whitespace-only transcodedUri is treated as absent: no swap, phase stays idle',
     () => {
       fc.assert(
         fc.property(
@@ -762,12 +770,17 @@ describe('useVideoCodecFallback — Property 8: Whitespace-only transcodedUri is
               expect(resolvedUri.trim()).not.toBe('');
             }
 
-            // The hook must have reached error state (permanent error callback).
-            expect(onPermanentError).toHaveBeenCalled();
+            // The whitespace value must not have been treated as a usable source,
+            // so no swap may have happened at all.
+            expect(onSourceResolved).not.toHaveBeenCalled();
 
-            // Re-read phase: must be 'error'.
+            // Mount must not raise a permanent error — capability detection is
+            // advisory; only a real UnsupportedCodecError may drive that.
+            expect(onPermanentError).not.toHaveBeenCalled();
+
+            // Re-read phase: must still be 'idle' (not 'done'/'swapping'/'error').
             const latest = harness.reread(() => useVideoCodecFallback(options));
-            expect(latest.phase).toBe('error');
+            expect(latest.phase).toBe('idle');
           },
         ),
         { numRuns: 50 },
@@ -963,30 +976,55 @@ describe('useVideoCodecFallback — Property 19: canPlayCodec false + transcoded
 // Property 20
 // ---------------------------------------------------------------------------
 
-// Feature: video-transcoding-compatibility, Property 20: canPlayCodec('h265') === false AND no transcodedUri → error state, no video element
+// Feature: video-transcoding-compatibility, Property 20: canPlayCodec('h265') === false AND no transcodedUri → no video source resolved, no premature error
 
 /**
- * **Validates: Requirements 5.5**
+ * **Validates: Requirements 5.5 (no source resolved for the original uri), 1.3**
  *
- * Property 20: canPlayCodec('h265') === false AND no transcodedUri → error state, no video element
+ * Property 20: canPlayCodec('h265') === false AND no transcodedUri → no video
+ * source is resolved on mount, and no permanent error is raised
  *
  * WHEN `canPlayCodec('h265')` returns `false` on web AND the VideoPlayer has
- * no `transcodedUri` (undefined or omitted), the hook SHALL reach the `error`
- * phase and SHALL NOT call `onSourceResolved` (i.e., no `<video>` source is
- * ever resolved). The permanent error callback MUST be invoked.
+ * no `transcodedUri` (undefined or omitted), the hook SHALL NOT call
+ * `onSourceResolved` (no `<video>` source is assigned — in particular the
+ * original `uri` is never assigned), SHALL NOT call `onPermanentError`, and
+ * SHALL remain in the `idle` phase awaiting a real UnsupportedCodecError.
  *
- * This validates the proactive codec check path (Requirement 5.5):
  *   canPlayCodec('h265') === false + no effectiveTranscodedUri
- *   → phase = 'error'
- *   → onPermanentError called
+ *   → phase stays 'idle'
  *   → onSourceResolved never called
+ *   → onPermanentError never called
+ *
+ * CORRECTED EXPECTATION — both tests below previously asserted `phase === 'error'`
+ * and that `onPermanentError` had fired on mount, quoting the first half of
+ * Requirement 5.5 ("render the 'Video format not supported' error state"). That
+ * expectation was wrong at the hook level:
+ *
+ *   • `canPlayType` returns "" for hvc1 on Chrome 107+ / macOS 13+, browsers that
+ *     CAN decode H.265 via VideoToolbox. A pre-emptive veto blacks out videos
+ *     that would have played.
+ *   • Every Requirement 1 criterion is phrased "WHEN the VideoPlayer detects an
+ *     UnsupportedCodecError" — reactive detection, not a capability veto.
+ *     Requirement 1.3 requires POSTing /video/request-transcode and polling when
+ *     no transcode document exists, which erroring on mount makes unreachable.
+ *     Requirement 1.7 allows the permanent error only if the transcoded URL also
+ *     fails after the swap.
+ *   • The shipped VideoPlayer mount path matches this: it schedules a short timer
+ *     that calls the codec-error handler, it does not render a capability error.
+ *
+ * The SECOND half of Requirement 5.5 — "SHALL NOT create or load any <video>
+ * element for the original uri" — is real, and remains asserted here (and is
+ * reinforced by Requirement 7.4). Only the "render the error state" half is not
+ * asserted, because it conflicts with Requirements 1.3/1.7. That conflict lives
+ * in requirements.md, not in this test; it is reported for the requirements
+ * record and deliberately NOT resolved here.
  *
  * Generator: `fc.webUrl()` for uri; `canPlayCodec` mocked to return false;
- * no transcodedUri passed; assert phase is `error` and `onSourceResolved`
- * is never called.
+ * no transcodedUri passed; assert phase is `idle` and `onSourceResolved` /
+ * `onPermanentError` are never called.
  */
 
-describe('useVideoCodecFallback — Property 20: canPlayCodec false + no transcodedUri → error state', () => {
+describe('useVideoCodecFallback — Property 20: canPlayCodec false + no transcodedUri → no source resolved, no premature error', () => {
   let harness: ReturnType<typeof createHarness>;
 
   beforeEach(() => {
@@ -1004,7 +1042,7 @@ describe('useVideoCodecFallback — Property 20: canPlayCodec false + no transco
   });
 
   it(
-    'error phase is reached and onSourceResolved is never called when no transcodedUri',
+    'phase stays idle and onSourceResolved is never called when no transcodedUri',
     () => {
       fc.assert(
         fc.property(
@@ -1033,18 +1071,21 @@ describe('useVideoCodecFallback — Property 20: canPlayCodec false + no transco
               onTimeoutError: jest.fn(),
             };
 
-            // Mount: proactive check fires; no transcodedUri → error branch.
+            // Mount: proactive check fires; no transcodedUri → stays idle.
             harness.run(() => useVideoCodecFallback(options));
 
-            // onSourceResolved must NEVER be called — no <video> source is resolved.
+            // onSourceResolved must NEVER be called — no <video> source is
+            // resolved on mount, so the original uri is never assigned as src
+            // (Requirement 5.5 second half, Requirement 7.4).
             expect(onSourceResolved).not.toHaveBeenCalled();
 
-            // The permanent error callback must be invoked.
-            expect(onPermanentError).toHaveBeenCalled();
+            // No premature permanent error — only a real UnsupportedCodecError
+            // (or a failed swap target, Requirement 1.7) may raise one.
+            expect(onPermanentError).not.toHaveBeenCalled();
 
-            // Phase must be 'error'.
+            // Phase must still be 'idle', awaiting reactive detection.
             const latest = harness.reread(() => useVideoCodecFallback(options));
-            expect(latest.phase).toBe('error');
+            expect(latest.phase).toBe('idle');
           },
         ),
         { numRuns: 50 },
@@ -1053,7 +1094,7 @@ describe('useVideoCodecFallback — Property 20: canPlayCodec false + no transco
   );
 
   it(
-    'error phase is reached for any uri when transcodedUri is explicitly undefined',
+    'idle phase is preserved for any uri when transcodedUri is explicitly undefined',
     () => {
       fc.assert(
         fc.property(
@@ -1086,12 +1127,12 @@ describe('useVideoCodecFallback — Property 20: canPlayCodec false + no transco
             // No video source must be resolved.
             expect(onSourceResolved).not.toHaveBeenCalled();
 
-            // Permanent error must fire.
-            expect(onPermanentError).toHaveBeenCalled();
+            // No permanent error on mount.
+            expect(onPermanentError).not.toHaveBeenCalled();
 
-            // Phase must be 'error'.
+            // Phase must still be 'idle'.
             const latest = harness.reread(() => useVideoCodecFallback(options));
-            expect(latest.phase).toBe('error');
+            expect(latest.phase).toBe('idle');
           },
         ),
         { numRuns: 50 },

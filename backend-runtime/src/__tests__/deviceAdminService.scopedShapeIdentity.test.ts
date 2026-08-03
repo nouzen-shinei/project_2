@@ -23,7 +23,9 @@ jest.mock('../firebaseAdmin', () => ({
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { getFirestore } = require('../firebaseAdmin') as { getFirestore: jest.Mock };
 
-const FLAG = 'DEVICE_TENANT_INDEX_LISTING_ENABLED';
+// The scoped-listing flag is always read/written through the literal key
+// `process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED` (never `process.env[someVar]`)
+// so the env var stays statically analysable — see `expo/no-dynamic-env-var`.
 const TENANT = 'tenant-shape';
 const OTHER = 'tenant-other';
 
@@ -195,20 +197,20 @@ function sortById(records: DeviceAdminRecord[]): DeviceAdminRecord[] {
 }
 
 describe('scoped vs full-scan — response-shape stability (Req 6.5)', () => {
-  const originalFlag = process.env[FLAG];
+  const originalFlag = process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
   afterEach(() => {
-    if (originalFlag === undefined) delete process.env[FLAG];
-    else process.env[FLAG] = originalFlag;
+    if (originalFlag === undefined) delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
+    else process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = originalFlag;
   });
 
   async function fullScan(): Promise<DeviceAdminRecord[]> {
-    delete process.env[FLAG];
+    delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
     getFirestore.mockReturnValue(buildFakeDb(fixedPopulation(), false));
     return listTenantDevices(TENANT);
   }
 
   async function scoped(): Promise<DeviceAdminRecord[]> {
-    process.env[FLAG] = '1';
+    process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = '1';
     getFirestore.mockReturnValue(buildFakeDb(fixedPopulation(), true));
     return listTenantDevices(TENANT);
   }

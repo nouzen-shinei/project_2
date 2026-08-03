@@ -41,7 +41,9 @@ jest.mock('../firebaseAdmin', () => ({
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { getFirestore } = require('../firebaseAdmin') as { getFirestore: jest.Mock };
 
-const FLAG = 'DEVICE_TENANT_INDEX_LISTING_ENABLED';
+// The scoped-listing flag is always read/written through the literal key
+// `process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED` (never `process.env[someVar]`)
+// so the env var stays statically analysable — see `expo/no-dynamic-env-var`.
 
 // ---------------------------------------------------------------------------
 // In-memory Firestore fake (serves both the full scan and the scoped query)
@@ -249,13 +251,13 @@ function associatedDeviceIds(pop: Population, t: string): string[] {
 }
 
 async function runFallback(pop: Population, t: string): Promise<DeviceAdminRecord[]> {
-  delete process.env[FLAG]; // flag off ⇒ full-scan fallback
+  delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED; // flag off ⇒ full-scan fallback
   getFirestore.mockReturnValue(buildFakeDb(pop, false));
   return listTenantDevices(t);
 }
 
 async function runScoped(pop: Population, t: string): Promise<DeviceAdminRecord[]> {
-  process.env[FLAG] = '1'; // flag on + backfill completed ⇒ scoped
+  process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = '1'; // flag on + backfill completed ⇒ scoped
   getFirestore.mockReturnValue(buildFakeDb(pop, true));
   return listTenantDevices(t);
 }
@@ -265,10 +267,10 @@ async function runScoped(pop: Population, t: string): Promise<DeviceAdminRecord[
 // ---------------------------------------------------------------------------
 
 describe('Property 5 — scoped listing equals full-scan listing (and the predicate set)', () => {
-  const originalFlag = process.env[FLAG];
+  const originalFlag = process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
   afterAll(() => {
-    if (originalFlag === undefined) delete process.env[FLAG];
-    else process.env[FLAG] = originalFlag;
+    if (originalFlag === undefined) delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
+    else process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = originalFlag;
   });
 
   it(

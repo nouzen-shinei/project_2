@@ -1179,10 +1179,32 @@ class NotificationService {
 
   /**
    * Get appropriate emoji for file types
+   *
+   * `attachment.fileType` / `attachment.fileName` (and the legacy
+   * `message.fileType` / `message.fileName`) are TYPED `string` but read back
+   * from Firestore documents, so the types describe what writers are supposed to
+   * store, not what a stored document actually contains. An attachment written
+   * without a `fileType` used to throw here ("Cannot read properties of
+   * undefined (reading 'toLowerCase')") and take the whole chat notification
+   * down with it. Both inputs are therefore normalised instead of having string
+   * methods called on them directly — same treatment the classifiers in
+   * `lib/fileUtils.ts` get.
+   *
+   * Normalising an absent mime type to '' (rather than returning early)
+   * deliberately keeps the filename-extension fallback in play: a `clip.mp4`
+   * with no stored mime type still gets 🎥. Behaviour for valid inputs is
+   * unchanged.
+   *
+   * WHY this is not delegated to `lib/fileUtils.getFileTypeInfo`: that helper
+   * collapses PDFs and Word documents into a single `document` category, so it
+   * cannot tell 📄 from 📝, and it has no category for archives-vs-database or
+   * ebooks that maps onto these emoji. Its extension lists also differ (it knows
+   * svg/heic/webm/csv, this one does not). Delegating would change the emoji for
+   * valid inputs, so the two implementations stay separate by design.
    */
-  private getFileTypeEmoji(fileType: string, fileName: string): string {
-    const type = fileType.toLowerCase();
-    const name = fileName.toLowerCase();
+  private getFileTypeEmoji(fileType: string | null | undefined, fileName: string | null | undefined): string {
+    const type = typeof fileType === 'string' ? fileType.toLowerCase() : '';
+    const name = typeof fileName === 'string' ? fileName.toLowerCase() : '';
     
     // Images
     if (type.startsWith('image/') || /\.(jpg|jpeg|png|gif|bmp|webp)$/.test(name)) {
@@ -1233,8 +1255,11 @@ class NotificationService {
   /**
    * Extract display name from email with improved formatting
    */
-  private extractDisplayName(email: string): string {
-    if (!email) return 'Unknown User';
+  private extractDisplayName(email: string | null | undefined): string {
+    // `message.sender` is typed `string` but comes back from Firestore, so this
+    // has to survive a document that stored nothing — or something that is not a
+    // string at all — for the sender field.
+    if (typeof email !== 'string' || !email) return 'Unknown User';
     
     // Extract the part before @
     const username = email.split('@')[0].toLowerCase();
@@ -1621,14 +1646,22 @@ class NotificationService {
     senderName?: string
   ): Promise<void> {
     try {
+      // `message.sender` is TYPED `string` but read back from a Firestore
+      // document, so a message written without a sender arrives here as
+      // undefined and used to throw on `.toLowerCase()`, killing the whole
+      // notification path. Normalise once — an unidentifiable sender simply
+      // matches nobody, so the notification is still delivered.
+      // (`sendRemoteChatNotification` already normalises the same field this way.)
+      const senderKey = typeof message.sender === 'string' ? message.sender.toLowerCase() : '';
+
       // CRITICAL: Don't send notification to the sender themselves
-      if (message.sender.toLowerCase() === recipientEmail.toLowerCase()) {
+      if (senderKey === recipientEmail.toLowerCase()) {
         logger.debug('🚫 Skipping: sender is same as recipient');
         return;
       }
 
       // CRITICAL: Don't send notification if current user sent this message
-      if (message.sender.toLowerCase() === currentUserEmail.toLowerCase()) {
+      if (senderKey === currentUserEmail.toLowerCase()) {
         logger.debug('🚫 Skipping: current user sent this message');
         return;
       }
@@ -1652,8 +1685,8 @@ class NotificationService {
 
       // Check if this message is from the currently active chat
       const fromContextActiveChat = context.currentChatPartner && 
-        message.sender.toLowerCase() === context.currentChatPartner.toLowerCase();
-      const fromTrackedActiveChat = this.isUserActivelyViewingChat(message.sender);
+        senderKey === context.currentChatPartner.toLowerCase();
+      const fromTrackedActiveChat = this.isUserActivelyViewingChat(senderKey);
       const isFromActiveChat = fromContextActiveChat || fromTrackedActiveChat;
 
       // Check if user is actively engaged with the app

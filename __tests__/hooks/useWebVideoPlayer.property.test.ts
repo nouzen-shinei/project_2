@@ -7,13 +7,21 @@
  *
  * For any sequence of state-changing actions (mute, speed, controls), the
  * `videoRef.current` HTMLVideoElement reference returned by `useWebVideoPlayer`
- * SHALL remain the same object throughout. A new element is only created when
- * `resolvedUri` changes.
+ * SHALL remain the same object throughout.
  *
  * Generator: `fc.array(fc.constantFrom('mute', 'speed', 'controls'), { minLength: 1, maxLength: 10 })`
+ *
+ * Who owns the element: the consumer renders `<video ref={videoRef} />`, so
+ * REACT creates the element and assigns `videoRef.current` during the commit
+ * phase — the hook only wires the committed element up to a source. The engine
+ * below therefore models that commit (see `onCommit`) instead of letting the
+ * hook build its own off-DOM element, which is what it used to do and which
+ * produced a blank inline player (see the WHY-no-document.createElement comment
+ * in the hook).
  */
 
 import * as fc from 'fast-check';
+import type { MutableRefObject } from 'react';
 
 // ---------------------------------------------------------------------------
 // Mocks — must be declared before any imports that load the hook.
@@ -72,7 +80,9 @@ function createFakeVideoElement(): HTMLVideoElement {
 // This engine simulates React's hooks dispatcher well enough to execute
 // useWebVideoPlayer in a controlled, synchronous environment (no DOM renderer).
 //
-// Supports: useState, useRef, useEffect (collected, then flushed), useCallback.
+// Supports: useState, useRef, useEffect / useLayoutEffect (collected, then
+// flushed), useCallback, and the ref-commit phase that sits between render and
+// layout effects (`onCommit`).
 // ---------------------------------------------------------------------------
 
 type EffectCleanup = (() => void) | void;
@@ -185,6 +195,14 @@ function createEngine() {
     jest.spyOn(React, 'useState').mockImplementation(useState as typeof React.useState);
     jest.spyOn(React, 'useRef').mockImplementation(useRef as typeof React.useRef);
     jest.spyOn(React, 'useEffect').mockImplementation(useEffect as typeof React.useEffect);
+    // useWebVideoPlayer wires the <video> element up from a useLayoutEffect (it
+    // has to run after React commits refs). This engine flushes every effect at
+    // one synchronous point, so layout effects are collected exactly like
+    // passive ones — without this spy the real dispatcher is reached and throws
+    // "Cannot read properties of null (reading 'useLayoutEffect')".
+    jest
+      .spyOn(React, 'useLayoutEffect')
+      .mockImplementation(useEffect as typeof React.useLayoutEffect);
     jest.spyOn(React, 'useCallback').mockImplementation(useCallback as typeof React.useCallback);
   }
 
@@ -197,22 +215,30 @@ function createEngine() {
 
   // ── Execute hook & flush ──────────────────────────────────────────────────
 
-  function run<T>(hookFn: () => T): T {
+  // `onCommit` stands in for React's commit phase: React attaches DOM refs
+  // after rendering and BEFORE running layout effects. useWebVideoPlayer's
+  // primary effect is a useLayoutEffect precisely so it can rely on that
+  // ordering, and it returns early when videoRef.current is null — so without
+  // an onCommit step the hook would be flushed inert and every assertion below
+  // would be vacuous.
+  function run<T>(hookFn: () => T, onCommit?: (result: T) => void): T {
     hookState.stateIdx = 0;
     hookState.refIdx = 0;
     hookState.effectIdx = 0;
     hookState.callbackIdx = 0;
     const result = hookFn();
+    onCommit?.(result);
     flushEffects();
     return result;
   }
 
-  function rerender<T>(hookFn: () => T): T {
+  function rerender<T>(hookFn: () => T, onCommit?: (result: T) => void): T {
     hookState.stateIdx = 0;
     hookState.refIdx = 0;
     hookState.effectIdx = 0;
     hookState.callbackIdx = 0;
     const result = hookFn();
+    onCommit?.(result);
     flushEffects();
     return result;
   }
@@ -240,26 +266,41 @@ function createEngine() {
 
 // ---------------------------------------------------------------------------
 // Document stub helpers
+//
+// The hook reads `typeof document` as its "are we in a browser" guard, so a
+// document has to exist. It must NOT call createElement — React owns the
+// element — but the stub still returns a working fake rather than throwing, so
+// that a regression back to hook-created elements shows up as a failure of this
+// property's own identity assertion (a different element than the committed
+// one) instead of an unrelated exception.
 // ---------------------------------------------------------------------------
 
-let currentFakeEl: HTMLVideoElement | null = null;
-
 function stubDocument() {
-  currentFakeEl = null;
   (global as unknown as Record<string, unknown>)['document'] = {
-    createElement: (tag: string) => {
-      if (tag === 'video') {
-        currentFakeEl = createFakeVideoElement();
-        return currentFakeEl;
-      }
-      return {};
-    },
+    createElement: (tag: string) =>
+      tag === 'video' ? createFakeVideoElement() : ({} as unknown),
   };
 }
 
 function removeDocumentStub() {
   delete (global as unknown as Record<string, unknown>)['document'];
-  currentFakeEl = null;
+}
+
+// ---------------------------------------------------------------------------
+// React's ref commit, modelled
+//
+// React creates the <video> node once, on mount, and keeps the SAME node for
+// every subsequent render of `<video ref={videoRef} />` — there is no `key` on
+// it in components/VideoPlayer.tsx, so not even a resolvedUri change replaces
+// it. Assigning only when the ref is still empty reproduces exactly that.
+// ---------------------------------------------------------------------------
+
+function commitVideoRef(result: {
+  videoRef: MutableRefObject<HTMLVideoElement | null>;
+}): void {
+  if (!result.videoRef.current) {
+    result.videoRef.current = createFakeVideoElement();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,11 +357,15 @@ describe('useWebVideoPlayer — Property 16', () => {
               autoPlay: false,
             };
 
-            // Initial render.
-            let result = engine.run(() => useWebVideoPlayer(opts));
+            // Initial render + commit (React attaches the <video> node here).
+            let result = engine.run(() => useWebVideoPlayer(opts), commitVideoRef);
 
             const initialEl = result.videoRef.current;
             expect(initialEl).not.toBeNull();
+            // The hook must have wired the committed element, not some other
+            // one — otherwise "the reference never changes" would hold simply
+            // because nothing ever touched it.
+            expect(initialEl?.src).toBe(resolvedUri);
 
             let isMuted = false;
             let playbackSpeed = 1;
@@ -341,7 +386,7 @@ describe('useWebVideoPlayer — Property 16', () => {
                   break;
               }
 
-              result = engine.rerender(() => useWebVideoPlayer(opts));
+              result = engine.rerender(() => useWebVideoPlayer(opts), commitVideoRef);
 
               // After every state-only re-render, the element MUST be the same.
               expect(result.videoRef.current).toBe(initialEl);
@@ -351,12 +396,29 @@ describe('useWebVideoPlayer — Property 16', () => {
             engine.unmount();
           },
         ),
-        { numRuns: 50 },
+        // Repo convention for property suites (see the spec task notes): at
+        // least 100 cases per property.
+        { numRuns: 100 },
       );
     },
   );
 
-  it('videoRef.current changes when resolvedUri changes', () => {
+  // Companion case: the negative control for Property 16.
+  //
+  // It used to read "videoRef.current changes when resolvedUri changes", which
+  // described the hook's ORIGINAL design — it built its own element with
+  // document.createElement inside the URI effect, so a new URI meant a new
+  // element. That design was removed on purpose (it left the visible, React-
+  // rendered <video> with no src and no listeners, i.e. a blank inline player).
+  // React now owns the node, and `components/VideoPlayer.tsx` renders it without
+  // a `key`, so a resolvedUri change does NOT replace it.
+  //
+  // The claim worth pinning is therefore the other half of the same behaviour:
+  // a URI change re-wires the SAME element to the new source. That keeps this
+  // case a real negative control — it is what distinguishes "the effect re-runs
+  // when the URI changes" from "the effect never runs at all", which is the way
+  // Property 16 could otherwise pass vacuously.
+  it('re-wires the same element to the new source when resolvedUri changes', () => {
     const uri1 = 'https://example.com/video1.mp4';
     const uri2 = 'https://example.com/video2.mp4';
 
@@ -366,15 +428,27 @@ describe('useWebVideoPlayer — Property 16', () => {
       playbackSpeed: 1,
     };
 
-    let result = engine.run(() => useWebVideoPlayer(opts));
+    let result = engine.run(() => useWebVideoPlayer(opts), commitVideoRef);
     const firstEl = result.videoRef.current;
     expect(firstEl).not.toBeNull();
+    expect(firstEl?.src).toBe(uri1);
 
-    // Change the URI — this is the only case a new element should be created.
+    const loadCallsAfterMount = (firstEl?.load as unknown as jest.Mock).mock.calls.length;
+
+    // Change the URI — the source is swapped on the element React already owns.
     opts = { ...opts, resolvedUri: uri2 };
-    result = engine.rerender(() => useWebVideoPlayer(opts));
+    result = engine.rerender(() => useWebVideoPlayer(opts), commitVideoRef);
 
-    // After URI change, videoRef.current must NOT be the same element instance.
-    expect(result.videoRef.current).not.toBe(firstEl);
+    // Same DOM node: React never replaces it, and the hook must not either.
+    expect(result.videoRef.current).toBe(firstEl);
+    // ...but it now points at the new source.
+    expect(result.videoRef.current?.src).toBe(uri2);
+    // Re-wired, not merely re-pointed: the old wiring is torn down (cleanup
+    // detaches the listeners, drops the src and reloads) and the new source is
+    // loaded, so load() is called again after mount.
+    expect((firstEl?.load as unknown as jest.Mock).mock.calls.length).toBeGreaterThan(
+      loadCallsAfterMount,
+    );
+    expect(firstEl?.removeAttribute as unknown as jest.Mock).toHaveBeenCalledWith('src');
   });
 });

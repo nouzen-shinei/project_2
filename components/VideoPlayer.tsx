@@ -4030,8 +4030,9 @@ function VideoPlayerLoaded({
           : {})}
       >
         <View style={isWebFullscreenExpanded ? styles.fullscreenVideoSurface : styles.inlineVideoSurface}>
-          {/* The <video> element is created and managed by useWebVideoPlayer via webVideoRef.
-              We render an empty container element and attach the ref so React sees the node.
+          {/* React creates and commits this <video> element; useWebVideoPlayer wires it
+              up through webVideoRef (it does not create the node). A `resolvedUri`
+              change re-points the SAME element — there is no `key`, so React keeps it.
               useWebVideoPlayer sets el.src internally — we NEVER set src here directly.
               This ensures the original `uri` is never assigned when h265 is unsupported. */}
           <video

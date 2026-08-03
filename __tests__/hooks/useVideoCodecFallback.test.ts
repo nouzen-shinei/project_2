@@ -475,8 +475,12 @@ describe('useVideoCodecFallback — Test 3: onSwapTargetError → error phase + 
 
 describe('useVideoCodecFallback — proactive mount behaviour (h265 not supported)', () => {
   /**
-   * Requirements 5.4, 5.5: On web, if h265 is not supported, the hook swaps
-   * immediately on mount when transcodedUri is present, or errors when absent.
+   * Requirement 5.4: On web, if h265 is not supported AND transcodedUri is
+   * present, the hook swaps immediately on mount.
+   *
+   * Requirements 1.3 / 1.7: if h265 detection fails AND there is no
+   * transcodedUri, the hook stays idle. Capability detection is advisory only —
+   * see the second test below for why a pre-emptive error would be wrong.
    */
 
   it('calls onSourceResolved on mount when h265 unsupported AND transcodedUri present', () => {
@@ -492,17 +496,46 @@ describe('useVideoCodecFallback — proactive mount behaviour (h265 not supporte
     expect(onSourceResolved).toHaveBeenCalledWith(transcodedUri, 0);
   });
 
-  it('sets phase to error on mount when h265 unsupported AND no transcodedUri', () => {
+  /**
+   * This test previously asserted `phase === 'error'` and that
+   * `onPermanentError` had been called on mount. That expectation was wrong:
+   *
+   *   • `canPlayType` returns "" for hvc1 on Chrome 107+ / macOS 13+, which CAN
+   *     decode H.265 via VideoToolbox. Treating "" as a definitive veto would
+   *     black out videos that play fine.
+   *   • Every Requirement 1 criterion is phrased "WHEN the VideoPlayer detects
+   *     an UnsupportedCodecError" — reactive detection, not a pre-emptive
+   *     capability veto.
+   *   • Requirement 1.3 requires calling /video/request-transcode and polling
+   *     when no transcode document exists; erroring on mount makes that
+   *     unreachable. Requirement 1.7 permits the permanent error only if the
+   *     transcoded URL ALSO fails after the swap.
+   *
+   * So the hook stays idle and lets the <video> element try. The transition is
+   * driven by onCodecError, which is asserted at the end of this test.
+   */
+  it('stays idle on mount when h265 unsupported AND no transcodedUri, and lets onCodecError drive the transition', () => {
     const onPermanentError = jest.fn();
+    const onSourceResolved = jest.fn();
     mockCanPlayCodec.mockReturnValue(false);
+    // requestTranscode is async; reject so the caught path keeps the test quiet.
+    global.fetch = jest.fn().mockRejectedValue(new Error('network'));
 
-    const { runAllEffects, getPhase } = runHook(
-      buildDefaultOptions({ transcodedUri: undefined, onPermanentError }),
+    const { result, runAllEffects, getPhase } = runHook(
+      buildDefaultOptions({ transcodedUri: undefined, onPermanentError, onSourceResolved }),
     );
     runAllEffects();
 
-    expect(getPhase()).toBe('error');
-    expect(onPermanentError).toHaveBeenCalled();
+    // Mount must NOT pre-emptively veto playback.
+    expect(getPhase()).toBe('idle');
+    expect(onPermanentError).not.toHaveBeenCalled();
+    expect(onSourceResolved).not.toHaveBeenCalled();
+
+    // The reactive path is what moves the state machine off idle: a real
+    // UnsupportedCodecError from the <video> element starts the transcode
+    // request (Requirement 1.3). setPhase('requesting') is synchronous.
+    result.onCodecError(0);
+    expect(getPhase()).toBe('requesting');
   });
 });
 
@@ -519,10 +552,20 @@ describe('useVideoCodecFallback — returned public API surface', () => {
     expect(typeof result.activeUri).toBe('string');
   });
 
-  it('activeUri starts as the original uri', () => {
+  /**
+   * This test previously asserted `activeUri === uri` on first render. That was
+   * wrong: no requirement dictates the initial value, and the hook deliberately
+   * starts it as '' (see the "Start empty — not uri" comment in the hook).
+   * VideoPlayerLoaded's useEffect([codecActiveUri]) would otherwise immediately
+   * call setWebResolvedUri(uri), bypassing the empty-string guard that keeps the
+   * app from requesting deleted H.265 originals (Requirement 7.4).
+   * activeUri is populated only when a real playable URL is resolved.
+   */
+  it('activeUri starts as an empty string, not the original uri', () => {
     const uri = 'https://example.com/original.mp4';
     const { result } = runHook(buildDefaultOptions({ uri }));
 
-    expect(result.activeUri).toBe(uri);
+    expect(result.activeUri).toBe('');
+    expect(result.activeUri).not.toBe(uri);
   });
 });

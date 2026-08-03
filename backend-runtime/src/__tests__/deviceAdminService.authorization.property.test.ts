@@ -38,6 +38,21 @@
 // the route-surface smoke test.
 process.env.TEST_MODE = '1';
 
+// This suite is an HTTP-level property: `beforeAll` builds the real Express app
+// and each of the 600 runs below (2 properties x 300 runs) is a real loopback
+// request/response round trip, with the server and the client sharing one
+// worker's event loop. In isolation that is ~420 ms + ~290 ms of test body and
+// well under a second of app build, but `backend-runtime/jest.config.js` sets
+// no `testTimeout` anywhere jest resolves it (verified with `--showConfig`:
+// the key is absent, so jest's implicit 5000 ms default applies to every test
+// AND every hook here). Wall-clock cost scales with CPU contention, not with
+// the work asserted, so under the full parallel suite the build hook or a
+// property body could cross 5000 ms and fail as a timeout while the property
+// itself still held. The budget is made explicit and generous rather than the
+// property being weakened: `numRuns` stays at 300, the generators still span
+// every endpoint x principal pair, and a genuine hang still fails the suite.
+jest.setTimeout(30_000);
+
 import * as fc from 'fast-check';
 import crypto from 'crypto';
 import type { AddressInfo } from 'net';
@@ -287,6 +302,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (server) {
+    // `fetch` keeps its sockets alive, which would otherwise hold the listener
+    // open past the suite (same teardown as
+    // `storageUploadRoute.integration.test.ts`).
+    (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
   for (const [key, value] of Object.entries(savedEnv)) {

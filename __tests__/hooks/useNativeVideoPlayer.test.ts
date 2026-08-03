@@ -8,7 +8,7 @@
  * Coverage:
  *   - All required NativePlayerState fields are returned with correct types
  *   - play, pause, seek, setMuted, setPlaybackSpeed functions are returned
- *   - player.remove() is called on unmount (cleanup)
+ *   - player.release() is called on unmount (cleanup)
  *
  * Approach: The hook logic is tested by mocking expo-video / expo and running
  * React hooks in isolation via jest.isolateModules + react-dom's act().
@@ -42,7 +42,14 @@ type MockPlayer = {
   playbackRate: number;
   play: jest.Mock;
   pause: jest.Mock;
-  remove: jest.Mock;
+  /**
+   * expo-video's `VideoPlayer` extends `SharedObject`, whose disposal method is
+   * `release()`. There is deliberately NO `remove()` on this mock: the real
+   * object has no such method, so a regression back to `player.remove()` must
+   * surface as a failure here rather than being swallowed by the hook's
+   * cleanup try/catch.
+   */
+  release: jest.Mock;
 };
 
 let mockPlayer: MockPlayer;
@@ -61,7 +68,7 @@ function createMockPlayer(): MockPlayer {
     playbackRate: 1,
     play: jest.fn(),
     pause: jest.fn(),
-    remove: jest.fn(),
+    release: jest.fn(),
   };
 }
 
@@ -382,10 +389,10 @@ describe('useNativeVideoPlayer', () => {
   // ── Cleanup (unmount) ────────────────────────────────────────────────────
 
   describe('cleanup on unmount', () => {
-    it('calls player.remove() when the cleanup effect runs', () => {
+    it('calls player.release() when the cleanup effect runs', () => {
       runHook(buildDefaultOptions());
 
-      // At least one cleanup was registered by the hook's useEffect(() => () => player.remove(), []).
+      // At least one cleanup was registered by the hook's useEffect(() => () => player.release(), []).
       expect(capturedCleanups.length).toBeGreaterThan(0);
 
       // Simulate unmount by running all captured cleanups.
@@ -393,21 +400,27 @@ describe('useNativeVideoPlayer', () => {
         cleanup();
       }
 
-      expect(mockPlayer.remove).toHaveBeenCalledTimes(1);
+      expect(mockPlayer.release).toHaveBeenCalledTimes(1);
     });
 
-    it('does not throw even if player.remove() throws during cleanup', () => {
-      mockPlayer.remove.mockImplementation(() => {
-        throw new Error('remove failed');
+    it('does not throw even if player.release() throws during cleanup', () => {
+      mockPlayer.release.mockImplementation(() => {
+        throw new Error('release failed');
       });
 
       runHook(buildDefaultOptions());
+
+      expect(capturedCleanups.length).toBeGreaterThan(0);
 
       expect(() => {
         for (const cleanup of capturedCleanups) {
           cleanup();
         }
       }).not.toThrow();
+
+      // The throwing method must actually have been reached — otherwise the
+      // assertion above passes without ever exercising the try/catch.
+      expect(mockPlayer.release).toHaveBeenCalledTimes(1);
     });
   });
 });

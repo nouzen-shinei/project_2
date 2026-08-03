@@ -14,10 +14,17 @@
  * Test strategy:
  *   Because no DOM renderer (react-test-renderer / @testing-library/react-hooks) is
  *   installed in this project, we test the hook by intercepting React's module-level
- *   hooks (useState, useEffect, useRef, useCallback) before the hook module is loaded.
- *   We capture every effect callback and every setState call, then trigger them
- *   imperatively — giving us deterministic, synchronous control over all state
- *   transitions without needing a React tree.
+ *   hooks (useState, useEffect, useLayoutEffect, useRef, useCallback) before the hook
+ *   module is loaded. We capture every effect callback and every setState call, then
+ *   trigger them imperatively — giving us deterministic, synchronous control over all
+ *   state transitions without needing a React tree.
+ *
+ *   The hook does NOT create its own <video> element: React renders
+ *   `<video ref={videoRef} />` and assigns `videoRef.current` during the commit
+ *   phase, which is why the hook's primary effect is a `useLayoutEffect` and why it
+ *   returns early when `videoRef.current` is null. The harness therefore has to model
+ *   that commit: it assigns the fake element to the returned `videoRef` after the
+ *   render call and before flushing effects.
  */
 
 // ─── Types re-exported from the hook ─────────────────────────────────────────
@@ -89,15 +96,21 @@ function makeFakeVideoElement(): FakeVideoElement {
  * Drives `useWebVideoPlayer` without a React renderer.
  *
  * 1. Mocks `react-native`'s Platform so `Platform.OS === 'web'`.
- * 2. Mocks `document.createElement('video')` to return a `FakeVideoElement`.
- * 3. Intercepts React's `useState`, `useEffect`, `useRef`, and `useCallback`
- *    so we can capture and invoke effect callbacks synchronously.
+ * 2. Defines a minimal `document` so the hook's `typeof document === 'undefined'`
+ *    guard passes. Its `createElement` throws on purpose — the hook must never
+ *    build its own off-DOM element again (see the WHY-no-document.createElement
+ *    comment in the hook).
+ * 3. Intercepts React's `useState`, `useEffect`, `useLayoutEffect`, `useRef`, and
+ *    `useCallback` so we can capture and invoke effect callbacks synchronously.
  * 4. Loads the hook module fresh via `jest.isolateModules`.
  * 5. Calls the hook function once (simulating a first render), which registers
  *    all effects but does not run them yet.
- * 6. Runs only the primary URI effect (the one that creates the `<video>`
- *    element and attaches event listeners) synchronously.
- * 7. Returns the fake video element and helpers for state inspection.
+ * 6. Models React's commit phase by assigning the `FakeVideoElement` to the
+ *    `videoRef` the hook returned — this is what React does for
+ *    `<video ref={videoRef} />` before layout effects run.
+ * 7. Runs only the primary URI effect (the one that wires the `<video>` element
+ *    to the source and attaches event listeners) synchronously.
+ * 8. Returns the fake video element and helpers for state inspection.
  */
 interface HookHarness {
   fakeEl: FakeVideoElement;
@@ -141,11 +154,18 @@ function runHook(overrides: Partial<UseWebVideoPlayerOptions> = {}): HookHarness
     Platform: { OS: 'web' },
   }));
 
-  // ── Mock document.createElement ─────────────────────────────────────────
+  // ── Minimal document stub ───────────────────────────────────────────────
+  // The hook only reads `typeof document` (as a "are we in a browser" guard);
+  // it must never construct an element itself, so createElement is a tripwire
+  // rather than a factory.
 
   (global as unknown as Record<string, unknown>).document = {
-    createElement: (_tag: string) => fakeEl,
-    // minimal stub — the hook only calls createElement
+    createElement: (tag: string) => {
+      throw new Error(
+        `useWebVideoPlayer called document.createElement('${tag}'). ` +
+          'React owns the <video> element; the hook must only wire up videoRef.current.',
+      );
+    },
   };
 
   // ── Intercept React hooks ────────────────────────────────────────────────
@@ -197,17 +217,28 @@ function runHook(overrides: Partial<UseWebVideoPlayerOptions> = {}): HookHarness
       useState,
       useRef,
       useEffect,
+      // The effect that wires the <video> element up and registers its
+      // listeners is a useLayoutEffect (it must run after React commits refs),
+      // so it has to be captured like any other effect. Without this the real
+      // dispatcher is reached outside a render and throws
+      // "Cannot read properties of null (reading 'useLayoutEffect')".
+      useLayoutEffect: useEffect,
       useCallback,
     };
   });
 
   // ── Load the hook with fresh module registry ─────────────────────────────
 
-  let hookFn!: (opts: UseWebVideoPlayerOptions) => { state: WebPlayerState };
+  type HookReturn = {
+    state: WebPlayerState;
+    videoRef: { current: HTMLVideoElement | null };
+  };
+
+  let hookFn!: (opts: UseWebVideoPlayerOptions) => HookReturn;
 
   jest.isolateModules(() => {
     const mod = require('../../hooks/useWebVideoPlayer') as {
-      useWebVideoPlayer: (opts: UseWebVideoPlayerOptions) => { state: WebPlayerState };
+      useWebVideoPlayer: (opts: UseWebVideoPlayerOptions) => HookReturn;
     };
     hookFn = mod.useWebVideoPlayer;
   });
@@ -220,13 +251,20 @@ function runHook(overrides: Partial<UseWebVideoPlayerOptions> = {}): HookHarness
     ...overrides,
   };
 
-  hookFn(options);
+  const rendered = hookFn(options);
 
-  // ── Run the primary URI effect (last useEffect whose deps include the URI) ─
-  // The hook uses multiple effects for syncing refs. The one that creates the
-  // video element is the first effect that has a non-empty deps array OR is
-  // the sole effect that calls document.createElement. We find it by running
-  // the effect that results in addEventListener being called.
+  // ── Model React's commit phase ───────────────────────────────────────────
+  // The consumer renders `<video ref={videoRef} />`, so React assigns the DOM
+  // node to videoRef.current after render and before layout effects run. The
+  // hook's primary effect bails out when videoRef.current is null, so without
+  // this assignment nothing would be wired and every event-driven assertion
+  // below would be testing an inert hook.
+  rendered.videoRef.current = fakeEl as unknown as HTMLVideoElement;
+
+  // ── Run the primary URI effect (the one whose deps include the URI) ───────
+  // The hook uses multiple effects for syncing refs. The one that wires the
+  // element is the only one that attaches listeners, so we find it by running
+  // effects in order until addEventListener is called.
 
   let primaryEffectIndex = -1;
   for (let i = 0; i < capturedEffects.length; i++) {

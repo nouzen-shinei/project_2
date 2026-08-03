@@ -28,7 +28,9 @@ jest.mock('../firebaseAdmin', () => ({
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { getFirestore } = require('../firebaseAdmin') as { getFirestore: jest.Mock };
 
-const FLAG = 'DEVICE_TENANT_INDEX_LISTING_ENABLED';
+// The scoped-listing flag is always read/written through the literal key
+// `process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED` (never `process.env[someVar]`)
+// so the env var stays statically analysable — see `expo/no-dynamic-env-var`.
 const OTHER_TENANT = 'other-tenant-zzz'; // disjoint from the probe pool
 
 // ---------------------------------------------------------------------------
@@ -188,13 +190,13 @@ function matchedDevices(devices: SeedDevice[], t: string): SeedDevice[] {
 // ---------------------------------------------------------------------------
 
 describe('Property 6 — read cost is proportional and invariant to other-tenant growth', () => {
-  const originalFlag = process.env[FLAG];
+  const originalFlag = process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
   beforeAll(() => {
-    process.env[FLAG] = '1'; // scoped mode for every case
+    process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = '1'; // scoped mode for every case
   });
   afterAll(() => {
-    if (originalFlag === undefined) delete process.env[FLAG];
-    else process.env[FLAG] = originalFlag;
+    if (originalFlag === undefined) delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
+    else process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = originalFlag;
   });
 
   it(

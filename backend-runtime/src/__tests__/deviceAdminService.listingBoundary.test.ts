@@ -116,27 +116,29 @@ describe('isIndexUnavailableError — index-unavailable classification (Req 8.4)
 // ---------------------------------------------------------------------------
 
 describe('isScopedListingEnabled + decideListingMode — flag examples (Req 8.1, 8.2)', () => {
-  const FLAG = 'DEVICE_TENANT_INDEX_LISTING_ENABLED';
-  const original = process.env[FLAG];
+  // `process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED` is accessed with a literal
+  // key (never `process.env[someVar]`) so the env var stays statically
+  // analysable — see `expo/no-dynamic-env-var`.
+  const original = process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
 
   afterEach(() => {
     if (original === undefined) {
-      delete process.env[FLAG];
+      delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
     } else {
-      process.env[FLAG] = original;
+      process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = original;
     }
   });
 
   it('isScopedListingEnabled is true only for exactly "1"', () => {
-    process.env[FLAG] = '1';
+    process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = '1';
     expect(isScopedListingEnabled()).toBe(true);
 
     for (const value of ['0', 'true', 'yes', '', ' 1 ', '01']) {
-      process.env[FLAG] = value;
+      process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED = value;
       expect(isScopedListingEnabled()).toBe(false);
     }
 
-    delete process.env[FLAG];
+    delete process.env.DEVICE_TENANT_INDEX_LISTING_ENABLED;
     expect(isScopedListingEnabled()).toBe(false);
   });
 
