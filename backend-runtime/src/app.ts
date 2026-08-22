@@ -89,6 +89,8 @@ import {
   sanitizeStorageSegment,
   type StorageUploadPurpose,
 } from './lib/uploadObjectPath';
+import { STORAGE_TENANT_CATEGORIES } from './lib/storageObjectRef';
+import { estimateTenantStorageBytes } from './lib/tenantStorageUsage';
 import {
   sendTeamMembershipChangeNotification,
   sendTenantJoinRequestNotification,
@@ -2325,93 +2327,6 @@ export async function resolveShareTokenForUpload(args: ResolveShareTokenForUploa
     console.warn('[storage_upload] unable to precreate share token', error);
     return undefined;
   }
-}
-
-async function sumStoragePrefixBytes(
-  bucket: ReturnType<admin.storage.Storage['bucket']>,
-  prefix: string,
-  excludePaths: Set<string> = new Set()
-): Promise<number> {
-  let total = 0;
-  let nextPageToken: string | undefined;
-  do {
-    const [files, , response] = await bucket.getFiles({ prefix, pageToken: nextPageToken });
-    files.forEach((file) => {
-      if (excludePaths.has(file.name)) return;
-      const sizeRaw = (file.metadata as any)?.size;
-      const size = typeof sizeRaw === 'string' ? Number(sizeRaw) : typeof sizeRaw === 'number' ? sizeRaw : 0;
-      if (Number.isFinite(size) && size > 0) {
-        total += size;
-      }
-    });
-    nextPageToken = (response as any)?.nextPageToken;
-  } while (nextPageToken);
-  return total;
-}
-
-async function estimateTenantStorageBytes(
-  bucket: ReturnType<admin.storage.Storage['bucket']>,
-  tenantId: string,
-  db?: admin.firestore.Firestore
-): Promise<number> {
-  const normalizedTenantId = tenantId.trim();
-  const prefixes = [
-    `tenant-branding/${normalizedTenantId}/`,
-    `chat-files/${normalizedTenantId}/`,
-    `notices/${normalizedTenantId}/`,
-    `receipts/${normalizedTenantId}/`,
-    `student_profiles/${normalizedTenantId}/`,
-    `profile-pictures/${normalizedTenantId}/`,
-  ];
-
-  // Query videoTranscodes for originalDeleted files to exclude from byte total.
-  // Per requirements 3.8 and 3.9: if query fails or times out, log a warning and
-  // proceed with the full sum (temporarily inflated until next reconciliation).
-  let excludePaths = new Set<string>();
-  if (db) {
-    // Cleared in the `finally` below once the race settles. Without that the
-    // 5s guard timer stays pending for its full duration after the query has
-    // already answered, keeping the event loop alive — invisible in the
-    // long-lived server, but it holds a short-lived process (a job script, a
-    // test run) open for five seconds after its work is done.
-    let excludeQueryTimeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const EXCLUDE_QUERY_TIMEOUT_MS = 5000;
-      const deletedQueryPromise = db
-        .collection('videoTranscodes')
-        .where('tenantId', '==', normalizedTenantId)
-        .where('originalDeleted', '==', true)
-        .get();
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        excludeQueryTimeout = setTimeout(
-          () => reject(new Error('videoTranscodes exclusion query timed out')),
-          EXCLUDE_QUERY_TIMEOUT_MS
-        );
-      });
-      const deletedSnap = await Promise.race([deletedQueryPromise, timeoutPromise]);
-      deletedSnap.forEach((doc: admin.firestore.QueryDocumentSnapshot) => {
-        const originalPath: unknown = doc.data().originalPath;
-        if (typeof originalPath === 'string' && originalPath.length > 0) {
-          excludePaths.add(originalPath);
-        }
-      });
-    } catch (err) {
-      console.warn(
-        '[estimateTenantStorageBytes] Failed to query originalDeleted videoTranscodes; proceeding with full sum (may be temporarily inflated).',
-        err instanceof Error ? err.message : err
-      );
-      excludePaths = new Set<string>(); // reset to empty — full sum
-    } finally {
-      if (excludeQueryTimeout !== undefined) {
-        clearTimeout(excludeQueryTimeout);
-      }
-    }
-  }
-
-  const results = await Promise.all(
-    prefixes.map((prefix) => sumStoragePrefixBytes(bucket, prefix, excludePaths).catch(() => 0))
-  );
-  return results.reduce((acc, value) => acc + value, 0);
 }
 
 async function loadOrInitTenantStorageUsage(
@@ -14790,14 +14705,15 @@ export function createApp(options: CreateAppOptions = {}){
   // routed here and authorized against the caller's tenant: every managed object
   // is stored under `{category}/{tenantId}/…`, so we require the object's second
   // path segment to equal the caller's tenant and the category to be one we own.
-  const STORAGE_TENANT_CATEGORIES = new Set([
-    'chat-files',
-    'tenant-branding',
-    'notices',
-    'student_profiles',
-    'receipts',
-    'profile-pictures',
-  ]);
+  // The category list itself now lives in `src/lib/storageObjectRef.ts` as
+  // `STORAGE_TENANT_CATEGORIES`, so these two routes, `estimateTenantStorageBytes`'s
+  // quota sum, the usage rollup's prefixes and the orphan sweep cannot disagree
+  // about what a managed prefix is: a seventh category added to one copy but not
+  // the others is exactly the shape of a data-loss bug. This Set is DERIVED from
+  // that tuple for O(1) `has`, never a second list. `_orphan-quarantine` is
+  // deliberately not in the tuple, which is what keeps both routes rejecting a
+  // quarantine path.
+  const MANAGED_STORAGE_CATEGORY_SET: ReadonlySet<string> = new Set<string>(STORAGE_TENANT_CATEGORIES);
 
   function resolveManagedStorageObjectPath(target: string): string | null {
     const raw = (target || '').trim();
@@ -14856,7 +14772,7 @@ export function createApp(options: CreateAppOptions = {}){
     const segments = objectPath.split('/');
     const category = segments[0];
     const pathTenantId = segments[1];
-    if (!STORAGE_TENANT_CATEGORIES.has(category) || pathTenantId !== tenantAccess.tenantId) {
+    if (!MANAGED_STORAGE_CATEGORY_SET.has(category) || pathTenantId !== tenantAccess.tenantId) {
       // The object is not under this tenant's managed prefix — refuse so a caller
       // can never delete another tenant's (or an unmanaged) object.
       return res.status(403).json({ error: 'forbidden_object_path' });
@@ -15673,7 +15589,7 @@ export function createApp(options: CreateAppOptions = {}){
       // tenant's video and destroy it / mis-attribute storage quota
       // (security-rules-hardening H5).
       const pathSegments = storagePath.split('/');
-      if (!STORAGE_TENANT_CATEGORIES.has(pathSegments[0]) || pathSegments[1] !== tenantAccess.tenantId) {
+      if (!MANAGED_STORAGE_CATEGORY_SET.has(pathSegments[0]) || pathSegments[1] !== tenantAccess.tenantId) {
         return res.status(403).json({ error: 'forbidden_object_path' });
       }
 

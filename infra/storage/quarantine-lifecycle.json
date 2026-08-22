@@ -1,0 +1,17 @@
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": {
+          "type": "Delete"
+        },
+        "condition": {
+          "age": 7,
+          "matchesPrefix": [
+            "_orphan-quarantine/"
+          ]
+        }
+      }
+    ]
+  }
+}

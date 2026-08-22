@@ -69,6 +69,26 @@ export function inc(name: string, labels?: Record<string,string>) {
   }
 }
 
+/**
+ * Add `delta` to a counter, for accumulators whose unit is not "one event" —
+ * bytes, primarily. `inc` cannot express them: `storage_orphan_sweep_orphan_bytes`
+ * incremented by one per orphan would count orphans, not bytes.
+ *
+ * A non-finite or non-positive `delta` is a no-op rather than a subtraction: these
+ * are counters, and a counter that can go down is not one. That also means a
+ * zero-valued accumulation creates no series, which is the same behaviour `inc`
+ * has for an event that never happened.
+ *
+ * Deliberately NOT fed to the windowed sampler — a window holds event timestamps,
+ * and "n bytes at time t" is not n events at time t. No byte accumulator is in
+ * the windowed allowlist, and none should be added.
+ */
+export function incBy(name: string, delta: number, labels?: Record<string,string>) {
+  if (!Number.isFinite(delta) || delta <= 0) return;
+  const key = buildKey(name, labels);
+  counters[key] = (counters[key]||0)+delta;
+}
+
 export function getWindowCount(name: string, windowMs: number, labels?: Record<string, string>) {
   const key = buildKey(name, labels);
   const list = windowedEvents[key] || [];
@@ -137,6 +157,43 @@ export const metricNames = {
   // its reservation instead of double-counting it. Labelled by `purpose` ONLY — the
   // uploadKey, its hash, the filename and the object path are unbounded-cardinality
   // label values and a leak surface (Req 6.4, 8.4).
-  storageUploadConcurrentRaceLost: 'storage_upload_concurrent_race_lost_total'
+  storageUploadConcurrentRaceLost: 'storage_upload_concurrent_race_lost_total',
+
+  // ── storage-orphan-cleanup (spec task 10.3) ────────────────────────────────
+  //
+  // Labels are restricted to `tenant_id`, `mode`, `reason`, `outcome` and
+  // `abort_reason` — never an object path, a filename, an email or a download
+  // token, for the reason the `storageUploadConcurrentRaceLost` note above already
+  // records: an unbounded label value is both a cost and a leak surface
+  // (Req 16.7, 16.8).
+  //
+  // ── READ THIS BEFORE RELYING ON ONE OF THESE ──────────────────────────────
+  //
+  // Everything in this file is an IN-PROCESS counter, scraped over the app's
+  // `/metrics` endpoint. The orphan sweep runs as a Cloud Run **job**, which is
+  // never scraped and whose heap is gone when the task ends — so an increment made
+  // by the sweep is real, correct and invisible to Cloud Monitoring.
+  //
+  // The names are registered here regardless, because they are the shared
+  // vocabulary: a future in-process caller (`POST /storage/reconcile` is the
+  // obvious one) increments the same names, and the log-based metrics the job's
+  // alert policy actually reads are created with these exact names too. What makes
+  // the job's numbers reach Cloud Monitoring is the structured log line
+  // `storageOrphanSweep.ts` emits alongside each of these increments; see the
+  // "Observability" block there and `infra/monitoring/README.md`.
+  storageOrphanSweepRuns: 'storage_orphan_sweep_runs_total',
+  storageOrphanSweepObjectsScanned: 'storage_orphan_sweep_objects_scanned_total',
+  storageOrphanSweepRetained: 'storage_orphan_sweep_retained_total',
+  storageOrphanSweepOrphans: 'storage_orphan_sweep_orphans_total',
+  storageOrphanSweepOrphanBytes: 'storage_orphan_sweep_orphan_bytes',
+  storageOrphanSweepQuarantined: 'storage_orphan_sweep_quarantined_total',
+  storageOrphanSweepQuarantinedBytes: 'storage_orphan_sweep_quarantined_bytes',
+  storageOrphanSweepQuarantineFailures: 'storage_orphan_sweep_quarantine_failures_total',
+  // The one to alert on: an abort means the sweep STOPPED rather than proceeded on
+  // partial knowledge, so nothing was deleted — and that the tool is not running.
+  storageOrphanSweepAborted: 'storage_orphan_sweep_aborted_total',
+  // Expected to stay flat at zero. Also alerted on.
+  storageOrphanSweepCrossTenantReferences: 'storage_orphan_sweep_cross_tenant_references_total',
+  storageOrphanSweepDanglingReferences: 'storage_orphan_sweep_dangling_references_total'
 };
 export { successCount, failedCount };

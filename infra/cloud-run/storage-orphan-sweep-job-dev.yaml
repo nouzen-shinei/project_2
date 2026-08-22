@@ -1,0 +1,181 @@
+# Storage orphan sweep — DEV job definition.
+#
+# Identical in every safety-relevant respect to `storage-orphan-sweep-job.yaml`;
+# it differs only in name and runner id — both manifests pin the SAME image
+# digest. It is NOT a more permissive variant: `STORAGE_ORPHAN_SWEEP_ENABLED` and
+# `STORAGE_ORPHAN_SWEEP_APPLY` are both "0" here too, so deploying this deploys a
+# job that logs its decision and exits 0 without initialising Firebase.
+#
+# This is the manifest spec task 12's verification sequence uses, all of it by
+# overriding variables at execution time rather than by editing this file:
+#
+#   gcloud run jobs execute storage-orphan-sweep-job-dev --region=asia-south1 \
+#     --update-env-vars=STORAGE_ORPHAN_SWEEP_ENABLED=1,STORAGE_ORPHAN_SWEEP_TENANT_IDS=<dev-tenant>
+#
+# then, only after reading `countsBySource` and `sampleOrphanPaths` on the report
+# document by eye, an apply run with a deliberately low ceiling:
+#
+#   … --update-env-vars=STORAGE_ORPHAN_SWEEP_ENABLED=1,STORAGE_ORPHAN_SWEEP_APPLY=1,\
+#       STORAGE_ORPHAN_SWEEP_MAX_QUARANTINE_PER_TENANT=25
+#
+# ── The image digest contains the sweep entrypoint ────────────────────────────
+# The digest below is the `backend-runtime` build tagged
+# `storage-orphan-sweep-20260808-01` (2026-08-08). It contains
+# `dist/jobs/runStorageOrphanSweep.js`, so `npm run storage:orphan-sweep`
+# resolves in this image — no repin is required before the first real run.
+# A digest, never a tag: a bulk tenant-file deleter must run the bytes that were
+# reviewed.
+#
+# ── Service account: its OWN identity, not usage-rollup-job@ ─────────────────
+# `storage-orphan-sweep-job@tution-app-6c0c3.iam.gserviceaccount.com` EXISTS and
+# is bound: `roles/datastore.user` and `roles/firebasedatabase.viewer` at PROJECT
+# level, and `roles/storage.objectUser` on the SINGLE bucket
+# `gs://tution-app-6c0c3.firebasestorage.app` — that one bucket, not the project.
+# It is deliberately NOT `usage-rollup-job@…`: this is the only identity in the
+# project that can delete a tenant's objects, and sharing it with a read-mostly
+# reporting job would hand that authority to the rollup as well.
+#
+# Intended scope, least privilege, and nothing beyond it:
+#   * Storage — object read, create and delete on the single application bucket
+#     `tution-app-6c0c3.firebasestorage.app` ONLY. Create is required because a
+#     quarantine move is a copy followed by a delete; delete is required for the
+#     original and for the expired quarantine copy.
+#   * Firestore — WRITE limited to `storageMaintenanceJobs/` (the job's own report
+#     and resume cursor) and `tenantStorageUsage/` (the one post-sweep quota
+#     recompute). Read is needed more widely, across the reference sources.
+#   * Realtime Database — READ on the `tenantChat/` tree only. Chat attachments
+#     are referenced only from there, which is why the runner refuses to start
+#     without `FIREBASE_DATABASE_URL`.
+#   * NO write permission to any application collection. This job reports dangling
+#     references and repairs none; it has no business editing a record.
+#
+# Read the Firestore and Realtime Database bullets above as this job's OWN
+# discipline, not as a boundary IAM enforces. Firestore has no collection-level
+# IAM: `roles/datastore.user` is project-wide Firestore READ AND WRITE, so nothing
+# at the IAM layer stops this identity writing any collection. The restriction to
+# `storageMaintenanceJobs/` and `tenantStorageUsage/` is enforced IN CODE — those
+# are the only writes the runner issues — and a code change could widen it
+# silently. Likewise `roles/firebasedatabase.viewer` is database-wide read, not
+# `tenantChat/`-scoped. Only the Storage bullet is genuinely IAM-bounded, by the
+# single-bucket binding.
+#
+# The quarantine retention rule is APPLIED AND LIVE on that bucket: one Delete
+# rule, `age: 7`, matching prefix `_orphan-quarantine/`, from
+# `infra/storage/quarantine-lifecycle.json`. Expired quarantine copies are
+# reclaimed whether or not the purge stage below is ever switched on.
+#
+# Note that dev and prod share one Firebase project and therefore one bucket, so
+# this job's identity reaches production objects. That is precisely why both files
+# ship with the switches off and why the ceiling exists.
+#
+# No HTTP endpoint exists for this feature. The job is reachable only through the
+# Cloud Run jobs API.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: storage-orphan-sweep-job-dev
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: storage-orphan-sweep-job@tution-app-6c0c3.iam.gserviceaccount.com
+          # An automatic retry of a partially applied sweep must be a HUMAN
+          # decision: the run has already moved objects and persisted a resume
+          # cursor, so the correct next step is to read the report, not to start
+          # again. Resuming is explicit — re-execute the job.
+          maxRetries: 0
+          # 30 minutes. A full enumeration of a large tenant can exceed this; the
+          # resume path (persisted prefix index + page token on the report
+          # document) covers the rest, and two bounded runs are preferable to one
+          # unbounded one.
+          timeoutSeconds: 1800
+          containers:
+            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:659c0a514d2c8ea04b1dfc4ae945835867f12c9b6d4a18421a0b57348aa6f554
+              command: ["npm"]
+              args: ["run", "storage:orphan-sweep"]
+              resources:
+                limits:
+                  cpu: "1"
+                  # Sized against the RETAIN SET, not the bucket: the listing is
+                  # paged and only one page is held at a time, so the resident
+                  # cost is the set of retained paths. 512Mi matches the rollup
+                  # job, and `STORAGE_ORPHAN_SWEEP_MAX_REFERENCES` aborts the
+                  # tenant rather than letting the set outgrow it.
+                  memory: "512Mi"
+              env:
+                - name: NODE_ENV
+                  value: production
+                - name: FIREBASE_PROJECT_ID
+                  value: tution-app-6c0c3
+                # REQUIRED. Chat attachments live in the Realtime Database, not
+                # Firestore, so without this the largest prefix in the bucket
+                # reads as entirely orphaned. The runner refuses to start when it
+                # is missing, before initialising Firebase.
+                - name: FIREBASE_DATABASE_URL
+                  value: https://tution-app-6c0c3-default-rtdb.asia-southeast1.firebasedatabase.app
+                # REQUIRED. An unnamed bucket resolves every stored reference as
+                # foreign and would report an entire tenant as orphaned. Also
+                # refused before init.
+                - name: FIREBASE_STORAGE_BUCKET
+                  value: tution-app-6c0c3.firebasestorage.app
+
+                # ── The three switches, all OFF ───────────────────────────────
+                # Only 1/true/yes is true. Anything else, including an empty
+                # value or an unset variable, is false.
+                #
+                # ENABLED off ⇒ the job is a no-op that does not even initialise
+                # Firebase. This is also the rollback: set it back to "0".
+                - name: STORAGE_ORPHAN_SWEEP_ENABLED
+                  value: "0"
+                # APPLY off ⇒ report mode, which mutates nothing outside
+                # `storageMaintenanceJobs/`. Independent of ENABLED on purpose:
+                # one mistyped variable cannot move an object.
+                - name: STORAGE_ORPHAN_SWEEP_APPLY
+                  value: "0"
+                # The IRREVERSIBLE stage — hard delete of expired quarantine
+                # copies — on its own switch, and it needs APPLY as well to
+                # delete rather than count. Redundant with the GCS lifecycle rule
+                # in `infra/storage/quarantine-lifecycle.json`, which is the
+                # retention mechanism that does not depend on this job running.
+                - name: STORAGE_ORPHAN_SWEEP_PURGE_ENABLED
+                  value: "0"
+                # Re-run a tenant already recorded `completed`, from the first
+                # prefix with fresh counters.
+                - name: STORAGE_ORPHAN_SWEEP_FORCE
+                  value: "0"
+
+                # ── Run parameters ───────────────────────────────────────────
+                # Objects touched within this window are retained regardless of
+                # references, which is what protects the non-atomic gap between a
+                # successful upload and its record write. A non-finite or
+                # non-positive value falls back to 7 — never to 0.
+                - name: STORAGE_ORPHAN_SWEEP_GRACE_DAYS
+                  value: "7"
+                # How long a quarantined object stays recoverable via
+                # `restoreFromQuarantine`. Matches the lifecycle rule's age: 7.
+                - name: STORAGE_ORPHAN_SWEEP_QUARANTINE_RETENTION_DAYS
+                  value: "7"
+                # Empty ⇒ every tenant with status == 'active'. Task 12's dev
+                # report run overrides this with a single dev tenant id.
+                - name: STORAGE_ORPHAN_SWEEP_TENANT_IDS
+                  value: ""
+                # Per-tenant per-run move ceiling: the blast radius of one bad
+                # run. Reaching it ends the tenant with
+                # `abortReason: 'quarantine_cap_reached'` and a resume cursor, so
+                # the remainder is a deliberate second run. Task 12's first apply
+                # run overrides this down to 25.
+                - name: STORAGE_ORPHAN_SWEEP_MAX_QUARANTINE_PER_TENANT
+                  value: "1000"
+                - name: STORAGE_ORPHAN_SWEEP_PAGE_SIZE
+                  value: "1000"
+                # Retain-set ceiling. Exceeding it ABORTS the tenant: a truncated
+                # retain set is indistinguishable from a set of orphans.
+                - name: STORAGE_ORPHAN_SWEEP_MAX_REFERENCES
+                  value: "2000000"
+                - name: STORAGE_ORPHAN_SWEEP_RUNNER_ID
+                  value: cloud-run-storage-orphan-sweep-job-dev

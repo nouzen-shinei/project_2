@@ -61,7 +61,7 @@ function sha256(input: string): string {
   return crypto.createHash('sha256').update(input).digest('hex').slice(0, 40);
 }
 
-function buildTranscodeStoragePath(originalPath: string): string {
+export function buildTranscodeStoragePath(originalPath: string): string {
   const ext = path.extname(originalPath);
   const base = originalPath.slice(0, originalPath.length - ext.length);
   return `${base}_h264.mp4`;

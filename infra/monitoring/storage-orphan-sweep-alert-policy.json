@@ -1,0 +1,46 @@
+{
+  "displayName": "Storage orphan sweep: investigate",
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [
+    "projects/tution-app-6c0c3/notificationChannels/5197969209122830959"
+  ],
+  "conditions": [
+    {
+      "displayName": "storage-orphan-sweep aborted a tenant",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/storage_orphan_sweep_aborted_total\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    },
+    {
+      "displayName": "storage-orphan-sweep saw a cross-tenant reference",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_run_job\" AND metric.type=\"logging.googleapis.com/user/storage_orphan_sweep_cross_tenant_references_total\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA"
+          }
+        ],
+        "trigger": { "count": 1 }
+      }
+    }
+  ],
+  "documentation": {
+    "content": "This alert covers the storage orphan sweep Cloud Run Job (storage-orphan-sweep-job / -dev, asia-south1).\n\nBoth conditions are threshold-on-zero: neither counter should ever move.\n\n## Condition 1 — aborted_total > 0\n\nThe abort counter is the one to alert on, and the reason is the opposite of the usual one. An abort means the sweep STOPPED rather than proceeded on partial knowledge, so nothing was deleted and no data is at risk. What it means is that the tool is not running, and a cleanup tool that silently stops running is exactly how orphan growth resumes unnoticed. Read the `abort_reason` label — `jsonPayload.abort_reason` on the log line the metric is extracted from:\n\n- `reference_source_failed` — a reference source could not be enumerated, most often the Realtime Database chat walk. Check `FIREBASE_DATABASE_URL`, the service account's RTDB read permission on `tenantChat/`, and `failedSources` on `storageMaintenanceJobs/orphanSweep/tenants/{tenantId}`. This is the common one and it is a configuration or permission problem, not a data problem.\n- `malformed_reference` — a stored reference value did not parse. Investigate the record before any apply run; do not raise a threshold to silence it.\n- `reference_cap_exceeded` — the retain set outgrew `STORAGE_ORPHAN_SWEEP_MAX_REFERENCES`. A truncated retain set is indistinguishable from a set of orphans, so the sweep refuses to continue. Raise the ceiling deliberately, with memory in mind.\n- `quarantine_cap_reached` — the per-tenant per-run move ceiling was hit. Expected on a first apply run against a backlog: the remainder is a second, deliberate run. Confirm the resume cursor is on the report document.\n- `tenant_scope_violation` — non-retryable, and the serious one. A mutation point was handed a path outside the tenant's scope. Do not re-run; investigate the enumeration.\n\n## Condition 2 — cross_tenant_references_total > 0\n\nExpected to stay flat at zero. A cross-tenant reference is a resolved reference belonging to another tenant: it is excluded from the retain set and the run continues, so this is a data-integrity signal rather than an outage. The sweep emits one log entry per tenant run that saw at least one, with the unbounded total in `jsonPayload.value`, so as a counter metric this series counts tenant runs rather than references — both are zero together, which is all a threshold-on-zero condition needs. Read `crossTenantReferences` on the report document and find out which record points across a tenant boundary before the next apply run.\n\n## Runbook\n\n- Reports: Firestore `storageMaintenanceJobs/orphanSweep/tenants/{tenantId}`.\n- Logs: filter on `[orphan_sweep]` and `[orphan_sweep_runner]`; counts and reasons only, no paths, filenames, emails or download tokens. The metric lines are the structured subset: `jsonPayload.metric=\"storage_orphan_sweep_*\"`, with the delta in `jsonPayload.value`.\n- In-process counters (`src/metrics.ts`, scraped over the app's `/metrics`) do NOT reach here: this is a Cloud Run job and nothing scrapes it. Every number above arrives as a log-based metric.\n- Rollback: `STORAGE_ORPHAN_SWEEP_ENABLED=0`. The job becomes a no-op that does not even initialise Firebase; already-quarantined objects stay recoverable via `restoreFromQuarantine` for the retention window.\n- `maxRetries: 0` on the job definition is deliberate — retrying a partially applied sweep is a human decision.\n\nNote: like the other job policies here, these conditions read log-based metrics, so `storage_orphan_sweep_aborted_total` and `storage_orphan_sweep_cross_tenant_references_total` must exist as log-based metrics in this project before the policy can fire. Each is created over `resource.type=\"cloud_run_job\" AND jsonPayload.metric=\"<name>\"` — the exact commands are in `infra/monitoring/README.md`. A filter that does not match the emitted line never receives a point, which on a condition expected to hold at zero is indistinguishable from everything being fine.\n",
+    "mimeType": "text/markdown"
+  }
+}

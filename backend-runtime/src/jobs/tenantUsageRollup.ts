@@ -5,6 +5,7 @@ import type { firestore as FirestoreNS, database as DatabaseNS } from 'firebase-
 import type { PlanId, PlanLimits } from '../lib/planLimits';
 import { resolveEffectivePlanLimitsForTenant, type TenantQuotaOverrides } from '../lib/effectivePlanLimits';
 import { stripUndefinedDeep } from '../lib/stripUndefinedDeep';
+import { STORAGE_TENANT_CATEGORIES } from '../lib/storageObjectRef';
 import { notifyUsageAlert } from '../usageAlertNotifier';
 
 import type { UsageMetricKey } from '../lib/usageMetrics';
@@ -31,14 +32,24 @@ const SKIP_PAYMENTS = parseBoolean(process.env.USAGE_ROLLUP_SKIP_PAYMENTS);
 const SKIP_CHAT = parseBoolean(process.env.USAGE_ROLLUP_SKIP_CHAT);
 const SKIP_STORAGE = parseBoolean(process.env.USAGE_ROLLUP_SKIP_STORAGE);
 
-const DEFAULT_STORAGE_PREFIXES: Array<{ label: string; template: string }> = [
-  { label: 'tenant-branding', template: 'tenant-branding/{tenantId}' },
-  { label: 'chat-files', template: 'chat-files/{tenantId}' },
-  { label: 'notices', template: 'notices/{tenantId}' },
-  { label: 'receipts', template: 'receipts/{tenantId}' },
-  { label: 'student-profiles', template: 'student_profiles/{tenantId}' },
-  { label: 'profile-pictures', template: 'profile-pictures/{tenantId}' },
-];
+/**
+ * The default storage prefixes this rollup sums, DERIVED from the single
+ * authoritative Managed_Category tuple in `src/lib/storageObjectRef.ts` rather
+ * than spelled out again — the same tuple `/storage/delete`,
+ * `/video/request-transcode`, `estimateTenantStorageBytes` and the orphan sweep
+ * read, so a seventh category cannot start counting against quota in one place
+ * and not another.
+ *
+ * The `{ label, template }` shape is unchanged, so `resolveStoragePrefixConfigs`
+ * and `USAGE_STORAGE_EXTRA_PREFIXES` behave exactly as before. `label` keeps its
+ * kebab-case spelling (`student_profiles` ⇒ `student-profiles`) because it is
+ * what the rollup writes into the usage document's `sources`, while `template`
+ * keeps the on-disk snake_case category. `_orphan-quarantine` is not in the
+ * tuple, so quarantined bytes stay out of the rollup's total.
+ */
+const DEFAULT_STORAGE_PREFIXES: { label: string; template: string }[] = STORAGE_TENANT_CATEGORIES.map(
+  (category) => ({ label: category.replace(/_/g, '-'), template: `${category}/{tenantId}` })
+);
 
 type Firestore = FirestoreNS.Firestore;
 type Timestamp = FirestoreNS.Timestamp;
@@ -512,12 +523,52 @@ async function estimateStorageBytes(
   return { totalBytes, sources };
 }
 
-async function sumStoragePrefixBytes(bucket: StorageBucket, prefix: string): Promise<number> {
+/**
+ * Sum the sizes of every object under `prefix`, one page at a time.
+ *
+ * ── This is the rollup's OWN copy of `lib/tenantStorageUsage.ts`'s helper ─────
+ *
+ * Deliberately left as a second copy for now — it differs from the shared one (no
+ * `excludePaths`, and it swallows a listing failure into `0` so one unreadable
+ * prefix cannot fail the whole rollup) and merging them is a separate change.
+ * What must NOT diverge is the pagination contract, so the reasoning is recorded
+ * here as well as there:
+ *
+ * `Bucket#getFiles` is wrapped by `@google-cloud/paginator`, whose `autoPaginate`
+ * defaults to TRUE. Under that default `paginator.run_` does not hand back a page:
+ * it drives a `ResourceStream` to exhaustion, collects EVERY object under the
+ * prefix into one array, and resolves `[allResults, query, ...otherArgs]` where
+ * `otherArgs[0]` is the `apiResponse` of the LAST request — whose `nextPageToken`
+ * is by definition absent. So `nextPageToken` was `undefined` on the first
+ * iteration, the `do/while` below ran exactly once, and the whole prefix was
+ * resident regardless of what the loop said.
+ *
+ * That matters here for the same reason it mattered there: `usage-rollup-job` is a
+ * Cloud Run job with a bounded memory limit, and it walks this helper once per
+ * configured prefix per tenant. A prefix that has grown large would OOM the job
+ * rather than page through it.
+ *
+ * With `autoPaginate: false`, `paginator.run_` calls the underlying method
+ * directly and resolves `[files, nextQuery, apiResponse]` for ONE page, which is
+ * what makes the loop below real. Same objects visited, same number of requests to
+ * GCS, same sum; one page resident instead of all of them. `sumStoragePrefixBytes`
+ * in `src/lib/tenantStorageUsage.ts` and `listObjectPage` in
+ * `src/jobs/storageOrphanSweep.ts` set the same flag for the same reason.
+ *
+ * Exported only so `__tests__/tenantUsageRollupStoragePrefix.test.ts` can pin that
+ * flag: against a fake bucket the flag is the only observable difference, because
+ * the real difference lives inside the client.
+ */
+export async function sumStoragePrefixBytes(bucket: StorageBucket, prefix: string): Promise<number> {
   try {
     let total = 0;
     let nextPageToken: string | undefined;
     do {
-      const [files, , response] = await bucket.getFiles({ prefix, pageToken: nextPageToken });
+      const [files, , response] = await bucket.getFiles({
+        prefix,
+        pageToken: nextPageToken,
+        autoPaginate: false,
+      });
       files.forEach((file) => {
         const sizeRaw = (file.metadata as any)?.size;
         const size = typeof sizeRaw === 'string' ? Number(sizeRaw) : typeof sizeRaw === 'number' ? sizeRaw : 0;
