@@ -194,6 +194,82 @@ export const metricNames = {
   storageOrphanSweepAborted: 'storage_orphan_sweep_aborted_total',
   // Expected to stay flat at zero. Also alerted on.
   storageOrphanSweepCrossTenantReferences: 'storage_orphan_sweep_cross_tenant_references_total',
-  storageOrphanSweepDanglingReferences: 'storage_orphan_sweep_dangling_references_total'
+  storageOrphanSweepDanglingReferences: 'storage_orphan_sweep_dangling_references_total',
+
+  // ── storage-sweep-scale-hardening (spec task 3.3) ──────────────────────────
+  //
+  // A Tenant_Sweep_Failure: a tenant whose sweep raised rather than reaching
+  // `completed` or `aborted`, now confined to that tenant instead of ending the
+  // run for every later one. Alerted on (Req 10.10), because a tenant that is
+  // never swept is how orphan growth resumes for that tenant unnoticed — the
+  // confinement makes one failure cheap, and this counter is what stops it also
+  // making it invisible.
+  //
+  // Labelled `tenant_id` and `mode` only. The eleven names above and their labels
+  // are untouched (Req 10.12) — in particular `storage_orphan_sweep_runs_total`
+  // still carries `outcome: 'in_progress'` for a confined failure, and does NOT
+  // follow the recorded status value to `'failed'`.
+  storageOrphanSweepTenantFailures: 'storage_orphan_sweep_tenant_failures_total',
+
+  // ── storage-sweep-scale-hardening (spec task 5.3) ──────────────────────────
+  //
+  // Firestore reference pages read, one line per Reference_Source per tenant per
+  // invocation, at INFO. Not alerted on: it is the number that says a keyset walk
+  // actually walked — a source with references and a page count of 1 over a
+  // collection larger than the page size is a cursor that never advanced.
+  //
+  // Labelled `tenant_id`, `mode` and **`reason`**, where `reason` carries the
+  // Reference_Source identifier. There is deliberately NO `source` label: Req 10.1
+  // permits exactly `tenant_id`, `mode`, `reason`, `outcome` and `abort_reason`, and
+  // `SweepMetricLabels` is a closed type precisely so an excess key cannot be
+  // expressed. A bounded set of eight source ids is the correct use of the `reason`
+  // slot; widening the closed set to carry a synonym is the change Req 10.1 exists
+  // to prevent.
+  storageOrphanSweepReferencePages: 'storage_orphan_sweep_reference_pages_total',
+
+  // ── storage-sweep-scale-hardening (spec task 6.3) ──────────────────────────
+  //
+  // Report_Document writes issued for one tenant's run, one line per tenant per
+  // invocation, at INFO (Req 10.6). Not alerted on: it is the number that says the
+  // write batching is in force. A count near the tenant's page count means the
+  // cadence collapsed — the usual cause being a Quarantine_Write_Threshold that
+  // resolved to `0`, which forces a write at every evaluation rather than
+  // suppressing one, so the report's `params.quarantineWriteThreshold` is the field
+  // to read next.
+  //
+  // Labelled `tenant_id` and `mode` only, and emitted through the existing
+  // `emitSweepMetric` one-shot pair, so the in-process counter and the log line move
+  // exactly once together.
+  storageOrphanSweepReportWrites: 'storage_orphan_sweep_report_writes_total',
+
+  // ── storage-sweep-scale-hardening (spec task 9.1) ──────────────────────────
+  //
+  // Run_Lease acquisition and fencing outcomes. Labelled `mode` and **`outcome`**
+  // only — `acquired` | `contended` | `lost` — and NO `tenant_id`: a lease is
+  // run-level, so there is no tenant the line is about. `SweepMetricLabels` is a
+  // closed type and `compactLabels` drops an absent key rather than writing an
+  // empty one, so the line still matches the documented
+  // `jsonPayload.metric` filter (Req 10.1, 10.5).
+  //
+  // `contended` is alerted on (Req 10.11), at WARNING: a run that is ALWAYS
+  // declined is indistinguishable, from the Report_Documents alone, from a run
+  // that is quietly succeeding — the same reasoning that puts an alert on
+  // `aborted_total`.
+  //
+  // ── Where each outcome is emitted from, recorded so no fourth site appears ──
+  //
+  // NOT from `jobs/storageOrphanSweepLease.ts`. That module's documented property
+  // is that it performs exactly one transaction on exactly one document and
+  // touches no other path (Req 5.2, 6.8), and it has no business also owning an
+  // observability concern — the same reasoning that keeps
+  // `reference_pages_total` out of the Reference_Collector. So:
+  //
+  //   `acquired`, `contended` → `runStorageOrphanSweep.ts` (spec task 9.2)
+  //   `lost`                  → `storageOrphanSweep.ts`'s tenant loop (task 9.3)
+  //
+  // All three go through the existing `emitSweepMetric` / `logSweepMetric` pair so
+  // the single-line JSON shape the deployed `infra/monitoring/` filters match is
+  // inherited rather than reimplemented (Req 10.3).
+  storageOrphanSweepLease: 'storage_orphan_sweep_lease_total'
 };
 export { successCount, failedCount };

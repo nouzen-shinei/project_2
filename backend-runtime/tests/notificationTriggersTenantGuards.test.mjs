@@ -10,6 +10,80 @@ const { createApp } = await import('../dist/app.js');
 const DEFAULT_TENANT_ID = 'tenant-guarded';
 const DEFAULT_EMAIL = 'coach@example.com';
 
+// The /twilio/* send routes enforce a tenant monthly reminder quota before dispatching
+// (TenantReminderLimitError -> 409 reminder_limit_reached). This suite covers tenant-guard
+// and audit-logging behaviour, not quota behaviour, so an unstubbed quota check would make it
+// depend on ambient tenant usage state. Stub Firestore the same way the Twilio suites do.
+function createFirestoreStub() {
+  const docs = new Map();
+
+  function defaultTenantDoc() {
+    return {
+      billingTier: 'free',
+      quotas: {
+        // 0 = unlimited in enforcement helper (treated as "no quota"), keeps tests deterministic.
+        maxMonthlyReminders: 0,
+      },
+    };
+  }
+
+  function snapshotFor(path) {
+    if (path.startsWith('tenants/') && !docs.has(path)) {
+      docs.set(path, defaultTenantDoc());
+    }
+    const value = docs.get(path);
+    return {
+      exists: value !== undefined,
+      data: () => (value !== undefined ? { ...value } : undefined),
+      id: path.split('/').pop(),
+    };
+  }
+
+  function makeDocRef(path) {
+    return {
+      path,
+      id: path.split('/').pop(),
+      async get() {
+        return snapshotFor(path);
+      },
+      async set(payload, options = {}) {
+        const existing = docs.get(path) || {};
+        docs.set(path, options.merge ? { ...existing, ...payload } : payload);
+      },
+      collection(name) {
+        return makeCollectionRef(`${path}/${name}`);
+      },
+    };
+  }
+
+  function makeCollectionRef(path) {
+    return {
+      path,
+      doc(id) {
+        return makeDocRef(`${path}/${id}`);
+      },
+    };
+  }
+
+  return {
+    collection(name) {
+      return makeCollectionRef(name);
+    },
+    async runTransaction(fn) {
+      const tx = {
+        async get(ref) {
+          return snapshotFor(ref.path);
+        },
+        set(ref, payload, options = {}) {
+          const existing = docs.get(ref.path) || {};
+          docs.set(ref.path, options.merge ? { ...existing, ...payload } : payload);
+        },
+      };
+      return await fn(tx);
+    },
+  };
+}
+
 function buildInternalToken({ uid = 'user-tenant', email = DEFAULT_EMAIL } = {}) {
   const payload = {
     sub: uid,
@@ -80,9 +154,12 @@ async function startServer({
   const smsCalls = [];
   const voiceCalls = [];
   const pushRequests = [];
+  const db = createFirestoreStub();
 
   const app = createApp({
     overrides: {
+      // Keeps the route's reminder-quota check off ambient tenant state (see createFirestoreStub).
+      getFirestore: () => db,
       requireTenantMembershipAccess: async (_authContext, tenantIdRaw) => ({
         tenantId: resolvedTenantId,
         role: 'staff',

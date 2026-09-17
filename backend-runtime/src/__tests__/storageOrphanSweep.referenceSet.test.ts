@@ -56,11 +56,25 @@ function createFakeFirestore(options: {
     }
   };
 
-  const docSnapshot = (id: string, data: DocData | undefined) => ({
-    id,
-    exists: data !== undefined,
-    data: () => data,
-  });
+  /**
+   * Every snapshot this fake mints, so `startAfter` can tell a
+   * `QueryDocumentSnapshot` from a bare field value without putting a marker
+   * property on the snapshot — the snapshot shape stays exactly as it was.
+   */
+  const snapshots = new WeakSet<object>();
+
+  const docSnapshot = (id: string, data: DocData | undefined) => {
+    const snapshot = {
+      id,
+      exists: data !== undefined,
+      data: () => data,
+    };
+    snapshots.add(snapshot);
+    return snapshot;
+  };
+
+  const isSnapshot = (candidate: unknown): candidate is { id: string } =>
+    typeof candidate === 'object' && candidate !== null && snapshots.has(candidate);
 
   const querySnapshot = (entries: [string, DocData][]) => ({
     size: entries.length,
@@ -73,17 +87,70 @@ function createFakeFirestore(options: {
 
   const collection = (name: string) => {
     const filters: [string, string, unknown][] = [];
+    /**
+     * ── Keyset paging, added for storage-sweep-scale-hardening task 5.1 ────────
+     *
+     * The collector now reads every Firestore Reference_Source through
+     * `.orderBy('__name__').limit(n)` with `.startAfter(lastDoc)` on each page
+     * after the first, so this fake has to answer those three calls or every
+     * source would fail to enumerate. It is a SECOND fake, local to this suite —
+     * the shared `support/storageOrphanSweepHarness.ts` gained the same three
+     * methods in task 2.2 — and the extension here is strictly ADDITIVE in the
+     * same way: a query that asks for none of the three behaves exactly as it did
+     * before, so no assertion in this file changes meaning.
+     *
+     * Within one collection `__name__` orders by document id, so the id is both the
+     * sort key and the cursor.
+     */
+    const orderings: string[] = [];
+    let limitCount: number | null = null;
+    let cursorId: string | null = null;
     const query: Record<string, unknown> = {
       where(field: string, operator: string, value: unknown) {
         filters.push([field, operator, value]);
         return query;
       },
+      orderBy(field: string) {
+        orderings.push(field);
+        return query;
+      },
+      limit(count: number) {
+        limitCount = count;
+        return query;
+      },
+      /**
+       * A `QueryDocumentSnapshot`, never a bare field value. A value cursor over
+       * documents that all share one `tenantId` skips documents, and a skipped
+       * document is a reference never collected — which makes the object it names
+       * an orphan candidate. So a regression to a value cursor fails loudly here
+       * rather than passing on a fixture whose values happen to be distinct.
+       */
+      startAfter(cursor: unknown) {
+        if (!isSnapshot(cursor)) {
+          throw new TypeError(
+            `startAfter(...) requires a QueryDocumentSnapshot from a previous page, not a bare ` +
+              `field value — received ${typeof cursor}: ${String(cursor)}`
+          );
+        }
+        cursorId = cursor.id;
+        return query;
+      },
       async get() {
         reads.push(`query:${name}`);
         failIfConfigured(name);
-        const entries = Object.entries(collections[name] ?? {}).filter(([, data]) =>
+        let entries = Object.entries(collections[name] ?? {}).filter(([, data]) =>
           filters.every(([field, operator, value]) => operator === '==' && data?.[field] === value)
         );
+        // The unordered, unlimited, uncursored query takes NONE of this: same
+        // insertion order, every match, no slice — exactly what it did before.
+        if (orderings.length > 0 || limitCount !== null || cursorId !== null) {
+          entries = entries.slice().sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+          if (cursorId !== null) {
+            const cursor = cursorId;
+            entries = entries.filter(([id]) => id > cursor);
+          }
+          if (limitCount !== null) entries = entries.slice(0, Math.max(0, Math.trunc(limitCount)));
+        }
         return querySnapshot(entries as [string, DocData][]);
       },
       doc(id: string) {
@@ -850,11 +917,18 @@ describe('collectTenantReferenceSet — scope, malformed values and the fingerpr
         },
       },
     });
+    // The two urls are swapped between the two document IDS, not merely listed in
+    // the other order. Since task 5.1 the collector reads each collection
+    // `orderBy('__name__')`, so visit order follows the document id and not the
+    // order this fixture literal happens to enumerate its documents in — a
+    // genuinely different insertion order therefore has to come from the ids. The
+    // claim under test is unchanged and now actually exercised: equal SETS built in
+    // different insertion orders yield the same fingerprint.
     const reversed = await collect({
       collections: {
         notices: {
-          notice_b: { tenantId: TENANT, imageUrl: url(second, 'other-token') },
-          notice_a: { tenantId: TENANT, imageUrl: url(first, 'other-token') },
+          notice_a: { tenantId: TENANT, imageUrl: url(second, 'other-token') },
+          notice_b: { tenantId: TENANT, imageUrl: url(first, 'other-token') },
         },
       },
     });

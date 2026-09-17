@@ -121,24 +121,74 @@ function createFakeFirestore(failures: Record<string, unknown>, mutations: strin
     if (Object.prototype.hasOwnProperty.call(failures, name)) throw failures[name];
   };
 
-  const docSnapshot = (id: string, data: DocData | undefined) => ({
-    id,
-    exists: data !== undefined,
-    data: () => data,
-  });
+  /** So `startAfter` can tell a snapshot from a bare field value. */
+  const snapshots = new WeakSet<object>();
+
+  const docSnapshot = (id: string, data: DocData | undefined) => {
+    const snapshot = {
+      id,
+      exists: data !== undefined,
+      data: () => data,
+    };
+    snapshots.add(snapshot);
+    return snapshot;
+  };
+
+  const isSnapshot = (candidate: unknown): candidate is { id: string } =>
+    typeof candidate === 'object' && candidate !== null && snapshots.has(candidate);
 
   const collection = (name: string) => {
     const filters: [string, string, unknown][] = [];
+    /**
+     * ── Keyset paging, added for storage-sweep-scale-hardening task 5.1 ────────
+     *
+     * The collector reads every Firestore Reference_Source through
+     * `.orderBy('__name__').limit(n)` + `.startAfter(lastDoc)`, so this suite's own
+     * fake answers those three calls too. Strictly ADDITIVE — the unordered,
+     * unlimited, uncursored query behaves exactly as it did before — and the point
+     * of this file is unchanged: a source that CANNOT be enumerated must abort the
+     * tenant, which is only a meaningful claim while a source that CAN be
+     * enumerated succeeds.
+     */
+    const orderings: string[] = [];
+    let limitCount: number | null = null;
+    let cursorId: string | null = null;
     const query: Record<string, unknown> = {
       where(field: string, operator: string, value: unknown) {
         filters.push([field, operator, value]);
         return query;
       },
+      orderBy(field: string) {
+        orderings.push(field);
+        return query;
+      },
+      limit(count: number) {
+        limitCount = count;
+        return query;
+      },
+      startAfter(cursor: unknown) {
+        if (!isSnapshot(cursor)) {
+          throw new TypeError(
+            `startAfter(...) requires a QueryDocumentSnapshot from a previous page, not a bare ` +
+              `field value — received ${typeof cursor}: ${String(cursor)}`
+          );
+        }
+        cursorId = cursor.id;
+        return query;
+      },
       async get() {
         failIfConfigured(name);
-        const entries = Object.entries(COLLECTIONS[name] ?? {}).filter(([, data]) =>
+        let entries = Object.entries(COLLECTIONS[name] ?? {}).filter(([, data]) =>
           filters.every(([field, operator, value]) => operator === '==' && data?.[field] === value)
         );
+        if (orderings.length > 0 || limitCount !== null || cursorId !== null) {
+          entries = entries.slice().sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+          if (cursorId !== null) {
+            const cursor = cursorId;
+            entries = entries.filter(([id]) => id > cursor);
+          }
+          if (limitCount !== null) entries = entries.slice(0, Math.max(0, Math.trunc(limitCount)));
+        }
         return {
           size: entries.length,
           empty: entries.length === 0,

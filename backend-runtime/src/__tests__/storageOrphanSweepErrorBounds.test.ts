@@ -122,14 +122,28 @@ describe('the report document `lastError` is bounded', () => {
       failGetFiles: (call) => (call.maxResults !== undefined ? 'e'.repeat(200_000) : undefined),
     });
 
-    await expect(
-      runStorageOrphanSweep({
-        db: db as never,
-        rtdb: createFakeRtdb({ log, tree: {} }) as never,
-        bucket: bucket as never,
-        config: sweepConfig({ tenantIds: [TENANT], nowMs: NOW }) as never,
-      })
-    ).rejects.toBeDefined();
+    // ── This was `.rejects.toBeDefined()` ─────────────────────────────────────
+    //
+    // Scaffolding rather than the subject: this case exists to observe the
+    // `lastError` WRITE, and it reached it by letting the listing failure propagate.
+    // `storage-sweep-scale-hardening` Req 1.1 confines that failure to its tenant,
+    // so the run now resolves. Every byte-bound assertion below is unchanged, and
+    // the run outcome is asserted more precisely than "it rejected with something":
+    // the recorded status, the run's failure count, and the bound on the coerced
+    // message the confinement records alongside `lastError`.
+    const run = await runStorageOrphanSweep({
+      db: db as never,
+      rtdb: createFakeRtdb({ log, tree: {} }) as never,
+      bucket: bucket as never,
+      config: sweepConfig({ tenantIds: [TENANT], nowMs: NOW }) as never,
+    });
+    expect(run.tenants[0].status).toBe('failed');
+    expect(run.tenantFailures).toBe(1);
+
+    const failureMessage = run.tenants[0].failureMessage as string;
+    expect(typeof failureMessage).toBe('string');
+    expect(Buffer.byteLength(failureMessage, 'utf8')).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_BYTES);
+    expect(failureMessage.endsWith(ELISION)).toBe(true);
 
     const report = db.read(tenantReportPath(TENANT)) as DocData;
     const lastError = report.lastError as string;

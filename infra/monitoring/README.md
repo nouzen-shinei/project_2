@@ -51,7 +51,18 @@ Cloud Run parses that into `jsonPayload`, so `jsonPayload.metric` selects the se
 - `storage_orphan_sweep_cross_tenant_references_total`
   - Filter: `resource.type="cloud_run_job" AND jsonPayload.metric="storage_orphan_sweep_cross_tenant_references_total"`
   - Emitted once per tenant run that saw at least one cross-tenant reference, with `value` carrying the unbounded total (the sample recorded on the report document is capped, deliberately, so a truncated sample cannot silence this). As a **counter** metric the series therefore counts *tenant runs that saw one*, not references; both are zero together, which is all a threshold-on-zero alert needs. Read the exact total from `jsonPayload.value` or from `crossTenantReferences` on the report document.
-- The remaining nine (`storage_orphan_sweep_runs_total`, `…_objects_scanned_total`, `…_retained_total`, `…_orphans_total`, `…_orphan_bytes`, `…_quarantined_total`, `…_quarantined_bytes`, `…_quarantine_failures_total`, `…_dangling_references_total`) are emitted the same way and are worth creating for dashboards, but nothing alerts on them. Each is `jsonPayload.metric="<name>"` with the delta in `jsonPayload.value`; for these, a **distribution** metric with `valueExtractor: EXTRACT(jsonPayload.value)` is what makes the numbers add up, since a counter would only count the summary lines.
+- `storage_orphan_sweep_tenant_failures_total`
+  - Filter: `resource.type="cloud_run_job" AND jsonPayload.metric="storage_orphan_sweep_tenant_failures_total"`
+  - **Alerted on.** A Tenant_Sweep_Failure means the run was asked to sweep a tenant and could not — the reference collector raised, or a listing page failed. The failure is *confined*: every other tenant is still swept and nothing was deleted for the failing one, so this is not an outage. It is the one shape in which the estate quietly stops being cleaned for a single tenant while every run looks healthy everywhere else, and a tenant that is never swept is how orphan growth resumes for that tenant unnoticed.
+  - Emitted once per failed tenant per invocation, `value: 1`, with `tenant_id` and `mode` on the entry. The run also exits non-zero, so the Cloud Run execution is visibly failed as well.
+- `storage_orphan_sweep_lease_total`
+  - Filter: `resource.type="cloud_run_job" AND jsonPayload.metric="storage_orphan_sweep_lease_total"`
+  - **Alerted on, filtered to `outcome="contended"`.** The Run_Lease admits one execution at a time; a declined acquisition means another execution held an unexpired lease, so this run listed nothing, swept nothing and exited **zero** — deliberately, because nothing was skipped. That is exactly why it needs an alert rather than an exit code: a run that is *always* declined is indistinguishable, from the report documents alone, from a run that is quietly succeeding.
+  - Three outcomes on one metric: `acquired` and `contended` from the runner, `lost` from the core's tenant loop when a renewal reads a foreign token. One line per outcome per invocation, `value: 1`, labelled `mode` and `outcome` and **no `tenant_id`** — a lease is run-level and names no tenant.
+  - **This one needs the label extractor**, because the alert condition filters on `outcome`. Created in the simple counter form the series carries no `outcome` at all, the condition can never fire, and on a threshold-on-zero condition that is indistinguishable from everything being fine. Use the `--config-from-file` form below.
+- The remaining eleven (`storage_orphan_sweep_runs_total`, `…_objects_scanned_total`, `…_retained_total`, `…_orphans_total`, `…_orphan_bytes`, `…_quarantined_total`, `…_quarantined_bytes`, `…_quarantine_failures_total`, `…_dangling_references_total`, `…_report_writes_total`, `…_reference_pages_total`) are emitted the same way and are worth creating for dashboards, but nothing alerts on them. Each is `jsonPayload.metric="<name>"` with the delta in `jsonPayload.value`; for these, a **distribution** metric with `valueExtractor: EXTRACT(jsonPayload.value)` is what makes the numbers add up, since a counter would only count the summary lines.
+  - `storage_orphan_sweep_report_writes_total` is the one to watch after the write-batching change: it is the Report_Document write count per tenant per invocation, and the whole point of the batching is that this number is now far below the listing's page count. A value that tracks the page count again means the cadence has regressed to one write per page on the single document the resume cursor lives on.
+  - `storage_orphan_sweep_reference_pages_total` carries the Reference_Source identifier on the **`reason`** label — eight bounded values, not a new `source` label, because the permitted label set is closed at `tenant_id`, `mode`, `reason`, `outcome` and `abort_reason`. A source that read no page emits nothing at all, so an absent series means "read no page" rather than "was not instrumented".
 - `storage_orphan_sweep_runs_total` is the one metric emitted on **every** invocation, including one that resolves no tenants at all — an `all_active` query that has stopped matching produces an otherwise completely silent green run, and a cleanup tool that silently stops running is what these metrics exist to catch. On that run the single entry carries `outcome: "completed"` and **no `tenant_id` field**, because there is no tenant it is about:
 
   ```json
@@ -76,6 +87,50 @@ gcloud logging metrics create storage_orphan_sweep_cross_tenant_references_total
   --description="Storage orphan sweep resolved a reference outside the swept tenant's scope (expected: zero)" \
   --log-filter='resource.type="cloud_run_job" AND jsonPayload.metric="storage_orphan_sweep_cross_tenant_references_total"'
 ```
+
+Create the two **new** alerted metrics (`storage-sweep-scale-hardening` task 10.1 — the policy's
+conditions 3 and 4 read these, so create them before applying the policy update):
+
+```bash
+export PROJECT_ID=tution-app-6c0c3
+
+gcloud logging metrics create storage_orphan_sweep_tenant_failures_total \
+  --project=$PROJECT_ID \
+  --description="Storage orphan sweep could not sweep a tenant (confined to that tenant; the run exits non-zero)" \
+  --log-filter='resource.type="cloud_run_job" AND jsonPayload.metric="storage_orphan_sweep_tenant_failures_total"'
+
+gcloud logging metrics create storage_orphan_sweep_lease_total \
+  --project=$PROJECT_ID \
+  --config-from-file=storage_orphan_sweep_lease_total.yaml
+```
+
+The lease metric is the one that **cannot** use the simple form: the policy's condition filters to
+`metric.label.outcome="contended"`, and a counter created without label extractors carries no
+`outcome` at all — so the condition would never receive a point, which on a threshold-on-zero
+condition is indistinguishable from everything being fine. Its config file, whose `filter` is the
+same `jsonPayload.metric` selector as every other metric here:
+
+```yaml
+# storage_orphan_sweep_lease_total.yaml
+name: storage_orphan_sweep_lease_total
+description: Storage orphan sweep Run_Lease outcomes (acquired / contended / lost)
+filter: resource.type="cloud_run_job" AND jsonPayload.metric="storage_orphan_sweep_lease_total"
+labelExtractors:
+  mode: EXTRACT(jsonPayload.mode)
+  outcome: EXTRACT(jsonPayload.outcome)
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  labels:
+    - key: mode
+    - key: outcome
+```
+
+There is deliberately **no `tenant_id` extractor** on that one: a lease is run-level, the emitted
+line carries no `tenant_id` field, and an extractor for an absent field would produce an empty label
+rather than a useful one. The `tenant_failures_total` metric is the opposite case and is worth
+creating from a config file too if you want the per-tenant breakdown the runbook tells you to read —
+same shape as the `aborted_total` example below, with `tenant_id` and `mode` extractors.
 
 To carry the labels through to Monitoring — worth it for `abort_reason`, which is what the
 runbook below tells you to read — create the metric from a config file instead
@@ -145,9 +200,30 @@ gcloud alpha monitoring policies create --project=$PROJECT_ID --policy-from-file
 ```
 
 Applying this policy is a **maintainer action** and is part of the orphan-sweep rollout, not of any
-deploy script. Create the two log-based metrics listed above first — a policy whose metric does not
+deploy script. Create the four log-based metrics listed above first — a policy whose metric does not
 exist never fires, which on a condition that is expected to stay at zero is indistinguishable from
 everything being fine.
+
+That policy is now **deployed and enabled**, and `storage-sweep-scale-hardening` task 10.1 **added
+two conditions to it** rather than rebuilding it: `tenant_failures_total > 0` and `lease_total`
+filtered to `outcome="contended"`. So the maintainer action for those two is an *update* of the
+existing policy, and the two new metrics have to exist first:
+
+```bash
+export PROJECT_ID=tution-app-6c0c3
+
+# The policy name, which is not the display name.
+gcloud alpha monitoring policies list --project=$PROJECT_ID \
+  --filter='displayName="Storage orphan sweep: investigate"' --format='value(name)'
+
+gcloud alpha monitoring policies update POLICY_NAME \
+  --project=$PROJECT_ID \
+  --policy-from-file=infra/monitoring/storage-orphan-sweep-alert-policy.json
+```
+
+The display name, the combiner, the enabled flag, the notification channel and both original
+conditions are unchanged in that file, so the update adds conditions 3 and 4 and touches nothing
+that is already firing.
 
 List policies:
 

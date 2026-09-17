@@ -17,6 +17,16 @@
  * Every fake also records the SET of method names invoked on it, because Property
  * 6 is stated over the methods called rather than over an outcome: a mutation that
  * happened to be a no-op must still fail the assertion.
+ *
+ * ── Transactions are observed at the CALL SITE, not at commit ───────────────
+ *
+ * `createFakeFirestore` exposes `runTransaction` (storage-sweep-scale-hardening
+ * task 2.1), and every `tx.get` / `tx.set` / `tx.update` / `tx.delete` appends to
+ * the same log the instant it is invoked, with `kind: 'write'` for the three
+ * mutators. That follows from the paragraph above rather than extending it: an
+ * attempted write inside a transaction that later aborts is precisely "a mutation
+ * that happened to be a no-op", so it must still fail an assertion stated over
+ * the methods invoked. **The log records intent; `documents` records outcome.**
  */
 
 // ─── The log ─────────────────────────────────────────────────────────────────
@@ -371,12 +381,59 @@ export interface FakeFirestoreOptions {
   writeFailures?: Record<string, unknown>;
 }
 
+/** The snapshot shape both `doc().get()` and a query page hand back. */
+export interface FakeDocSnapshot {
+  id: string;
+  ref: { path: string };
+  exists: boolean;
+  data(): DocData | undefined;
+}
+
+/** Anything with a document path: a `doc()` handle, or a real `DocumentReference`. */
+export interface FakeDocumentRef {
+  path: string;
+}
+
+/**
+ * The transaction surface `runTransaction` hands its body. Deliberately exactly
+ * the four methods `acquireRunLease`'s shape uses — `get`, `set`, `update`,
+ * `delete` — and the three mutators are synchronous and chainable, as the real
+ * SDK's are.
+ */
+export interface FakeTransaction {
+  get(ref: FakeDocumentRef): Promise<FakeDocSnapshot>;
+  set(ref: FakeDocumentRef, data: DocData, options?: { merge?: boolean }): FakeTransaction;
+  update(ref: FakeDocumentRef, data: DocData): FakeTransaction;
+  delete(ref: FakeDocumentRef): FakeTransaction;
+}
+
+/**
+ * One EXECUTED query, recorded so the ordering fields are assertable directly
+ * (Req 3.4, 11.9) rather than inferred from the documents that came back. Pushed
+ * by `get()` before the configured failure check, so a page that failed is still
+ * visible here.
+ */
+export interface FakeQueryRecord {
+  collection: string;
+  filters: { field: string; operator: string; value: unknown }[];
+  /** The `orderBy` fields, in the order they were requested. `[]` when unordered. */
+  orderBy: string[];
+  orderByDirections: ('asc' | 'desc')[];
+  /** `null` when the query asked for no limit. */
+  limit: number | null;
+  /** The cursor snapshot's document path, or `null` when there was no cursor. */
+  startAfterPath: string | null;
+}
+
 export interface FakeFirestore {
   collection(name: string): Record<string, unknown>;
   doc(path: string): Record<string, unknown>;
+  runTransaction<T>(body: (tx: FakeTransaction) => Promise<T>): Promise<T>;
   /** Raw document store, keyed by full path. */
   documents: Map<string, DocData>;
   read(path: string): DocData | undefined;
+  /** Every query executed, in order. See `FakeQueryRecord`. */
+  queries: FakeQueryRecord[];
 }
 
 /**
@@ -384,12 +441,19 @@ export interface FakeFirestore {
  * `doc().get()` and `set(data, { merge: true })`, with every write logged by full
  * document path — which is what lets Property 6 assert that report mode writes
  * nothing outside `storageMaintenanceJobs/`.
+ *
+ * Extended by storage-sweep-scale-hardening tasks 2.1 and 2.2 with
+ * `runTransaction` and with `orderBy` / `limit` / `startAfter` on the query. Both
+ * additions are strictly additive: a query that asks for none of the three
+ * behaves exactly as it did before — same insertion order, every match, no slice
+ * — because every existing suite reads that path.
  */
 export function createFakeFirestore(options: FakeFirestoreOptions): FakeFirestore {
   const documents = new Map<string, DocData>();
   for (const [name, docs] of Object.entries(options.collections ?? {})) {
     for (const [id, data] of Object.entries(docs)) documents.set(`${name}/${id}`, { ...data });
   }
+  const queries: FakeQueryRecord[] = [];
 
   const failIfConfigured = (name: string): void => {
     if (Object.prototype.hasOwnProperty.call(options.failures ?? {}, name)) {
@@ -397,14 +461,83 @@ export function createFakeFirestore(options: FakeFirestoreOptions): FakeFirestor
     }
   };
 
-  const snapshotFor = (path: string) => {
+  /**
+   * Every snapshot this fake ever minted. `startAfter` checks membership, which is
+   * how a bare field value is told apart from a `QueryDocumentSnapshot` without
+   * putting a marker property on the snapshot itself — the snapshot shape stays
+   * byte-identical to the shipped one.
+   */
+  const snapshots = new WeakSet<object>();
+
+  const snapshotFor = (path: string): FakeDocSnapshot => {
     const data = documents.get(path);
-    return {
+    const snapshot: FakeDocSnapshot = {
       id: path.slice(path.lastIndexOf('/') + 1),
       ref: { path },
       exists: data !== undefined,
       data: () => (data === undefined ? undefined : data),
     };
+    snapshots.add(snapshot);
+    return snapshot;
+  };
+
+  const isSnapshot = (candidate: unknown): candidate is FakeDocSnapshot =>
+    typeof candidate === 'object' && candidate !== null && snapshots.has(candidate);
+
+  const refPath = (ref: unknown, method: string): string => {
+    const path = (ref as { path?: unknown } | null | undefined)?.path;
+    if (typeof path !== 'string' || path.length === 0) {
+      throw new TypeError(
+        `FakeTransaction.${method} requires a document reference with a string path, received ${String(ref)}`
+      );
+    }
+    return path;
+  };
+
+  /**
+   * One document's ordering key, with the document path appended as the final
+   * tie-break exactly as Firestore appends `__name__`.
+   *
+   * `__name__` resolves to the full document path, so ordering is lexicographic by
+   * name — which is what makes "pages by document id" and therefore "visits every
+   * document exactly once" a meaningful claim. Ordering by a data field is
+   * supported so the fake does not silently accept a query it cannot serve, but
+   * this spec exercises only `__name__` (Req 3.4).
+   */
+  const orderingKey = (path: string, orderings: { field: string }[]): unknown[] => {
+    const data = documents.get(path);
+    const key: unknown[] = orderings.map(({ field }) => (field === '__name__' ? path : data?.[field]));
+    key.push(path);
+    return key;
+  };
+
+  const compareOrderingKeys = (
+    left: unknown[],
+    right: unknown[],
+    orderings: { direction: 'asc' | 'desc' }[]
+  ): number => {
+    for (let index = 0; index < left.length; index += 1) {
+      // The implicit trailing `__name__` term follows the direction of the last
+      // explicit `orderBy`, as Firestore's does.
+      const direction = orderings[Math.min(index, orderings.length - 1)]?.direction ?? 'asc';
+      const one = left[index];
+      const other = right[index];
+      let comparison = 0;
+      if (one !== other) {
+        comparison =
+          typeof one === 'number' && typeof other === 'number'
+            ? one < other
+              ? -1
+              : 1
+            : String(one ?? '') < String(other ?? '')
+              ? -1
+              : String(one ?? '') > String(other ?? '')
+                ? 1
+                : 0;
+      }
+      if (comparison !== 0) return direction === 'desc' ? -comparison : comparison;
+    }
+    return 0;
   };
 
   const writeDoc = async (path: string, data: DocData, merge: boolean): Promise<void> => {
@@ -442,20 +575,96 @@ export function createFakeFirestore(options: FakeFirestoreOptions): FakeFirestor
 
   const collection = (name: string) => {
     const filters: [string, string, unknown][] = [];
+    /**
+     * The ordering fields, recorded so Req 3.4 ("`__name__` and no other field")
+     * and Req 11.9 are assertable from `db.queries` rather than inferred from the
+     * documents that came back.
+     */
+    const orderings: { field: string; direction: 'asc' | 'desc' }[] = [];
+    let limitCount: number | null = null;
+    let cursorPath: string | null = null;
+
     const query: Record<string, unknown> = {
       where(field: string, operator: string, value: unknown) {
         filters.push([field, operator, value]);
         return query;
       },
+      orderBy(field: string, direction: 'asc' | 'desc' = 'asc') {
+        orderings.push({ field, direction });
+        return query;
+      },
+      limit(count: number) {
+        limitCount = count;
+        return query;
+      },
+      /**
+       * Req 3.3 — **a `QueryDocumentSnapshot`, never a bare field value**, and the
+       * throw is the point rather than defensiveness.
+       *
+       * A value cursor over documents that all share one `tenantId` either returns
+       * nothing or returns everything, and the failure that matters is the *skip*:
+       * a skipped document is a reference not collected, which makes the object it
+       * names an Orphan candidate. A regression to a value cursor must therefore
+       * fail loudly here rather than pass quietly on a fixture whose field values
+       * happen to be distinct.
+       */
+      startAfter(cursor: unknown) {
+        if (!isSnapshot(cursor)) {
+          throw new TypeError(
+            `startAfter(...) requires a QueryDocumentSnapshot from a previous page of this fake, ` +
+              `not a bare field value — received ${typeof cursor}: ${String(cursor)}`
+          );
+        }
+        cursorPath = cursor.ref.path;
+        return query;
+      },
       async get() {
+        // UNCHANGED, deliberately: same method name, same target, same kind and no
+        // `detail`. Existing suites read this entry — one asserts `log.methods()`
+        // equals exactly `['firestore.query.get']` — so the ordering metadata goes
+        // to `db.queries` instead of into this entry.
         options.log.record({ store: 'firestore', method: 'query.get', target: name, kind: 'read' });
+        queries.push({
+          collection: name,
+          filters: filters.map(([field, operator, value]) => ({ field, operator, value })),
+          orderBy: orderings.map((ordering) => ordering.field),
+          orderByDirections: orderings.map((ordering) => ordering.direction),
+          limit: limitCount,
+          startAfterPath: cursorPath,
+        });
         failIfConfigured(name);
         const entries = Array.from(documents.entries())
           .filter(([path]) => path.startsWith(`${name}/`) && !path.slice(name.length + 1).includes('/'))
           .filter(([, data]) =>
             filters.every(([field, operator, value]) => operator === '==' && data?.[field] === value)
           );
-        const docs = entries.map(([path]) => snapshotFor(path));
+        let docs = entries.map(([path]) => snapshotFor(path));
+
+        // The unordered, unlimited, uncursored query takes NONE of this: insertion
+        // order, every match, no slice — precisely what it did before task 2.2, so
+        // every existing suite is unaffected.
+        if (orderings.length > 0 || limitCount !== null || cursorPath !== null) {
+          docs = docs
+            .slice()
+            .sort((left, right) =>
+              compareOrderingKeys(
+                orderingKey(left.ref.path, orderings),
+                orderingKey(right.ref.path, orderings),
+                orderings
+              )
+            );
+          if (cursorPath !== null) {
+            // Keyset, by document name: the cursor is resolved from its PATH, so it
+            // stays meaningful even if the cursor document has since been deleted —
+            // the same stability the bucket fake's name cursor has.
+            const cursorKey = orderingKey(cursorPath, orderings);
+            docs = docs.filter(
+              (doc) => compareOrderingKeys(orderingKey(doc.ref.path, orderings), cursorKey, orderings) > 0
+            );
+          }
+          if (limitCount !== null) docs = docs.slice(0, Math.max(0, Math.trunc(limitCount)));
+        }
+
         return {
           size: docs.length,
           empty: docs.length === 0,
@@ -476,11 +685,106 @@ export function createFakeFirestore(options: FakeFirestoreOptions): FakeFirestor
     return query;
   };
 
+  /**
+   * ── `runTransaction` (spec task 2.1, Reqs 6.7, 11.12) ──────────────────────
+   *
+   * Three properties, each deliberate:
+   *
+   * 1. **Every `tx.get`, `tx.set`, `tx.update` and `tx.delete` is logged at the
+   *    CALL SITE — not at commit** — with the full document path and, for the
+   *    three mutators, `kind: 'write'`. The parent spec's Property 6 is stated
+   *    over the *methods invoked*, so a mutation that turned out to be a no-op
+   *    must still fail it, and an attempted write inside a transaction that later
+   *    aborts is exactly such a case. The log records **intent**; `documents`
+   *    records **outcome**.
+   * 2. **Writes are buffered and applied at commit**, matching the real SDK, so a
+   *    body that reads its own write sees the pre-transaction value.
+   * 3. **No retry.** The real SDK retries on contention; this fake runs the body
+   *    exactly once, because a retrying fake hides a non-idempotent transaction
+   *    body, and because the Run_Lease's correctness must not depend on a retry.
+   *    A body that throws propagates on the first attempt, with nothing applied.
+   *
+   * ── What this buys, with no test edited ───────────────────────────────────
+   *
+   * The parent's `storageOrphanSweep.reportNoMutation.property.test.ts` becomes
+   * strictly **stronger with no edit at all**. Its `foreignWrites` filter is
+   * `log.writes().filter((e) => e.store !== 'firestore' || !e.target.startsWith('storageMaintenanceJobs/'))`
+   * — i.e. it already selects every `kind: 'write'` whose target lies outside
+   * `storageMaintenanceJobs/`. So the moment `tx.set` is logged as a write, a
+   * lease written to `jobLeases/` inside a transaction fails that assertion
+   * automatically, and the file keeps its
+   * `// Feature: storage-orphan-cleanup, Property 6:` tag (Req 11.5) while
+   * satisfying Req 11.12.
+   */
+  const runTransaction = async <T>(body: (tx: FakeTransaction) => Promise<T>): Promise<T> => {
+    type BufferedWrite =
+      | { kind: 'set'; path: string; data: DocData; merge: boolean }
+      | { kind: 'update'; path: string; data: DocData }
+      | { kind: 'delete'; path: string };
+
+    const buffered: BufferedWrite[] = [];
+
+    const tx: FakeTransaction = {
+      async get(ref) {
+        const path = refPath(ref, 'get');
+        options.log.record({ store: 'firestore', method: 'tx.get', target: path, kind: 'read' });
+        failIfConfigured(path.slice(0, path.indexOf('/')));
+        // The pre-transaction value: buffered writes are not visible to a read,
+        // exactly as in the real SDK.
+        return snapshotFor(path);
+      },
+      set(ref, data, setOptions) {
+        const path = refPath(ref, 'set');
+        options.log.record({ store: 'firestore', method: 'tx.set', target: path, kind: 'write' });
+        buffered.push({ kind: 'set', path, data: { ...data }, merge: setOptions?.merge === true });
+        return tx;
+      },
+      update(ref, data) {
+        const path = refPath(ref, 'update');
+        options.log.record({ store: 'firestore', method: 'tx.update', target: path, kind: 'write' });
+        buffered.push({ kind: 'update', path, data: { ...data } });
+        return tx;
+      },
+      delete(ref) {
+        const path = refPath(ref, 'delete');
+        options.log.record({ store: 'firestore', method: 'tx.delete', target: path, kind: 'write' });
+        buffered.push({ kind: 'delete', path });
+        return tx;
+      },
+    };
+
+    // Exactly once. See property 3 above.
+    const result = await body(tx);
+
+    // Commit. Every configured write failure is checked BEFORE anything is
+    // applied, so a rejected commit leaves the store exactly as the transaction
+    // found it — atomic, as the real SDK is. The intent is already in the log.
+    for (const write of buffered) {
+      if (Object.prototype.hasOwnProperty.call(options.writeFailures ?? {}, write.path)) {
+        throw (options.writeFailures as Record<string, unknown>)[write.path];
+      }
+    }
+    for (const write of buffered) {
+      if (write.kind === 'delete') {
+        documents.delete(write.path);
+        continue;
+      }
+      // `update` merges, matching this fake's own `doc.update` rather than the real
+      // SDK's precondition that the document exist; the lease uses `set`/`delete`.
+      const existing = write.kind === 'update' || write.merge ? (documents.get(write.path) ?? {}) : {};
+      documents.set(write.path, { ...existing, ...write.data });
+    }
+
+    return result;
+  };
+
   return {
     collection,
     doc: (path: string) => docHandle(path),
+    runTransaction,
     documents,
     read: (path: string) => documents.get(path),
+    queries,
   };
 }
 

@@ -140,6 +140,20 @@ afterAll(() => {
 
 describe('Property 7: sweep idempotence and resumability', () => {
   it('examines the same union of objects when interrupted after any page and resumed', async () => {
+    /**
+     * ── Part 3: the vacuity guard (storage-sweep-scale-hardening Req 11.25) ────
+     *
+     * How many generated schedules reached each arm. Asserted AFTER `fc.assert`
+     * returns, because it is a statement about the generated population rather than
+     * about any one input: if either arm was reached zero times, this property
+     * stopped checking something and must say so in red.
+     *
+     * A guard that cannot fail is not a guard. Force the injected failure never to
+     * fire — `return undefined` from `failGetFiles` — and `interrupted` must go to
+     * `0` and this test must FAIL.
+     */
+    const armsReached = { interrupted: 0, uninterrupted: 0 };
+
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 14 }),
@@ -177,33 +191,59 @@ describe('Property 7: sweep idempotence and resumability', () => {
             },
           });
 
-          let interrupted = false;
-          try {
-            await runStorageOrphanSweep({
-              db: db as never,
-              rtdb: rtdb as never,
-              bucket: failingBucket as never,
-              config: sweepConfig({ pageSize, nowMs: NOW }) as never,
-            });
-          } catch (error) {
-            interrupted = true;
-            expect((error as Error).message).toContain('listing page failed');
-          }
+          // ── Part 1: interruption from an OUTCOME, never from an exception ──
+          //
+          // A listing failure is confined to its tenant and RECORDED
+          // (storage-sweep-scale-hardening Req 1.1), so nothing is thrown to catch.
+          // The precondition is read off the returned result and the recorded
+          // Report_Document — values that exist whether or not anything was thrown,
+          // which is exactly why a later change converting a throw into a result
+          // cannot remove them from under this property (Req 11.23, 11.26).
+          const firstRun = await runStorageOrphanSweep({
+            db: db as never,
+            rtdb: rtdb as never,
+            bucket: failingBucket as never,
+            config: sweepConfig({ pageSize, nowMs: NOW }) as never,
+          });
 
-          if (!interrupted) {
-            // The schedule asked for a page that this fixture never reaches; the
-            // run simply completed, which is not a counterexample.
-            return;
-          }
-
-          // A failed page leaves the PREVIOUS page's cursor and counters intact and
-          // records `lastError` (Req 13.13, 13.14).
           const afterFailure = db.read(tenantReportPath(TENANT));
           expect(afterFailure).toBeDefined();
-          expect(afterFailure!.status).toBe('in_progress');
-          expect(typeof afterFailure!.lastError).toBe('string');
+          const interrupted = firstRun.tenants[0].status === 'failed';
+          expect(firstRun.tenantFailures).toBe(interrupted ? 1 : 0);
+
+          // ── Part 2: EVERY generated schedule reaches assertions (Req 11.24) ─
+          //
+          // There is no early return. A schedule whose failing page index this
+          // fixture never reaches is not skipped — it is asserted as an
+          // *uninterrupted* run. The old `if (!interrupted) return;` asserted
+          // nothing on those schedules, and once the confinement stopped the throw
+          // it would have asserted nothing on ALL of them: 100 green runs with zero
+          // assertions evaluated.
+          if (interrupted) {
+            armsReached.interrupted += 1;
+            // A failed page leaves the PREVIOUS page's cursor and counters intact
+            // and records `lastError` (Req 13.13, 13.14). The recorded status is
+            // `'failed'` rather than the legacy `'in_progress'` — the substitution
+            // Req 11.19 permits, and the one changed value in that same diagnostic
+            // write.
+            expect(afterFailure!.status).toBe('failed');
+            expect(typeof afterFailure!.lastError).toBe('string');
+            expect(firstRun.tenants[0].failureMessage).toContain('listing page failed');
+          } else {
+            armsReached.uninterrupted += 1;
+            // The schedule asked for a page this fixture never reaches, so the run
+            // completed — which is a case to ASSERT, not to skip: the whole fixture
+            // was examined, the recorded status is `completed`, and no tenant failed.
+            expect(firstRun.tenants[0].status).toBe('completed');
+            expect(afterFailure!.status).toBe('completed');
+            expect([...examinedNames(log)].sort()).toEqual([...baselineExamined].sort());
+          }
 
           // ── The resumption, against the identical fixture ────────────────
+          //
+          // Reached by BOTH arms. For an uninterrupted first run it is the
+          // recorded-`completed` no-op, which lists nothing and therefore leaves the
+          // union equal to the baseline all the same.
           const resumedLog = createOperationLog();
           const resumed = await runStorageOrphanSweep({
             db: db as never,
@@ -222,6 +262,12 @@ describe('Property 7: sweep idempotence and resumability', () => {
       ),
       { numRuns: 100 }
     );
+
+    // Req 11.25: vacuity is a visible failure, not a silent pass. Both arms must
+    // have been generated — an interrupted run whose resumption completes the union,
+    // and a schedule that never interrupted and was asserted as such.
+    expect(armsReached.interrupted).toBeGreaterThan(0);
+    expect(armsReached.uninterrupted).toBeGreaterThan(0);
   });
 
   it('is an exact no-op when re-run on a completed tenant, and restarts with force', async () => {
@@ -299,28 +345,31 @@ describe('Property 7: sweep idempotence and resumability', () => {
 
           // Interrupt after the second page so a cursor is definitely persisted.
           let pagedSeen = 0;
-          let interrupted = false;
-          try {
-            await runStorageOrphanSweep({
-              db: db as never,
-              rtdb: createFakeRtdb({ log, tree: fixture.tree }) as never,
-              bucket: createFakeBucket({
-                log,
-                objects: fixture.objects,
-                failGetFiles: (call) => {
-                  if (call.maxResults === undefined) return undefined;
-                  pagedSeen += 1;
-                  return pagedSeen === 3 ? new Error('listing page failed') : undefined;
-                },
-              }) as never,
-              config: sweepConfig({ pageSize, nowMs: NOW }) as never,
-            });
-          } catch {
-            interrupted = true;
-          }
-          expect(interrupted).toBe(true);
+          const interruptedRun = await runStorageOrphanSweep({
+            db: db as never,
+            rtdb: createFakeRtdb({ log, tree: fixture.tree }) as never,
+            bucket: createFakeBucket({
+              log,
+              objects: fixture.objects,
+              failGetFiles: (call) => {
+                if (call.maxResults === undefined) return undefined;
+                pagedSeen += 1;
+                return pagedSeen === 3 ? new Error('listing page failed') : undefined;
+              },
+            }) as never,
+            config: sweepConfig({ pageSize, nowMs: NOW }) as never,
+          });
+
+          // Was `catch { interrupted = true }` then `expect(interrupted).toBe(true)`.
+          // The confined failure is recorded rather than thrown, so the interruption
+          // is established from the returned result and the recorded status — and
+          // this is an ASSERTION about the outcome, not a precondition gate: every
+          // generated fixture here reaches page 3 (Req 11.19, 11.23, 11.26).
+          expect(interruptedRun.tenants[0].status).toBe('failed');
+          expect(interruptedRun.tenantFailures).toBe(1);
 
           const afterFailure = db.read(tenantReportPath(TENANT));
+          expect(afterFailure!.status).toBe('failed');
           const persistedCursor = afterFailure!.resume as { pageToken: string | null } | null;
           const persistedFingerprint = afterFailure!.referenceFingerprint as string;
           expect(persistedCursor).not.toBeNull();

@@ -53,6 +53,10 @@
  */
 
 import crypto from 'node:crypto';
+// Node's built-in heap statistics, for the mid-collection guard's default reading.
+// A built-in, so this adds no dependency and keeps the module free of `express` and
+// of any runtime `firebase-admin` import.
+import v8 from 'node:v8';
 import type { database as DatabaseNS, firestore as FirestoreNS } from 'firebase-admin';
 
 import {
@@ -70,6 +74,18 @@ import {
 // from a job.
 import { inc, incBy, metricNames } from '../metrics';
 import { stripUndefinedDeep } from '../lib/stripUndefinedDeep';
+// The report-write cadence, decided in ONE pure place (spec task 1.2) so Reqs
+// 7.1–7.5 are that function's postcondition rather than this call site's
+// behaviour. No clock, no I/O: the live elapsed milliseconds are handed in.
+import {
+  DEFAULT_REPORT_WRITE_PAGE_INTERVAL,
+  DEFAULT_REPORT_WRITE_TIME_INTERVAL_MS,
+  HEAP_GUARD_SAMPLE_INTERVAL,
+  estimateRetainSetFootprintBytes,
+  exceedsHeapGuard,
+  resolveQuarantineWriteThreshold,
+  shouldWriteTenantReport,
+} from '../lib/sweepScaleLimits';
 import {
   QUARANTINE_PREFIX,
   STORAGE_TENANT_CATEGORIES,
@@ -107,8 +123,35 @@ export function tenantReportPath(tenantId: string): string {
  * Hard ceiling on the retain set. Exceeding it ABORTS the tenant — the sweep
  * never proceeds with a truncated retain set, because a truncated retain set is
  * indistinguishable from a set of orphans (Req 9.7).
+ *
+ * ── Why 500,000 and not the 2,000,000 this shipped with (Req 8.1) ────────────
+ *
+ * At `RETAIN_SET_BYTES_PER_PATH` (232 B, see `lib/sweepScaleLimits.ts`) a ceiling
+ * of 2,000,000 estimates at ≈ **464 MB** of live retain set, which does not fit a
+ * `512Mi` container at all and does not fit `1Gi` with a declared 896 MB
+ * old-space limit either: `0.7 × 896 MB ≈ 627 MB`. So the documented
+ * `reference_cap_exceeded` abort could not fire — the container was killed first,
+ * exit 137, with no Report_Document explaining itself. THAT is the defect this
+ * number fixes, and it is why the runner now refuses to start when the estimate
+ * for the configured ceiling exceeds the Heap_Guard_Fraction of the observed
+ * Heap_Limit (Req 8.6): a ceiling that cannot fit is a misconfiguration, not a
+ * runtime surprise.
+ *
+ * 500,000 estimates at ≈ **116 MB**, comfortably inside the 627 MB guard the
+ * configured `1Gi` container produces, which leaves the abort reachable and the
+ * estimate's headroom real.
+ *
+ * The cost, stated plainly: a tenant legitimately holding more than 500,000
+ * references now aborts where it previously *attempted* the sweep. That is the
+ * safe direction — an abort quarantines nothing and writes a report saying why —
+ * and it is one environment variable away from being raised deliberately, by an
+ * operator who has read the logged estimate and the logged heap limit.
+ *
+ * Both Cloud Run Job definitions carry this same number in
+ * `STORAGE_ORPHAN_SWEEP_MAX_REFERENCES` (Req 9.11), and
+ * `storageOrphanSweepManifests.test.ts` asserts the two cannot drift.
  */
-export const DEFAULT_MAX_REFERENCES = 2_000_000;
+export const DEFAULT_MAX_REFERENCES = 500_000;
 
 /**
  * Conversations per level-1 RTDB page, and messages per level-2 page.
@@ -122,6 +165,27 @@ export const DEFAULT_MAX_REFERENCES = 2_000_000;
  */
 export const DEFAULT_CONVERSATION_PAGE_SIZE = 20;
 export const DEFAULT_MESSAGE_PAGE_SIZE = 200;
+
+/**
+ * Documents per page for every Firestore reference query and for the
+ * active-tenant query (Req 3.12).
+ *
+ * 1000 matches `collectPaymentsReceived`'s `PAGE_SIZE` in
+ * `jobs/tenantUsageRollup.ts`, whose keyset loop this module's
+ * `forEachQueryDocPaged` copies rather than reinvents — one page size across the
+ * two jobs means one number to reason about when a collection turns out to be
+ * larger than anyone expected.
+ *
+ * Overridable through `STORAGE_ORPHAN_SWEEP_FIRESTORE_PAGE_SIZE`, which is parsed
+ * by `parsePositiveIntEnv` and therefore falls back to THIS number rather than to
+ * zero for a non-finite, non-positive or unparseable value (Req 3.13).
+ *
+ * The page size is a memory knob and nothing else: `retainPaths`,
+ * `referenceFingerprint` and `countsBySource` are invariant under it for a fixed
+ * fixture, which is what lets it be changed on a deploy without discarding every
+ * in-flight resume cursor (the fingerprint is the stale-resume detector).
+ */
+export const DEFAULT_FIRESTORE_PAGE_SIZE = 1_000;
 
 /**
  * Cap on the cross-tenant sample recorded on the report. The unbounded total is
@@ -235,8 +299,29 @@ const VIDEO_PATH_EXTENSIONS: ReadonlySet<string> = new Set([
 //     nothing. `tenant_id` is simply absent rather than empty, which the closed
 //     label type already permits and `compactLabels` already handles.
 
-/** The complete permitted label set (Req 16.7). Excess keys cannot be expressed. */
-interface SweepMetricLabels {
+/**
+ * The complete permitted label set (Req 16.7). Excess keys cannot be expressed.
+ *
+ * ── EXPORTED for the runner, and deliberately still CLOSED (spec task 9.2) ────
+ *
+ * The Run_Lease's `acquired` and `contended` outcomes are emitted from
+ * `runStorageOrphanSweep.ts`, because acquisition happens in the runner — before
+ * the core is entered at all — and the lease module's own documented property is
+ * that it performs one transaction on one document and owns no observability
+ * concern. So the runner needs this type and `emitSweepMetric` below.
+ *
+ * The alternative was a third hand-rolled `console.log(JSON.stringify(...))` in the
+ * runner, and it is REJECTED: Req 10.3 requires the single-line JSON shape the
+ * deployed `infra/monitoring/` filters match to be *inherited rather than
+ * reimplemented*, and a second copy of that shape is exactly how it drifts away
+ * from a filter no deploy can update transactionally.
+ *
+ * Exporting widens who may *emit*; it widens nothing about *what may be said*. The
+ * five keys are still the whole permitted set (Req 10.1) — do not add a sixth for a
+ * caller's convenience. The lease line carries `mode` and `outcome` only and no
+ * `tenant_id`, because a lease is run-level and names no tenant.
+ */
+export interface SweepMetricLabels {
   tenant_id?: string;
   mode?: string;
   reason?: string;
@@ -311,8 +396,17 @@ function logSweepMetric(
  * The rule that keeps the two surfaces agreeing: for any one delta, call EITHER
  * `emitSweepMetric` (one-shot) OR `countSweepMetric` + `logSweepMetric`
  * (accumulated per object, logged once per tenant). Never both.
+ *
+ * ── EXPORTED for the runner's two lease outcomes (spec task 9.2) ─────────────
+ *
+ * `countSweepMetric` and `logSweepMetric` stay module-private: the runner has no
+ * per-object counter to move and no per-tenant delta to flush, so the one-shot pair
+ * is the only shape it needs, and keeping the other two private keeps the
+ * "EITHER/OR, never both" rule above a rule about calls inside this file. See
+ * `SweepMetricLabels` for why the runner emits through this rather than through a
+ * copy of the JSON shape.
  */
-function emitSweepMetric(
+export function emitSweepMetric(
   name: string,
   labels: SweepMetricLabels,
   value: number,
@@ -391,6 +485,22 @@ export interface TenantReferenceSet {
    */
   countsBySource: Record<ReferenceSourceId, number>;
   /**
+   * Firestore pages READ per source, including the terminating empty page
+   * (Req 10.7). Zero for the two sources that issue no paged query: the Realtime
+   * Database walk, and `tenant_branding`'s single `tenants/{tenantId}` document
+   * read (Req 4.5).
+   *
+   * `profile_pictures_derived` accumulates the pages of BOTH collections it reads
+   * — `tenantMemberships` and `tenantProfiles` — because the unit is the
+   * Reference_Source, which is what the metric's `reason` label carries.
+   *
+   * This is the cheapest place to notice a walk that stopped after one page: a
+   * source with a non-zero `countsBySource` and a `pagesBySource` of 1 over a
+   * collection larger than the page size is the shape of a cursor that never
+   * advanced.
+   */
+  pagesBySource: Record<ReferenceSourceId, number>;
+  /**
    * The subset of `retainPaths` that was admitted by DERIVATION rather than by
    * reading a reference field: the profile-picture paths derived from member
    * emails (source 8) and the `{base}_h264.mp4` outputs derived from chat video
@@ -452,6 +562,45 @@ export interface TenantReferenceSet {
    * then a breached ceiling.
    */
   abortReason: ReferenceAbortReason | null;
+  /**
+   * WHICH ceiling bound first, when one did (Req 8.9). `null` ⇒ neither.
+   *
+   *  - `'configured'` — `retainPaths.size` exceeded `maxReferences`, the check the
+   *    shipped code already made after every insertion (Req 8.16);
+   *  - `'memory_guard'` — the mid-collection heap sample tripped **both**
+   *    conditions of `exceedsHeapGuard` (Req 8.8).
+   *
+   * ── Diagnostic, NOT behavioural, and that is why `SweepAbortReason` is untouched
+   *
+   * Both breaches produce `abortReason: 'reference_cap_exceeded'` and both
+   * quarantine nothing, because the gate in `sweepTenant` precedes any listing so
+   * zero objects move (Req 8.12). A sixth `SweepAbortReason` value would have
+   * invalidated every existing metric label, every `infra/monitoring/` filter and
+   * every report reader for a distinction that changes no behaviour (Req 8.10) — so
+   * the distinction lives here and on the Report_Document root instead.
+   */
+  capBreach: 'configured' | 'memory_guard' | null;
+  /**
+   * `estimateRetainSetFootprintBytes(retainPaths.size)` — what the set this
+   * collector actually built is estimated to cost.
+   *
+   * Distinct from the Report_Document's `params.footprintEstimateBytes`, which is
+   * the estimate for the configured **ceiling** and is a run parameter. This one is
+   * an observation about one tenant, and the pair is what tells an operator whether
+   * a tenant is anywhere near the ceiling it was judged against.
+   */
+  footprintEstimateBytes: number;
+  /**
+   * The Heap_Limit the last heap sample reported, or `null` when no sample was
+   * taken or the reading was unusable.
+   *
+   * `null` is the ordinary case rather than a failure: the heap is sampled once per
+   * `HEAP_GUARD_SAMPLE_INTERVAL` admitted references (Req 8.7), so a tenant with
+   * fewer than 10,000 references is never sampled at all and has no reading to
+   * report. It is the limit the guard COMPARED against, which is why an unreadable
+   * one is recorded as `null` rather than as a substituted default.
+   */
+  heapLimitBytes: number | null;
 }
 
 export interface CollectTenantReferenceSetArgs {
@@ -460,9 +609,62 @@ export interface CollectTenantReferenceSetArgs {
   tenantId: string;
   bucketName: string;
   maxReferences: number;
+  /**
+   * Documents per Firestore page, defaulting to `DEFAULT_FIRESTORE_PAGE_SIZE`
+   * (Req 3.12, 3.13).
+   *
+   * OPTIONAL, so this exported signature does not change shape: every existing
+   * caller keeps compiling and gets the documented default. A test drives a
+   * multi-page walk cheaply by passing a small value, and `retainPaths`,
+   * `referenceFingerprint` and `countsBySource` are identical whatever it passes.
+   */
+  firestorePageSize?: number;
   /** Overridable only so tests can exercise multi-page RTDB walks cheaply. */
   conversationPageSize?: number;
   messagePageSize?: number;
+  /**
+   * The heap READING the mid-collection guard samples, defaulting to
+   * `readProcessHeapUsage` — a `v8.getHeapStatistics()` call and nothing else.
+   *
+   * ── Why the reading is injected and the COMPARISON is not ───────────────────
+   *
+   * Only the reading is a seam. The comparison stays the pure `exceedsHeapGuard`,
+   * so a test can put the crossing at a chosen admitted-reference count instead of
+   * trying to make a real heap grow to 128 MiB — and it still exercises the same
+   * two-condition predicate production runs. A seam over the comparison would let a
+   * test assert a guard that is present without asserting the guard that is
+   * correct.
+   *
+   * Production installs nothing, so the default IS the behaviour, following the
+   * `quarantineObject` / `invalidateLiveCount` precedent.
+   */
+  readHeapUsage?: () => { usedBytes: number; limitBytes: number };
+}
+
+/**
+ * The default heap reading: `v8.getHeapStatistics()`, coerced.
+ *
+ * Total by construction. `getHeapStatistics` is a native call that does not throw
+ * in any documented case, but a non-numeric field would otherwise flow into
+ * `exceedsHeapGuard` — which is total too and returns `false` for it, i.e.
+ * "continue" — so the coercion here is belt to that brace and keeps the collector's
+ * "never throws for an enumeration concern" posture intact for a *measurement*
+ * concern as well.
+ *
+ * `NaN` is the honest value for an unreadable field, and it is the direction that
+ * does NOT abort a tenant: an unreadable limit mid-collection is not evidence of a
+ * memory problem, and that input was already settled at start-up by the runner's
+ * Req 8.6 refusal.
+ */
+export function readProcessHeapUsage(): { usedBytes: number; limitBytes: number } {
+  try {
+    const stats = v8.getHeapStatistics();
+    const usedBytes = typeof stats?.used_heap_size === 'number' ? stats.used_heap_size : Number.NaN;
+    const limitBytes = typeof stats?.heap_size_limit === 'number' ? stats.heap_size_limit : Number.NaN;
+    return { usedBytes, limitBytes };
+  } catch {
+    return { usedBytes: Number.NaN, limitBytes: Number.NaN };
+  }
 }
 
 // ─── Internal helpers (pure) ─────────────────────────────────────────────────
@@ -709,6 +911,154 @@ function normalisePositiveInt(value: unknown, fallback: number): number {
     : fallback;
 }
 
+// ─── The Reference_Page_Helper ────────────────────────────────────────────────
+
+/**
+ * One keyset-paginated walk over `collection` where `field == value`, in ascending
+ * document-name order, handing each matching document's data and id to `handler`
+ * exactly once.
+ *
+ * `onPage` fires once per page successfully READ, including the terminating empty
+ * page. It is a callback rather than a return value on purpose: a walk that throws
+ * on its fifth page has still read four, and the caller's `pagesBySource` should
+ * say so — a return value would report nothing for exactly the source whose page
+ * count an operator most wants to see.
+ *
+ * This is the design's `forEachTenantDocPaged` — the single Reference_Page_Helper
+ * every Firestore Reference_Source is enumerated through (Req 3.1, 3.8) —
+ * generalised in exactly ONE dimension: the equality filter's FIELD is a
+ * parameter. That is what makes `resolveSweepTenantIds`'s `all_active` branch
+ * (`status == 'active'`) literally this loop rather than a second copy of it
+ * (Req 4.1). Nothing else differs between the two call sites, so there is one
+ * paging implementation in this module and not two that can drift.
+ *
+ * The loop's shape is copied from `collectPaymentsReceived` in
+ * `jobs/tenantUsageRollup.ts` rather than reinvented.
+ *
+ * ── `orderBy('__name__')` AND NO OTHER FIELD (Req 3.4), for two reasons ───────
+ *
+ * The first is a correctness trap: Firestore EXCLUDES from a result set any
+ * document that lacks the ordering field. Ordering by anything optional therefore
+ * drops documents silently — and a dropped document is a reference never
+ * collected, which makes the object it names an Orphan candidate. `__name__`
+ * cannot be absent.
+ *
+ * The second is operational: an equality filter plus `orderBy('__name__')` in the
+ * same direction is served by the automatically maintained single-field index on
+ * the filtered field, so NO composite index has to be deployed. Any other ordering
+ * field needs one; a missing index is a query failure; a query failure is a
+ * `failedSources` entry; a `failedSources` entry aborts the tenant.
+ *
+ * ── The cursor is a `QueryDocumentSnapshot`, never a field value (Req 3.3) ────
+ *
+ * `startAfter(someTenantId)` over documents that all share one `tenantId` either
+ * returns nothing or returns everything, and the failure that matters is the
+ * *skip*: a skipped document is a reference not collected. So the cursor is
+ * always the last snapshot of the page just handled.
+ *
+ * ── TWO INDEPENDENT STOP CONDITIONS, not one ─────────────────────────────────
+ *
+ * A short page ends the walk (Req 3.5), and an EMPTY page ends the walk on its
+ * own — checked BEFORE the handler loop, for every page size (Req 3.17). They look
+ * like one rule wearing two hats and they are not. At `pageSize: 1` every
+ * non-empty page is a FULL page, so the short-page test never fires; over a
+ * collection whose document count is an exact multiple of the page size the empty
+ * page is the ONLY thing that terminates the loop. Collapsing the two is an
+ * infinite loop, not a wrong answer.
+ *
+ * Checking empty first also means the cursor is only ever taken from a page that
+ * had a last document, so `page.docs[page.size - 1]` is never `undefined`.
+ *
+ * ── `shouldStop`, before each request and after each handled document ─────────
+ *
+ * The configured reference ceiling and the heap guard both set a flag the caller
+ * already consults in every other loop; `forEachTenantDoc` had nothing to check
+ * because it did not loop. Evaluating `shouldStop` before requesting each page is
+ * what makes a cap-exceeded or heap-guarded tenant STOP READING rather than page
+ * through all seven collections to grow a set it has already refused.
+ *
+ * ── Memory (Req 3.6, 3.7) ────────────────────────────────────────────────────
+ *
+ * At most one page's `docs` array is reachable at a time, plus the single cursor
+ * snapshot. Reqs 3.3 and 3.6 are in mild tension and this is the resolution: the
+ * cursor is ONE document, not a handle onto its page, so "one page plus one
+ * document" is the true bound. The page reference is dropped before the next
+ * round-trip is issued and nothing is accumulated across pages — the handler
+ * extracts the strings it wants and nothing else escapes.
+ *
+ * ── Failure (Req 3.9) ────────────────────────────────────────────────────────
+ *
+ * This function does not catch. The caller's `try` is around the WHOLE walk, not
+ * around the first request, so a failure on the LAST page still propagates to
+ * `runSource` and lands in `failedSources`. A `try` around only the first request
+ * passes every single-page fixture and swallows exactly the case pagination
+ * introduces.
+ *
+ * Performs no write.
+ */
+async function forEachQueryDocPaged(args: {
+  db: Firestore;
+  collection: string;
+  /** The equality filter's field: `tenantId` for a Reference_Source, `status` for `all_active`. */
+  field: string;
+  value: string;
+  /** Already normalised to a positive integer by the caller. */
+  pageSize: number;
+  /** Total and side-effect free. Evaluated before each request and after each document. */
+  shouldStop: () => boolean;
+  handler: (data: unknown, docId: string) => void;
+  /** Called once per page successfully read, the terminating empty page included. */
+  onPage?: () => void;
+}): Promise<void> {
+  const { db, collection, field, value, pageSize, shouldStop, handler, onPage } = args;
+
+  // A `QueryDocumentSnapshot`, never a field value (Req 3.3).
+  let cursor: FirestoreNS.QueryDocumentSnapshot | null = null;
+  let page: FirestoreNS.QuerySnapshot | null = null;
+
+  for (;;) {
+    if (shouldStop()) return;
+
+    let query: FirestoreNS.Query = db
+      .collection(collection)
+      .where(field, '==', value)
+      .orderBy('__name__')
+      .limit(pageSize);
+    if (cursor !== null) query = query.startAfter(cursor);
+
+    // Release the previous page's snapshots BEFORE the next round-trip, so the
+    // walk holds one page plus one cursor document and never two pages (Req 3.7).
+    page = null;
+    page = await query.get();
+    if (onPage) onPage();
+
+    // STOP CONDITION 1 — an empty page, checked BEFORE the handler loop and
+    // independently of the short-page test below (Req 3.17). At `pageSize: 1`, and
+    // over any collection whose count is an exact multiple of the page size, this
+    // is the only terminator. It also guarantees the cursor assignment below never
+    // indexes an empty array.
+    if (page.empty) return;
+
+    for (const doc of page.docs) {
+      let data: unknown;
+      try {
+        data = doc.data();
+      } catch {
+        data = undefined;
+      }
+      handler(data, doc.id);
+      if (shouldStop()) return;
+    }
+
+    // The LAST SNAPSHOT of this page — the only thing that survives the next
+    // iteration's reassignment of `page`.
+    cursor = page.docs[page.size - 1];
+
+    // STOP CONDITION 2 — a short page (Req 3.5).
+    if (page.size < pageSize) return;
+  }
+}
+
 // ─── Phase 1 ─────────────────────────────────────────────────────────────────
 
 /**
@@ -727,7 +1077,11 @@ function normalisePositiveInt(value: unknown, fallback: number): number {
  *    to `failedSources` with a coerced message;
  *  - every member of `retainPaths` satisfies `classifyTenantScopedPath(path, tenantId)`;
  *  - `referenceFingerprint` is a function of the retain set alone;
- *  - `abortReason` is non-null exactly when the caller must abort.
+ *  - `abortReason` is non-null exactly when the caller must abort;
+ *  - every Firestore Reference_Source is read through the keyset-paginated
+ *    `forEachQueryDocPaged`, and `retainPaths`, `referenceFingerprint` and
+ *    `countsBySource` are INVARIANT under `firestorePageSize` for a fixed fixture
+ *    — the page size bounds memory and decides no verdict about any object.
  */
 export async function collectTenantReferenceSet(
   args: CollectTenantReferenceSetArgs
@@ -751,11 +1105,17 @@ export async function collectTenantReferenceSet(
   const rtdb = args.rtdb;
   const bucketName = typeof args.bucketName === 'string' ? args.bucketName : '';
   const maxReferences = normalisePositiveInt(args.maxReferences, DEFAULT_MAX_REFERENCES);
+  const firestorePageSize = normalisePositiveInt(
+    args.firestorePageSize,
+    DEFAULT_FIRESTORE_PAGE_SIZE
+  );
   const conversationPageSize = normalisePositiveInt(
     args.conversationPageSize,
     DEFAULT_CONVERSATION_PAGE_SIZE
   );
   const messagePageSize = normalisePositiveInt(args.messagePageSize, DEFAULT_MESSAGE_PAGE_SIZE);
+  // The READING is the seam; the comparison below is the pure `exceedsHeapGuard`.
+  const readHeapUsage = args.readHeapUsage ?? readProcessHeapUsage;
 
   const retainPaths = new Set<string>();
   const derivedPaths = new Set<string>();
@@ -767,8 +1127,28 @@ export async function collectTenantReferenceSet(
   let crossTenantReferenceCount = 0;
   let malformedReferences = 0;
   let capExceeded = false;
+  /** WHICH ceiling bound first (Req 8.9). Set exactly where `capExceeded` is. */
+  let capBreach: 'configured' | 'memory_guard' | null = null;
+  /**
+   * Admitted references since the last heap sample. Reset at each sample, so the
+   * heap is read once per `HEAP_GUARD_SAMPLE_INTERVAL` admissions (Req 8.7) — cheap
+   * relative to the Firestore round-trip that produced them, and fine-grained
+   * enough that the overshoot between two samples is at most
+   * `10,000 × 232 B ≈ 2.3 MB` against a guard measured in hundreds of MB.
+   */
+  let admittedSinceHeapSample = 0;
+  /** The last sampled Heap_Limit, or `null` when unsampled or unreadable. */
+  let heapLimitBytes: number | null = null;
 
   const countsBySource = REFERENCE_SOURCE_IDS.reduce((acc, id) => {
+    acc[id] = 0;
+    return acc;
+  }, {} as Record<ReferenceSourceId, number>);
+
+  // Initialised for EVERY source, for the same reason `countsBySource` is: a key
+  // that is present and zero says "this source read no page", which is a signal;
+  // an absent key says only that nobody instrumented it.
+  const pagesBySource = REFERENCE_SOURCE_IDS.reduce((acc, id) => {
     acc[id] = 0;
     return acc;
   }, {} as Record<ReferenceSourceId, number>);
@@ -791,6 +1171,16 @@ export async function collectTenantReferenceSet(
    * (Req 9.8). Once breached, admission stops: `retainPaths` never exceeds
    * `maxReferences + 1`, which keeps the caller's `size > maxReferences` gate
    * true while refusing to grow further.
+   *
+   * ── The heap guard sits at the SAME point, for the same reason (Req 8.7, 8.8) ──
+   *
+   * The configured ceiling catches a retain set that outgrew a number an operator
+   * chose. The heap guard catches one that outgrew the number the estimate PREDICTED
+   * — a path longer than the 120 bytes charged for it, a V8 representation that
+   * costs more than the 48-byte slot assumed, anything the estimator got wrong. Both
+   * belong at the single admission point, because that is the only place the set
+   * grows, and both set `capExceeded`, which `shouldStop` reads: a breached tenant
+   * stops READING rather than merely stopping admitting.
    */
   const offer = (
     value: unknown,
@@ -840,7 +1230,39 @@ export async function collectTenantReferenceSet(
     }
     if (isNew) {
       retainPaths.add(resolved.objectPath);
-      if (retainPaths.size > maxReferences) capExceeded = true;
+      admittedSinceHeapSample += 1;
+
+      if (retainPaths.size > maxReferences) {
+        // Unchanged from the shipped behaviour (Req 8.16); only the `capBreach`
+        // label is new.
+        capExceeded = true;
+        capBreach = 'configured';
+      } else if (admittedSinceHeapSample >= HEAP_GUARD_SAMPLE_INTERVAL) {
+        admittedSinceHeapSample = 0;
+        const heap = readHeapUsage();
+        // Recorded as GIVEN, so the report states what the guard compared. `null`
+        // for an unusable reading rather than a substituted default: a limit we
+        // could not read is a fact worth reporting, and a default standing in for
+        // it would hide the one signal that tells an operator `NODE_OPTIONS` never
+        // reached the process.
+        heapLimitBytes =
+          typeof heap.limitBytes === 'number' && Number.isFinite(heap.limitBytes)
+            ? heap.limitBytes
+            : null;
+        // BOTH conditions, and neither is inline (Req 8.8, 8.17, 8.18):
+        //   usedBytes > HEAP_GUARD_FLOOR_BYTES (128 MiB)
+        //   AND usedBytes > 0.7 × limitBytes
+        // A reading at or below the floor keeps collecting whatever fraction of the
+        // reported limit it represents, so a misreported one-byte limit cannot abort
+        // a tenant holding a handful of references; and a non-finite or non-positive
+        // limit is likewise NOT a breach — an unreadable limit is not evidence of a
+        // memory problem, and that input was already settled at start-up by the
+        // runner's Req 8.6 refusal.
+        if (exceedsHeapGuard(heap.usedBytes, heap.limitBytes)) {
+          capExceeded = true;
+          capBreach = 'memory_guard';
+        }
+      }
     }
   };
 
@@ -865,20 +1287,39 @@ export async function collectTenantReferenceSet(
     emails.add(trimmed.toLowerCase());
   };
 
-  /** `where('tenantId','==',t)` over one collection, one query, read-only. */
+  /**
+   * `where('tenantId','==',t)` over one collection, KEYSET-PAGINATED, read-only.
+   *
+   * The whole body is `forEachQueryDocPaged`; this closure only supplies the two
+   * things the walk cannot know — which Reference_Source the pages belong to, and
+   * that "stop" means "the retain-set ceiling has been breached". So all seven
+   * Firestore Reference_Sources are paginated by paginating one place (Req 3.1,
+   * 3.8), and `pagesBySource` is accumulated where the source id is in scope.
+   *
+   * `shouldStop` is `capExceeded`, which `offer` sets the moment the ceiling is
+   * breached. Feeding it in here is what turns the ceiling from "stop admitting"
+   * into "stop reading": without it a breached tenant would still page through the
+   * remaining collections to grow a set it has already refused. It costs nothing in
+   * fidelity, because `offer` already returns early on `capExceeded` — so the
+   * retain set, the fingerprint and every per-source count are identical whether
+   * the reads stop or continue.
+   */
   const forEachTenantDoc = async (
+    sourceId: ReferenceSourceId,
     collection: string,
     handler: (data: unknown, docId: string) => void
   ): Promise<void> => {
-    const snapshot = await db.collection(collection).where('tenantId', '==', tenantId).get();
-    snapshot.forEach((doc) => {
-      let data: unknown;
-      try {
-        data = doc.data();
-      } catch {
-        data = undefined;
-      }
-      handler(data, doc.id);
+    await forEachQueryDocPaged({
+      db,
+      collection,
+      field: 'tenantId',
+      value: tenantId,
+      pageSize: firestorePageSize,
+      shouldStop: () => capExceeded,
+      handler,
+      onPage: () => {
+        pagesBySource[sourceId] += 1;
+      },
     });
   };
 
@@ -978,7 +1419,7 @@ export async function collectTenantReferenceSet(
 
   // ── Source 2: videoTranscodes ─────────────────────────────────────────────
   await runSource('video_transcodes', async () => {
-    await forEachTenantDoc('videoTranscodes', (data) => {
+    await forEachTenantDoc('video_transcodes', 'videoTranscodes', (data) => {
       // The OUTPUT is retained at every `status`, `'error'` included:
       // `/video/request-transcode` returns a `transcodedUrl` regardless of status
       // and repairs the status afterwards, so `status` is not a liveness signal
@@ -1002,7 +1443,7 @@ export async function collectTenantReferenceSet(
   // ── Source 3: sharedFiles ─────────────────────────────────────────────────
   // A share document can outlive its message, so it is an independent proof.
   await runSource('shared_files', async () => {
-    await forEachTenantDoc('sharedFiles', (data) => {
+    await forEachTenantDoc('shared_files', 'sharedFiles', (data) => {
       const file = readField(data, 'file');
       offer(readField(file, 'url'), 'shared_files', false);
       offer(readField(file, 'thumbnailUrl'), 'shared_files', false);
@@ -1020,7 +1461,7 @@ export async function collectTenantReferenceSet(
   // value keeps a stray shape from being counted as a Malformed_Reference, which
   // would abort the tenant.
   await runSource('fees', async () => {
-    await forEachTenantDoc('fees', (data) => {
+    await forEachTenantDoc('fees', 'fees', (data) => {
       const receipts = readField(data, 'receipts');
       if (Array.isArray(receipts)) {
         for (const entry of receipts) {
@@ -1042,7 +1483,7 @@ export async function collectTenantReferenceSet(
 
   // ── Source 5: notices ─────────────────────────────────────────────────────
   await runSource('notices', async () => {
-    await forEachTenantDoc('notices', (data) => {
+    await forEachTenantDoc('notices', 'notices', (data) => {
       offer(readField(data, 'imageUrl'), 'notices', false);
       offer(readField(data, 'audioUrl'), 'notices', false);
       // `imageStoragePath` is read DESPITE being absent from `types/notice.ts`:
@@ -1060,7 +1501,7 @@ export async function collectTenantReferenceSet(
   // job filters `status == 'active'` for its counts; copying that filter here
   // would delete a suspended student's photo and make reinstatement lossy.
   await runSource('students', async () => {
-    await forEachTenantDoc('students', (data) => {
+    await forEachTenantDoc('students', 'students', (data) => {
       offer(readField(data, 'profileImageUrl'), 'students', false);
     });
   });
@@ -1121,10 +1562,10 @@ export async function collectTenantReferenceSet(
     // Memberships are soft-revoked, never hard-deleted (`app.ts` sets
     // `status: 'revoked'` with a `statusHistory` entry), so a departed member's
     // row survives and their avatar stays retained. ANY status is read.
-    await forEachTenantDoc('tenantMemberships', (data) => {
+    await forEachTenantDoc('profile_pictures_derived', 'tenantMemberships', (data) => {
       collectEmail(readField(data, 'email'));
     });
-    await forEachTenantDoc('tenantProfiles', (data) => {
+    await forEachTenantDoc('profile_pictures_derived', 'tenantProfiles', (data) => {
       collectEmail(readField(data, 'email'));
       // A second, independent proof — used in addition to the derivation, never
       // instead of it.
@@ -1186,6 +1627,10 @@ export async function collectTenantReferenceSet(
           ? 'reference_cap_exceeded'
           : null;
 
+  // What the set this collector built is estimated to cost (Req 8.4). An
+  // over-estimate by construction — see `estimateRetainSetFootprintBytes`.
+  const footprintEstimateBytes = estimateRetainSetFootprintBytes(retainPaths.size);
+
   // Counts, the fingerprint and the abort reason only: no object path, no
   // filename, no email address, no download token.
   console.log('[orphan_sweep] references collected', {
@@ -1193,10 +1638,17 @@ export async function collectTenantReferenceSet(
     total: retainPaths.size,
     fingerprint: referenceFingerprint.slice(0, 8),
     countsBySource,
+    pagesBySource,
+    firestorePageSize,
     crossTenantReferences: crossTenantReferenceCount,
     malformedReferences,
     failedSources: failedSources.map((entry) => entry.id),
     abortReason,
+    // Which ceiling bound, and the two numbers behind it. `null` for a tenant that
+    // breached neither and for a tenant never large enough to be sampled.
+    capBreach,
+    footprintEstimateBytes,
+    heapLimitBytes,
   });
 
   return {
@@ -1204,6 +1656,7 @@ export async function collectTenantReferenceSet(
     retainPaths,
     referenceFingerprint,
     countsBySource,
+    pagesBySource,
     derivedPaths,
     transcodeOnlyReferences: Array.from(transcodeOnlySample),
     transcodeOnlyReferenceCount,
@@ -1212,6 +1665,9 @@ export async function collectTenantReferenceSet(
     malformedReferences,
     failedSources,
     abortReason,
+    capBreach,
+    footprintEstimateBytes,
+    heapLimitBytes,
   };
 }
 
@@ -1281,12 +1737,104 @@ export interface SweepConfig {
   pageSize: number;
   maxQuarantinePerTenant: number;
   maxReferences: number;
+  /**
+   * Documents per Firestore page for the seven Reference_Sources and for the
+   * active-tenant query (Req 3.12, 3.13).
+   *
+   * OPTIONAL here and REQUIRED on `ResolvedSweepConfig`, so no existing caller of
+   * this exported shape has to change while everything downstream of the resolver
+   * reads a real number. Absent ⇒ `DEFAULT_FIRESTORE_PAGE_SIZE`.
+   */
+  firestorePageSize?: number;
+  /**
+   * The report-write cadence (Reqs 7.1, 7.2, 7.11, 7.12). The page interval is the
+   * **upper** bound on write frequency, the time interval the **lower** bound.
+   *
+   * OPTIONAL here and REQUIRED on `ResolvedSweepConfig`, exactly like
+   * `firestorePageSize`, so no existing caller of this exported shape has to change
+   * while everything downstream of the resolver reads a real number. Absent ⇒ the
+   * documented defaults from `lib/sweepScaleLimits.ts`.
+   */
+  reportWritePages?: number;
+  reportWriteMs?: number;
+  /**
+   * Req 7.3 — objects quarantined since the last Report_Document write that force
+   * one. **Mode-independent** (Req 7.16): there is no Report_Mode override and none
+   * may be added, because `movedSinceWrite` is simply always `0` in a mode that
+   * moves no object.
+   *
+   * Resolved to **at least 1** below, never to zero (Req 7.21). See the resolver.
+   */
+  quarantineWriteThreshold?: number;
+  /**
+   * The Heap_Limit the **runner** observed in-process at start-up (Req 8.5), in
+   * bytes, forwarded so the Report_Document's `params` can record what the
+   * pre-flight refusal of Req 8.6 was decided against (Req 8.13).
+   *
+   * OPTIONAL, and absent means "no reading was taken" rather than "the limit is
+   * zero": `params.heapLimitBytes` then records the collector's own mid-collection
+   * reading, or `null`. Every existing caller of this exported shape keeps
+   * compiling and records `null`, which is the honest value for a run whose limit
+   * nobody read.
+   *
+   * It is a reading rather than a knob. Nothing in this module compares against it
+   * — the mid-collection guard uses the collector's own `readHeapUsage` reading, so
+   * a stale start-up number cannot decide a tenant's fate — and no environment
+   * variable sets it.
+   *
+   * `null` is accepted as well as absent, so a caller that read and got nothing
+   * usable can say so rather than having to drop the field.
+   */
+  heapLimitBytes?: number | null;
+  /**
+   * The Run_Lease duration in force for this run, in milliseconds, or `null`/absent
+   * when **no lease was installed** — which is the parent suite's configuration and
+   * every direct invocation of this core.
+   *
+   * ── ECHOED, never resolved here, and that is Req 5.16 in the type system ─────
+   *
+   * The clamp that decides this number is `clampRunLeaseMs`, and it lives in
+   * `jobs/storageOrphanSweepLease.ts`. Resolving it here would mean importing that
+   * module, and the import direction is **lease → core**, never the reverse: the
+   * core must stay structurally incapable of depending on the lease so that "every
+   * guarantee `storage-orphan-cleanup` states holds whether or not a Run_Lease was
+   * acquired" is a fact about the module graph rather than a claim in a comment.
+   *
+   * So the runner clamps once and passes the resolved number down, exactly as it
+   * does with `heapLimitBytes` — a value observed elsewhere and recorded here
+   * (Req 5.16, and the `params.leaseMs` field of task 9.2).
+   */
+  leaseMs?: number | null;
+  /**
+   * The Lease_Token of the execution writing this report, or `null` when no lease
+   * was installed.
+   *
+   * This is the field that would have made the shipped overlap diagnosable: a
+   * Report_Document whose `leaseToken` differs from the token in a run's start-up
+   * log line is a report written by **another** execution. It is bookkeeping about
+   * this job and no part of it is a credential — holding the token grants no access
+   * to anything; it only identifies which execution may renew or release the lease
+   * (see `RunLeaseDoc` in the lease module), which is also why the runner may log
+   * it.
+   *
+   * Echoed for the same reason `leaseMs` is.
+   */
+  leaseToken?: string | null;
   /** Re-run a tenant already recorded `completed`. */
   force?: boolean;
   runnerId: string;
   /** Injected ONCE per run so a multi-hour sweep uses one grace cutoff throughout. */
   nowMs?: number;
-  /** Overridden only by tests; otherwise minted once per run. */
+  /**
+   * Minted once per run when absent.
+   *
+   * Supplied by the **runner** in production since task 9.2, not only by tests: the
+   * Run_Lease document records the run's Sweep_Id so a Report_Document and the lease
+   * that produced it can be tied together, and the lease is acquired before this core
+   * is entered (Req 5.1) — so the id has to exist before then. The runner mints it
+   * with the exported `mintSweepId` and passes the same value here, which is what
+   * makes the lease's `sweepId` and every report's `sweepId` the same string.
+   */
   sweepId?: string;
 }
 
@@ -1294,6 +1842,32 @@ export interface SweepConfig {
 export interface ResolvedSweepConfig extends SweepConfig {
   nowMs: number;
   sweepId: string;
+  /** Resolved through `normalisePositiveInt`, so never zero and never non-finite. */
+  firestorePageSize: number;
+  /** Resolved (Req 7.12). Recorded in the Report_Document's `params` (Req 7.13). */
+  reportWritePages: number;
+  reportWriteMs: number;
+  /**
+   * Resolved, and **floored at 1** (Req 7.21) — see the resolver in
+   * `runStorageOrphanSweep` for why the floor is not belt-and-braces.
+   */
+  quarantineWriteThreshold: number;
+  /**
+   * The runner's start-up Heap_Limit reading, or `null` when no usable reading was
+   * supplied (Req 8.13). Resolved to `null` rather than left `undefined` so the
+   * Report_Document records the field on every write — an absent field and an
+   * unreadable limit are different facts, and only the second is worth a `null`.
+   */
+  heapLimitBytes: number | null;
+  /**
+   * The Run_Lease duration in force, or `null` when no lease was installed
+   * (task 9.2). Resolved to `null` rather than left `undefined` for the same reason
+   * `heapLimitBytes` is: the Report_Document then records the field on every write,
+   * and "no lease was installed" is a fact worth recording rather than an absence.
+   */
+  leaseMs: number | null;
+  /** The writing execution's Lease_Token, or `null` when no lease was installed. */
+  leaseToken: string | null;
   graceCutoffMs: number;
   /** `mode === 'sweep' && apply === true` — the ONLY combination that mutates. */
   applyMode: boolean;
@@ -1301,7 +1875,30 @@ export interface ResolvedSweepConfig extends SweepConfig {
 
 export interface TenantSweepResult {
   tenantId: string;
-  status: 'completed' | 'aborted' | 'in_progress';
+  /**
+   * ── `'failed'` is an ADDITIVE widening, and it is not `'in_progress'` ───────
+   *
+   * `'failed'` is a Tenant_Sweep_Failure: this tenant's sweep raised rather than
+   * reaching `completed` or `aborted`, and `runStorageOrphanSweep`'s per-tenant
+   * confinement recorded it and carried on with the next tenant (Req 1.1, 1.7,
+   * 9.14). The recorded meaning of `'completed'`, `'aborted'` and `'in_progress'`
+   * is unchanged, and `sweepTenant` itself still returns only `'completed'` or
+   * `'aborted'` — the confinement is the sole producer of `'failed'`.
+   *
+   * Reusing `'in_progress'` would have been free in the type system and actively
+   * misleading to the operator the confinement exists for: a Report_Document
+   * reading `in_progress` for a tenant that failed reads as "a run is still
+   * going", which is the one thing that tenant is not doing.
+   *
+   * Every site that reads a *recorded* status discriminates on equality with
+   * `'completed'` — the `force`-false early return, `freshStart`, and
+   * `countersFromProgress` (which does not branch on status at all) — so a
+   * recorded `'failed'` inherits the persisted cursor and counters and re-lists,
+   * exactly as `'in_progress'` does (Req 1.13, 1.14, 9.13). Rewriting any of
+   * those three as an inequality against `'in_progress'` would treat a `'failed'`
+   * document as recorded-and-done and skip that tenant forever. Do not.
+   */
+  status: 'completed' | 'aborted' | 'in_progress' | 'failed';
   abortReason?: SweepAbortReason;
   mode: 'report' | 'sweep';
   applied: boolean;
@@ -1327,6 +1924,41 @@ export interface TenantSweepResult {
   usageBytesAfter: number | null;
   /** Set when the recompute or its write failed; the run is still `completed`. */
   usageError?: string;
+  /**
+   * The coerced thrown value, on a `status: 'failed'` result and nowhere else
+   * (Req 1.3). Optional, so every existing field and every existing constructor
+   * of this interface is unchanged (Req 9.7).
+   *
+   * Coerced through `describeThrownValue`, so a thrown `null`, a symbol and an
+   * object whose `message` getter throws each yield a non-empty, length-bounded
+   * string (Req 1.2). It is the operator's only diagnostic for a tenant that was
+   * not swept, and it may carry whatever the thrower put in it — which is exactly
+   * why it never reaches a metric label (Req 10.2).
+   */
+  failureMessage?: string;
+  /**
+   * WHICH reference ceiling bound, on a result whose `abortReason` is
+   * `'reference_cap_exceeded'` and nowhere else (Req 8.9).
+   *
+   * Optional, so every existing field and every existing constructor of this
+   * interface is unchanged (Req 9.7). Purely DIAGNOSTIC: `'configured'` and
+   * `'memory_guard'` abort identically and quarantine nothing, which is exactly why
+   * `SweepAbortReason` keeps its five values rather than gaining a sixth (Req 8.10,
+   * 8.12) — the distinction an operator needs is "which limit did I hit", and that
+   * is a field, not an outcome.
+   */
+  capBreach?: 'configured' | 'memory_guard';
+  /**
+   * Report_Document writes this process issued for this tenant, including the
+   * terminal one (Req 7.8, 7.18).
+   *
+   * Optional, so every existing field and every existing constructor of this
+   * interface is unchanged (Req 9.7). What an operator reads it for: a count far
+   * below the tenant's page count is the evidence that batching is in force, and a
+   * count equal to the page count means the cadence collapsed — see
+   * `params.quarantineWriteThreshold`, whose recorded `0` would be the cause.
+   */
+  reportWrites?: number;
 }
 
 /**
@@ -1639,6 +2271,51 @@ export interface SweepTenantArgs {
    * invalidation is the runner's concern, not this module's.
    */
   invalidateLiveCount?: (cacheKey: string) => void | Promise<void>;
+  /**
+   * The LIVE clock, defaulting to `Date.now`, read by the report-write scheduler
+   * and by **nothing else** (Req 7.2).
+   *
+   * ── Why it is named `now` and not `clock`, and why that matters ─────────────
+   *
+   * `config.nowMs` is frozen for the whole run **on purpose**: the parent design
+   * freezes it so a multi-hour sweep cannot have its Grace_Cutoff drift underneath
+   * it and start judging objects it retained an hour earlier. This seam is the
+   * opposite thing — a live reading, needed because the Report_Write_Time_Interval
+   * is a *lower* bound on write frequency and a frozen clock would make
+   * `msSinceWrite` permanently `0`.
+   *
+   * The name is deliberately the narrow one. A future edit that reached for this
+   * seam to compute a cutoff — `graceCutoffMs`, a `retainedUntil`, a manifest
+   * timestamp — would silently break the parent spec's Property 5, because two
+   * pages of one listing would then be judged against two different cutoffs and
+   * nothing would fail loudly. Everything time-like that must agree across the run
+   * reads `config.nowMs`; only the cadence reads this.
+   */
+  now?: () => number;
+  /**
+   * `assertSweepInvariants`, injectable so Req 7.10's cadence is COUNTABLE.
+   *
+   * ── Why a seam rather than a spy on the export ─────────────────────────────
+   *
+   * Req 7.10 is "the per-page invariant check is evaluated on every listing page,
+   * independently of the Report_Document write interval" — a claim about a *count*,
+   * not about an outcome, and the check is deliberately side-effect-free unless it
+   * throws. The call below resolves the module-local declaration, so a spy on the
+   * module's export never sees it; without this seam the only observable would be
+   * the page count, which is the very thing the claim relates the count to.
+   *
+   * Same posture and same reason as `invalidateLiveCount`: the seam exists so the
+   * requirement is expressible and testable. Nothing in production passes it — the
+   * runner does not, `runStorageOrphanSweep` only forwards what it was given — so
+   * the default IS the behaviour, and a replacement that swallowed a violation
+   * could only ever be installed by a test.
+   *
+   * Do not use it to *change* the check. It is `typeof assertSweepInvariants` so a
+   * substitute must accept exactly the same five arguments, and Property 8 counts
+   * calls while delegating to the real function, which is what keeps the count
+   * honest about the check that actually ran.
+   */
+  assertInvariants?: typeof assertSweepInvariants;
 }
 
 /**
@@ -1660,6 +2337,12 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
   const { bucket, db, references, config } = args;
   const tenantId = args.tenantId;
   const reportRef = db.doc(tenantReportPath(tenantId));
+  // See `SweepTenantArgs.now`: the LIVE clock, for the write cadence and nothing
+  // else. `config.nowMs` stays the frozen one every verdict is judged against.
+  const now = args.now ?? Date.now;
+  // See `SweepTenantArgs.assertInvariants`. The default is the behaviour; the seam
+  // exists so Property 8 can COUNT the per-page evaluations Req 7.10 requires.
+  const assertInvariants = args.assertInvariants ?? assertSweepInvariants;
   const metricLabels: SweepMetricLabels = { tenant_id: tenantId, mode: config.mode };
 
   // One of the two alerted signals (Req 16.13), emitted BEFORE the gate so an
@@ -1692,6 +2375,14 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
     references.abortReason ??
     (references.retainPaths.size > config.maxReferences ? 'reference_cap_exceeded' : null);
 
+  // WHICH ceiling bound (Req 8.9), for the result and the report. The collector's own
+  // label when it set one; `'configured'` when THIS gate's own `size > maxReferences`
+  // comparison is what caught it, which is the only way a cap abort arrives here
+  // unlabelled. `undefined` for the other four abort reasons: `capBreach` is
+  // meaningful only alongside `reference_cap_exceeded`.
+  const gateCapBreach: 'configured' | 'memory_guard' | undefined =
+    gateReason === 'reference_cap_exceeded' ? (references.capBreach ?? 'configured') : undefined;
+
   if (gateReason) {
     const result: TenantSweepResult = {
       tenantId,
@@ -1704,6 +2395,9 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
       danglingReferenceCount: 0,
       usageBytesBefore: null,
       usageBytesAfter: null,
+      capBreach: gateCapBreach,
+      // The gate's own write, and the only one a pre-listing abort issues.
+      reportWrites: 1,
     };
     await writeTenantReport({
       reportRef,
@@ -1711,6 +2405,7 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
       config,
       status: 'aborted',
       abortReason: gateReason,
+      capBreach: gateCapBreach ?? null,
       resume: null,
       counters: emptyCounters(),
       danglingReferenceCount: 0,
@@ -1719,11 +2414,13 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
       startedAt: new Date(),
       completed: false,
       lastError: null,
+      reportWrites: 1,
     });
     console.log('[orphan_sweep] tenant aborted before listing', {
       tenantId,
       mode: config.mode,
       abortReason: gateReason,
+      capBreach: gateCapBreach ?? null,
       failedSources: references.failedSources.map((entry) => entry.id),
       malformedReferences: references.malformedReferences,
       references: references.retainPaths.size,
@@ -1784,6 +2481,8 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
       danglingReferenceCount: toNonNegativeInt(progressData.danglingReferenceCount),
       usageBytesBefore: toNullableNumber(progressData.usageBytesBefore),
       usageBytesAfter: toNullableNumber(progressData.usageBytesAfter),
+      // An exact no-op re-writes nothing, so this process issued no report write.
+      reportWrites: 0,
     };
   }
 
@@ -1855,11 +2554,21 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
    */
   const quarantinedInThisRun = new Set<string>();
 
+  /**
+   * Report_Document writes this process has issued for this tenant (Req 7.8).
+   *
+   * Incremented by `persist` itself rather than by its callers, so the number the
+   * document records is the number of writes that reached Firestore — including the
+   * two terminal writes below, which do not route through `maybeWrite`.
+   */
+  let reportWrites = 0;
+
   const persist = async (
     status: 'in_progress' | 'completed' | 'aborted',
     resume: SweepResumeState | null,
     extra?: { danglingReferenceCount?: number; abortReason?: SweepAbortReason }
   ): Promise<void> => {
+    reportWrites += 1;
     await writeTenantReport({
       reportRef,
       references,
@@ -1875,7 +2584,141 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
       completed: false,
       lastError: null,
       partialFieldsOnly: status === 'in_progress',
+      reportWrites,
     });
+  };
+
+  // ══ The report-write cadence ═══════════════════════════════════════════════
+  //
+  // Three **since-the-last-write** accumulators, one per configured bound, all
+  // three reset or rebased after EVERY write. That symmetry is what makes Req 7.8's
+  // bound a consequence of `shouldWriteTenantReport` rather than of this call site.
+  //
+  // ── Why the moved-object count exists at all: TWO defects, and one trigger ──
+  //
+  // **Defect 1 — a lagging persisted counter reopens the per-tenant Quarantine
+  // ceiling.** The worked trace: ceiling 1000, page interval 10, apply mode, 100
+  // objects moved per page. Nine pages move 900 objects. The process crashes. The
+  // persisted `quarantinedCount` is still `0`, because no write has happened yet.
+  // The 900 moved objects are gone from the listing — they are under
+  // `_orphan-quarantine/` now — so the resumed run finds the NEXT 1000 candidates
+  // and moves them from an inherited base of `0`. Total: **1900 objects against a
+  // documented ceiling of 1000.**
+  //
+  // With the threshold at its default of 25, the same trace stops at the 25th move
+  // of page 1: the threshold is reached, the Report_Document is written, and at no
+  // instant does the persisted `quarantinedCount` lag the objects actually moved by
+  // 25 or more (Req 7.3). The crash-and-resume pair therefore moves at most
+  // **`ceiling + 24`** rather than `2 x ceiling` — an overshoot bounded by the
+  // THRESHOLD rather than by a whole write interval's worth of moves (Req 7.22).
+  // The inherited counter is what closes Defect 1, and a lagging inherited counter
+  // reopens it.
+  //
+  // **Defect 2 — "any page that moved an object" bounds the write count by nothing
+  // useful, and that is why the trigger counts OBJECTS rather than PAGES.** Forcing
+  // a write after *any page that quarantined one or more objects* is the obvious
+  // reading of the exception and it is a defect: bounding the resulting write count
+  // by "the number of pages that moved an object" is true and useless, because that
+  // count is itself bounded only by the ceiling. At the shipped ceiling default of
+  // 1000, a listing whose orphans are spread **one per page** produces roughly
+  // **1000 forced writes to a single Firestore document** — exactly the failure this
+  // batching exists to eliminate, reintroduced by the mechanism meant to make
+  // batching safe. Report_Mode is safe from it only incidentally, because it moves
+  // nothing and the exception is unreachable there; Apply_Mode against a backlog is
+  // the common case, not a rare one.
+  //
+  // **What protects the per-page trigger today is incidental, not designed.** A
+  // quarantining page has necessarily performed at least one copy -> `getMetadata`
+  // -> manifest write -> delete before its report write, so roughly **150–600 ms**
+  // of forced work separates two writes. On a page moving 100 objects that is
+  // seconds. On a page moving **exactly one small object** it is **2–6 report writes
+  // per second** against Firestore's guidance of roughly **one sustained write per
+  // second per document** — contention and latency on the very document the resume
+  // cursor lives on. A delay produced by unrelated I/O is not a write-rate bound.
+  //
+  // **An artificial delay between writes was considered and REJECTED** (Req 7.23).
+  // A sleep slows the sweep in order to protect a write, and it makes a run's
+  // wall-clock duration depend on a Firestore write quota — a job whose
+  // `timeoutSeconds` budget is spent waiting is a job that sweeps fewer tenants.
+  // Bounding the lag in objects removes the exposure without buying it back in
+  // latency, so **insert no delay** anywhere in this write path.
+  //
+  // ── The resulting bound, and why it is strictly better rather than a trade ───
+  //
+  // The writes attributable to moves are at most **`ceil(M / T)`** for `M` objects
+  // moved at threshold `T`, which at the ceiling is at most `ceiling / threshold` —
+  // **independently of the listing page size and of how the moved objects are
+  // distributed across pages** (Req 7.9). Both consequences beat the per-page
+  // trigger rather than trading against it: the write count falls, *and* the
+  // crash-then-resume overshoot falls from a whole interval's moves to the
+  // threshold.
+  //
+  // Worked comparison, because it is the clearest statement of the fix: a
+  // **1000-page listing at the shipped ceiling of 1000 with orphans one per page**
+  // gives `ceil(1000/25) = ` **40** move-attributable writes under the threshold,
+  // against **1000** under the rejected per-page trigger. At the first cautious
+  // apply ceiling of 25 it gives exactly **one** write on account of moves, not 25 —
+  // which is what Req 7.19 fixes the default to 25 for.
+  //
+  // Report_Mode moves nothing, so `movedSinceWrite` is always `0` there and its
+  // write count is purely interval-driven — which is the case the million-object
+  // tenant is actually in, and the case this batching exists for.
+  let pagesSinceWrite = 0;
+  let movedSinceWrite = 0;
+  let lastWriteAtMs = now();
+
+  /**
+   * ONE procedure, TWO call sites — the per-object loop and the page boundary — so
+   * `shouldWriteTenantReport` stays the only place the cadence is decided and the
+   * two sites cannot drift into two cadences.
+   *
+   * The cursor a write persists is ALWAYS `pageToken` as it currently stands: the
+   * token for the last **fully completed** page. A mid-page threshold write
+   * therefore re-persists that UNADVANCED cursor alongside counters that already
+   * include the moves made so far on the page in flight (Reqs 7.6, 7.7, 7.24). The
+   * counters may **lead** the cursor and can never **lag** it, and that asymmetry is
+   * the safe one: a resume re-examines a partially handled page, finds its
+   * already-moved objects gone from the listing, and inherits a `quarantinedCount`
+   * that is exact rather than short. Re-examination costs nothing either way — a
+   * quarantined object is no longer in the listing, and `quarantinedInThisRun`
+   * skips a re-offer without consuming ceiling budget. The threshold governs
+   * **when** a write occurs and governs **no ordering guarantee**.
+   *
+   * `status: 'in_progress'` is CORRECT here and stays: a run that is mid-listing
+   * genuinely is still going. Only the catch's terminal write records `'failed'`,
+   * so the two never compete for the field.
+   *
+   * `terminal` is never passed `true` by either call site, and that is by design
+   * rather than an oversight: Req 7.5's three terminal writes — the two
+   * `persist('aborted', …)` calls in the per-object loop, the final
+   * `writeTenantReport` below, and the catch's `lastError`-only `set` — are
+   * **unconditional**. A terminal outcome is one of the three enumerated exceptions,
+   * so the scheduler would answer `true` regardless and routing those writes through
+   * here would add nothing but a way for one of them to be skipped. The parameter
+   * exists so this procedure's argument list *is* the scheduler's `ReportWriteEvent`,
+   * which is what makes "the cadence is decided in one place" checkable by reading
+   * one call.
+   */
+  const maybeWrite = async (prefixCompleted: boolean, terminal: boolean): Promise<void> => {
+    if (
+      !shouldWriteTenantReport(
+        { pagesSinceWrite, msSinceWrite: now() - lastWriteAtMs, movedSinceWrite },
+        { prefixCompleted, terminal },
+        {
+          pageInterval: config.reportWritePages,
+          timeIntervalMs: config.reportWriteMs,
+          quarantineThreshold: config.quarantineWriteThreshold,
+        }
+      )
+    ) {
+      return;
+    }
+    await persist('in_progress', { prefixIndex, pageToken });
+    // All three, after EVERY write. Dropping `movedSinceWrite` from this reset is
+    // the edit that turns the threshold from a bound on the lag into a one-shot.
+    pagesSinceWrite = 0;
+    movedSinceWrite = 0;
+    lastWriteAtMs = now();
   };
 
   /**
@@ -2042,6 +2885,25 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
             counters.quarantinedBytes += movedBytes;
             countSweepMetric(metricNames.storageOrphanSweepQuarantined, metricLabels);
             countSweepMetric(metricNames.storageOrphanSweepQuarantinedBytes, metricLabels, movedBytes);
+
+            // ── The threshold is evaluated AFTER EACH MOVE, not only at a page
+            //    boundary, and this is the one place an implementer gets it wrong ──
+            //
+            // A boundary-only check leaves Defect 1's ceiling breach **fully open**
+            // in the worst case: `config.pageSize` defaults to **1000 objects**, so a
+            // listing whose orphans cluster on one page can move up to the **entire
+            // ceiling** within a single page and crash before the boundary check ever
+            // runs — persisted count `0`, resume moves a further ceiling, total
+            // `2 x ceiling`. That is the identical breach the exception exists to
+            // close, so Req 7.3's "lags by fewer than the Quarantine_Write_Threshold"
+            // and Req 7.22's "at most that threshold" are only satisfiable by a
+            // PER-MOVE evaluation.
+            //
+            // `pageToken` is unadvanced here, so this write cannot move the cursor
+            // forward — see `maybeWrite` for why leading counters are the safe
+            // asymmetry.
+            movedSinceWrite += 1;
+            await maybeWrite(false, false);
           } else {
             counters.quarantineFailures += 1;
             countSweepMetric(metricNames.storageOrphanSweepQuarantineFailures, metricLabels);
@@ -2051,20 +2913,43 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
         // The page's work is complete; ONLY NOW does the cursor advance. Persisting
         // after the mutation rather than before is the `offlineDevicePrune`
         // ordering: a mid-run failure leaves the last SUCCESSFUL cursor intact, and
-        // the worst case is re-examining one page (Req 13.5).
+        // the worst case is re-examining one page (Req 13.5). The cursor and the
+        // counters still travel in the SAME write (Req 7.24) — that is what makes
+        // batching remove write points without desynchronising the two, so an
+        // interruption can cause a page to be re-examined and can never cause an
+        // object to be skipped.
         pageToken = page.nextPageToken;
-        await persist('in_progress', { prefixIndex, pageToken });
+        pagesSinceWrite += 1;
+        // Req 7.4 — a finished Managed_Category prefix forces a write.
+        const prefixCompleted = pageToken === null;
 
         // Every candidate is moved, failed, or blocked by the ceiling — never
         // silently dropped (Req 13.16) — and the retain set has not moved
         // underneath the listing (Property 14).
-        assertSweepInvariants(
+        //
+        // ── MOVED ABOVE THE CONDITIONAL WRITE, and run on EVERY page (Req 7.10) ──
+        //
+        // It is a programming-error detector for a dropped object; gating it on the
+        // write interval would make it fire on one page in ten. The reorder has one
+        // behaviour consequence worth recording: the shipped code wrote first, so a
+        // violation left the *advanced* cursor persisted; now it leaves the
+        // *previous* cursor, which is strictly more conservative — the page whose
+        // accounting failed is re-examined rather than skipped.
+        //
+        // **Its cadence stays per PAGE and the threshold does not touch it.** A
+        // threshold write can land BETWEEN two invariant checks; that costs nothing,
+        // because a violation detected at the following boundary still leaves an
+        // unadvanced cursor persisted. Do NOT add an invariant evaluation to the
+        // per-move path to "match" the write.
+        assertInvariants(
           tenantId,
           counters,
           retainPaths.size,
           retainPathsSizeAtStart,
           inheritedCounters
         );
+
+        await maybeWrite(prefixCompleted, false);
 
         if (pageToken === null) break;
       }
@@ -2074,13 +2959,27 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
   } catch (error) {
     // The previous page's cursor and counters stay exactly as they were: this
     // write touches `lastError` and nothing else (Req 13.13, 13.14). The error
-    // then propagates so the runner exits non-zero and the Cloud Run task is
-    // visibly failed (Req 13.15).
+    // then propagates — now into `runStorageOrphanSweep`'s per-tenant confinement
+    // rather than into `main().catch`, so every later tenant is still swept while
+    // the runner still exits non-zero (Req 1.1, 2.1, parent Req 13.15).
     const message = describeThrownValue(error);
     try {
       await reportRef.set(
         stripUndefinedDeep({
-          status: 'in_progress',
+          // ── The ONE place a Report_Document comes to record `'failed'` ──────
+          //
+          // One changed value (Req 1.7). Everything else about this write is
+          // unchanged — still `status`, `lastError`, `runnerId`, `updatedAt` and
+          // nothing else — which is what keeps the previous page's cursor and
+          // counters standing exactly as the failing attempt left them (Req 1.6).
+          //
+          // `'in_progress'` would read as "a run is still going" for a tenant that
+          // has stopped, and would be indistinguishable from a genuinely
+          // mid-listing document. A reader that predates `'failed'` still parses
+          // every other field and falls into its non-`'completed'` branch, so it
+          // resumes this tenant from its cursor: correct behaviour, arrived at by
+          // not recognising the value (Req 9.15).
+          status: 'failed',
           lastError: message,
           runnerId: config.runnerId,
           updatedAt: new Date(),
@@ -2096,6 +2995,20 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
     // rethrow, which is the last moment this process can say anything — and the
     // partial counters are flushed with it, so the objects this attempt DID examine
     // are not lost to the crash.
+    //
+    // ── DO NOT "FIX" THE LABEL VALUE BELOW ───────────────────────────────────
+    //
+    // `outcome` stays `in_progress` even though the document just written and the
+    // `TenantSweepResult` the confinement records both say `'failed'` (Req 1.15,
+    // 10.12). The divergence is deliberate, because the two have different
+    // consumers: the document is read by the resume path and by a human, both
+    // inside this repository; this label is matched by a log-based metric filter
+    // deployed in `infra/monitoring/`, which cannot be updated transactionally
+    // with a deploy. Renaming it would change a deployed metric label value.
+    //
+    // This is also the `runs_total` line for this tenant for this invocation
+    // (Req 1.9): the confinement site that catches this rethrow must NOT emit
+    // another one, or every confined listing failure doubles the line.
     logTenantMetricDeltas();
     emitSweepMetric(
       metricNames.storageOrphanSweepRuns,
@@ -2176,6 +3089,11 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
 
   const status: 'completed' | 'aborted' = abortReason === null ? 'completed' : 'aborted';
 
+  // Req 7.5's terminal write, unchanged apart from carrying the write count. It does
+  // NOT route through `maybeWrite`: a terminal outcome is one of the three
+  // enumerated exceptions, so the scheduler would return `true` unconditionally and
+  // asking it would only add a way for this write to be skipped.
+  reportWrites += 1;
   await writeTenantReport({
     reportRef,
     references,
@@ -2190,6 +3108,7 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
     startedAt,
     completed: true,
     lastError: usageError,
+    reportWrites,
   });
 
   // Counts and reasons only: no object path, no filename, no email address, no
@@ -2236,6 +3155,11 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
     metricLabels,
     danglingReferenceCount
   );
+  // Req 10.6 — the number that says batching is in force, at INFO and not alerted
+  // on: a count near the tenant's page count means the cadence collapsed. A per-RUN
+  // figure like the dangling total, not a delta, and emitted through the same
+  // one-shot pair, so the counter and the line move exactly once together.
+  emitSweepMetric(metricNames.storageOrphanSweepReportWrites, metricLabels, reportWrites);
   emitSweepMetric(metricNames.storageOrphanSweepRuns, { ...metricLabels, outcome: status }, 1);
 
   return {
@@ -2250,6 +3174,7 @@ export async function sweepTenant(args: SweepTenantArgs): Promise<TenantSweepRes
     usageBytesBefore,
     usageBytesAfter,
     ...(usageError ? { usageError } : {}),
+    reportWrites,
   };
 }
 
@@ -2383,8 +3308,24 @@ async function writeTenantReport(args: {
   reportRef: ReturnType<Firestore['doc']>;
   references: TenantReferenceSet;
   config: ResolvedSweepConfig;
-  status: 'in_progress' | 'completed' | 'aborted';
+  /**
+   * Widened to match `TenantSweepResult.status` (Req 9.14). No caller passes
+   * `'failed'` today: the one Report_Document that comes to record it is written
+   * by `sweepTenant`'s own catch, which sets `status`, `lastError`, `runnerId` and
+   * `updatedAt` with `{ merge: true }` and deliberately does not route through
+   * here — that is what keeps the previous page's cursor and counters standing
+   * (Req 1.6). The union is widened anyway so the two status fields cannot drift
+   * apart.
+   */
+  status: 'in_progress' | 'completed' | 'aborted' | 'failed';
   abortReason: SweepAbortReason | null;
+  /**
+   * Which reference ceiling bound (Req 8.9), when one did. Passed explicitly only by
+   * the pre-listing gate, which is the one site that can resolve the collector's
+   * label against its own `size > maxReferences` comparison; every other call site
+   * omits it and the collector's own value is recorded.
+   */
+  capBreach?: 'configured' | 'memory_guard' | null;
   resume: SweepResumeState | null;
   counters: SweepCounters;
   danglingReferenceCount: number | null;
@@ -2399,6 +3340,11 @@ async function writeTenantReport(args: {
    * untouched, rather than writing a zero over a previous run's real value.
    */
   partialFieldsOnly?: boolean;
+  /**
+   * Report_Document writes issued for this tenant so far, INCLUDING this one
+   * (Req 7.8). A progress field, so it is written on a mid-listing write too.
+   */
+  reportWrites: number;
 }): Promise<void> {
   const { config, counters, references } = args;
   const now = new Date();
@@ -2410,6 +3356,20 @@ async function writeTenantReport(args: {
     applied: config.applyMode,
     sweepId: config.sweepId,
     runnerId: config.runnerId,
+    // ── Which EXECUTION wrote this, not merely which runner (Req 5.19's diagnostic) ──
+    //
+    // `runnerId` names a deployment; `leaseToken` names one process's Run_Lease. It
+    // is the field that would have made the shipped overlap diagnosable: a report
+    // whose `leaseToken` differs from the token in a run's start-up log line is a
+    // report written by ANOTHER execution — which, before the lease, was a state an
+    // operator could only detect by listing `_orphan-quarantine/{tenantId}/` and
+    // comparing Sweep_Id folders by eye.
+    //
+    // `null` when no lease was installed, which is every direct invocation of this
+    // core. No requirement mandates this field and no task bullet asks for it; it is
+    // specified in `design.md`'s "New Report_Document fields" table, so it is written
+    // here rather than left for a later reader to conclude the write was forgotten.
+    leaseToken: config.leaseToken ?? null,
     referenceFingerprint: references.referenceFingerprint,
     params: {
       graceDays: config.graceDays,
@@ -2418,10 +3378,48 @@ async function writeTenantReport(args: {
       pageSize: config.pageSize,
       maxQuarantinePerTenant: config.maxQuarantinePerTenant,
       maxReferences: config.maxReferences,
+      // The RESOLVED value, not the configured one (Req 3.14): `parsePositiveIntEnv`
+      // and `normalisePositiveInt` both fall back to the documented default rather
+      // than to zero, so this is what was actually in force.
+      firestorePageSize: config.firestorePageSize,
+      // Req 7.13 — the write cadence actually in force, so an operator reading a
+      // report can see it rather than infer it from `reportWrites`. All three are
+      // RESOLVED values: `quarantineWriteThreshold` recorded as `0` would be the
+      // visible symptom of a collapsed cadence, which is why the resolver floors it
+      // at 1 (Req 7.21) and why this field is worth having.
+      reportWritePages: config.reportWritePages,
+      reportWriteMs: config.reportWriteMs,
+      quarantineWriteThreshold: config.quarantineWriteThreshold,
+      // ── Req 8.13, the same three numbers the runner logs at start-up (Req 8.14) ──
+      //
+      // `maxReferences` above is the resolved ceiling; this is what that ceiling is
+      // estimated to COST, so a report states what was compared rather than only that
+      // something was. Derived from the ceiling — NOT from `references.retainPaths.size`
+      // — deliberately: it is a run PARAMETER, it belongs beside `maxReferences`, and it
+      // is the exact number the pre-flight refusal of Req 8.6 was decided against. The
+      // per-tenant figure for the set actually collected travels separately, on
+      // `TenantReferenceSet.footprintEstimateBytes`.
+      footprintEstimateBytes: estimateRetainSetFootprintBytes(config.maxReferences),
+      // The OBSERVED limit, `null` when nothing usable was observed. The runner's
+      // start-up reading when it supplied one — that is the reading Req 8.6's refusal
+      // compared — otherwise the collector's own last mid-collection reading, so a core
+      // invoked directly still records what the guard compared rather than nothing.
+      heapLimitBytes: config.heapLimitBytes ?? references.heapLimitBytes ?? null,
+      // The Run_Lease duration in force, `null` when NO lease was installed — which
+      // is the honest value for every direct invocation of this core and for the
+      // whole parent suite (Req 5.16). Echoed from the runner rather than resolved
+      // here; see `SweepConfig.leaseMs` for why this module must not import the
+      // clamp.
+      leaseMs: config.leaseMs ?? null,
       nowMs: config.nowMs,
       force: config.force === true,
     },
     countsBySource: references.countsBySource,
+    // Additive. Non-zero for every source that has data is the cheapest signal that
+    // no walk stopped after one page; `?? {}` for the same reason
+    // `transcodeOnlyReferences` carries one — a caller holding an older
+    // `TenantReferenceSet` shape writes an empty map rather than an `undefined`.
+    pagesBySource: references.pagesBySource ?? {},
     referenceCount: references.retainPaths.size,
     derivedReferenceCount: references.derivedPaths ? references.derivedPaths.size : 0,
     resume: args.resume,
@@ -2443,6 +3441,22 @@ async function writeTenantReport(args: {
     // Non-empty `failedSources` means the orphan count is not authoritative.
     partial: references.failedSources.length > 0,
     abortReason: args.abortReason,
+    // Additive (Req 8.9, 9.6), and `null` rather than absent for every run that
+    // breached no ceiling: a reader distinguishing "no breach" from "a field this
+    // writer did not know about" is exactly what an additive field owes it.
+    // Meaningful only alongside `abortReason === 'reference_cap_exceeded'`.
+    //
+    // An EXPLICIT `null` from the caller wins over the collector's own label, which
+    // is why this is an `undefined` test rather than `??`. The case is real: a tenant
+    // whose ceiling breached AND whose source failed aborts as
+    // `reference_source_failed` by the documented precedence, and recording a
+    // `capBreach` beside that abort reason would name a limit that is not the reason
+    // this tenant stopped. Only the pre-listing gate, which resolved that precedence,
+    // passes the field; every other write omits it and gets the collector's value.
+    capBreach: args.capBreach === undefined ? (references.capBreach ?? null) : args.capBreach,
+    // Additive (Req 9.6). Manual verification step 7 reads it off the report: a
+    // count far below the tenant's page count is the evidence batching is in force.
+    reportWrites: args.reportWrites,
     startedAt: args.startedAt,
     updatedAt: now,
     completedAt: args.status === 'in_progress' ? null : now,
@@ -3148,6 +4162,55 @@ export interface RunStorageOrphanSweepArgs {
   /** Only tests set these, to exercise multi-page RTDB walks cheaply. */
   conversationPageSize?: number;
   messagePageSize?: number;
+  /**
+   * The heap READING forwarded to `collectTenantReferenceSet`, unexamined, for the
+   * mid-collection guard. Defaults there to `readProcessHeapUsage`, so production
+   * passes nothing and the default is the behaviour.
+   *
+   * It exists on this shape so a property test can put the guard's crossing at a
+   * chosen admitted-reference count while driving the REAL run — which is the only
+   * way to assert that a breach quarantines nothing and stops the paged reads. The
+   * comparison it feeds is the pure `exceedsHeapGuard` either way.
+   */
+  readHeapUsage?: () => { usedBytes: number; limitBytes: number };
+  /**
+   * The LIVE clock, forwarded to `sweepTenant` for the report-write cadence and
+   * for nothing else. See `SweepTenantArgs.now` for why it is not `config.nowMs`.
+   */
+  now?: () => number;
+  /**
+   * Forwarded to `sweepTenant`, unexamined. See `SweepTenantArgs.assertInvariants`
+   * for why the seam exists and why production passes nothing.
+   */
+  assertInvariants?: typeof assertSweepInvariants;
+  /**
+   * Extend the Run_Lease and — the part that matters — **check that the recorded
+   * Lease_Token is still ours**. Called as the FIRST statement of each tenant
+   * iteration (Req 5.8). `{ ok: false }` means the lease is gone.
+   *
+   * ── OPTIONAL, and the optionality is Req 5.16 stated in the type system ──────
+   *
+   * This is the **only** coupling this core has to the Run_Lease: a zero-argument
+   * callback, injected by the runner, exactly as `quarantineObject` and
+   * `invalidateLiveCount` already are. With nothing installed the loop behaves
+   * precisely as it did before the lease existed — which makes "every guarantee
+   * `storage-orphan-cleanup` states holds independently of whether a Run_Lease was
+   * acquired" **structurally** true rather than merely asserted, because "without a
+   * lease" is literally the configuration the parent spec's entire suite runs in.
+   *
+   * Do NOT import `jobs/storageOrphanSweepLease.ts` here to "simplify" this into a
+   * handle. The import direction is lease → core, and a core that imported the lease
+   * back would break Req 5.16 at the module graph, where it is cheapest to check.
+   *
+   * ── Optional here, REQUIRED in the runner, and both are true at once ─────────
+   *
+   * "Advisory" describes what the lease *guarantees* — no correctness property
+   * depends on it — not whether it may be skipped. Once the lease is wired into the
+   * runner there is no path in which the runner sweeps a tenant without a granted
+   * lease (Req 5.22). This parameter is optional so a *test* or a direct caller can
+   * run leaseless, not so production can.
+   */
+  renewRunLease?: () => Promise<{ ok: boolean }>;
 }
 
 export interface StorageOrphanSweepRunResult {
@@ -3155,6 +4218,34 @@ export interface StorageOrphanSweepRunResult {
   /** True whenever the run could not mutate: report mode, or `apply: false`. */
   dryRun: boolean;
   sweepId: string;
+  /**
+   * The number of Tenant_Sweep_Failures — tenants recorded `status: 'failed'`
+   * (Req 1.11). The runner's exit-code input: `> 0` ⇒ a non-zero exit code, so
+   * confining a failure cannot turn a red run green (Req 2.1).
+   *
+   * Counts Tenant_Sweep_Failures ONLY. No abort of any kind contributes, for any
+   * of the five abort reasons: an abort is a designed safe outcome (Req 2.2).
+   *
+   * REQUIRED rather than optional, unlike the new `TenantSweepResult` fields: this
+   * result is constructed fresh on every call and no persisted document has its
+   * shape, so there is no older value to be backward compatible with.
+   */
+  tenantFailures: number;
+  /**
+   * Whether the run stopped because its Run_Lease was lost to a foreign
+   * Lease_Token, or because the lease document was gone (Req 5.9). The run's other
+   * exit-code input, alongside `tenantFailures`: `true` ⇒ a non-zero exit code.
+   *
+   * `false` for every run with no `renewRunLease` installed — the parent spec's
+   * entire suite, and every direct invocation of this core (Req 5.16).
+   *
+   * A lost lease is deliberately NOT an abort. `SweepAbortReason` stays at exactly
+   * its five values (Req 8.10): a sixth would be a new metric label value that no
+   * deployed `infra/monitoring/` filter matches, i.e. an outcome nobody is alerted
+   * on, for a condition that is about the RUN rather than about a tenant's data.
+   * Tenants already swept keep their results and their Report_Documents.
+   */
+  leaseLost: boolean;
 }
 
 /**
@@ -3199,6 +4290,80 @@ export async function runStorageOrphanSweep(
       DEFAULT_MAX_QUARANTINE_PER_TENANT
     ),
     maxReferences: normalisePositiveInt(source.maxReferences, DEFAULT_MAX_REFERENCES),
+    firestorePageSize: normalisePositiveInt(
+      source.firestorePageSize,
+      DEFAULT_FIRESTORE_PAGE_SIZE
+    ),
+    // Req 7.12 — both fall back to their own documented default rather than to zero.
+    reportWritePages: normalisePositiveInt(
+      source.reportWritePages,
+      DEFAULT_REPORT_WRITE_PAGE_INTERVAL
+    ),
+    reportWriteMs: normalisePositiveInt(
+      source.reportWriteMs,
+      DEFAULT_REPORT_WRITE_TIME_INTERVAL_MS
+    ),
+    // ── The DEFAULT is Req 7.20; the floor at 1 is the separate Req 7.21 ───────
+    //
+    // Two obligations, and they are not interchangeable — which is the whole reason
+    // this one field does not go through `normalisePositiveInt` like its neighbours.
+    //
+    // Req 7.20: a configured value that is non-finite, not greater than zero, or
+    // TRUNCATES TO ZERO resolves to the documented default of 25.
+    // `normalisePositiveInt` gets the third case wrong: `0.5` is finite and positive,
+    // so it never reaches the fallback, and `Math.trunc(0.5)` is `0`. Paired with the
+    // floor below that resolved to `1` — a write after EVERY move, where the manifests
+    // and this report's own `params` document 25. `1` looks harmless next to `0`
+    // precisely because it is not a write storm; it is still the wrong number, and an
+    // operator who fat-fingered a decimal got it silently. So the resolution is
+    // delegated to `resolveQuarantineWriteThreshold`, the pure module's own rule, and
+    // `loadRunnerConfig` calls the same function — the two layers cannot disagree
+    // about `0.5` the way they did.
+    //
+    // Req 7.21: the floor STAYS, and it is not belt-and-braces. It exists to make a
+    // resolved `0` unreachable by ANY path, and a resolved `0` is the DANGEROUS
+    // direction, not a suppressed write — the reason is the opposite of what it looks
+    // like. Req 7.3's condition is `movedSinceWrite >= threshold`, it is checked FIRST
+    // and UNCONDITIONALLY by `shouldWriteTenantReport`, and `movedSinceWrite` is never
+    // negative. So `0` holds at EVERY evaluation and forces a Report_Document write on
+    // every move, every page boundary and every terminal event alike: that is Defect
+    // 2's write storm, arrived at through a configuration that merely looks unusual.
+    // It is a backstop against a resolved zero, never a substitute for the fallback
+    // above.
+    quarantineWriteThreshold: Math.max(
+      1,
+      resolveQuarantineWriteThreshold(source.quarantineWriteThreshold)
+    ),
+    // Req 8.13 — a READING, not a knob, so it is echoed rather than normalised: an
+    // unusable value becomes `null` ("nothing usable was observed") and never a
+    // substituted default, because the whole operator value of this field is that it
+    // reports what the process actually saw. A logged/recorded limit near 2 GB on a
+    // `1Gi` container is how an operator learns `NODE_OPTIONS` did not reach the
+    // process, and a default silently standing in for it would destroy that signal.
+    heapLimitBytes:
+      typeof source.heapLimitBytes === 'number' &&
+      Number.isFinite(source.heapLimitBytes) &&
+      source.heapLimitBytes > 0
+        ? source.heapLimitBytes
+        : null,
+    // ── The lease's two echoed fields, resolved the same way and for the same
+    //    reason: this core must not import the lease module (Req 5.16) ──────────
+    //
+    // `clampRunLeaseMs` is the rule that decides a lease duration and it lives in
+    // `jobs/storageOrphanSweepLease.ts`. Calling it here would reverse the import
+    // direction and make the core depend on the mechanism whose whole point is that
+    // no guarantee depends on it. So the runner clamps once and this echoes: an
+    // unusable value becomes `null`, meaning "no lease was installed", and never a
+    // substituted default — a default standing in for an absent lease would make the
+    // parent suite's own runs (which install none) look like leased ones.
+    leaseMs:
+      typeof source.leaseMs === 'number' && Number.isFinite(source.leaseMs) && source.leaseMs > 0
+        ? source.leaseMs
+        : null,
+    leaseToken:
+      typeof source.leaseToken === 'string' && source.leaseToken.length > 0
+        ? source.leaseToken
+        : null,
     quarantineRetentionDays: normalisePositiveInt(
       source.quarantineRetentionDays,
       DEFAULT_QUARANTINE_RETENTION_DAYS
@@ -3223,7 +4388,10 @@ export async function runStorageOrphanSweep(
     );
   }
 
-  const tenantIds = await resolveSweepTenantIds(db, config.tenantIds);
+  // Paged, and a failure on ANY page propagates from here — before the tenant loop
+  // begins, so no tenant is swept (Req 4.7). See `resolveSweepTenantIds` for why
+  // this one is not confined the way a per-tenant failure is.
+  const tenantIds = await resolveSweepTenantIds(db, config.tenantIds, config.firestorePageSize);
 
   console.log('[orphan_sweep] run starting', {
     mode: config.mode,
@@ -3234,6 +4402,7 @@ export async function runStorageOrphanSweep(
     pageSize: config.pageSize,
     maxQuarantinePerTenant: config.maxQuarantinePerTenant,
     maxReferences: config.maxReferences,
+    firestorePageSize: config.firestorePageSize,
     sweepId: config.sweepId,
     runnerId: config.runnerId,
     tenants: tenantIds.length,
@@ -3268,52 +4437,331 @@ export async function runStorageOrphanSweep(
   }
 
   const tenants: TenantSweepResult[] = [];
+  // Set only by the fencing check below, and read only by the runner's exit code.
+  // A lost lease is NOT an abort: `SweepAbortReason` stays at exactly its five
+  // values (Req 8.10), and this is a `break` with a non-zero exit rather than a
+  // sixth reason that would invalidate every deployed `infra/monitoring/` filter.
+  let leaseLost = false;
   for (const tenantId of tenantIds) {
+    // ── The Run_Lease fencing check, FIRST statement of the body (Req 5.8) ──────
+    //
+    // The top and not the bottom, and the difference is which fact the check
+    // establishes: a renewal AFTER tenant *n* proves the lease was ours during *n*,
+    // which is a fact about the past and changes nothing anyone can act on. A
+    // renewal BEFORE tenant *n+1* is the fact that matters — it is the only moment
+    // at which declining to start a tenant still prevents anything.
+    //
+    // Req 5.18: the lease is lost **at the instant of the reading**, not at the end
+    // of the tenant in flight and not "probably lost, verify later". Because this
+    // sits at the top of the body, the instant of the reading and the instant of the
+    // decision to start this tenant are the SAME instant, so no tenant is ever
+    // started under a lease that was already gone. That is why the check is here and
+    // not, say, folded into the collector's arguments.
+    //
+    // Req 5.19: a fenced execution leaves the Run_Lease document **exactly as its
+    // current holder recorded it**. This branch writes nothing to it — `renew`'s own
+    // fencing branch writes nothing either — and the runner's `finally` release is a
+    // token-matched no-op that finds a foreign token and deletes nothing. Releasing
+    // on the way out would be strictly worse than doing nothing: it would strip the
+    // new holder of the exclusivity it legitimately acquired and manufacture the
+    // overlap the whole mechanism exists to prevent, at the one moment two
+    // executions are demonstrably live.
+    //
+    // ── Renewal is a FENCE, not a liveness mechanism ────────────────────────────
+    //
+    // The lease duration (45 min) exceeds the job's `timeoutSeconds` (1800 s) by
+    // design, so the platform kills the task before the lease can expire underneath
+    // it and renewal never *needs* to extend anything. Saying so matters here rather
+    // than only in the lease module: a reader who assumes renewal is for liveness
+    // concludes that a MID-TENANT renewal is also needed, and a mid-tenant renewal
+    // would put a Firestore transaction inside the object-listing page loop.
+    //
+    // Tenants already swept keep their results and their Report_Documents. Nothing
+    // is rolled back, because nothing needs to be: everything moved so far was moved
+    // under a lease this execution genuinely held.
+    if (args.renewRunLease) {
+      const renewal = await args.renewRunLease();
+      if (!renewal.ok) {
+        leaseLost = true;
+        // No `tenant_id`: a lease is run-level, so there is no tenant this line is
+        // about — and this one is emitted before `tenantId` is swept at all. At
+        // WARNING, like the other two lease outcomes an operator must see.
+        emitSweepMetric(
+          metricNames.storageOrphanSweepLease,
+          { mode: config.mode, outcome: 'lost' },
+          1,
+          'WARNING'
+        );
+        console.warn('[orphan_sweep] run lease lost; starting no further tenant', {
+          mode: config.mode,
+          sweepId: config.sweepId,
+          tenantsSwept: tenants.length,
+        });
+        break;
+      }
+    }
+
+    // ── TWO nested try/catch blocks, not one, and the reason is metric accounting
+    //
+    // Req 1.9 asks for exactly one `runs_total` line per tenant per invocation.
+    // The two failure sites differ in whether that line has already been emitted
+    // by the time the throw arrives here, so they cannot share one wrapper:
+    //
+    //  - `collectTenantReferenceSet` emits no `runs_total` at all, so the collector
+    //    site must emit it (`emitRunsTotal: true`);
+    //  - `sweepTenant`'s own catch already emitted `runs_total{outcome:'in_progress'}`
+    //    and flushed its metric deltas before rethrowing, so the listing site must
+    //    NOT (`emitRunsTotal: false`). One shared wrapper would double the line for
+    //    every confined listing failure.
+    //
+    // Neither site writes a Report_Document. The listing site's report was already
+    // written by `sweepTenant`'s catch, with its previous cursor and counters
+    // intact; the collector site never reached a listing, so that tenant's report
+    // keeps whatever the previous run recorded. The asymmetry is harmless: the next
+    // run re-sweeps that tenant from its persisted cursor either way, because
+    // `'failed'` and every other recorded non-`'completed'` status resume
+    // identically (Req 1.13, 1.14).
+
     // Phase 1 runs on EVERY run: the retain set is never resumed across runs
     // (Req 13.4).
-    const references = await collectTenantReferenceSet({
-      db,
-      rtdb,
-      tenantId,
-      bucketName,
-      maxReferences: config.maxReferences,
-      conversationPageSize: args.conversationPageSize,
-      messagePageSize: args.messagePageSize,
-    });
-
-    tenants.push(
-      await sweepTenant({
-        bucket,
+    let references: TenantReferenceSet;
+    try {
+      references = await collectTenantReferenceSet({
         db,
+        rtdb,
         tenantId,
-        references,
-        config,
-        quarantineObject: args.quarantineObject,
-        invalidateLiveCount: args.invalidateLiveCount,
-      })
+        bucketName,
+        maxReferences: config.maxReferences,
+        firestorePageSize: config.firestorePageSize,
+        conversationPageSize: args.conversationPageSize,
+        messagePageSize: args.messagePageSize,
+        readHeapUsage: args.readHeapUsage,
+      });
+    } catch (error) {
+      const failure = recordTenantFailure(tenantId, error, config, { emitRunsTotal: true });
+      // ── Req 1.12 as a POSTCONDITION, asserted rather than inferred ──────────
+      //
+      // "A tenant whose Reference_Collector call raised quarantines zero objects,
+      // including every object already identified as an Orphan candidate." It is
+      // true structurally here — `sweepTenant` is never reached, so no mover is
+      // ever offered a path — but Req 1.12 asks for it as a stated postcondition
+      // rather than as a consequence of the order in which the collector and the
+      // listing happen to be invoked. So it is checked at the confinement site,
+      // where a future edit that made this failure result inherit partial counters
+      // would trip it.
+      assertNoQuarantineOnTenantFailure(failure);
+      tenants.push(failure);
+      continue;
+    }
+
+    // ── One `reference_pages_total` line per source that read a page (Req 10.7) ──
+    //
+    // Emitted HERE rather than inside `collectTenantReferenceSet` for one reason:
+    // the collector deliberately emits no metric at all — the confinement above
+    // depends on it (`emitRunsTotal: true` at the collector site exists precisely
+    // because the collector emits nothing), and adding a `mode` argument to the
+    // collector purely to label a metric would put an observability concern inside
+    // the phase whose whole documented property is that it reads and returns.
+    //
+    // The Reference_Source identifier rides on `reason`, NOT on a new `source`
+    // label. Req 10.1 permits exactly `tenant_id`, `mode`, `reason`, `outcome` and
+    // `abort_reason`, and `SweepMetricLabels` is a closed type precisely so an
+    // excess key cannot be expressed. Eight bounded values in `reason` is the
+    // correct use of that slot; widening the closed set to carry a synonym is the
+    // change Req 10.1 exists to prevent. Do not "fix" this by adding a label.
+    //
+    // `emitSweepMetric` because this is a one-shot per (tenant, source): no page is
+    // counted per object anywhere, so the counter and the line move together
+    // (Req 10.3). A source that read no page emits nothing, so an absent series
+    // means "read no page" rather than "was not instrumented" (Req 10.9) — which is
+    // what silently covers the RTDB walk and `tenant_branding`'s single `doc.get`.
+    for (const sourceId of REFERENCE_SOURCE_IDS) {
+      emitSweepMetric(
+        metricNames.storageOrphanSweepReferencePages,
+        { tenant_id: tenantId, mode: config.mode, reason: sourceId },
+        references.pagesBySource ? references.pagesBySource[sourceId] : 0
+      );
+    }
+
+    try {
+      tenants.push(
+        await sweepTenant({
+          bucket,
+          db,
+          tenantId,
+          references,
+          config,
+          quarantineObject: args.quarantineObject,
+          invalidateLiveCount: args.invalidateLiveCount,
+          now: args.now,
+          assertInvariants: args.assertInvariants,
+        })
+      );
+    } catch (error) {
+      tenants.push(recordTenantFailure(tenantId, error, config, { emitRunsTotal: false }));
+    }
+  }
+
+  return {
+    tenants,
+    dryRun: !applyMode,
+    sweepId: config.sweepId,
+    // Req 1.11. Read off the recorded status, so the count and the results cannot
+    // disagree. `'failed'` only — no abort of any kind contributes (Req 2.2).
+    tenantFailures: tenants.filter((tenant) => tenant.status === 'failed').length,
+    // Req 5.9, the run's OTHER exit-code input. `false` for every run with no
+    // `renewRunLease` installed, which is the parent suite's configuration and every
+    // direct invocation of this core.
+    leaseLost,
+  };
+}
+
+/**
+ * Record a Tenant_Sweep_Failure: the ONLY producer of `status: 'failed'`
+ * (Req 1.1, 1.7).
+ *
+ * `describeThrownValue` coerces the thrown value, so a thrown `null`, a symbol, an
+ * object whose `message` getter throws and a 10 kB string each yield a non-empty,
+ * length-bounded message (Req 1.2, 1.3).
+ *
+ * The counters are EMPTY rather than partial. A listing failure's real, partial
+ * counters live on the tenant's Report_Document, which `sweepTenant`'s catch has
+ * already written and which the next run inherits; this result says "not swept",
+ * and a half-count on it would be read as a total.
+ *
+ * `emitRunsTotal` is the whole reason the confinement is two nested blocks — see
+ * the comment at the call sites. The `outcome` label is `in_progress`, matching the
+ * value `sweepTenant`'s catch emits, and it does NOT follow the status to
+ * `'failed'`: the value `'failed'` is confined to the two status fields and reaches
+ * no metric label (Req 1.15, 10.12).
+ */
+function recordTenantFailure(
+  tenantId: string,
+  error: unknown,
+  config: ResolvedSweepConfig,
+  opts: { emitRunsTotal: boolean }
+): TenantSweepResult {
+  const failureMessage = describeThrownValue(error);
+  const metricLabels: SweepMetricLabels = { tenant_id: tenantId, mode: config.mode };
+
+  // Once per failure, from both sites (Req 10.4, 10.8). At WARNING: a tenant that
+  // was not swept is the signal an operator is alerted on (Req 10.10).
+  emitSweepMetric(metricNames.storageOrphanSweepTenantFailures, metricLabels, 1, 'WARNING');
+  if (opts.emitRunsTotal) {
+    emitSweepMetric(
+      metricNames.storageOrphanSweepRuns,
+      { ...metricLabels, outcome: 'in_progress' },
+      1
     );
   }
 
-  return { tenants, dryRun: !applyMode, sweepId: config.sweepId };
+  // The tenant id and the coerced message. No object path, no filename, no email
+  // address, no download token is added by this line (Req 2.3, 16.8, 16.9, 16.10).
+  console.warn('[orphan_sweep] tenant failed; confined to this tenant', {
+    tenantId,
+    mode: config.mode,
+    message: failureMessage,
+  });
+
+  return {
+    tenantId,
+    status: 'failed',
+    mode: config.mode,
+    applied: config.applyMode,
+    sweepId: config.sweepId,
+    ...emptyCounters(),
+    danglingReferenceCount: 0,
+    usageBytesBefore: null,
+    usageBytesAfter: null,
+    failureMessage,
+  };
 }
 
-/** `sweep_{nowMs}_{random}` — a single plain path segment, as the quarantine builder requires. */
-function mintSweepId(nowMs: number): string {
+/**
+ * Req 1.12, as a postcondition on a Tenant_Sweep_Failure whose collector threw:
+ * zero objects quarantined, zero bytes quarantined.
+ *
+ * Throws, like `assertSweepInvariants`, because a violation is a code defect rather
+ * than a runtime condition: the only way to reach it is to change
+ * `recordTenantFailure` so a failure result carries counters it did not earn.
+ */
+function assertNoQuarantineOnTenantFailure(result: TenantSweepResult): void {
+  if (result.quarantinedCount !== 0 || result.quarantinedBytes !== 0) {
+    throw new Error(
+      `[orphan_sweep] INVARIANT: tenant ${result.tenantId} failed in reference collection yet reports ${result.quarantinedCount} quarantined objects (${result.quarantinedBytes} bytes); a tenant whose collector threw reaches no listing and must quarantine nothing`
+    );
+  }
+}
+
+/**
+ * `sweep_{nowMs}_{random}` — a single plain path segment, as the quarantine builder
+ * requires.
+ *
+ * ── EXPORTED for the runner (spec task 9.2), and the reason is an ORDERING ────
+ *
+ * The Run_Lease document records the run's Sweep_Id, so a Report_Document and the
+ * lease that produced it can be tied together — which is the whole diagnostic value
+ * of `RunLeaseDoc.sweepId`. But the lease must be acquired BEFORE the core is
+ * entered (Req 5.1), so the id cannot be the one the core mints for itself: the
+ * runner has to mint it, hand it to `acquireRunLease`, and pass the same value in
+ * `SweepConfig.sweepId`.
+ *
+ * Exported rather than reimplemented in the runner because the format is a
+ * CONSTRAINT, not a convention: it must be a single plain path segment, since
+ * `buildQuarantinePath` interpolates it. A second minting rule in the runner is
+ * exactly the "one rule stated in two places" drift this spec has already had to
+ * repair once.
+ */
+export function mintSweepId(nowMs: number): string {
   return `sweep_${nowMs}_${crypto.randomBytes(3).toString('hex')}`;
 }
 
 /**
- * The tenants to sweep: the configured allow-list, or the active-tenant query —
- * `tenants` where `status == 'active'`, the shape `loadTenantRecords` uses in
- * `jobs/tenantUsageRollup.ts`.
+ * The tenants to sweep: the configured allow-list, or the KEYSET-PAGINATED
+ * active-tenant query — `tenants` where `status == 'active'`, the shape
+ * `loadTenantRecords` uses in `jobs/tenantUsageRollup.ts`.
  *
  * The identifier is the DOCUMENT ID in both cases, never a value read out of a
- * record (Req 4.11): every listing prefix and every scope check is built from it,
- * so a tenant id sourced from a mutable field would be a confinement hole.
+ * record (Req 4.2, parent Req 4.11): every listing prefix and every Scope_Guard
+ * check is built from it, so a tenant id sourced from a mutable field would be a
+ * confinement hole. A fixture whose `tenantId` FIELD disagrees with its document
+ * id therefore yields the id — record content cannot forge a prefix.
+ *
+ * ── The allow-list branch issues NO Firestore query at all (Req 4.6) ──────────
+ *
+ * Duplicates and blanks are dropped and the configured order is preserved, which
+ * is deterministic for a given list — Req 1.10's requirement, met without a read.
+ *
+ * ── The `all_active` branch is `forEachQueryDocPaged`, unchanged ──────────────
+ *
+ * Same loop, same `orderBy('__name__')`, same snapshot cursor, same two stop
+ * conditions — the only difference is the equality filter's field. So this query
+ * stops being the one unbounded read left in the job without introducing a second
+ * paging implementation that can drift from the first. Ascending document-name
+ * order (Req 4.4) and de-duplication (Req 4.8) both fall out of it: the walk is
+ * name-ordered and visits each document once, and the `Set` makes "once per run"
+ * true even if a future filter could match a document twice.
+ *
+ * Only the id STRINGS are retained; every page's snapshots are released before the
+ * next page is requested (Req 4.3).
+ *
+ * ── A FAILURE ON ANY PAGE PROPAGATES: no tenant is swept, the runner exits
+ * non-zero (Req 4.7) — and this is deliberately NOT confined per-tenant the way a
+ * listing failure is ────────────────────────────────────────────────────────────
+ *
+ * Task 3.1's confinement is right for a tenant, because "we could not sweep THIS
+ * tenant" is a fact with a name attached: it is counted, logged, alerted on and
+ * red. A partial tenant LIST has no such name. It is indistinguishable from a
+ * smaller estate — every tenant it omits looks exactly like a tenant that does not
+ * exist — so a run that swept "the tenants we managed to enumerate" is a green run
+ * that has quietly stopped covering half the estate, and nothing in the report
+ * would say so. So this one throws, before the loop, and the whole run is visibly
+ * failed.
  */
 async function resolveSweepTenantIds(
   db: Firestore,
-  configured: string[] | 'all_active'
+  configured: string[] | 'all_active',
+  pageSize: number
 ): Promise<string[]> {
   if (Array.isArray(configured)) {
     const seen = new Set<string>();
@@ -3323,10 +4771,24 @@ async function resolveSweepTenantIds(
     }
     return Array.from(seen);
   }
-  const snapshot = await db.collection('tenants').where('status', '==', 'active').get();
-  const ids: string[] = [];
-  snapshot.forEach((doc) => {
-    if (typeof doc.id === 'string' && doc.id.trim()) ids.push(doc.id.trim());
+
+  const seen = new Set<string>();
+  await forEachQueryDocPaged({
+    db,
+    collection: 'tenants',
+    field: 'status',
+    value: 'active',
+    pageSize: normalisePositiveInt(pageSize, DEFAULT_FIRESTORE_PAGE_SIZE),
+    // Nothing can cancel the tenant list: there is no ceiling on it and a partial
+    // list is the failure this walk must not produce quietly.
+    shouldStop: () => false,
+    // `docId` IS `doc.id`. The document's DATA is ignored entirely — it is not read
+    // for the identifier, and it is not read for the `status` either, which the
+    // query already filtered on.
+    handler: (_data, docId) => {
+      const trimmed = typeof docId === 'string' ? docId.trim() : '';
+      if (trimmed) seen.add(trimmed);
+    },
   });
-  return ids;
+  return Array.from(seen);
 }

@@ -101,15 +101,56 @@ spec:
               resources:
                 limits:
                   cpu: "1"
-                  # Sized against the RETAIN SET, not the bucket: the listing is
-                  # paged and only one page is held at a time, so the resident
-                  # cost is the set of retained paths. 512Mi matches the rollup
-                  # job, and `STORAGE_ORPHAN_SWEEP_MAX_REFERENCES` aborts the
-                  # tenant rather than letting the set outgrow it.
-                  memory: "512Mi"
+                  # ── Sized against the RETAIN SET, and the arithmetic is stated ──
+                  # The listing is paged and only one page is held at a time, so
+                  # the resident cost is the set of retained paths, not the bucket.
+                  # At `STORAGE_ORPHAN_SWEEP_MAX_REFERENCES` of 500000 and roughly
+                  # 232 bytes per retained path (a V8 one-byte path string, a Set
+                  # slot, the snapshot the transcode derivation takes and the sorted
+                  # array the fingerprint builds — `lib/sweepScaleLimits.ts` charges
+                  # each term at its declaration), the whole retain set is estimated
+                  # at ~116 MB, against the 896 MB V8 old-space limit declared in
+                  # NODE_OPTIONS below and the 1Gi container limit here. The guard
+                  # the runner checks that estimate against is 0.7 x 896 MB ~= 627 MB,
+                  # so the estimate has real headroom and the documented
+                  # `reference_cap_exceeded` abort is REACHABLE.
+                  #
+                  # This block previously claimed 512Mi sufficed because
+                  # MAX_REFERENCES "aborts the tenant rather than letting the set
+                  # outgrow it". That was FALSE at the old default of 2000000: the
+                  # estimate was ~464 MB, the container was killed at 512Mi with
+                  # exit 137 long before the abort could fire, and the tenant got no
+                  # Report_Document and no explanation. The runner now REFUSES TO
+                  # START when the estimate for the configured ceiling exceeds the
+                  # guard, so this manifest and the code cannot disagree silently.
+                  memory: "1Gi"
               env:
                 - name: NODE_ENV
                   value: production
+                # ── Declaring the V8 old-space limit is LOAD-BEARING, not hygiene ─
+                # `v8.getHeapStatistics().heap_size_limit` reports what V8 BELIEVES
+                # it may use. With no `--max-old-space-size`, V8 derives that from
+                # SYSTEM memory — which on Cloud Run is the HOST's, not the cgroup's
+                # — so a process inside a 512Mi container can report a limit near
+                # 2 GB, every heap comparison this job makes is then against a
+                # fiction, and the cgroup kills the task anyway. Declaring it makes
+                # the number real: an overrun becomes a `JavaScript heap out of
+                # memory` error WITH A STACK in the job's logs instead of a silent
+                # exit 137.
+                #
+                # 896 MiB under a 1Gi limit leaves ~128 MiB for the non-heap
+                # footprint (native allocations, code, stacks, the storage client's
+                # buffers). The number must track the memory limit above, which is
+                # why it lives HERE and not in the `storage:orphan-sweep` npm
+                # script: `package.json` would impose a container-derived cap on
+                # local runs where no such cap applies.
+                #
+                # Verify it arrived: the runner logs the OBSERVED heap limit in its
+                # `starting job` line. A limit near 2 GB on a 1Gi container means
+                # this variable did not reach the process. Reading that line is the
+                # FIRST step of task 12's dev verification sequence above.
+                - name: NODE_OPTIONS
+                  value: "--max-old-space-size=896"
                 - name: FIREBASE_PROJECT_ID
                   value: tution-app-6c0c3
                 # REQUIRED. Chat attachments live in the Realtime Database, not
@@ -168,14 +209,70 @@ spec:
                 # run. Reaching it ends the tenant with
                 # `abortReason: 'quarantine_cap_reached'` and a resume cursor, so
                 # the remainder is a deliberate second run. Task 12's first apply
-                # run overrides this down to 25.
+                # run overrides this down to 25 — and UNCHANGED at 1000 here, in
+                # both job definitions: the override is an execution-time flag, not
+                # an edit to this value.
+                #
+                # That 25 is the same number as
+                # `STORAGE_ORPHAN_SWEEP_QUARANTINE_WRITE_THRESHOLD` below, and the
+                # equality is deliberate rather than a coincidence: the write
+                # threshold's default EQUALS the cautious first-run ceiling this
+                # file's runbook documents, so that run writes the Report_Document
+                # ONCE at the end of its moves rather than 25 times. The note lives
+                # in this file only, because the dev definition is the only one of
+                # the two that documents a cautious first apply run — in the runbook
+                # at the top and here. The threshold does NOT replace the ceiling:
+                # one bounds how many objects a run may move, the other only how
+                # often the report is written.
                 - name: STORAGE_ORPHAN_SWEEP_MAX_QUARANTINE_PER_TENANT
                   value: "1000"
                 - name: STORAGE_ORPHAN_SWEEP_PAGE_SIZE
                   value: "1000"
                 # Retain-set ceiling. Exceeding it ABORTS the tenant: a truncated
-                # retain set is indistinguishable from a set of orphans.
+                # retain set is indistinguishable from a set of orphans. 500000
+                # matches `DEFAULT_MAX_REFERENCES` in the runner, estimates at
+                # ~116 MB of retain set (see the memory comment above), and leaves
+                # the abort reachable inside the declared old-space limit. It was
+                # 2000000, which could not fire the abort at all.
                 - name: STORAGE_ORPHAN_SWEEP_MAX_REFERENCES
-                  value: "2000000"
+                  value: "500000"
+                # Documents per Firestore page for the seven reference sources and
+                # for the active-tenant query. A memory knob and nothing else: the
+                # retain set, its fingerprint and every per-source count are
+                # invariant under it, so it can change on a deploy without
+                # invalidating an in-flight resume cursor.
+                - name: STORAGE_ORPHAN_SWEEP_FIRESTORE_PAGE_SIZE
+                  value: "1000"
+                # ── The Report_Document write cadence ────────────────────────────
+                # Pages is the UPPER bound on write frequency, milliseconds the
+                # LOWER bound: a listing writes at least every 10 fully examined
+                # pages and at most once per 30s of quiet progress, plus a forced
+                # write at every prefix boundary and at the terminal event. The
+                # tenant with a million objects is the case this exists for — one
+                # write per listing page was a thousand sequential writes to one
+                # document.
+                - name: STORAGE_ORPHAN_SWEEP_REPORT_WRITE_PAGES
+                  value: "10"
+                - name: STORAGE_ORPHAN_SWEEP_REPORT_WRITE_MS
+                  value: "30000"
+                # Objects quarantined since the last write that FORCE one, counted
+                # in OBJECTS rather than pages — which is what makes its bound a
+                # bound: the persisted `quarantinedCount` a resume inherits lags the
+                # objects actually moved by fewer than this, so a crash-and-resume
+                # pair overshoots the per-tenant ceiling by at most this threshold
+                # rather than by a whole write interval's worth of moves. This value
+                # resolves to `DEFAULT_QUARANTINE_WRITE_THRESHOLD`, so an operator
+                # reading either job definition reads the cadence in force in both;
+                # see the ceiling comment above for why that default is 25.
+                - name: STORAGE_ORPHAN_SWEEP_QUARANTINE_WRITE_THRESHOLD
+                  value: "25"
+                # Run-lease lifetime, in milliseconds. 45 minutes, deliberately
+                # LONGER than `timeoutSeconds: 1800` above: a lease that could expire
+                # under a still-running task would let a second execution start
+                # while the first is mid-sweep, which is the overlap the lease
+                # exists to prevent. It is self-healing — an abandoned lease expires
+                # rather than needing a human to clear it.
+                - name: STORAGE_ORPHAN_SWEEP_LEASE_MS
+                  value: "2700000"
                 - name: STORAGE_ORPHAN_SWEEP_RUNNER_ID
                   value: cloud-run-storage-orphan-sweep-job-dev
