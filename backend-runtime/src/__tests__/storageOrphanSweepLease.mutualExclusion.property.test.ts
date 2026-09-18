@@ -793,6 +793,10 @@ describe('Property 4: the Run_Lease is mutually exclusive, fenced and self-heali
             shared
           );
           expect(holder.kind).toBe('granted');
+          // `crashed` lives only on the `granted` variant, and the `expect` above
+          // narrows nothing — same idiom runStorageOrphanSweep.test.ts uses for its
+          // `decision.action !== 'refuse'` checks.
+          if (holder.kind !== 'granted') throw new Error('unreachable');
           expect(holder.crashed).toBe(true);
 
           // The abandoned lease, and the expiry it recorded.

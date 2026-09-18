@@ -156,7 +156,7 @@ function decideWatchingTheClock(
     construct(target, args) {
       // `new Date()` with no arguments is a clock read; `new Date(ms)` is not.
       if (args.length === 0) clockReads += 1;
-      return Reflect.construct(target as ObjectConstructor, args);
+      return Reflect.construct(target as unknown as ObjectConstructor, args);
     },
     get(target, prop, receiver) {
       if (prop === 'now') {

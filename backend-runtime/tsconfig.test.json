@@ -1,0 +1,31 @@
+// Type-check configuration for the test tree.
+//
+// Why this file exists:
+//   tsconfig.json intentionally excludes "**/*.test.ts" -- test files must never be
+//   emitted into dist/, so the production build cannot compile them. The side effect is
+//   that `npm run build` / `tsc -p tsconfig.json --noEmit` never type-checks a test file.
+//   ts-jest also runs with `diagnostics: false` (see jest.config.js) to keep the suite
+//   fast and its memory ceiling low, so jest does not type-check them either.
+//
+// This config closes that gap: it checks EVERYTHING, tests included, at exactly the same
+// strictness as production (it extends tsconfig.json and does not relax `strict`).
+// It is noEmit-only -- nothing here ever lands in dist/.
+//
+// Run via `npm run typecheck`, which checks the production project first and then this one.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // jest globals (describe/it/expect) are needed on top of the production `node` types.
+    "types": ["node", "jest"],
+    // jest and fast-check types live in the repo-root node_modules; express/pdfkit/etc.
+    // live in the local one. Both must resolve.
+    "typeRoots": [
+      "../node_modules/@types",
+      "node_modules/@types"
+    ]
+  },
+  "include": ["src/**/*.ts"],
+  // Clear the inherited "**/*.test.ts" exclusion -- checking those files is the point.
+  "exclude": []
+}

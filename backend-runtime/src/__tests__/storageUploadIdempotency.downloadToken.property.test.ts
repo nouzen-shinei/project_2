@@ -596,6 +596,9 @@ describe('Property 12: The returned download URL is stable across retries, and i
             const selected = selectUploadDownloadToken({
               bytes,
               downloadToken: `${left}${token}${right}`,
+              // Token selection never reads `generation` (F9 added it for the write
+              // precondition), so `null` leaves this case's behaviour untouched.
+              generation: null,
             });
             expect(selected).toBe(token);
           },

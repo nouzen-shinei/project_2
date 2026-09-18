@@ -410,11 +410,19 @@ describe('the paged reference query orders by __name__ and nothing else', () => 
     // SKIP: a skipped document is a reference never collected. The fake
     // discriminates through a `WeakSet` of the snapshots it minted, so the snapshot
     // shape stays byte-identical to the shipped one.
-    const query = db
-      .collection('notices')
+    // The fake's query builder is deliberately an untyped bag
+    // (`FakeFirestore.collection` returns `Record<string, unknown>`), so the chain
+    // needs a local structural type to be type-checked at all.
+    type PagedQueryBuilder = {
+      where(field: string, operator: string, value: unknown): PagedQueryBuilder;
+      orderBy(field: string): PagedQueryBuilder;
+      limit(count: number): PagedQueryBuilder;
+      startAfter(cursor: unknown): unknown;
+    };
+    const query = (db.collection('notices') as unknown as PagedQueryBuilder)
       .where('tenantId', '==', TENANT)
       .orderBy('__name__')
-      .limit(2) as { startAfter(cursor: unknown): unknown };
+      .limit(2);
     expect(() => query.startAfter(TENANT)).toThrow(TypeError);
     expect(() => query.startAfter('notices/d01')).toThrow(/QueryDocumentSnapshot/);
   });

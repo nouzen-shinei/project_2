@@ -564,8 +564,15 @@ interface UploadOptions {
   tenantId?: string;
 }
 
+/**
+ * `Buffer<ArrayBuffer>`, not a bare `Buffer`: `fetch`'s `BodyInit` accepts a view over
+ * a plain `ArrayBuffer` only, and a bare `Buffer` is `Buffer<ArrayBufferLike>`, which
+ * also admits a `SharedArrayBuffer`-backed buffer that `fetch` genuinely cannot send.
+ * Every caller passes a `Buffer.alloc`/`Buffer.from` result, which is already
+ * `Buffer<ArrayBuffer>`.
+ */
 async function upload(
-  bodyBytes: number | Buffer,
+  bodyBytes: number | Buffer<ArrayBuffer>,
   options: UploadOptions = {}
 ): Promise<{ status: number; body: any }> {
   const { contentType = 'image/jpeg', tenantId = TENANT, ...query } = options;

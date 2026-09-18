@@ -25,15 +25,51 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: backend-runtime/package-lock.json
+          # Both lockfiles: this job installs twice — backend-runtime's own
+          # dependencies and the repo-root dev dependencies the jest toolchain
+          # lives in — so the cache key has to track both.
+          cache-dependency-path: |
+            package-lock.json
+            backend-runtime/package-lock.json
       - name: Install deps
         run: npm ci
       - name: Build
         run: npm run build
+      # The jest toolchain (jest, ts-jest, @types/jest) and fast-check are declared
+      # in the REPO-ROOT package.json, and backend-runtime/jest.config.js resolves
+      # into ../node_modules on purpose — moduleDirectories, modulePaths and three
+      # moduleNameMapper entries all point at root paths. There is no npm workspace,
+      # so the `npm ci` above leaves ../node_modules absent. This step overrides the
+      # job's backend-runtime working directory to install the root dev deps, and it
+      # runs BEFORE the typecheck because that step resolves @types/jest through
+      # ../node_modules/@types.
+      - name: Install root dev deps (jest toolchain)
+        run: npm ci
+        working-directory: .
+      # Type-checks the test tree, which nothing else does: tsconfig.json excludes
+      # "**/*.test.ts" (tests must not be emitted into dist/), and ts-jest runs with
+      # `diagnostics: false`. Without this step a type error in a test file reaches
+      # nobody. tsconfig.test.json checks tests at full production strictness.
+      - name: Typecheck (including tests)
+        run: npm run typecheck
       - name: Test
         run: npm test
         env:
           REDIS_URL: redis://127.0.0.1:6379
+      # `npm test` runs only the `node --test tests/*.test.mjs` suite, so before this
+      # step the ~1261 jest tests under src/__tests__ never ran in CI at all.
+      #
+      # The flags are mandatory, not tuning:
+      #   --testPathIgnorePatterns videoTranscoder : a bare `jest` hangs forever on the
+      #     videoTranscoder suite (it spawns ffmpeg and never terminates).
+      #   --maxWorkers=4 --workerIdleMemoryLimit=512MB : unbounded workers have
+      #     hard-crashed a maintainer machine twice. Do not drop these.
+      #
+      # This step depends on the root install above: jest, ts-jest, @types/jest and
+      # fast-check are root dev dependencies, and jest.config.js resolves them
+      # through ../node_modules by design rather than by accident.
+      - name: Jest
+        run: npm run test:jest
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4

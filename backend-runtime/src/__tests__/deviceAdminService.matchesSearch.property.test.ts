@@ -67,7 +67,7 @@ function oracleMatchesSearch(device: DeviceAdminRecord, term: string): boolean {
     return true;
   }
   return SEARCHABLE_FIELDS.some((key) => {
-    const value = (device as Record<string, unknown>)[key];
+    const value = (device as unknown as Record<string, unknown>)[key];
     return typeof value === 'string' && value.toLowerCase().includes(normalized);
   });
 }

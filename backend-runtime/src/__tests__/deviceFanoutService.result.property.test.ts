@@ -127,7 +127,7 @@ describe('deviceFanoutService — Fanout_Result assembly properties', () => {
         }
         // Every emitted value is a plain finite number — no nested objects/strings.
         for (const key of keys) {
-          expect(typeof (serialized as Record<string, unknown>)[key]).toBe('number');
+          expect(typeof (serialized as unknown as Record<string, unknown>)[key]).toBe('number');
         }
       }),
       { numRuns: NUM_RUNS }
@@ -148,7 +148,7 @@ describe('deviceFanoutService — Fanout_Result assembly properties', () => {
         // the (possibly non-finite/undefined) inputs and either suppressed state.
         expect(Object.keys(result).sort()).toEqual(EXPECTED_KEYS);
         for (const key of EXPECTED_KEYS) {
-          const value = (result as Record<string, unknown>)[key];
+          const value = (result as unknown as Record<string, unknown>)[key];
           expect(typeof value).toBe('number');
           expect(Number.isFinite(value as number)).toBe(true);
         }

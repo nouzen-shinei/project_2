@@ -103,8 +103,11 @@ function buildFakeDb(pop: Population, backfillCompleted: boolean) {
             return {
               async get() {
                 const docs = pop.bans
-                  .filter((b) => (b as Record<string, unknown>)[field] === value)
-                  .map((b, i) => new FakeDocSnap(`ban-${i}`, b as Record<string, unknown>));
+                  .filter((b) => (b as unknown as Record<string, unknown>)[field] === value)
+                  .map(
+                    (b, i) =>
+                      new FakeDocSnap(`ban-${i}`, b as unknown as Record<string, unknown>)
+                  );
                 return { docs };
               },
             };

@@ -20,7 +20,8 @@
 #
 # ── The image digest contains the sweep entrypoint ────────────────────────────
 # The digest below is the `backend-runtime` build tagged
-# `storage-orphan-sweep-20260808-01` (2026-08-08). It contains
+# `sweep-scale-hardening` (Cloud Build aebe712a-53bc-4994-b23d-0a54f7b3a597),
+# built from the working tree that carries this spec's code. It contains
 # `dist/jobs/runStorageOrphanSweep.js`, so `npm run storage:orphan-sweep`
 # resolves in this image — no repin is required before the first real run.
 # A digest, never a tag: a bulk tenant-file deleter must run the bytes that were
@@ -95,7 +96,7 @@ spec:
           # unbounded one.
           timeoutSeconds: 1800
           containers:
-            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:659c0a514d2c8ea04b1dfc4ae945835867f12c9b6d4a18421a0b57348aa6f554
+            - image: gcr.io/tution-app-6c0c3/backend-runtime@sha256:d7dd74b4b7dc48b966521baf267f0908ab45c39609d1501709a3ddb98778d7d1
               command: ["npm"]
               args: ["run", "storage:orphan-sweep"]
               resources:

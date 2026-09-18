@@ -591,7 +591,7 @@ describe('the module reads no clock', () => {
     const watched = new Proxy(RealDate, {
       construct(target, args) {
         if (args.length === 0) clockReads += 1;
-        return Reflect.construct(target as ObjectConstructor, args);
+        return Reflect.construct(target as unknown as ObjectConstructor, args);
       },
       get(target, prop, receiver) {
         if (prop === 'now') {

@@ -6,6 +6,10 @@ module.exports = {
   testMatch: ['**/__tests__/**/*.test.ts'],
   transform: {
     '^.+\\.tsx?$': ['ts-jest', {
+      // Deliberately off, and NOT "nothing checks these files": `npm run typecheck`
+      // does, via tsconfig.test.json, at full production strictness. Type-checking
+      // inside every jest run would slow the suite and raise its memory ceiling, so
+      // the check lives in its own fast pass instead. See tsconfig.test.json.
       diagnostics: false,
       tsconfig: {
         strict: false,
