@@ -1909,7 +1909,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
+    paddingHorizontal: 20,
     paddingTop: 60,
     paddingBottom: 20,
     borderBottomWidth: 1,
@@ -1933,7 +1933,7 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
-    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
+    paddingHorizontal: 20,
   },
   hiddenInviteManagerHost: {
     height: 0,
@@ -2179,7 +2179,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     backgroundColor: 'transparent',
     borderBottomWidth: 1,
-    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
+    paddingHorizontal: 20,
   },
   tabButton: {
     flexDirection: 'row',
