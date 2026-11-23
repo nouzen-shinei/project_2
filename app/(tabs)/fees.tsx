@@ -37,6 +37,8 @@ import { useRouter } from 'expo-router';
 import useFees from '../../hooks/useFees';
 import useStudents from '../../hooks/useStudents';
 import { useTheme } from '../../hooks/useTheme';
+import { useSubmitFailure } from '../../hooks/useSubmitFailure';
+import { SubmitFailedContent } from '../../components/SubmitFailedContent';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useAuth } from '../../hooks/useAuthUnified'; // Add useAuth import
 import Toast from 'react-native-toast-message';
@@ -422,6 +424,9 @@ export default function Fees() {
   const [showPaymentLanguageModal, setShowPaymentLanguageModal] = useState(false);
   const [showLanguageOrderModal, setShowLanguageOrderModal] = useState(false);
   const [confirmingPayment, setConfirmingPayment] = useState(false);
+  const paymentFailure = useSubmitFailure();
+  const [updatingFee, setUpdatingFee] = useState(false);
+  const feeUpdateFailure = useSubmitFailure();
   const [showFeeDetailsModal, setShowFeeDetailsModal] = useState(false);
   const [showAddFeeModal, setShowAddFeeModal] = useState(false);
   const [showDueMonthModal, setShowDueMonthModal] = useState(false);
@@ -439,6 +444,8 @@ export default function Fees() {
   const [showReceiptUpload, setShowReceiptUpload] = useState(false);
   const [selectedReceipt, setSelectedReceipt] = useState<string | null>(null);
   const [uploadingReceipt, setUploadingReceipt] = useState(false);
+  const receiptUploadFailure = useSubmitFailure();
+  const clearReceiptUploadFailure = receiptUploadFailure.clear;
   const [uploadProgress, setUploadProgress] = useState(0);
   const easedUploadProgress = useEasedUploadProgress(uploadProgress, {
     isActive: uploadingReceipt,
@@ -517,7 +524,8 @@ export default function Fees() {
     selectedReceiptFilesRef.current = [];
     setSkippedReceiptFiles([]);
     setIsReceiptDropActive(false);
-  }, []);
+    clearReceiptUploadFailure();
+  }, [clearReceiptUploadFailure]);
 
   const getReceiptFileIdentity = useCallback((file: any) => {
     const fileName = String(file?.name || file?.fileName || '').trim().toLowerCase();
@@ -4230,6 +4238,10 @@ export default function Fees() {
     setUploadingReceipt(true);
     setUploadProgress(0);
 
+    // Any exit from the try below that doesn't reach `uploaded = true`
+    // (storage limit, upload or save failure) shows the failed state on the
+    // Upload button in `finally`.
+    let uploaded = false;
     try {
       const uploadedReceipts = [];
 
@@ -4313,6 +4325,7 @@ export default function Fees() {
       await updateFeeRecord(selectedFee.id, {
         receipts: allReceipts
       } as any);
+      uploaded = true;
 
       // Update the selectedFee state
       setSelectedFee({
@@ -4339,6 +4352,7 @@ export default function Fees() {
     } finally {
       setUploadingReceipt(false);
       setUploadProgress(0);
+      if (!uploaded) receiptUploadFailure.trigger();
     }
   };
 
@@ -4549,6 +4563,7 @@ export default function Fees() {
     });
     // Clear any previous form errors
     setFormErrors({});
+    paymentFailure.clear();
     setShowPaymentModal(true);
   };
 
@@ -4575,6 +4590,7 @@ export default function Fees() {
       paidDate: latestFee.paidDate || '',
       method: latestFee.method || ''
     });
+    feeUpdateFailure.clear();
     setShowFeeDetailsModal(true);
   };
 
@@ -4983,6 +4999,7 @@ export default function Fees() {
       setShowPaymentModal(false);
     } catch (error) {
       logger.error('Error recording payment:', error);
+      paymentFailure.trigger();
       Alert.alert('Error', 'Failed to record payment');
     } finally {
       setConfirmingPayment(false);
@@ -5028,11 +5045,13 @@ export default function Fees() {
   };
 
   const handleFeeUpdate = async () => {
-    if (!selectedFee || !feeEditForm.dueDate) {
-      Alert.alert('Error', 'Please fill in required fields');
+    // Update Fee is disabled while the due date is empty (see the button);
+    // this is only a guard against stray calls.
+    if (!selectedFee || !feeEditForm.dueDate || updatingFee) {
       return;
     }
 
+    setUpdatingFee(true);
     try {
       // Update the fee record with new values (amount is not editable, so we don't update it)
       await updateFeeRecord(selectedFee.id!, {
@@ -5051,7 +5070,10 @@ export default function Fees() {
       setShowFeeDetailsModal(false);
     } catch (error) {
       logger.error('Error updating fee:', error);
+      feeUpdateFailure.trigger();
       Alert.alert('Error', 'Failed to update fee');
+    } finally {
+      setUpdatingFee(false);
     }
   };
 
@@ -8396,16 +8418,27 @@ export default function Fees() {
               style={[
                 styles.modalButton,
                 styles.submitButton,
-                { backgroundColor: theme.success, opacity: confirmingPayment ? 0.7 : 1 }
+                {
+                  backgroundColor: paymentFailure.failed ? theme.error : theme.success,
+                  opacity: confirmingPayment ? 0.7 : 1,
+                }
               ]}
               onPress={handlePaymentSubmit}
-              disabled={confirmingPayment}
+              disabled={confirmingPayment || paymentFailure.failed}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: confirmingPayment || paymentFailure.failed, busy: confirmingPayment }}
             >
               {confirmingPayment ? (
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                   <ActivityIndicator size="small" color="white" />
                   <Text style={[styles.buttonText, { color: 'white', marginLeft: 8 }]}>Recording…</Text>
                 </View>
+              ) : paymentFailure.failed ? (
+                <SubmitFailedContent
+                  label="Not recorded"
+                  shake={paymentFailure.shake}
+                  textStyle={styles.buttonText}
+                />
               ) : (
                 <Text style={[styles.buttonText, { color: 'white' }]}>Confirm Payment</Text>
               )}
@@ -9324,11 +9357,39 @@ export default function Fees() {
               <Text style={[styles.buttonText, { color: theme.textSecondary }]}>Close</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.modalButton, styles.submitButton, { backgroundColor: theme.primary, opacity: isFeeDirty ? 1 : 0.5 }]}
+              style={[
+                styles.modalButton,
+                styles.submitButton,
+                {
+                  backgroundColor: feeUpdateFailure.failed ? theme.error : theme.primary,
+                  opacity: feeUpdateFailure.failed
+                    ? 1
+                    : updatingFee ? 0.7 : isFeeDirty && feeEditForm.dueDate ? 1 : 0.5,
+                },
+              ]}
               onPress={handleFeeUpdate}
-              disabled={!isFeeDirty}
+              disabled={!isFeeDirty || !feeEditForm.dueDate || updatingFee || feeUpdateFailure.failed}
+              accessibilityRole="button"
+              accessibilityState={{
+                disabled: !isFeeDirty || !feeEditForm.dueDate || updatingFee || feeUpdateFailure.failed,
+                busy: updatingFee,
+              }}
+              accessibilityHint={isFeeDirty && !feeEditForm.dueDate ? 'Choose a due date to update the fee.' : undefined}
             >
-              <Text style={[styles.buttonText, { color: '#ffffff' }]}>Update Fee</Text>
+              {updatingFee ? (
+                <View style={styles.buttonContent}>
+                  <ActivityIndicator size="small" color="#ffffff" />
+                  <Text style={[styles.buttonText, { color: '#ffffff' }]}>Updating…</Text>
+                </View>
+              ) : feeUpdateFailure.failed ? (
+                <SubmitFailedContent
+                  label="Update failed"
+                  shake={feeUpdateFailure.shake}
+                  textStyle={styles.buttonText}
+                />
+              ) : (
+                <Text style={[styles.buttonText, { color: '#ffffff' }]}>Update Fee</Text>
+              )}
             </TouchableOpacity>
           </View>
         </View>
@@ -9891,14 +9952,37 @@ export default function Fees() {
                   </TouchableOpacity>
                   
                   <TouchableOpacity
-                    style={[styles.previewButton, styles.previewConfirmButton, { backgroundColor: theme.primary }]}
+                    style={[
+                      styles.previewButton,
+                      styles.previewConfirmButton,
+                      {
+                        backgroundColor: receiptUploadFailure.failed ? theme.error : theme.primary,
+                        opacity: !receiptUploadFailure.failed && uploadingReceipt ? 0.7 : 1,
+                      },
+                    ]}
                     onPress={confirmUploadFiles}
-                    disabled={selectedFiles.length === 0 || uploadingReceipt}
+                    disabled={selectedFiles.length === 0 || uploadingReceipt || receiptUploadFailure.failed}
+                    accessibilityRole="button"
+                    accessibilityState={{
+                      disabled: selectedFiles.length === 0 || uploadingReceipt || receiptUploadFailure.failed,
+                      busy: uploadingReceipt,
+                    }}
                   >
-                    <Upload size={16} color="white" />
-                    <Text style={[styles.previewButtonText, { color: 'white', marginLeft: 8 }]}>
-                      Upload {selectedFiles.length} File{selectedFiles.length !== 1 ? 's' : ''}
-                    </Text>
+                    {receiptUploadFailure.failed ? (
+                      <SubmitFailedContent
+                        label="Failed"
+                        shake={receiptUploadFailure.shake}
+                        textStyle={styles.previewButtonText}
+                        iconSize={16}
+                      />
+                    ) : (
+                      <>
+                        <Upload size={16} color="white" />
+                        <Text style={[styles.previewButtonText, { color: 'white', marginLeft: 8 }]}>
+                          Upload {selectedFiles.length} File{selectedFiles.length !== 1 ? 's' : ''}
+                        </Text>
+                      </>
+                    )}
                   </TouchableOpacity>
                 </View>
                 </View>

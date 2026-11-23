@@ -19,6 +19,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useTheme } from '../../hooks/useTheme';
+import { useSubmitFailure } from '../../hooks/useSubmitFailure';
+import { SubmitFailedContent } from '../../components/SubmitFailedContent';
 import { useAuth } from '../../hooks/useAuthUnified';
 import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
@@ -111,6 +113,7 @@ export default function AdminPanel() {
     return map;
   }, [memberships]);
   const [loadingAction, setLoadingAction] = useState(false);
+  const roleChangeFailure = useSubmitFailure();
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [activeTab, setActiveTab] = useState<'users' | 'team'>('users'); // New tab state
   // Role change confirmation modal state
@@ -1469,6 +1472,7 @@ export default function AdminPanel() {
   const closeRoleChangeModal = () => {
     setShowRoleChangeModal(false);
     resetRoleChangeModalState();
+    roleChangeFailure.clear();
   };
 
   const confirmRemoveMember = async () => {
@@ -1644,6 +1648,7 @@ export default function AdminPanel() {
       const errorMessage = error instanceof Error ? error.message : 'Unable to update role.';
       logger.error('AdminPanel: failed to change role', error);
       Toast.show({ type: 'error', text1: 'Failed to Change Role', text2: errorMessage });
+      roleChangeFailure.trigger();
     } finally {
       setLoadingAction(false);
     }
@@ -1868,25 +1873,39 @@ export default function AdminPanel() {
                   styles.modalButton,
                   styles.deleteButton,
                   {
-                    backgroundColor:
-                      loadingAction || !roleChangeSelectionDirty ? theme.border : theme.warning,
+                    backgroundColor: roleChangeFailure.failed
+                      ? theme.error
+                      : loadingAction || !roleChangeSelectionDirty ? theme.border : theme.warning,
                   },
                 ]}
                 onPress={confirmRoleChange}
-                disabled={loadingAction || !roleChangeSelectionDirty}
+                disabled={loadingAction || !roleChangeSelectionDirty || roleChangeFailure.failed}
+                accessibilityRole="button"
+                accessibilityState={{
+                  disabled: loadingAction || !roleChangeSelectionDirty || roleChangeFailure.failed,
+                  busy: loadingAction,
+                }}
               >
-                <Text
-                  style={[
-                    styles.modalButtonText,
-                    { color: loadingAction || !roleChangeSelectionDirty ? theme.text : '#ffffff' },
-                  ]}
-                > 
-                  {loadingAction
-                    ? 'Changing...'
-                    : roleChangeSelectionDirty
-                    ? 'Apply Role'
-                    : 'Select Role'}
-                </Text>
+                {roleChangeFailure.failed ? (
+                  <SubmitFailedContent
+                    label="Failed"
+                    shake={roleChangeFailure.shake}
+                    textStyle={styles.modalButtonText}
+                  />
+                ) : (
+                  <Text
+                    style={[
+                      styles.modalButtonText,
+                      { color: loadingAction || !roleChangeSelectionDirty ? theme.text : '#ffffff' },
+                    ]}
+                  > 
+                    {loadingAction
+                      ? 'Changing...'
+                      : roleChangeSelectionDirty
+                      ? 'Apply Role'
+                      : 'Select Role'}
+                  </Text>
+                )}
               </TouchableOpacity>
             </View>
           </View>

@@ -13,6 +13,8 @@ import {
   Linking,
   Platform,
 } from 'react-native';
+import { useSubmitFailure } from '@/hooks/useSubmitFailure';
+import { SubmitFailedContent } from '@/components/SubmitFailedContent';
 import { Modal } from '@/components/AppModal';
 import { 
   X, 
@@ -1020,6 +1022,9 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   const [selectedNotice, setSelectedNotice] = useState<Notice | null>(null);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [uploading, setUploading] = useState(false);
+  // After a failed post the submit button turns red, says "Failed to post" and
+  // stays disabled for a few seconds.
+  const postFailure = useSubmitFailure();
   const [selectedImageUri, setSelectedImageUri] = useState<string>(''); // Local image URI before upload
   const [selectedAudio, setSelectedAudio] = useState<SelectedAudio | null>(null);
   const [audioMetadataLoading, setAudioMetadataLoading] = useState(false);
@@ -1097,6 +1102,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   });
 
   const resetForm = () => {
+    postFailure.clear();
     setFormData({
       title: '',
       content: '',
@@ -1251,26 +1257,16 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   };
 
   const handleSubmit = async () => {
-    if (!formData.title.trim() || !formData.content.trim()) {
-      Toast.show({
-        type: 'error',
-        text1: 'Missing fields',
-        text2: 'Please fill in title and content',
-        position: 'top',
-      });
+    // The button is disabled in these cases (see `submitDisabled`); this is
+    // only a guard against stray calls.
+    if (!formData.title.trim() || !formData.content.trim() || audioMetadataLoading) {
       return;
     }
 
-    if (audioMetadataLoading) {
-      Toast.show({
-        type: 'info',
-        text1: 'Please wait',
-        text2: 'Still reading audio details. Try again in a moment.',
-        position: 'top',
-      });
-      return;
-    }
-
+    // Any exit from the try below that doesn't reach `posted = true` (upload
+    // failure, storage limit, addNotice rejecting) puts the button into its
+    // failed state in `finally`.
+    let posted = false;
     try {
       setUploading(true);
       let finalFormData = { ...formData };
@@ -1407,6 +1403,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
       }
 
       await addNotice(finalFormData);
+      posted = true;
       Toast.show({
         type: 'success',
         text1: 'Notice posted',
@@ -1425,6 +1422,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
       });
     } finally {
       setUploading(false);
+      if (!posted) postFailure.trigger();
     }
   };
 
@@ -1654,6 +1652,9 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   }, [notices]);
 
   const hasPendingMedia = Boolean(selectedImageUri || selectedAudio);
+  const noticeFieldsComplete = Boolean(formData.title.trim() && formData.content.trim());
+  const submitDisabled =
+    uploading || postFailure.failed || audioMetadataLoading || !noticeFieldsComplete;
   const canSetNoticeVisibility = activeMembership?.role === 'owner' || activeMembership?.role === 'admin';
   const isAdminsOnlyNotice = Array.isArray(formData.targetTenantRoles) && formData.targetTenantRoles.length > 0;
 
@@ -2012,23 +2013,43 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={[
-                      styles.formButton, 
-                      styles.submitButton, 
-                      { 
-                        backgroundColor: uploading ? theme.textSecondary : theme.primary,
-                        opacity: uploading ? 0.7 : 1 
+                      styles.formButton,
+                      styles.submitButton,
+                      {
+                        backgroundColor: postFailure.failed
+                          ? theme.error
+                          : uploading
+                            ? theme.textSecondary
+                            : theme.primary,
+                        opacity: uploading ? 0.7 : submitDisabled && !postFailure.failed ? 0.5 : 1,
                       }
                     ]}
                     onPress={handleSubmit}
-                    disabled={uploading}
+                    disabled={submitDisabled}
+                    accessibilityRole="button"
+                    accessibilityLabel={
+                      postFailure.failed ? 'Failed to post notice. You can try again in a few seconds.' : undefined
+                    }
+                    accessibilityHint={
+                      !noticeFieldsComplete ? 'Enter a title and content to post.' : undefined
+                    }
+                    accessibilityState={{ disabled: submitDisabled, busy: uploading || audioMetadataLoading }}
                   >
-                    {uploading ? (
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    {uploading || audioMetadataLoading ? (
+                      <View style={styles.submitButtonContent}>
                         <ActivityIndicator size="small" color="#ffffff" />
                         <Text style={styles.formButtonText}>
-                          {hasPendingMedia ? 'Uploading media...' : 'Posting...'}
+                          {uploading
+                            ? hasPendingMedia ? 'Uploading media...' : 'Posting...'
+                            : 'Reading audio...'}
                         </Text>
                       </View>
+                    ) : postFailure.failed ? (
+                      <SubmitFailedContent
+                        label="Failed to post"
+                        shake={postFailure.shake}
+                        textStyle={styles.formButtonText}
+                      />
                     ) : (
                       <Text style={styles.formButtonText}>Post Notice</Text>
                     )}
@@ -2361,6 +2382,11 @@ const styles = StyleSheet.create({
   },
   cancelButton: {},
   submitButton: {},
+  submitButtonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
   formButtonText: {
     fontSize: 16,
     fontFamily: 'Inter-SemiBold',

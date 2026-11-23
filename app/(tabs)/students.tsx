@@ -28,6 +28,8 @@ import { useAttendance } from '../../hooks/useAttendance';
 import AttendanceCalendar from '../../components/AttendanceCalendarNew';
 import type { Student } from '../../types';
 import { useTheme } from '../../hooks/useTheme';
+import { useSubmitFailure } from '../../hooks/useSubmitFailure';
+import { SubmitFailedContent } from '../../components/SubmitFailedContent';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useAuth } from '../../hooks/useAuthUnified';
 import { useRouter } from 'expo-router';
@@ -146,6 +148,7 @@ export default function Students() {
   const [profileImage, setProfileImage] = useState<string | null>(null);
   const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [isAddingStudent, setIsAddingStudent] = useState(false);
+  const addStudentFailure = useSubmitFailure();
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [studentToDelete, setStudentToDelete] = useState<Student | null>(null);
   const [isDeletingStudent, setIsDeletingStudent] = useState(false);
@@ -400,6 +403,7 @@ export default function Students() {
       // Single modal: avoid competing alerts (especially storage-limit).
       Alert.alert('Success', messageParts.join('\n\n'));
     } catch (err) {
+      addStudentFailure.trigger();
       const message = err instanceof Error ? err.message : String(err || '');
       const isStudentLimit = /student[_\s-]?limit[_\s-]?reached/i.test(message) || /student limit reached/i.test(message);
 
@@ -439,6 +443,7 @@ export default function Students() {
     setProfileImage(null);
     setSubjectsInputText('');
     setIsAddingStudent(false);
+    addStudentFailure.clear();
   };
 
   const handleMoveStudentUp = async (studentId: string) => {
@@ -1335,33 +1340,48 @@ export default function Students() {
             <Text style={[styles.modalTitle, { color: theme.text }]}>Add Student</Text>
             <TouchableOpacity 
               onPress={handleAddStudent}
-              disabled={isAddingStudent}
+              disabled={isAddingStudent || addStudentFailure.failed}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: isAddingStudent || addStudentFailure.failed, busy: isAddingStudent }}
               style={[
                 styles.saveButton,
                 { 
                   opacity: isAddingStudent ? 0.6 : 1,
-                  backgroundColor: isAddingStudent ? theme.textSecondary : 'transparent',
+                  backgroundColor: addStudentFailure.failed
+                    ? theme.error
+                    : isAddingStudent ? theme.textSecondary : 'transparent',
                   flexDirection: 'row',
                   alignItems: 'center',
                   gap: 6
                 }
               ]}
             >
-              {isAddingStudent && (
-                <ActivityIndicator 
-                  size="small" 
-                  color="#ffffff" 
+              {addStudentFailure.failed ? (
+                <SubmitFailedContent
+                  label="Failed"
+                  shake={addStudentFailure.shake}
+                  textStyle={styles.saveText}
+                  iconSize={16}
                 />
+              ) : (
+                <>
+                  {isAddingStudent && (
+                    <ActivityIndicator 
+                      size="small" 
+                      color="#ffffff" 
+                    />
+                  )}
+                  <Text style={[
+                    styles.saveText, 
+                    { 
+                      color: isAddingStudent ? '#ffffff' : theme.primary,
+                      fontFamily: isAddingStudent ? 'Inter-Medium' : 'Inter-SemiBold'
+                    }
+                  ]}>
+                    {isAddingStudent ? 'Saving...' : 'Save'}
+                  </Text>
+                </>
               )}
-              <Text style={[
-                styles.saveText, 
-                { 
-                  color: isAddingStudent ? '#ffffff' : theme.primary,
-                  fontFamily: isAddingStudent ? 'Inter-Medium' : 'Inter-SemiBold'
-                }
-              ]}>
-                {isAddingStudent ? 'Saving...' : 'Save'}
-              </Text>
             </TouchableOpacity>
           </View>
           

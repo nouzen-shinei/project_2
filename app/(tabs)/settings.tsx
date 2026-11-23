@@ -28,6 +28,8 @@ import { useEasedUploadProgress } from '@/hooks/useEasedUploadProgress';
 import useStudents from '../../hooks/useStudents';
 import useFees from '../../hooks/useFees';
 import { useTheme } from '../../hooks/useTheme';
+import { useSubmitFailure } from '../../hooks/useSubmitFailure';
+import { SubmitFailedContent } from '../../components/SubmitFailedContent';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useSettings } from '../../hooks/useSettings';
 import { useOfflineDataGate } from '../../hooks/useOfflineDataGate';
@@ -440,6 +442,7 @@ export default function Settings() {
   });
   const [showImagePickerModal, setShowImagePickerModal] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
+  const profileSaveFailure = useSubmitFailure();
   const [selectedImageFileName, setSelectedImageFileName] = useState<string | null>(null);
   const [selectedImageFileSize, setSelectedImageFileSize] = useState<number | null>(null);
   const resolvedDisplayName = useMemo(
@@ -1195,6 +1198,7 @@ export default function Settings() {
   // Removed success alert for silent save UX
     } catch (error) {
       logger.error('Error saving profile:', error);
+      profileSaveFailure.trigger();
       Alert.alert('Error', 'Failed to save profile');
     } finally {
       // Ensure we don't leave the UI in loading state
@@ -1260,6 +1264,7 @@ export default function Settings() {
   setPendingProfilePictureUri(null);
   setSelectedImageFileName(null);
   setSelectedImageFileSize(null);
+    profileSaveFailure.clear();
     setEditingProfile(true);
   };
 
@@ -2697,15 +2702,27 @@ export default function Settings() {
                     style={[
                       styles.actionButton,
                       styles.saveButton,
-                      hasUnsavedChanges
-                        ? { backgroundColor: theme.primary, opacity: (uploadingProfilePicture || savingProfile) ? 0.7 : 1 }
-                        : { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border, opacity: 0.6 },
+                      profileSaveFailure.failed
+                        ? { backgroundColor: theme.error, opacity: 1 }
+                        : hasUnsavedChanges
+                          ? { backgroundColor: theme.primary, opacity: (uploadingProfilePicture || savingProfile) ? 0.7 : 1 }
+                          : { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border, opacity: 0.6 },
                     ]}
                     onPress={saveProfile}
-                    disabled={uploadingProfilePicture || savingProfile || !hasUnsavedChanges}
-                    accessibilityState={{ disabled: (uploadingProfilePicture || savingProfile || !hasUnsavedChanges) }}
+                    disabled={uploadingProfilePicture || savingProfile || !hasUnsavedChanges || profileSaveFailure.failed}
+                    accessibilityRole="button"
+                    accessibilityState={{
+                      disabled: uploadingProfilePicture || savingProfile || !hasUnsavedChanges || profileSaveFailure.failed,
+                      busy: uploadingProfilePicture || savingProfile,
+                    }}
                   >
-                    {(uploadingProfilePicture || savingProfile) ? (
+                    {profileSaveFailure.failed ? (
+                      <SubmitFailedContent
+                        label="Failed"
+                        shake={profileSaveFailure.shake}
+                        textStyle={styles.saveButtonText}
+                      />
+                    ) : (uploadingProfilePicture || savingProfile) ? (
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                         <ActivityIndicator size="small" color="#ffffff" />
                         <Text style={styles.saveButtonText}>{uploadingProfilePicture ? 'Uploading…' : 'Saving…'}</Text>

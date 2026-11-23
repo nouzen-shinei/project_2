@@ -33,6 +33,9 @@ import {
 } from 'lucide-react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { useTheme } from '../../hooks/useTheme';
+import { useSubmitFailure } from '../../hooks/useSubmitFailure';
+import { SubmitFailedContent } from '../../components/SubmitFailedContent';
+import Toast from 'react-native-toast-message';
 import { useRouter } from 'expo-router';
 import { useBirthdays } from '../../components/BirthdayProvider';
 import { useStudents } from '../../hooks/useStudents';
@@ -98,6 +101,7 @@ export default function SendReminders() {
     saving, 
     loading: settingsLoading 
   } = useReminderSettings();
+  const settingsSaveFailure = useSubmitFailure();
   const tenantId = activeTenant?.id ?? null;
   const {
     usageSummary,
@@ -4858,10 +4862,12 @@ export default function SendReminders() {
                       style={[
                         styles.sendButton, 
                         { 
-                          backgroundColor: hasUnsavedChanges ? theme.primary : theme.border,
+                          backgroundColor: settingsSaveFailure.failed
+                            ? theme.error
+                            : hasUnsavedChanges ? theme.primary : theme.border,
                           margin: 0,
                           flex: 1,
-                          opacity: hasUnsavedChanges ? 1 : 0.5
+                          opacity: hasUnsavedChanges || settingsSaveFailure.failed ? 1 : 0.5
                         }
                       ]}
                       onPress={async () => {
@@ -4869,13 +4875,33 @@ export default function SendReminders() {
                           const success = await saveSettings();
                           if (success) {
                             setShowSettingsModal(false);
+                          } else {
+                            // saveSettings reports failure only through its return value.
+                            settingsSaveFailure.trigger();
+                            Toast.show({
+                              type: 'error',
+                              text1: 'Settings not saved',
+                              text2: 'Please check your connection and try again.',
+                              position: 'top',
+                            });
                           }
                         }
                       }}
-                      disabled={saving || !hasUnsavedChanges}
+                      disabled={saving || !hasUnsavedChanges || settingsSaveFailure.failed}
+                      accessibilityRole="button"
+                      accessibilityState={{
+                        disabled: saving || !hasUnsavedChanges || settingsSaveFailure.failed,
+                        busy: saving,
+                      }}
                     >
                       {saving ? (
                         <ActivityIndicator color="#fff" size="small" />
+                      ) : settingsSaveFailure.failed ? (
+                        <SubmitFailedContent
+                          label="Save failed"
+                          shake={settingsSaveFailure.shake}
+                          textStyle={styles.sendButtonText}
+                        />
                       ) : (
                         <Text style={[
                           styles.sendButtonText,

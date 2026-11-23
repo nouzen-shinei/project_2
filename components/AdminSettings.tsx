@@ -23,6 +23,8 @@ import { useAuth } from '@/hooks/useAuthUnified';
 import { formatDateToString } from '@/lib/utils';
 import { logger } from '@/lib/logger';
 import { Save, RefreshCw, ImagePlus, Trash2, KeyRound, Info } from 'lucide-react-native';
+import { useSubmitFailure } from '@/hooks/useSubmitFailure';
+import { SubmitFailedContent } from '@/components/SubmitFailedContent';
 import type { TenantMembershipRole, TenantNotificationPreferences, TenantJoinRequestStatus, TenantSettings } from '@/types';
 import TenantMembershipManager from './TenantMembershipManager';
 import TenantInviteManager, { TenantInviteManagerHandle } from './TenantInviteManager';
@@ -87,6 +89,8 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
   const [notificationPrefs, setNotificationPrefs] = useState<TenantNotificationPreferences>(DEFAULT_NOTIFICATION_PREFS);
   const [notificationPrefsOriginal, setNotificationPrefsOriginal] = useState<TenantNotificationPreferences>(DEFAULT_NOTIFICATION_PREFS);
   const [savingNotificationPrefs, setSavingNotificationPrefs] = useState(false);
+  const saveFailure = useSubmitFailure();
+  const notificationPrefsSaveFailure = useSubmitFailure();
   const [reconcilingStorage, setReconcilingStorage] = useState(false);
   const [reconcileStorageConfirmVisible, setReconcileStorageConfirmVisible] = useState(false);
   const [coachingCentersTooltipVisible, setCoachingCentersTooltipVisible] = useState(false);
@@ -816,6 +820,7 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
         position: 'top',
         topOffset: 60,
       });
+      notificationPrefsSaveFailure.trigger();
     } finally {
       setSavingNotificationPrefs(false);
     }
@@ -823,14 +828,9 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
 
   const handleSave = async () => {
     const trimmedCoachingName = coachingName.trim();
+    // Save is disabled while the name is empty (see `saveDisabled`); this is
+    // only a guard against stray calls.
     if (!trimmedCoachingName) {
-      Toast.show({
-        type: 'error',
-        text1: 'Missing coaching name',
-        text2: 'Enter a coaching name to continue.',
-        position: 'top',
-        topOffset: 60,
-      });
       return;
     }
     try {
@@ -962,10 +962,14 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
         topOffset: 60,
         visibilityTime: 4000,
       });
+      saveFailure.trigger();
     } finally {
       setSaving(false);
     }
   };
+
+  const coachingNameMissing = !coachingName.trim();
+  const saveDisabled = saving || !isDirty || coachingNameMissing || saveFailure.failed;
 
   if (tenantUnavailable) {
     return (
@@ -999,14 +1003,30 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
           <Text style={[styles.cancelButton, { color: theme.textSecondary }]}>Cancel</Text>
         </TouchableOpacity>
         <Text style={[styles.title, { color: theme.text }]}>Admin Settings</Text>
-        {/** Save button disabled until changes are made (or while saving) **/}
-        <TouchableOpacity onPress={handleSave} disabled={saving || !isDirty}>
-          <View style={styles.saveButton}>
-            <Save size={20} color={(saving || !isDirty) ? theme.textSecondary : theme.primary} />
-            <Text style={[styles.saveButtonText, { color: (saving || !isDirty) ? theme.textSecondary : theme.primary }]}>
-              {saving ? 'Saving...' : 'Save'}
-            </Text>
-          </View>
+        {/** Save button disabled until changes are made, while the coaching name is empty, while saving, and briefly after a failed save **/}
+        <TouchableOpacity
+          onPress={handleSave}
+          disabled={saveDisabled}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: saveDisabled, busy: saving }}
+          accessibilityHint={coachingNameMissing ? 'Enter a coaching name to save.' : undefined}
+        >
+          {saveFailure.failed ? (
+            <SubmitFailedContent
+              label="Failed"
+              shake={saveFailure.shake}
+              textStyle={styles.saveButtonText}
+              color={theme.error}
+              iconSize={20}
+            />
+          ) : (
+            <View style={styles.saveButton}>
+              <Save size={20} color={saveDisabled ? theme.textSecondary : theme.primary} />
+              <Text style={[styles.saveButtonText, { color: saveDisabled ? theme.textSecondary : theme.primary }]}>
+                {saving ? 'Saving...' : 'Save'}
+              </Text>
+            </View>
+          )}
         </TouchableOpacity>
       </View>
 
@@ -1026,6 +1046,11 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
               onChangeText={setCoachingName}
               autoCapitalize="words"
             />
+            {coachingNameMissing && (
+              <Text style={{ color: theme.error, fontSize: 12, marginTop: 8 }}>
+                Enter a coaching name to save your changes.
+              </Text>
+            )}
             <Text style={{ color: theme.textSecondary, fontSize: 12, marginTop: 8 }}>
               This name will appear in reminders, emails, and receipts.
             </Text>
@@ -1299,24 +1324,42 @@ export default function AdminSettings({ onClose }: AdminSettingsProps) {
                 <TouchableOpacity
                   style={[
                     styles.notificationActionButton,
-                    {
-                      backgroundColor: notificationPrefsDirty ? theme.primary : theme.surface,
-                      borderColor: notificationPrefsDirty ? theme.primary : theme.border,
-                      opacity: notificationPrefsDirty && !savingNotificationPrefs ? 1 : 0.6,
-                    },
+                    notificationPrefsSaveFailure.failed
+                      ? { backgroundColor: theme.error, borderColor: theme.error, opacity: 1 }
+                      : {
+                          backgroundColor: notificationPrefsDirty ? theme.primary : theme.surface,
+                          borderColor: notificationPrefsDirty ? theme.primary : theme.border,
+                          opacity: notificationPrefsDirty && !savingNotificationPrefs ? 1 : 0.6,
+                        },
                   ]}
-                  disabled={!notificationPrefsDirty || savingNotificationPrefs}
+                  disabled={!notificationPrefsDirty || savingNotificationPrefs || notificationPrefsSaveFailure.failed}
                   onPress={handleSaveNotificationPrefs}
+                  accessibilityRole="button"
+                  accessibilityState={{
+                    disabled: !notificationPrefsDirty || savingNotificationPrefs || notificationPrefsSaveFailure.failed,
+                    busy: savingNotificationPrefs,
+                  }}
                 >
-                  <Save size={16} color={notificationPrefsDirty ? '#fff' : theme.textSecondary} />
-                  <Text
-                    style={[
-                      styles.notificationActionText,
-                      { color: notificationPrefsDirty ? '#fff' : theme.textSecondary },
-                    ]}
-                  >
-                    {savingNotificationPrefs ? 'Saving…' : 'Save changes'}
-                  </Text>
+                  {notificationPrefsSaveFailure.failed ? (
+                    <SubmitFailedContent
+                      label="Failed to save"
+                      shake={notificationPrefsSaveFailure.shake}
+                      textStyle={styles.notificationActionText}
+                      iconSize={16}
+                    />
+                  ) : (
+                    <>
+                      <Save size={16} color={notificationPrefsDirty ? '#fff' : theme.textSecondary} />
+                      <Text
+                        style={[
+                          styles.notificationActionText,
+                          { color: notificationPrefsDirty ? '#fff' : theme.textSecondary },
+                        ]}
+                      >
+                        {savingNotificationPrefs ? 'Saving…' : 'Save changes'}
+                      </Text>
+                    </>
+                  )}
                 </TouchableOpacity>
               </View>
             </>

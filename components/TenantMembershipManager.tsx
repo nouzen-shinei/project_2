@@ -32,6 +32,8 @@ import { MediaPickerUtil } from '@/lib/mediaPickerUtil';
 import { useTenant } from '@/hooks/useTenantContext';
 import { useTheme } from '@/hooks/useTheme';
 import { useAuth } from '@/hooks/useAuthUnified';
+import { useSubmitFailure } from '@/hooks/useSubmitFailure';
+import { SubmitFailedContent } from '@/components/SubmitFailedContent';
 import { logger } from '@/lib/logger';
 import { formatDateToString } from '@/lib/utils';
 import {
@@ -546,10 +548,13 @@ const TenantMembershipManager = () => {
   const [createForm, setCreateForm] = useState<CreateTenantFormState>(() => buildBlankCreateForm());
   const [creatingTenant, setCreatingTenant] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const createFailure = useSubmitFailure();
+  const joinFailure = useSubmitFailure();
   const [createLogoAsset, setCreateLogoAsset] = useState<TenantLogoAsset | null>(null);
   const [createLogoPreviewUrl, setCreateLogoPreviewUrl] = useState<string | null>(null);
   const [pickingCreateLogo, setPickingCreateLogo] = useState(false);
 
+  const createFieldsComplete = Boolean(createForm.name.trim() && createForm.timezone.trim());
   const normalizedCode = sanitizeCode(joinCode);
   const canSubmitCode = normalizedCode.length >= 5;
   const reviewerQuickJoinEnabled = isReviewerQuickJoinEnabled();
@@ -568,6 +573,7 @@ const TenantMembershipManager = () => {
     setJoinError(null);
     setCheckingCode(false);
     setClaimingCode(false);
+    joinFailure.clear();
   };
 
   const openJoinModal = () => {
@@ -584,6 +590,7 @@ const TenantMembershipManager = () => {
     setCreateError(null);
     setCreateLogoAsset(null);
     setCreateLogoPreviewUrl(null);
+    createFailure.clear();
   };
 
   const openCreateModal = () => {
@@ -790,6 +797,7 @@ const TenantMembershipManager = () => {
       } else {
         setJoinError('Unable to join that coaching center right now.');
       }
+      joinFailure.trigger();
     } finally {
       setClaimingCode(false);
     }
@@ -941,6 +949,7 @@ const TenantMembershipManager = () => {
           ? createTenantError.message
           : 'Failed to create coaching center.';
       setCreateError(message);
+      createFailure.trigger();
     } finally {
       setCreatingTenant(false);
     }
@@ -1583,16 +1592,30 @@ const TenantMembershipManager = () => {
               style={[
                 styles.primaryButton,
                 {
-                  backgroundColor: theme.primary,
-                  opacity: createForm.name.trim() ? 1 : 0.5,
+                  backgroundColor: createFailure.failed ? theme.error : theme.primary,
+                  opacity: createFieldsComplete || createFailure.failed ? 1 : 0.5,
                   marginTop: 4,
                 },
               ]}
               onPress={handleCreateTenant}
-              disabled={creatingTenant || !createForm.name.trim()}
+              disabled={creatingTenant || createFailure.failed || !createFieldsComplete}
+              accessibilityRole="button"
+              accessibilityState={{
+                disabled: creatingTenant || createFailure.failed || !createFieldsComplete,
+                busy: creatingTenant,
+              }}
+              accessibilityHint={
+                !createFieldsComplete ? 'Enter a center name and timezone to create the center.' : undefined
+              }
             >
               {creatingTenant ? (
                 <ActivityIndicator color="#fff" />
+              ) : createFailure.failed ? (
+                <SubmitFailedContent
+                  label="Failed to create"
+                  shake={createFailure.shake}
+                  textStyle={styles.primaryButtonText}
+                />
               ) : (
                 <Text style={styles.primaryButtonText}>Create coaching center</Text>
               )}
@@ -1698,12 +1721,23 @@ const TenantMembershipManager = () => {
                 )}
                 {!alreadyMember && !alreadyPending && !joinSuccess && (
                   <TouchableOpacity
-                    style={[styles.primaryButton, { backgroundColor: theme.success, marginTop: 16 }]}
+                    style={[
+                      styles.primaryButton,
+                      { backgroundColor: joinFailure.failed ? theme.error : theme.success, marginTop: 16 },
+                    ]}
                     onPress={handleClaimCode}
-                    disabled={claimingCode}
+                    disabled={claimingCode || joinFailure.failed}
+                    accessibilityRole="button"
+                    accessibilityState={{ disabled: claimingCode || joinFailure.failed, busy: claimingCode }}
                   >
                     {claimingCode ? (
                       <ActivityIndicator color="#fff" />
+                    ) : joinFailure.failed ? (
+                      <SubmitFailedContent
+                        label="Failed to join"
+                        shake={joinFailure.shake}
+                        textStyle={styles.primaryButtonText}
+                      />
                     ) : (
                       <Text style={styles.primaryButtonText}>Join this center</Text>
                     )}

@@ -31,9 +31,12 @@ import {
   Shield,
   Users,
   AlertTriangle,
+  AlertCircle,
 } from 'lucide-react-native';
 import Toast from 'react-native-toast-message';
 import { useTheme } from '../../hooks/useTheme';
+import { useSubmitFailure } from '../../hooks/useSubmitFailure';
+import { SubmitFailedContent } from '../../components/SubmitFailedContent';
 import useFees from '../../hooks/useFees';
 import { useAttendance } from '../../hooks/useAttendance';
 import { Student } from '../../types';
@@ -67,6 +70,7 @@ export default function StudentProfile() {
   const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setSaving] = useState(false);
+  const saveFailure = useSubmitFailure();
   const [editedStudent, setEditedStudent] = useState<Student | null>(null);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isUploadingImage, setIsUploadingImage] = useState(false);
@@ -185,6 +189,7 @@ export default function StudentProfile() {
     setIsEditing(false);
     setEditedStudent(student);
     setSelectedImage(null);
+    saveFailure.clear();
   };
 
   const uploadProfileImage = async (
@@ -429,6 +434,7 @@ export default function StudentProfile() {
       
     } catch (error) {
       logger.error('Error saving student:', error);
+      saveFailure.trigger();
       Alert.alert('Error', 'Failed to save changes. Please try again.');
     } finally {
       setSaving(false);
@@ -522,10 +528,18 @@ export default function StudentProfile() {
         <TouchableOpacity 
           style={styles.headerButton} 
           onPress={isEditing ? (isSaving ? undefined : handleSave) : handleEdit}
-          disabled={isSaving}
+          disabled={isSaving || (isEditing && saveFailure.failed)}
+          accessibilityRole="button"
+          accessibilityLabel={
+            isEditing
+              ? saveFailure.failed ? 'Failed to save. You can try again in a few seconds.' : 'Save changes'
+              : 'Edit student'
+          }
         >
           {isSaving ? (
             <ActivityIndicator size="small" color={theme.primary} />
+          ) : isEditing && saveFailure.failed ? (
+            <AlertCircle size={24} color={theme.error} />
           ) : isEditing ? (
             <Save size={24} color={theme.primary} />
           ) : (
@@ -972,18 +986,31 @@ export default function StudentProfile() {
               </TouchableOpacity>
               
               <TouchableOpacity 
-                style={[styles.saveButton, { backgroundColor: theme.primary }]}
+                style={[styles.saveButton, { backgroundColor: saveFailure.failed ? theme.error : theme.primary }]}
                 onPress={handleSave}
-                disabled={isSaving}
+                disabled={isSaving || saveFailure.failed}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: isSaving || saveFailure.failed, busy: isSaving }}
               >
-                {isSaving ? (
-                  <ActivityIndicator size="small" color="#ffffff" />
+                {saveFailure.failed ? (
+                  <SubmitFailedContent
+                    label="Save failed"
+                    shake={saveFailure.shake}
+                    textStyle={styles.saveButtonText}
+                    iconSize={20}
+                  />
                 ) : (
-                  <Save size={20} color="#ffffff" />
+                  <>
+                    {isSaving ? (
+                      <ActivityIndicator size="small" color="#ffffff" />
+                    ) : (
+                      <Save size={20} color="#ffffff" />
+                    )}
+                    <Text style={styles.saveButtonText}>
+                      {isSaving ? 'Saving...' : 'Save Changes'}
+                    </Text>
+                  </>
                 )}
-                <Text style={styles.saveButtonText}>
-                  {isSaving ? 'Saving...' : 'Save Changes'}
-                </Text>
               </TouchableOpacity>
             </View>
           </View>

@@ -20,6 +20,8 @@ import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
 import { useAuth } from '@/hooks/useAuthUnified';
 import { useTenantUsageSummary } from '@/hooks/useTenantUsageSummary';
+import { useSubmitFailure } from '@/hooks/useSubmitFailure';
+import { SubmitFailedContent } from '@/components/SubmitFailedContent';
 import { tenantService } from '@/services/tenantService';
 import { tenantBackendClient } from '@/services/tenantBackendClient';
 import type { TenantInvite, TenantMembershipRole } from '@/types';
@@ -97,6 +99,8 @@ const TenantInviteManager = forwardRef<TenantInviteManagerHandle, TenantInviteMa
   const [formExpiresInDays, setFormExpiresInDays] = useState<number>(7);
   const [formMessage, setFormMessage] = useState('');
   const [creatingInvite, setCreatingInvite] = useState(false);
+  const inviteFailure = useSubmitFailure();
+  const clearInviteFailure = inviteFailure.clear;
   const [formError, setFormError] = useState<string | null>(null);
   const [resendingInviteId, setResendingInviteId] = useState<string | null>(null);
   const [revokingInviteId, setRevokingInviteId] = useState<string | null>(null);
@@ -234,13 +238,15 @@ const TenantInviteManager = forwardRef<TenantInviteManagerHandle, TenantInviteMa
     setFormExpiresInDays(activeTenant?.settings?.inviteExpiryDaysDefault ?? 7);
     setFormMessage('');
     setFormError(null);
+    clearInviteFailure();
     setInviteModalVisible(true);
-  }, [activeTenant?.settings?.inviteExpiryDaysDefault, onUpgradePress, router, seatsFull]);
+  }, [activeTenant?.settings?.inviteExpiryDaysDefault, clearInviteFailure, onUpgradePress, router, seatsFull]);
 
   const closeModal = () => {
     if (creatingInvite) {
       return;
     }
+    clearInviteFailure();
     setInviteModalVisible(false);
   };
 
@@ -340,6 +346,7 @@ const TenantInviteManager = forwardRef<TenantInviteManagerHandle, TenantInviteMa
       const errorMessage =
         createError instanceof Error ? createError.message : 'Failed to create invite. Try again later.';
       setFormError(errorMessage);
+      inviteFailure.trigger();
     } finally {
       setCreatingInvite(false);
     }
@@ -818,15 +825,27 @@ const TenantInviteManager = forwardRef<TenantInviteManagerHandle, TenantInviteMa
               style={[
                 styles.primaryButton,
                 {
-                  backgroundColor: theme.primary,
-                  opacity: formEmail.trim() ? 1 : 0.6,
+                  backgroundColor: inviteFailure.failed ? theme.error : theme.primary,
+                  opacity: formEmail.trim() || inviteFailure.failed ? 1 : 0.6,
                 },
               ]}
               onPress={handleCreateInvite}
-              disabled={creatingInvite || !formEmail.trim()}
+              disabled={creatingInvite || inviteFailure.failed || !formEmail.trim()}
+              accessibilityRole="button"
+              accessibilityState={{
+                disabled: creatingInvite || inviteFailure.failed || !formEmail.trim(),
+                busy: creatingInvite,
+              }}
+              accessibilityHint={!formEmail.trim() ? 'Enter an email address to send the invite.' : undefined}
             >
               {creatingInvite ? (
                 <ActivityIndicator color="#fff" />
+              ) : inviteFailure.failed ? (
+                <SubmitFailedContent
+                  label="Failed to send"
+                  shake={inviteFailure.shake}
+                  textStyle={styles.primaryButtonText}
+                />
               ) : (
                 <Text style={styles.primaryButtonText}>Send invite</Text>
               )}

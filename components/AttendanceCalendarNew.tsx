@@ -10,9 +10,11 @@ import {
 import { Modal } from '@/components/AppModal';
 import { Calendar, ChevronLeft, ChevronRight, X, Save, Users, User, Edit3, Eye, AlertCircle } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
+import { useSubmitFailure } from '../hooks/useSubmitFailure';
 import { formatDateToString } from '../lib/utils';
 import Toast from 'react-native-toast-message';
 import ConfirmationModal from './ConfirmationModal';
+import { SubmitFailedContent } from './SubmitFailedContent';
 
 const { width: screenWidth } = Dimensions.get('window');
 
@@ -65,6 +67,7 @@ export default function AttendanceCalendar({
   });
   const [modifiedRecords, setModifiedRecords] = useState<AttendanceRecord[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const saveFailure = useSubmitFailure();
   const [isEditMode, setIsEditMode] = useState(false);
   const [dayDetailsModalVisible, setDayDetailsModalVisible] = useState(false);
   
@@ -334,6 +337,7 @@ export default function AttendanceCalendar({
         position: 'top',
         visibilityTime: 3000,
       });
+      saveFailure.trigger();
     } finally {
       setIsLoading(false);
     }
@@ -721,14 +725,34 @@ export default function AttendanceCalendar({
                   <Text style={styles.saveButtonText}>Cancel</Text>
                 </TouchableOpacity>
                 <TouchableOpacity 
-                  style={[styles.saveButton, styles.saveButtonActive]} 
+                  style={[
+                    styles.saveButton,
+                    saveFailure.failed ? { backgroundColor: theme.error } : styles.saveButtonActive,
+                    !saveFailure.failed && (isLoading || modifiedRecords.length === 0) && styles.headerActionDisabled,
+                  ]} 
                   onPress={handleSave} 
-                  disabled={isLoading || modifiedRecords.length === 0}
+                  disabled={isLoading || modifiedRecords.length === 0 || saveFailure.failed}
+                  accessibilityRole="button"
+                  accessibilityState={{
+                    disabled: isLoading || modifiedRecords.length === 0 || saveFailure.failed,
+                    busy: isLoading,
+                  }}
                 >
-                  <Save size={20} color="#ffffff" />
-                  <Text style={styles.saveButtonText}>
-                    {isLoading ? 'Saving...' : `Save (${modifiedRecords.length})`}
-                  </Text>
+                  {saveFailure.failed ? (
+                    <SubmitFailedContent
+                      label="Failed"
+                      shake={saveFailure.shake}
+                      textStyle={[styles.saveButtonText, { marginLeft: 0 }]}
+                      iconSize={20}
+                    />
+                  ) : (
+                    <>
+                      <Save size={20} color="#ffffff" />
+                      <Text style={styles.saveButtonText}>
+                        {isLoading ? 'Saving...' : `Save (${modifiedRecords.length})`}
+                      </Text>
+                    </>
+                  )}
                 </TouchableOpacity>
               </View>
             )}

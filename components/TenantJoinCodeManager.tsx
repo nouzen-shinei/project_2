@@ -16,6 +16,8 @@ import { AlertCircle, KeyRound, Link2 } from 'lucide-react-native';
 import { useTheme } from '@/hooks/useTheme';
 import { useTenant } from '@/hooks/useTenantContext';
 import { useAuth } from '@/hooks/useAuthUnified';
+import { useSubmitFailure } from '@/hooks/useSubmitFailure';
+import { SubmitFailedContent } from '@/components/SubmitFailedContent';
 import { tenantService } from '@/services/tenantService';
 import { getReviewerQuickJoinCode } from '@/services/reviewerQuickJoin';
 import type { TenantCode } from '@/types';
@@ -75,6 +77,8 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
   const [loading, setLoading] = useState(() => Boolean(activeTenant?.id && canManageCodes));
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const generateFailure = useSubmitFailure();
+  const { trigger: triggerGenerateFailure, clear: clearGenerateFailure } = generateFailure;
   const [revokingCodeId, setRevokingCodeId] = useState<string | null>(null);
   const [expiryDays, setExpiryDays] = useState<number>(14);
   const [usageCapOption, setUsageCapOption] = useState<number>(DEFAULT_USAGE_CAP);
@@ -218,11 +222,12 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
       logger.error('TenantJoinCodeManager: create code failed', createError);
       const message =
         createError instanceof Error ? createError.message : 'Failed to create join code. Try again later.';
+      triggerGenerateFailure();
       Alert.alert('Unable to create join code', message);
     } finally {
       setCreating(false);
     }
-  }, [activeTenant?.id, creating, expiryDays, user?.uid]);
+  }, [activeTenant?.id, creating, expiryDays, triggerGenerateFailure, usageCapOption, user?.uid]);
 
   const handleCopyCode = useCallback(async (codeValue: string, codeId: string) => {
     try {
@@ -343,8 +348,9 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
     if (creating) {
       return;
     }
+    clearGenerateFailure();
     setShowGenerateModal(false);
-  }, [creating]);
+  }, [clearGenerateFailure, creating]);
 
   const submitGenerateCode = useCallback(() => {
     if (isAtOrOverActiveCodeLimit) {
@@ -354,8 +360,9 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
   }, [handleGenerateCode, isAtOrOverActiveCodeLimit]);
 
   const handleOpenGenerateModal = useCallback(() => {
+    clearGenerateFailure();
     setShowGenerateModal(true);
-  }, []);
+  }, [clearGenerateFailure]);
 
   const renderJoinCodeSkeletonList = () => (
     <View style={{ marginTop: 4 }}>
@@ -687,15 +694,27 @@ const TenantJoinCodeManager = forwardRef<TenantJoinCodeManagerHandle, TenantJoin
                   styles.modalButton,
                   {
                     borderColor: 'transparent',
-                    backgroundColor: theme.primary,
-                    opacity: creating || isAtOrOverActiveCodeLimit ? 0.7 : 1,
+                    backgroundColor: generateFailure.failed ? theme.error : theme.primary,
+                    opacity: !generateFailure.failed && (creating || isAtOrOverActiveCodeLimit) ? 0.7 : 1,
                   },
                 ]}
                 onPress={submitGenerateCode}
-                disabled={creating || isAtOrOverActiveCodeLimit}
+                disabled={creating || isAtOrOverActiveCodeLimit || generateFailure.failed}
+                accessibilityRole="button"
+                accessibilityState={{
+                  disabled: creating || isAtOrOverActiveCodeLimit || generateFailure.failed,
+                  busy: creating,
+                }}
               >
                 {creating ? (
                   <ActivityIndicator size="small" color="#fff" />
+                ) : generateFailure.failed ? (
+                  <SubmitFailedContent
+                    label="Failed"
+                    shake={generateFailure.shake}
+                    textStyle={styles.modalButtonText}
+                    iconSize={16}
+                  />
                 ) : (
                   <Text style={[styles.modalButtonText, { color: '#fff' }]}>Generate</Text>
                 )}
