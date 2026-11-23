@@ -9,10 +9,10 @@ import {
   Linking,
   Platform,
   Image,
-  Modal,
   SafeAreaView,
   useWindowDimensions,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { Download, Share, ExternalLink, Eye, X } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
 import {

@@ -16,7 +16,6 @@ import {
   Platform,
   Image,
   FlatList as RNFlatList,
-  Modal,
   Pressable,
   SafeAreaView,
   Animated,
@@ -29,6 +28,7 @@ import {
   LayoutAnimation,
   UIManager,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { FlashList } from '@shopify/flash-list';
 import Toast from 'react-native-toast-message';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';

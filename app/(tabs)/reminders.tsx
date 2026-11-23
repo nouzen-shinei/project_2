@@ -9,12 +9,12 @@ import {
   ScrollView,
   TouchableOpacity,
   TextInput,
-  Modal,
   Alert,
   ActivityIndicator,
   Switch,
   Dimensions,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import {
   Send,
   Users,

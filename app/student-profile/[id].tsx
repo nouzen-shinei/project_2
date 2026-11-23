@@ -10,10 +10,10 @@ import {
   Alert,
   Image,
   ActivityIndicator,
-  Modal,
   FlatList,
   Platform,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { useLocalSearchParams, useRouter, useNavigation } from 'expo-router';
 import { 
   User, 

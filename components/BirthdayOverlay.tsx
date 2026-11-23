@@ -1,5 +1,6 @@
 import React, { useEffect } from 'react';
-import { Modal, View, Text, Pressable, Dimensions } from 'react-native';
+import { View, Text, Pressable, Dimensions } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useBirthdays } from './BirthdayProvider';

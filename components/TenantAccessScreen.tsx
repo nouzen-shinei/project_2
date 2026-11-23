@@ -1,5 +1,6 @@
 import React from 'react';
-import { Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { X } from 'lucide-react-native';

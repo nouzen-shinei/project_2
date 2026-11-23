@@ -9,10 +9,10 @@ import {
   RefreshControl,
   TouchableOpacity,
   Dimensions,
-  Modal,
   ActivityIndicator,
   Platform,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { Users, CreditCard, CircleAlert as AlertCircle, Plus, Bell, Mail, MessageSquare, Phone, CheckCircle, XCircle, Clock, Trash2, FileText } from 'lucide-react-native';
 import { router } from 'expo-router';
 import useStudents from '../../hooks/useStudents';

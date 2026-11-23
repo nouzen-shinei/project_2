@@ -3,12 +3,12 @@ import {
   ActivityIndicator,
   Alert,
   ScrollView,
-  Modal,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import * as Clipboard from 'expo-clipboard';
 import Toast from 'react-native-toast-message';
 import { AlertCircle, KeyRound, Link2 } from 'lucide-react-native';

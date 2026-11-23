@@ -8,13 +8,13 @@ import {
   Pressable,
   TouchableOpacity,
   TextInput,
-  Modal,
   Alert,
   Image,
   Platform,
   ActivityIndicator,
   FlatList,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { Plus, Search, User, Phone, Mail, MessageCircle, Calendar, TrendingUp, Camera, ChevronUp, ChevronDown, Trash2, Download, Edit3 } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system';

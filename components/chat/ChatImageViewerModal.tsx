@@ -1,5 +1,6 @@
 import React, { useCallback } from 'react';
-import { Modal, View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { X, AlertCircle, Download, Share, RotateCcw } from 'lucide-react-native';
 import ProgressiveImage from '../ui/ProgressiveImage';
 import { ShareModal } from '../index';

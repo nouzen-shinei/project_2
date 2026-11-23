@@ -1,6 +1,7 @@
 import { logger } from '@/lib/logger';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Modal, Platform, Share as RNShare, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, Platform, Share as RNShare, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { Copy, Download, Share as ShareIcon, X } from 'lucide-react-native';
 import * as Clipboard from 'expo-clipboard';
 

@@ -1,6 +1,7 @@
 import { logger } from '@/lib/logger';
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Modal, ScrollView, Alert, Platform } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Alert, Platform } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { 
   Paperclip, 
   Image, 

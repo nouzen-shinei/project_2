@@ -8,7 +8,6 @@ import {
   TouchableOpacity,
   Alert,
   TextInput,
-  Modal,
   Platform,
   Linking,
   Share,
@@ -17,6 +16,7 @@ import {
   FlatList,
   ActivityIndicator,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { User, Bell, Shield, CircleHelp as HelpCircle, LogOut, ChevronRight, Moon, Sun, Mail, MessageSquare, Phone, Download, Trash2, X, UserCheck, Pencil, Save, Camera, FileText, ExternalLink, Settings as SettingsIcon, Monitor, Calendar, RefreshCw, CreditCard } from 'lucide-react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';

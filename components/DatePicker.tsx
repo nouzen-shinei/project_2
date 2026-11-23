@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Modal, View, Text, TouchableOpacity, StyleSheet, Pressable, FlatList, Platform } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Pressable, FlatList, Platform } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { Calendar as CalendarIcon, X as XIcon } from 'lucide-react-native';
 import { formatDateToString } from '../lib/utils';
 

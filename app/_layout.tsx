@@ -16,6 +16,7 @@ import { useAuth, authService } from '../hooks/useAuthUnified';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useNotifications } from '../hooks/useNotifications';
 import Toast from 'react-native-toast-message';
+import AppToast from '../components/AppToast';
 import {
   Inter_400Regular,
   Inter_500Medium,
@@ -35,7 +36,8 @@ import BirthdayOverlay from '../components/BirthdayOverlay';
 import BirthdayAmbient from '../components/BirthdayAmbient';
 import BirthdayMusic from '../components/BirthdayMusic';
 import BirthdayFab from '../components/BirthdayFab';
-import { Platform, Image, ActivityIndicator, View, Text, useColorScheme, Modal, TouchableOpacity, Alert } from 'react-native';
+import { Platform, Image, ActivityIndicator, View, Text, useColorScheme, TouchableOpacity, Alert } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaInsetsContext, SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import AuthGate from '../components/AuthGate';
@@ -539,7 +541,7 @@ export default function RootLayout() {
                     </View>
                     <ReloginRequiredModal />
                     <StatusBar style="auto" />
-                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                    <AppToast />
                   </ModalAlertProvider>
                 </VideoSeekProvider>
               </ThemeProvider>
@@ -571,7 +573,7 @@ export default function RootLayout() {
                     </Stack>
                     <ReloginRequiredModal />
                     <StatusBar style="auto" />
-                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                    <AppToast />
                   </ModalAlertProvider>
                 </VideoSeekProvider>
               </ThemeProvider>
@@ -595,7 +597,7 @@ export default function RootLayout() {
                     <LoginScreen />
                     <ReloginRequiredModal />
                     <StatusBar style="auto" />
-                    <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                    <AppToast />
                   </ModalAlertProvider>
                 </VideoSeekProvider>
               </ThemeProvider>
@@ -625,7 +627,7 @@ export default function RootLayout() {
                         onTenantBootstrapped={() => setTenantBootstrapped(true)}
                       />
                       <ReloginRequiredModal />
-                      <Toast position="top" topOffset={60} visibilityTime={4000} autoHide />
+                      <AppToast />
                     </ModalAlertProvider>
                   </VideoSeekProvider>
                 </ThemeProvider>

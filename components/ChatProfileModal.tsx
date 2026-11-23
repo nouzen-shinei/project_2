@@ -2,13 +2,13 @@ import React from 'react';
 import {
   View,
   Text,
-  Modal,
   StyleSheet,
   TouchableOpacity,
   Image,
   ScrollView,
   Dimensions,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import {
   X,
   User,

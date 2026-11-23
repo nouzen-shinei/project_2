@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Modal } from 'react-native';
+import { View, Text, StyleSheet, Dimensions, TouchableOpacity } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import ProgressiveImage from './ui/ProgressiveImage';
 import { HydratedChatMessage, chatCacheService } from '../services/chatCacheService';
 import { useTheme } from '../hooks/useTheme';

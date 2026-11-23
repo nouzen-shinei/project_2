@@ -1,5 +1,6 @@
 import React, { useMemo, useCallback } from 'react';
-import { Modal, View, Text, TouchableOpacity, ScrollView, StyleSheet, Platform, Share } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, StyleSheet, Platform, Share } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import type { Tenant } from '@/types';
 import type {
   UsageSummaryResponse,

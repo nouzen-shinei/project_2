@@ -13,7 +13,6 @@ import {
   GestureResponderEvent,
   AccessibilityActionEvent,
   LayoutChangeEvent,
-  Modal,
   SafeAreaView,
   StatusBar,
   AppState,
@@ -22,6 +21,7 @@ import {
   ViewStyle,
   ActivityIndicator,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import {
   Play,
   Pause,

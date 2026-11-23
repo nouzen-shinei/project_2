@@ -2,12 +2,12 @@ import React from 'react';
 import {
   View,
   Text,
-  Modal,
   TouchableOpacity,
   StyleSheet,
   Dimensions,
   ScrollView,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { useTheme } from '../hooks/useTheme';
 import { X } from 'lucide-react-native';
 

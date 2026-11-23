@@ -1,5 +1,6 @@
 import React from 'react';
-import { Modal, Pressable, View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
+import { Pressable, View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { Camera, File as FileIcon, Image as ImageIcon, Play } from 'lucide-react-native';
 
 interface ChatAttachmentModalProps {

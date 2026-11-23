@@ -16,7 +16,6 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
-  Modal,
   View,
   Text,
   TouchableOpacity,
@@ -24,6 +23,7 @@ import {
   BackHandler,
   Alert,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import * as Linking from 'expo-linking';
 import {
   CameraView,

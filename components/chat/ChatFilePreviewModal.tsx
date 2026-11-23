@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Modal, View, Text, TouchableOpacity, ScrollView, SafeAreaView, TextInput, Image, StyleSheet, Platform, ActivityIndicator } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, SafeAreaView, TextInput, Image, StyleSheet, Platform, ActivityIndicator } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { X, Trash2, Send, File as FileIcon, Music, Play, Pause } from 'lucide-react-native';
 import VideoPlayer from '../VideoPlayer';
 import { isImageFile, isVideoFile, isAudioFile } from '../../lib/fileUtils';

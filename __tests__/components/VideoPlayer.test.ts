@@ -197,6 +197,7 @@ jest.mock('../../hooks/useNativeVideoPlayer', () => ({
 }));
 
 jest.mock('../../components/ShareModal', () => ({ ShareModal: 'ShareModal' }));
+jest.mock('@/components/AppModal', () => ({ Modal: 'Modal' }));
 jest.mock('../../services/chatCacheService', () => ({ chatCacheService: {} }));
 
 jest.mock('../../hooks/useVideoSeekConfig', () => ({

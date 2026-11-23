@@ -3,7 +3,6 @@ import {
   View,
   Text,
   TouchableOpacity,
-  Modal,
   Pressable,
   Dimensions,
   Platform,
@@ -13,6 +12,7 @@ import {
   FlatList,
   LayoutChangeEvent,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { X, Search, Clipboard as ClipboardIcon, Check, ChevronLeft, ChevronRight } from 'lucide-react-native';
 import * as Clipboard from 'expo-clipboard';
 

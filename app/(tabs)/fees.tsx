@@ -8,7 +8,6 @@ import {
   ScrollView,
   TouchableOpacity,
   TouchableWithoutFeedback,
-  Modal,
   Alert,
   TextInput,
   Platform,
@@ -17,6 +16,7 @@ import {
   InteractionManager,
   useWindowDimensions, // added for responsive header
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { ScrollView as GHScrollView } from 'react-native-gesture-handler';
 import { useIsFocused } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';

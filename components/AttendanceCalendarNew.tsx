@@ -3,11 +3,11 @@ import {
   View,
   Text,
   TouchableOpacity,
-  Modal,
   ScrollView,
   StyleSheet,
   Dimensions,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { Calendar, ChevronLeft, ChevronRight, X, Save, Users, User, Edit3, Eye, AlertCircle } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
 import { formatDateToString } from '../lib/utils';

@@ -4,7 +4,6 @@ import {
   View,
   Text,
   StyleSheet,
-  Modal,
   ScrollView,
   TouchableOpacity,
   TextInput,
@@ -13,6 +12,7 @@ import {
   Linking,
   Platform,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import { 
   X, 
   ExternalLink,

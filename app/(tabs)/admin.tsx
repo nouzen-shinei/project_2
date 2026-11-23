@@ -10,8 +10,8 @@ import {
   ActivityIndicator,
   TouchableOpacity,
   TextInput,
-  Modal,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import Toast from 'react-native-toast-message';
 import { Plus, Trash2, RefreshCw, Shield, User, Settings, Search, X, PieChart, KeyRound } from 'lucide-react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
@@ -1933,7 +1933,7 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
-    paddingHorizontal: 20,
+    paddingHorizontal: Platform.select({ web: 10, default: 20 }),
   },
   hiddenInviteManagerHost: {
     height: 0,

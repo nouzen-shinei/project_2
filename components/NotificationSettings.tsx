@@ -10,8 +10,8 @@ import {
   TouchableOpacity,
   Platform,
   Linking,
-  Modal,
 } from 'react-native';
+import { Modal } from '@/components/AppModal';
 import * as Notifications from 'expo-notifications';
 import { Bell, MessageCircle, Quote, X, Megaphone, Users } from 'lucide-react-native';
 
