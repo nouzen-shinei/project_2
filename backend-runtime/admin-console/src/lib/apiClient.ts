@@ -476,6 +476,8 @@ export interface BillingCatalogPlanVariant {
     staffSeats?: number;
     students?: number;
     storageMb?: number;
+    /** Notices people may post per month (automatic notices don't count). */
+    noticePosts?: number;
     reminders?: {
       total?: number;
       whatsapp?: number;
@@ -520,6 +522,8 @@ export function upsertBillingPlanVariant(payload: {
     staffSeats?: number;
     students?: number;
     storageMb?: number;
+    /** Notices people may post per month (automatic notices don't count). */
+    noticePosts?: number;
     reminders?: {
       total?: number;
       whatsapp?: number;
@@ -737,6 +741,7 @@ export interface TenantAdminSummary {
     maxMonthlyEmailReminders?: number;
     maxMonthlyVoiceReminders?: number;
     maxStorageMb?: number;
+    maxMonthlyNoticePosts?: number;
   };
   membershipCounts?: {
     total?: number;
@@ -1080,6 +1085,7 @@ export interface TenantQuotaOverridePayload {
     maxMonthlyEmailReminders?: number | null;
     maxMonthlyVoiceReminders?: number | null;
     maxStorageMb?: number | null;
+    maxMonthlyNoticePosts?: number | null;
   };
   note?: string;
 }
@@ -1266,7 +1272,7 @@ export function fetchChatDelta(payload: ChatDeltaRequest) {
   return apiRequest('/chat/delta', { method: 'POST', body: payload });
 }
 
-export type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage';
+export type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage' | 'noticePosts';
 
 export interface UsageStorageSource {
   label: string;
@@ -1364,6 +1370,7 @@ function buildUsageStatuses(summary: UsageSummaryResponse): UsageMetricStatusMap
     staff: buildUsageMetricStatus(summary.staff, limits.staffSeats),
     reminders: buildUsageMetricStatus(summary.reminders.total, limits.reminders.total),
     storage: buildUsageMetricStatus(summary.storageBytes, limits.storageBytes),
+    noticePosts: buildUsageMetricStatus(summary.noticePosts, limits.noticePosts),
   };
 }
 

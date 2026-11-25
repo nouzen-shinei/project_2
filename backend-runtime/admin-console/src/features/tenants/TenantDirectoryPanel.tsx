@@ -78,7 +78,8 @@ type QuotaField =
   | 'maxMonthlySmsReminders'
   | 'maxMonthlyEmailReminders'
   | 'maxMonthlyVoiceReminders'
-  | 'maxStorageMb';
+  | 'maxStorageMb'
+  | 'maxMonthlyNoticePosts';
 
 type QuotaFormState = Record<QuotaField, string> & { note: string };
 
@@ -91,6 +92,7 @@ const DEFAULT_QUOTA_FORM: QuotaFormState = {
   maxMonthlyEmailReminders: '',
   maxMonthlyVoiceReminders: '',
   maxStorageMb: '',
+  maxMonthlyNoticePosts: '',
   note: '',
 };
 
@@ -103,6 +105,11 @@ const QUOTA_FIELDS: Array<{ key: QuotaField; label: string; helper: string }> = 
   { key: 'maxMonthlyEmailReminders', label: 'Monthly Email reminders', helper: 'Email reminders allowed each month.' },
   { key: 'maxMonthlyVoiceReminders', label: 'Monthly voice reminders', helper: 'Voice call reminders allowed each month.' },
   { key: 'maxStorageMb', label: 'Storage (MB)', helper: 'Used for media uploads + backups.' },
+  {
+    key: 'maxMonthlyNoticePosts',
+    label: 'Monthly notice posts',
+    helper: "Notices members can post each month. Automatic usage/billing notices don't count.",
+  },
 ];
 
 type AuditFilters = {
@@ -1883,6 +1890,7 @@ export function TenantDirectoryPanel() {
     const staffUsed = usageSummary?.staff ?? inspectorTenant.membershipCounts?.staff ?? 0;
     const remindersUsed = usageSummary?.reminders?.total ?? 0;
     const storageUsed = usageSummary?.storageBytes ?? 0;
+    const noticePostsUsed = usageSummary?.noticePosts ?? 0;
     const reminderBreakdown = usageSummary?.reminders;
     const reminderParts: string[] = [];
     if (reminderBreakdown) {
@@ -1935,6 +1943,14 @@ export function TenantDirectoryPanel() {
         used: storageUsed,
         limit: planLimits.storageBytes,
         detail: `${formatStorage(storageUsed)} of ${formatStorage(planLimits.storageBytes)}`,
+      },
+      {
+        key: 'noticePosts',
+        label: 'Monthly notice posts',
+        used: noticePostsUsed,
+        limit: planLimits.noticePosts,
+        detail: `${formatNumber(noticePostsUsed)} of ${formatNumber(planLimits.noticePosts)} notices`,
+        extra: 'Automatic usage/billing notices excluded',
       },
     ];
 
@@ -2177,7 +2193,8 @@ export function TenantDirectoryPanel() {
                 </p>
                 <p className="muted small-text">
                   Includes {formatNumber(planDisplay.staffSeats)} staff seats · {formatNumber(planDisplay.students)} students ·{' '}
-                  {formatNumber(planDisplay.reminders.total)} reminders · {formatStorage(planDisplay.storageBytes)} storage
+                  {formatNumber(planDisplay.reminders.total)} reminders · {formatStorage(planDisplay.storageBytes)} storage ·{' '}
+                  {formatNumber(planDisplay.noticePosts)} notice posts / month
                 </p>
               </div>
             </div>

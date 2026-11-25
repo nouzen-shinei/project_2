@@ -17,6 +17,8 @@ export interface BillingCatalogPlanVariant {
     staffSeats?: number;
     students?: number;
     storageMb?: number;
+    /** Notices people may post per month; missing = the tier's default. */
+    noticePosts?: number;
     reminders?: {
       total?: number;
       whatsapp?: number;

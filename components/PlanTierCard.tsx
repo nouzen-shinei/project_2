@@ -20,6 +20,8 @@ export type PlanTierDisplay = {
   students: number;
   reminders: PlanTierReminders;
   storageBytes: number;
+  /** Notices people may post per month (automatic notices don't count). */
+  noticePosts: number;
 };
 
 function formatInr(amountInr: number | null): string {
@@ -101,6 +103,7 @@ export default function PlanTierCard({
           {plan.reminders.email}
         </Text>
         <Text style={[styles.limitLine, { color: theme.text }]}>Storage: {formatBytes(plan.storageBytes)}</Text>
+        <Text style={[styles.limitLine, { color: theme.text }]}>Notice posts / month: {plan.noticePosts}</Text>
       </View>
 
       {actionLabel ? (

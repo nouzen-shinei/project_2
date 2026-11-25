@@ -124,6 +124,7 @@ const NO_QUOTA_OVERRIDES: TenantQuota = {
   maxStaff: null,
   maxMonthlyReminders: null,
   maxStorageMb: null,
+  maxMonthlyNoticePosts: null,
 };
 
 const DEFAULT_QUOTAS: TenantQuota = NO_QUOTA_OVERRIDES;

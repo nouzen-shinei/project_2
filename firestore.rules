@@ -161,8 +161,10 @@ service cloud.firestore {
     //     `where('visibleToRoles','array-contains',<own role>)` (hooks/useNotices.ts),
     //     which is how list and count queries satisfy this rule. Docs without
     //     `visibleToRoles` (pre-backfill) are unreadable from the client.
-    //   - Create: posted as yourself, with your own role, source 'user', and
-    //     visible to yourself. Only owners/admins may restrict the audience.
+    //   - Create: backend-only (POST /tenants/:tenantId/notices via
+    //     noticeBackendClient.createNotice), which enforces the plan's monthly
+    //     notice-post limit and sets author, role, source and audience. Rules
+    //     can't count, so a direct client create would bypass the limit.
     //   - Update: members may only record views and reactions; owners/admins may
     //     also edit the notice. Nobody can change tenantId/createdBy/createdAt/
     //     source from the client.
@@ -179,25 +181,12 @@ service cloud.firestore {
           && noticeRole(data.tenantId) in data.visibleToRoles;
       }
 
-      function isValidNewNotice(data) {
-        return isActiveTenantMember(data.tenantId)
-          && data.createdBy == request.auth.uid
-          && data.createdByRole == noticeRole(data.tenantId)
-          && data.source == 'user'
-          && data.visibleToRoles is list
-          && noticeRole(data.tenantId) in data.visibleToRoles
-          && data.roleRestricted is bool
-          && (data.roleRestricted
-                ? hasTenantAdminAccess(data.tenantId)
-                : data.visibleToRoles.hasAll(['owner', 'admin', 'staff', 'member']));
-      }
-
       function noticeChangedKeys() {
         return request.resource.data.diff(resource.data).affectedKeys();
       }
 
       allow read: if canSeeNotice(resource.data) || isAdmin();
-      allow create: if isValidNewNotice(request.resource.data);
+      allow create: if false;
       allow update: if request.resource.data.tenantId == resource.data.tenantId
         && (
           isAdmin()

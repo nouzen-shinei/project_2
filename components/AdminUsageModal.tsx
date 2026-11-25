@@ -32,7 +32,7 @@ interface AdminUsageModalProps {
   requestingUsageRegeneration?: boolean;
 }
 
-type HistoryChartMetricKey = 'reminders' | 'students' | 'chat' | 'storage';
+type HistoryChartMetricKey = 'reminders' | 'students' | 'chat' | 'noticePosts' | 'storage';
 
 interface HistoryChartPoint {
   month: string;
@@ -41,6 +41,7 @@ interface HistoryChartPoint {
   reminders: number;
   students: number;
   chat: number;
+  noticePosts: number;
   storage: number;
 }
 
@@ -49,6 +50,7 @@ const metricLabelByKey: Record<UsageMetricKey, string> = {
   staff: 'Staff seats',
   reminders: 'Reminders',
   storage: 'Storage',
+  noticePosts: 'Notice posts',
 };
 
 const formatUsageWindow = (monthId?: string | null) => {
@@ -248,16 +250,19 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
         (typeof effectivePlanLimits?.storageBytes === 'number'
           ? Math.round(effectivePlanLimits.storageBytes / (1024 * 1024))
           : null),
+      maxMonthlyNoticePosts: tenant?.quotas?.maxMonthlyNoticePosts ?? effectivePlanLimits?.noticePosts ?? null,
     }),
     [
       tenant?.quotas?.maxStudents,
       tenant?.quotas?.maxStaff,
       tenant?.quotas?.maxMonthlyReminders,
       tenant?.quotas?.maxStorageMb,
+      tenant?.quotas?.maxMonthlyNoticePosts,
       effectivePlanLimits?.students,
       effectivePlanLimits?.staffSeats,
       effectivePlanLimits?.reminders?.total,
       effectivePlanLimits?.storageBytes,
+      effectivePlanLimits?.noticePosts,
     ],
   );
 
@@ -317,6 +322,14 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
           value: storageValue,
           helper: storageHelper,
         },
+        {
+          key: 'noticePosts',
+          label: 'Monthly Notice Posts',
+          value: usageSummary
+            ? `${formatCount(usageSummary.noticePosts)} / ${formatCount(quotaLimits.maxMonthlyNoticePosts)}`
+            : `— / ${formatCount(quotaLimits.maxMonthlyNoticePosts)}`,
+          helper: "Notices posted this month. Automatic usage and billing notices don't count.",
+        },
       ];
     },
     [usageLoading, usageSummary, tenantMembersCount, quotaLimits, usageWindowLabel],
@@ -331,6 +344,7 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
         staff: string;
         students: string;
         chat: string;
+        noticePosts: string;
         storage: string;
       }[];
     }
@@ -343,6 +357,7 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
         staff: formatCount(point.staff),
         students: formatCount(point.students),
         chat: formatCount(point.chatMessages),
+        noticePosts: formatCount(point.noticePosts),
         storage: formatStorageMbValue(storageMb),
       };
     });
@@ -373,6 +388,7 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
         reminders: Math.max(0, point.remindersTotal ?? 0),
         students: Math.max(0, point.students ?? 0),
         chat: Math.max(0, point.chatMessages ?? 0),
+        noticePosts: Math.max(0, point.noticePosts ?? 0),
         storage: storageMb,
       } satisfies HistoryChartPoint;
     });
@@ -383,12 +399,14 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
       acc.reminders = Math.max(acc.reminders, point.reminders);
       acc.students = Math.max(acc.students, point.students);
       acc.chat = Math.max(acc.chat, point.chat);
+      acc.noticePosts = Math.max(acc.noticePosts, point.noticePosts);
       acc.storage = Math.max(acc.storage, point.storage);
       return acc;
     }, {
       reminders: 0,
       students: 0,
       chat: 0,
+      noticePosts: 0,
       storage: 0,
     });
   }, [historyChartSeries]);
@@ -418,13 +436,19 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
         format: (value: number) => formatCount(value),
       },
       {
+        key: 'noticePosts' as const,
+        label: 'Notice posts',
+        color: theme.textSecondary,
+        format: (value: number) => formatCount(value),
+      },
+      {
         key: 'storage' as const,
         label: 'Storage (MB)',
         color: theme.text,
         format: (value: number) => formatStorageMbValue(value),
       },
     ],
-    [theme.primary, theme.success, theme.warning, theme.text],
+    [theme.primary, theme.success, theme.warning, theme.textSecondary, theme.text],
   );
 
   const canExportHistory = !!(usageHistory && usageHistory.length > 0);
@@ -433,7 +457,7 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
     if (!usageHistory || usageHistory.length === 0) {
       return;
     }
-    const header = ['Month', 'Reminders', 'Staff', 'Students', 'Chat Messages', 'Storage (MB)'];
+    const header = ['Month', 'Reminders', 'Staff', 'Students', 'Chat Messages', 'Notice Posts', 'Storage (MB)'];
     const csvLines = [
       header.join(','),
       ...usageHistory.map((point) => {
@@ -446,6 +470,7 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
           point.staff ?? '',
           point.students ?? '',
           point.chatMessages ?? '',
+          point.noticePosts ?? '',
           storageMb,
         ].join(',');
       }),
@@ -826,6 +851,9 @@ const AdminUsageModal: React.FC<AdminUsageModalProps> = ({
                   <View style={styles.historyMetricRow}>
                     <Text style={[styles.historyMetricText, { color: theme.text }]}>Students: {row.students}</Text>
                     <Text style={[styles.historyMetricText, { color: theme.text }]}>Chat: {row.chat}</Text>
+                  </View>
+                  <View style={styles.historyMetricRow}>
+                    <Text style={[styles.historyMetricText, { color: theme.text }]}>Notice posts: {row.noticePosts}</Text>
                   </View>
                   <Text style={[styles.historyStorageText, { color: theme.textSecondary }]}>Storage: {row.storage}</Text>
                 </View>

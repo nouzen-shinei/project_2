@@ -17,6 +17,8 @@ export interface BillingPlanVariantLimits {
     email?: number;
   };
   storageMb?: number;
+  /** Notices people may post per calendar month (automatic notices excluded). */
+  noticePosts?: number;
 }
 
 export interface BillingPlanVariant {
@@ -165,6 +167,7 @@ export async function listPlanVariants(db: admin.firestore.Firestore, options?: 
                 staffSeats: Number.isFinite((limitsRaw as any).staffSeats) ? Number((limitsRaw as any).staffSeats) : undefined,
                 students: Number.isFinite((limitsRaw as any).students) ? Number((limitsRaw as any).students) : undefined,
                 storageMb: Number.isFinite((limitsRaw as any).storageMb) ? Number((limitsRaw as any).storageMb) : undefined,
+                noticePosts: Number.isFinite((limitsRaw as any).noticePosts) ? Number((limitsRaw as any).noticePosts) : undefined,
                 reminders:
                   remindersRaw && typeof remindersRaw === 'object'
                     ? {
@@ -231,6 +234,7 @@ function parsePlanVariantSnapshot(
             staffSeats: Number.isFinite((limitsRaw as any).staffSeats) ? Number((limitsRaw as any).staffSeats) : undefined,
             students: Number.isFinite((limitsRaw as any).students) ? Number((limitsRaw as any).students) : undefined,
             storageMb: Number.isFinite((limitsRaw as any).storageMb) ? Number((limitsRaw as any).storageMb) : undefined,
+            noticePosts: Number.isFinite((limitsRaw as any).noticePosts) ? Number((limitsRaw as any).noticePosts) : undefined,
             reminders:
               remindersRaw && typeof remindersRaw === 'object'
                 ? {

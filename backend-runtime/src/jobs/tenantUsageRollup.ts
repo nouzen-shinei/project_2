@@ -17,6 +17,7 @@ const METRIC_LABELS: Record<UsageMetricKey, string> = {
   staff: 'Team seats',
   reminders: 'Monthly reminders',
   storage: 'Storage',
+  noticePosts: 'Monthly notice posts',
 };
 
 const ALERT_UNCHANGED_REMINDER_DAYS = Math.max(1, Number(process.env.USAGE_ALERT_UNCHANGED_REMINDER_DAYS ?? '7'));
@@ -291,6 +292,8 @@ async function loadTenantRecords(db: Firestore, tenantId?: string | null): Promi
               maxMonthlyVoiceReminders:
                 typeof quotasRaw.maxMonthlyVoiceReminders === 'number' ? quotasRaw.maxMonthlyVoiceReminders : null,
               maxStorageMb: typeof quotasRaw.maxStorageMb === 'number' ? quotasRaw.maxStorageMb : null,
+              maxMonthlyNoticePosts:
+                typeof quotasRaw.maxMonthlyNoticePosts === 'number' ? quotasRaw.maxMonthlyNoticePosts : null,
             }
           : undefined,
       },
@@ -317,6 +320,8 @@ async function loadTenantRecords(db: Firestore, tenantId?: string | null): Promi
             maxMonthlyVoiceReminders:
               typeof quotasRaw.maxMonthlyVoiceReminders === 'number' ? quotasRaw.maxMonthlyVoiceReminders : null,
             maxStorageMb: typeof quotasRaw.maxStorageMb === 'number' ? quotasRaw.maxStorageMb : null,
+            maxMonthlyNoticePosts:
+              typeof quotasRaw.maxMonthlyNoticePosts === 'number' ? quotasRaw.maxMonthlyNoticePosts : null,
           }
         : undefined,
     } satisfies TenantRecord;
@@ -443,8 +448,8 @@ async function collectReminderBreakdown(db: Firestore, tenantId: string, month: 
 
 async function countNoticePosts(db: Firestore, tenantId: string, month: MonthCursor): Promise<number> {
   // The "notice posts" usage figure counts only notices people posted, not
-  // the backend's own Usage Monitor / Billing notices. (Recorded for the admin
-  // console's usage history; plan noticePosts limits aren't enforced.)
+  // the backend's own Usage Monitor / Billing notices. This is the same query
+  // POST /tenants/:tenantId/notices uses to enforce the plan's noticePosts limit.
   // Index: notices (tenantId ASC, source ASC, createdAt ASC).
   const query = db
     .collection('notices')
@@ -1087,6 +1092,7 @@ async function evaluateAlerts(
     { metric: 'staff', value: metrics.staffSeatsUsed, limit: planLimits.staffSeats },
     { metric: 'reminders', value: metrics.remindersSent.total, limit: planLimits.reminders.total },
     { metric: 'storage', value: metrics.storageBytes ?? 0, limit: planLimits.storageBytes },
+    { metric: 'noticePosts', value: metrics.noticePosts, limit: planLimits.noticePosts },
   ];
 
   const existingAlerts = await loadExistingAlerts(usageDocRef);

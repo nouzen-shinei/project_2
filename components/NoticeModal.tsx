@@ -36,7 +36,21 @@ import {
   FileAudio
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
-import { useNoticeActions, useNoticeCounts, useNoticeDocument, useNoticeFeed } from '../hooks/useNotices';
+import {
+  useNoticeActions,
+  useNoticeCounts,
+  useNoticeDocument,
+  useNoticeFeed,
+  useNoticePostQuota,
+} from '../hooks/useNotices';
+import { useRouter } from 'expo-router';
+import { isNoticePostLimitError } from '../services/noticeBackendClient';
+import {
+  formatNoticePostResetDate,
+  noticePostLimitInfoFromDetails,
+  showNoticePostLimitAlert,
+  type NoticePostLimitInfo,
+} from '../services/noticePostLimitAlert';
 import { matchesNoticeFilter, type NoticeFilter } from '../lib/noticeFilters';
 import { useAuth, authService } from '../hooks/useAuthUnified';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
@@ -154,6 +168,7 @@ const getUsageNoticeContentOverride = (notice: any): string | null => {
     staff: 'Team seats',
     reminders: 'Reminders',
     storage: 'Storage',
+    noticePosts: 'Notice posts',
   };
   const metricLabel = metricLabelByKey[metric] ?? metric;
   const percentage = Math.round(ratio * 100);
@@ -1038,7 +1053,10 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   const { activeMembership, activeTenant } = useTenant();
   const { addNotice, deleteNotice } = useNoticeActions();
   const { isOnline } = useNetworkStatus();
+  const router = useRouter();
   const [showAddForm, setShowAddForm] = useState(false);
+  // Monthly notice-post allowance, loaded when the Add Notice form opens.
+  const noticePostQuota = useNoticePostQuota({ enabled: visible && showAddForm });
   const [noticeFilter, setNoticeFilter] = useState<NoticeFilter>('all');
   const [selectedNotice, setSelectedNotice] = useState<Notice | null>(null);
   const [showDetailModal, setShowDetailModal] = useState(false);
@@ -1297,6 +1315,21 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
     }
   };
 
+  // Owners/admins manage the plan, so they get a "View plans" shortcut.
+  const openPlansFromNotices = () => {
+    setShowAddForm(false);
+    onClose();
+    // Let the modal start closing before navigating (same as AdminSettings).
+    setTimeout(() => router.push('/(tabs)/plan'), 80);
+  };
+
+  const presentNoticePostLimit = (info: NoticePostLimitInfo) => {
+    showNoticePostLimitAlert(info, {
+      canManagePlan: canSetNoticeVisibility,
+      onViewPlans: openPlansFromNotices,
+    });
+  };
+
   const handleSubmit = async () => {
     // The button is disabled in these cases (see `submitDisabled`); this is
     // only a guard against stray calls.
@@ -1305,11 +1338,38 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
     }
 
     // Any exit from the try below that doesn't reach `posted = true` (upload
-    // failure, storage limit, addNotice rejecting) puts the button into its
-    // failed state in `finally`.
+    // failure, storage limit, notice-post limit, addNotice rejecting) puts the
+    // button into its failed state in `finally`.
     let posted = false;
     try {
       setUploading(true);
+
+      // Notices are posted through the backend, so there is no offline queue.
+      if (!isOnline) {
+        Toast.show({
+          type: 'error',
+          text1: "You're offline",
+          text2: 'Reconnect to post the notice.',
+          position: 'top',
+        });
+        return;
+      }
+
+      // Check the monthly allowance before uploading media, so a post that
+      // would be rejected doesn't upload files first. If the check itself
+      // fails, carry on: the backend enforces the limit when posting.
+      if (selectedImageUri || selectedAudio) {
+        const latestQuota = await noticePostQuota.refresh();
+        if (latestQuota && latestQuota.limit !== null && latestQuota.remaining === 0) {
+          presentNoticePostLimit({
+            limit: latestQuota.limit,
+            used: latestQuota.used,
+            resetsAt: latestQuota.resetsAt,
+          });
+          return;
+        }
+      }
+
       let finalFormData = { ...formData };
 
       const actorRole = activeMembership?.role || null;
@@ -1454,6 +1514,14 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
       resetForm();
       setShowAddForm(false);
     } catch (error) {
+      if (isNoticePostLimitError(error)) {
+        const info = noticePostLimitInfoFromDetails(error.details);
+        if (info) {
+          noticePostQuota.markLimitReached(info.limit, info.used, info.resetsAt);
+          presentNoticePostLimit(info);
+          return;
+        }
+      }
       logger.error('Error adding notice:', error);
       Toast.show({
         type: 'error',
@@ -1695,8 +1763,19 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
 
   const hasPendingMedia = Boolean(selectedImageUri || selectedAudio);
   const noticeFieldsComplete = Boolean(formData.title.trim() && formData.content.trim());
+  const quota = noticePostQuota.quota;
+  const noticePostLimit = quota && quota.limit !== null && quota.limit > 0 ? quota.limit : null;
+  const noticePostsRemaining = noticePostLimit !== null && quota ? Math.max(0, quota.remaining ?? 0) : null;
+  const noticePostsUsedUp = noticePostsRemaining === 0;
+  // "Low" = the last 10% (at least the last 5 posts).
+  const noticePostsLow =
+    noticePostLimit !== null &&
+    noticePostsRemaining !== null &&
+    noticePostsRemaining > 0 &&
+    noticePostsRemaining <= Math.max(5, Math.ceil(noticePostLimit * 0.1));
+  const noticePostsResetDate = formatNoticePostResetDate(quota?.resetsAt);
   const submitDisabled =
-    uploading || postFailure.failed || audioMetadataLoading || !noticeFieldsComplete;
+    uploading || postFailure.failed || audioMetadataLoading || !noticeFieldsComplete || noticePostsUsedUp;
 
   // Show the chips whenever the center has notices (or a filter is active, so
   // the user can always get back to "All").
@@ -2056,6 +2135,49 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                   ))}
                 </View>
 
+                {/* Monthly notice-post allowance (only when the plan has a limit) */}
+                {noticePostLimit !== null && noticePostsRemaining !== null ? (
+                  noticePostsUsedUp ? (
+                    <View
+                      style={[
+                        styles.noticeQuotaBanner,
+                        { backgroundColor: `${theme.warning}1A`, borderColor: `${theme.warning}66` },
+                      ]}
+                      accessibilityRole="alert"
+                    >
+                      <AlertCircle size={18} color={theme.warning} />
+                      <View style={styles.noticeQuotaBannerBody}>
+                        <Text style={[styles.noticeQuotaBannerTitle, { color: theme.text }]}>
+                          No notice posts left this month
+                        </Text>
+                        <Text style={[styles.noticeQuotaBannerText, { color: theme.textSecondary }]}>
+                          {`All ${noticePostLimit.toLocaleString('en-IN')} have been used.`}
+                          {noticePostsResetDate ? ` You can post again from ${noticePostsResetDate}.` : ''}
+                          {canSetNoticeVisibility ? '' : ' Ask an owner or admin to upgrade the plan.'}
+                        </Text>
+                        {canSetNoticeVisibility ? (
+                          <TouchableOpacity
+                            onPress={openPlansFromNotices}
+                            accessibilityRole="link"
+                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                          >
+                            <Text style={[styles.noticeQuotaBannerLink, { color: theme.primary }]}>View plans</Text>
+                          </TouchableOpacity>
+                        ) : null}
+                      </View>
+                    </View>
+                  ) : (
+                    <Text
+                      style={[
+                        styles.noticeQuotaHint,
+                        { color: noticePostsLow ? theme.warning : theme.textSecondary },
+                      ]}
+                    >
+                      {`${noticePostsRemaining.toLocaleString('en-IN')} of ${noticePostLimit.toLocaleString('en-IN')} notice posts left this month`}
+                    </Text>
+                  )
+                ) : null}
+
                 {/* Form Actions */}
                 <View style={styles.formActions}>
                   <TouchableOpacity
@@ -2087,7 +2209,11 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                       postFailure.failed ? 'Failed to post notice. You can try again in a few seconds.' : undefined
                     }
                     accessibilityHint={
-                      !noticeFieldsComplete ? 'Enter a title and content to post.' : undefined
+                      noticePostsUsedUp
+                        ? 'No notice posts left this month.'
+                        : !noticeFieldsComplete
+                          ? 'Enter a title and content to post.'
+                          : undefined
                     }
                     accessibilityState={{ disabled: submitDisabled, busy: uploading || audioMetadataLoading }}
                   >
@@ -2546,6 +2672,41 @@ const styles = StyleSheet.create({
     gap: 12,
     marginTop: 24,
     marginBottom: 20,
+  },
+  noticeQuotaHint: {
+    fontSize: 12,
+    fontFamily: 'Inter-Regular',
+    marginTop: 20,
+    marginBottom: -12,
+    textAlign: 'center',
+  },
+  noticeQuotaBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    marginTop: 20,
+    marginBottom: -8,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  noticeQuotaBannerBody: {
+    flex: 1,
+    gap: 4,
+  },
+  noticeQuotaBannerTitle: {
+    fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+  },
+  noticeQuotaBannerText: {
+    fontSize: 13,
+    fontFamily: 'Inter-Regular',
+    lineHeight: 18,
+  },
+  noticeQuotaBannerLink: {
+    fontSize: 13,
+    fontFamily: 'Inter-SemiBold',
+    marginTop: 2,
   },
   formButton: {
     flex: 1,

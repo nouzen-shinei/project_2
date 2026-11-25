@@ -29,6 +29,7 @@ const metricLabelByKey: Record<UsageMetricKey, string> = {
   staff: 'Team seats',
   reminders: 'Monthly reminders',
   storage: 'Storage',
+  noticePosts: 'Monthly notice posts',
 };
 
 const formatAlertValue = (metric: UsageMetricKey, value?: number | null) => {
@@ -248,6 +249,8 @@ const TenantUsageSummary = ({
       (typeof effectivePlanLimits?.storageBytes === 'number'
         ? Math.round(effectivePlanLimits.storageBytes / (1024 * 1024))
         : null),
+    maxMonthlyNoticePosts:
+      activeTenant?.quotas?.maxMonthlyNoticePosts ?? effectivePlanLimits?.noticePosts ?? null,
   };
 
   const staffCount = useMemo(() => {
@@ -308,6 +311,14 @@ const TenantUsageSummary = ({
     ? (formatAlertValue('storage', storageLimitBytes) ?? `${storageLimitBytes} B`)
     : null;
   const storageValueLabel = storageLimitLabel ? `${storageUsedLabel}/${storageLimitLabel}` : storageUsedLabel;
+
+  const noticePostsCount = usageSummary?.noticePosts ?? 0;
+  const noticePostsPercent =
+    typeof quotas.maxMonthlyNoticePosts === 'number'
+    && Number.isFinite(quotas.maxMonthlyNoticePosts)
+    && quotas.maxMonthlyNoticePosts > 0
+      ? Math.round((noticePostsCount / quotas.maxMonthlyNoticePosts) * 100)
+      : 0;
 
   const usageWindowLabel = useMemo(() => formatUsageWindow(usageSummary?.month), [usageSummary?.month]);
 
@@ -423,7 +434,9 @@ const TenantUsageSummary = ({
     usageAlertPushEnabled,
   ]);
 
-  const showUpgradeCta = canManagePlan && (studentPercent >= 90 || staffPercent >= 90 || reminderPercent >= 90);
+  const showUpgradeCta =
+    canManagePlan &&
+    (studentPercent >= 90 || staffPercent >= 90 || reminderPercent >= 90 || noticePostsPercent >= 90);
 
   if (!activeTenant || !canView) {
     return null;
@@ -656,6 +669,14 @@ const TenantUsageSummary = ({
         percent={reminderPercent}
         loading={usageSummaryLoading}
         helper={reminderHelper}
+        theme={theme}
+      />
+      <UsageRow
+        label="Monthly notice posts"
+        valueLabel={`${noticePostsCount}/${quotas.maxMonthlyNoticePosts}`}
+        percent={noticePostsPercent}
+        loading={usageSummaryLoading}
+        helper="Notices posted this month (automatic usage and billing notices don't count)"
         theme={theme}
       />
       <UsageRow

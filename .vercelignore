@@ -106,7 +106,9 @@ backend-runtime/coverage/
 **/.turbo/
 **/.next/
 
-# Firebase/Google config and locks (do not commit/upload)
+# Firebase/Google config (do not upload)
 android/app/google-services.json
 app/google-services.json
-package-lock.json
+# NOTE: package-lock.json must be uploaded. Without it Vercel resolves fresh
+# versions; newer @react-navigation/core no longer pulls in `query-string`,
+# which expo-router 5 imports, and the web build fails.

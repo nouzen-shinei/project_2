@@ -10,7 +10,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { AlertTriangle, Download, HardDrive, RefreshCcw, TrendingUp, Users, UserPlus } from 'lucide-react';
+import { AlertTriangle, Download, HardDrive, Megaphone, RefreshCcw, TrendingUp, Users, UserPlus } from 'lucide-react';
 import { SectionCard } from '../../components/SectionCard';
 import { StatCard } from '../../components/StatCard';
 import { Sparkline } from '../../components/Sparkline';
@@ -49,6 +49,7 @@ type DeltaMap = {
   staff?: number | null;
   remindersTotal?: number | null;
   storageBytes?: number | null;
+  noticePosts?: number | null;
 };
 
 const usageBadgeClass = (status?: UsageStatus) => {
@@ -127,6 +128,7 @@ const computeDeltaMap = (history: UsageHistoryPoint[]): DeltaMap => {
     staff: current.staff - previous.staff,
     remindersTotal: current.remindersTotal - previous.remindersTotal,
     storageBytes: current.storageBytes - previous.storageBytes,
+    noticePosts: (current.noticePosts ?? 0) - (previous.noticePosts ?? 0),
   };
 };
 
@@ -341,6 +343,7 @@ export function UsageAnalyticsPanel() {
         remindersEmail: point.remindersEmail ?? 0,
         storageBytes: point.storageBytes ?? 0,
         storageGb: Number(((point.storageBytes ?? 0) / GB).toFixed(2)),
+        noticePosts: point.noticePosts ?? 0,
       })),
     [orderedHistory],
   );
@@ -486,6 +489,16 @@ export function UsageAnalyticsPanel() {
         trend: <Sparkline data={chartData} dataKey="storageBytes" color="#34d399" />,
         icon: <HardDrive size={22} />,
         delta: describeDelta(deltaMap.storageBytes ?? null, true),
+      },
+      {
+        key: 'noticePosts' as UsageMetricKey,
+        title: 'Notice posts',
+        value: formatNumber(summary.noticePosts),
+        subtitle: `${describeHeadroom(planLimits.noticePosts, summary.noticePosts)} · automatic notices excluded`,
+        badge: renderStatusBadge(statuses?.noticePosts),
+        trend: <Sparkline data={chartData} dataKey="noticePosts" color="#a78bfa" />,
+        icon: <Megaphone size={22} />,
+        delta: describeDelta(deltaMap.noticePosts ?? null),
       },
     ];
   }, [summary, planLimits, statuses, chartData, reminderBreakdownLine, deltaMap]);

@@ -1,1 +1,1 @@
-export type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage';
+export type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage' | 'noticePosts';

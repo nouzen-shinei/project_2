@@ -29,6 +29,7 @@ import { billingService, type BillingCatalogPlanVariant, type BillingCurrentResp
 import { finishGooglePlayTransactionSafe, purchaseGooglePlaySubscription } from '@/services/googlePlayBilling';
 import { getLastInAppRoute } from '@/lib/lastInAppRoute';
 import { describeBillingChange } from '@/lib/billingChangeDescriptions';
+import { getPlanLimits } from '@/lib/planLimits';
 
 function formatBillingDate(value?: string) {
   if (!value || typeof value !== 'string') return null;
@@ -136,6 +137,9 @@ function variantToPlanTierDisplay(variant: BillingCatalogPlanVariant): PlanTierD
   const remindersSms = toFiniteNumber(limits?.reminders?.sms) ?? 0;
   const remindersVoice = toFiniteNumber(limits?.reminders?.voice) ?? 0;
   const remindersEmail = toFiniteNumber(limits?.reminders?.email) ?? 0;
+  // Variants saved before notice posts had a limit don't set it; the backend
+  // then applies the tier default, so show that.
+  const noticePosts = toFiniteNumber(limits?.noticePosts) ?? getPlanLimits(variant.planId).noticePosts;
 
   return {
     id: variant.planId,
@@ -151,6 +155,7 @@ function variantToPlanTierDisplay(variant: BillingCatalogPlanVariant): PlanTierD
       email: remindersEmail,
     },
     storageBytes: mbToBytes(storageMb),
+    noticePosts,
   };
 }
 
@@ -175,6 +180,7 @@ function limitsToPlanTierDisplay(options: {
       email: typeof limits?.reminders?.email === 'number' ? limits.reminders.email : 0,
     },
     storageBytes: typeof limits?.storageBytes === 'number' ? limits.storageBytes : 0,
+    noticePosts: typeof limits?.noticePosts === 'number' ? limits.noticePosts : getPlanLimits(id).noticePosts,
   };
 }
 
@@ -341,6 +347,7 @@ export default function PlanAndBillingScreen() {
       students: 0,
       reminders: { total: 0, whatsapp: 0, sms: 0, voice: 0, email: 0 },
       storageBytes: 0,
+      noticePosts: 0,
     };
   }, [catalogPlans, currentBilling?.planId, currentBillingVariantId, effectivePlanLimits, usageSummary?.planLimits]);
 
@@ -409,6 +416,7 @@ export default function PlanAndBillingScreen() {
       students: 0,
       reminders: { total: 0, whatsapp: 0, sms: 0, voice: 0, email: 0 },
       storageBytes: 0,
+      noticePosts: 0,
     };
   }, [freeVariant]);
 
@@ -1381,6 +1389,7 @@ export default function PlanAndBillingScreen() {
                     students: 0,
                     reminders: { total: 0, whatsapp: 0, sms: 0, voice: 0, email: 0 },
                     storageBytes: 0,
+                    noticePosts: 0,
                   }}
                   isCurrent={effectivePlanId === 'pro'}
                   actionLabel={currentPlanDisplay.id === 'enterprise' || effectivePlanId === 'pro' ? undefined : 'Upgrade to Pro'}

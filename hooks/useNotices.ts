@@ -2,7 +2,6 @@ import { logger } from '@/lib/logger';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import {
-  addDoc,
   collection,
   doc,
   getCountFromServer,
@@ -30,7 +29,7 @@ import { Notice, NoticeFormData } from '../types/notice';
 import { noticeService } from '../services/noticeService';
 import { useTenant } from './useTenantContext';
 import type { TenantMembershipRole } from '../types/tenant';
-import { noticeBackendClient } from '../services/noticeBackendClient';
+import { noticeBackendClient, type NoticePostQuota } from '../services/noticeBackendClient';
 import {
   countNoticeReactions,
   deriveNoticeIndexFields,
@@ -49,7 +48,10 @@ import { noticeFilterConstraints, type NoticeFilter } from '../lib/noticeFilters
  *                       (1 read per 1,000 matching notices), refreshed when
  *                       notices change.
  *   - useRecentNotices  live last-14-days notices for the startup popup.
+ *   - useNoticePostQuota this month's notice-post allowance (backend).
  *   - useNoticeActions  writes (post, delete, view, react), no listeners.
+ *                       Posting goes through the backend, which enforces the
+ *                       plan's monthly notice-post limit.
  *
  * Every query is scoped to the tenant AND to notices the caller's role may
  * see (`visibleToRoles array-contains <role>`), which the security rules also
@@ -540,6 +542,57 @@ export function useRecentNotices({ enabled, days = 14 }: { enabled: boolean; day
 }
 
 // ---------------------------------------------------------------------------
+// Monthly notice-post allowance
+// ---------------------------------------------------------------------------
+
+/**
+ * This month's notice-post allowance for the active tenant (only notices
+ * people post count; automatic ones don't). Fetched from the backend when
+ * `enabled` turns on (e.g. the Add Notice form opens) and on `refresh()`.
+ * Advisory: the backend enforces the limit when the notice is posted.
+ */
+export function useNoticePostQuota({ enabled }: { enabled: boolean }) {
+  const { activeTenant } = useTenant();
+  const tenantId = activeTenant?.id;
+  const [quota, setQuota] = useState<NoticePostQuota | null>(null);
+  const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    setQuota(null);
+  }, [tenantId]);
+
+  const refresh = useCallback(async (): Promise<NoticePostQuota | null> => {
+    if (!tenantId) return null;
+    const requestId = ++requestIdRef.current;
+    try {
+      const next = await noticeBackendClient.getNoticeQuota({ tenantId });
+      if (requestId === requestIdRef.current) setQuota(next);
+      return next;
+    } catch (error) {
+      logger.warn('[useNoticePostQuota] Failed to load notice-post quota:', error);
+      return null;
+    }
+  }, [tenantId]);
+
+  useEffect(() => {
+    if (enabled) void refresh();
+  }, [enabled, refresh]);
+
+  /** Record that the server rejected a post because the allowance is used up. */
+  const markLimitReached = useCallback((limit: number, used: number, resetsAt?: string | null) => {
+    setQuota((prev) => ({
+      monthId: prev?.monthId ?? '',
+      used: Math.max(used, limit),
+      limit,
+      remaining: 0,
+      resetsAt: resetsAt ?? prev?.resetsAt,
+    }));
+  }, []);
+
+  return { quota, refresh, markLimitReached };
+}
+
+// ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
@@ -554,47 +607,27 @@ export function useNoticeActions() {
       if (!user) throw new Error('User not authenticated');
       if (!tenantId) throw new Error('Select a coaching center before creating notices');
 
-      const createdByRole: TenantMembershipRole = activeMembership?.role || 'member';
       const indexFields = deriveNoticeIndexFields({ ...noticeData, source: 'user' });
-      const createdByName = user.displayName || user.email?.split('@')[0] || 'Unknown User';
-      const createdByEmail = user.email || '';
+      const targetTenantRoles = indexFields.roleRestricted ? indexFields.visibleToRoles : undefined;
 
-      const newNotice = {
-        ...noticeData,
-        // Store the normalized audience; omitted (undefined) for "Everyone".
-        targetTenantRoles: indexFields.roleRestricted ? indexFields.visibleToRoles : undefined,
-        ...indexFields,
+      // The backend writes the notice (clients can't create notices directly)
+      // so it can enforce the plan's monthly notice-post limit. A rejected post
+      // throws NoticeBackendError('notice_post_limit_reached').
+      const created = await noticeBackendClient.createNotice({
         tenantId,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        createdBy: user.uid,
-        createdByRole,
-        createdByName,
-        createdByEmail,
-        isActive: true,
-        viewCount: 0,
-        userViews: {},
-        reactionCount: 0,
-      };
-
-      // Firestore rejects `undefined` field values, and optional form fields are
-      // often left unset (targetTenantRoles for an "Everyone" notice,
-      // audioDurationMs/audioFileSize when the picker can't read them). Leave
-      // those fields out of the document instead.
-      const noticeDoc = Object.fromEntries(
-        Object.entries(newNotice).filter(([, value]) => value !== undefined),
-      );
-
-      const docRef = await addDoc(collection(db, 'notices'), noticeDoc);
+        notice: { ...noticeData, targetTenantRoles },
+        createdByName: user.displayName || user.email?.split('@')[0] || undefined,
+      });
       noticeEvents.emitChanged();
 
+      const createdByRole: TenantMembershipRole = created.createdByRole || activeMembership?.role || 'member';
       const createdAtIso = new Date().toISOString();
       const targetAudience = Array.isArray(noticeData.targetAudience) && noticeData.targetAudience.length > 0
         ? [...noticeData.targetAudience]
         : ['all'];
 
       const dispatchNotice: Notice = {
-        id: docRef.id,
+        id: created.id,
         title: noticeData.title,
         content: noticeData.content,
         imageUrl: noticeData.imageUrl,
@@ -609,11 +642,11 @@ export function useNoticeActions() {
         createdAt: createdAtIso,
         createdBy: user.uid,
         createdByRole,
-        createdByName,
-        createdByEmail,
+        createdByName: created.createdByName,
+        createdByEmail: created.createdByEmail,
         updatedAt: createdAtIso,
         isActive: true,
-        targetTenantRoles: newNotice.targetTenantRoles,
+        targetTenantRoles,
         targetAudience,
         tenantId,
         viewCount: 0,
@@ -625,7 +658,7 @@ export function useNoticeActions() {
         logger.warn('[useNotices] Failed to dispatch notice notifications:', error);
       });
 
-      return docRef.id;
+      return created.id;
     },
     [user, tenantId, activeMembership?.role],
   );

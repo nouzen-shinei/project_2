@@ -1,6 +1,6 @@
 import type { PlanId, PlanLimits, UsageStatus } from '@/lib/planLimits';
 
-export type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage';
+export type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage' | 'noticePosts';
 
 export interface UsageMetricStatus {
   value: number;

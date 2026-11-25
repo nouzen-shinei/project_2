@@ -53,6 +53,7 @@ import {
 import { getEmailBackendBaseUrl, getWebAppBaseUrl } from './runtimeEndpoints';
 import { getMaintenanceMode } from './maintenanceMode';
 import { finalizeReminderQuotaFromHistory } from './lib/reminderQuota';
+import { deriveNoticeIndexFields, normalizeTargetTenantRoles } from './lib/noticeIndexFields';
 import { startBirthdayNotificationScheduler, runBirthdayNotificationJob, BirthdayJobOptions } from './birthdayNotificationJob';
 import { startDailyQuoteScheduler, runDailyQuoteJob, getDailyQuoteSchedulerStatus } from './dailyQuoteJob';
 import { startBillingBackfillScheduler, getBillingBackfillSchedulerStatus } from './billingBackfillJob';
@@ -1365,6 +1366,17 @@ class TenantStudentLimitError extends Error {
   }
 }
 
+class TenantNoticePostLimitError extends Error {
+  limit: number;
+  used: number;
+
+  constructor(limit: number, used: number) {
+    super('notice_post_limit_reached');
+    this.limit = limit;
+    this.used = used;
+  }
+}
+
 /**
  * Thrown by `reserveTenantStorageBytes` when the tenant's allowance cannot
  * accommodate an increment. Exported so a test can drive `reserveUploadQuotaBytes`
@@ -2643,6 +2655,8 @@ async function resolveTenantPlanLimitsForEnforcement(
           maxStudents: typeof quotasRaw.maxStudents === 'number' ? quotasRaw.maxStudents : null,
           maxMonthlyReminders: typeof quotasRaw.maxMonthlyReminders === 'number' ? quotasRaw.maxMonthlyReminders : null,
           maxStorageMb: typeof quotasRaw.maxStorageMb === 'number' ? quotasRaw.maxStorageMb : null,
+          maxMonthlyNoticePosts:
+            typeof quotasRaw.maxMonthlyNoticePosts === 'number' ? quotasRaw.maxMonthlyNoticePosts : null,
         }
       : null,
   });
@@ -3312,6 +3326,81 @@ async function assertTenantStudentCreateAllowed(
   }
 }
 
+/**
+ * Notices people posted in a calendar month (UTC). Automatic notices (Usage
+ * Monitor, Billing, system) have another `source` and don't count. Same query
+ * as `countNoticePosts` in jobs/tenantUsageRollup.ts.
+ * Index: notices (tenantId ASC, source ASC, createdAt ASC).
+ */
+function userNoticePostsQuery(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  monthId: string
+): admin.firestore.Query {
+  const { start, end } = monthBoundsUtc(monthId);
+  return db
+    .collection('notices')
+    .where('tenantId', '==', tenantId)
+    .where('source', '==', 'user')
+    .where('createdAt', '>=', admin.firestore.Timestamp.fromDate(start))
+    .where('createdAt', '<', admin.firestore.Timestamp.fromDate(end));
+}
+
+/** The plan's monthly notice-post allowance; 0 means unlimited (same as other limits). */
+function noticePostLimitOf(planLimits: import('./lib/planLimits').PlanLimits): number {
+  const limit = planLimits.noticePosts;
+  return typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 0;
+}
+
+function nextMonthStartIso(monthId: string): string {
+  return monthBoundsUtc(monthId).end.toISOString();
+}
+
+/**
+ * Creates a user-posted notice if the tenant still has notice posts left this
+ * month, otherwise throws TenantNoticePostLimitError.
+ *
+ * The count and the create run in one transaction that also reads and writes
+ * `noticePostLocks/{tenantId}`. Two posts racing for the last slot therefore
+ * conflict on that document and one of them retries, sees the other's notice,
+ * and is rejected. Deleting a notice frees its slot because the count is taken
+ * from the notices themselves.
+ */
+async function createUserNoticeWithinPlanLimit(
+  db: admin.firestore.Firestore,
+  tenantId: string,
+  record: Record<string, unknown>
+): Promise<{ id: string; used: number; limit: number; monthId: string }> {
+  const planLimits = await resolveTenantPlanLimitsForEnforcement(db, tenantId);
+  const limit = noticePostLimitOf(planLimits);
+  const monthId = formatMonthId(new Date());
+  const noticeRef = db.collection('notices').doc();
+  const lockRef = db.collection('noticePostLocks').doc(tenantId);
+
+  const used = await db.runTransaction(async (tx) => {
+    await tx.get(lockRef);
+    const countSnap = await tx.get(userNoticePostsQuery(db, tenantId, monthId).count());
+    const usedBefore = countSnap.data().count ?? 0;
+    if (limit > 0 && usedBefore >= limit) {
+      throw new TenantNoticePostLimitError(limit, usedBefore);
+    }
+    tx.create(noticeRef, record);
+    tx.set(
+      lockRef,
+      {
+        tenantId,
+        monthId,
+        lastNoticeId: noticeRef.id,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    return usedBefore + 1;
+  });
+
+  return { id: noticeRef.id, used, limit, monthId };
+}
+
 async function assertTenantStaffSeatAvailable(db: admin.firestore.Firestore, tenantId: string): Promise<void> {
   const tenantRef = db.collection('tenants').doc(tenantId);
   const tenantSnap = await tenantRef.get();
@@ -3942,6 +4031,7 @@ interface TenantAdminSummary {
     maxMonthlyEmailReminders?: number;
     maxMonthlyVoiceReminders?: number;
     maxStorageMb?: number;
+    maxMonthlyNoticePosts?: number;
   };
   membershipCounts?: {
     total?: number;
@@ -4151,7 +4241,7 @@ const notificationStatsInspectorSchema = z.object({
   days: z.number().int().min(1).max(180).optional(),
 });
 
-type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage';
+type UsageMetricKey = 'students' | 'staff' | 'reminders' | 'storage' | 'noticePosts';
 
 interface UsageStorageSource {
   label: string;
@@ -4429,6 +4519,7 @@ const tenantQuotaUpdateSchema = z
       maxMonthlyEmailReminders: quotaValueSchema,
       maxMonthlyVoiceReminders: quotaValueSchema,
       maxStorageMb: quotaValueSchema,
+      maxMonthlyNoticePosts: quotaValueSchema,
     }),
     note: z.string().trim().max(300).optional(),
   })
@@ -4436,6 +4527,26 @@ const tenantQuotaUpdateSchema = z
     message: 'At least one quota must be provided',
     path: ['quotas'],
   });
+
+// Body of POST /tenants/:tenantId/notices (the app's NoticeFormData). Author,
+// tenant, timestamps and index fields are set by the server. Unknown keys are
+// dropped.
+const noticeCreateSchema = z.object({
+  title: z.string().trim().min(1).max(500),
+  content: z.string().trim().min(1).max(50_000),
+  priority: z.enum(['low', 'medium', 'high']).default('medium'),
+  targetAudience: z.array(z.string().trim().min(1).max(40)).max(20).default(['all']),
+  targetTenantRoles: z.array(z.enum(['owner', 'admin', 'staff', 'member'])).max(4).nullish(),
+  imageUrl: z.string().trim().max(4096).nullish(),
+  audioUrl: z.string().trim().max(4096).nullish(),
+  audioFileName: z.string().trim().max(300).nullish(),
+  audioFileSize: z.number().min(0).max(5_000_000_000).nullish(),
+  audioDurationMs: z.number().min(0).max(7 * 24 * 60 * 60 * 1000).nullish(),
+  audioStoragePath: z.string().trim().max(1024).nullish(),
+  linkUrl: z.string().trim().max(4096).nullish(),
+  linkTitle: z.string().trim().max(300).nullish(),
+  createdByName: z.string().trim().max(120).nullish(),
+});
 
 const tenantBillingPlanVariantUpdateSchema = z.object({
   tenantId: z.string().trim().min(6).max(120),
@@ -4483,6 +4594,7 @@ const billingPlanVariantUpsertSchema = z.object({
       staffSeats: z.number().int().min(0).max(100_000).optional(),
       students: z.number().int().min(0).max(1_000_000).optional(),
       storageMb: z.number().int().min(0).max(5_000_000).optional(),
+      noticePosts: z.number().int().min(0).max(1_000_000).optional(),
       reminders: z
         .object({
           total: z.number().int().min(0).max(10_000_000).optional(),
@@ -4883,6 +4995,7 @@ function buildUsageAlertDetails(
     staff: 'Team seats',
     reminders: 'Reminders',
     storage: 'Storage',
+    noticePosts: 'Notice posts',
   };
   const metricLabel = METRIC_LABELS[metric] ?? metric;
   const percentage = Math.round(ratio * 100);
@@ -4998,6 +5111,23 @@ async function countPendingSeatInvitesLiveCached(db: any, tenantId: string): Pro
 
 async function countActiveStudentsLiveCached(db: any, tenantId: string): Promise<number> {
   return getCachedLiveCount(`students:${tenantId}`, () => countActiveStudentsLive(db, tenantId));
+}
+
+/** Cache key for this month's user notice-post count; invalidate on notice create/delete. */
+function noticePostsLiveCountKey(tenantId: string): string {
+  return `noticePosts:${tenantId}:${formatMonthId(new Date())}`;
+}
+
+/** This month's user-posted notices (1 read per 1,000 notices), or -1 if the count fails. */
+async function countUserNoticePostsThisMonthLiveCached(db: any, tenantId: string): Promise<number> {
+  return getCachedLiveCount(noticePostsLiveCountKey(tenantId), async () => {
+    try {
+      return await countQueryFast(userNoticePostsQuery(db, tenantId, formatMonthId(new Date())));
+    } catch (error) {
+      console.warn('[notice_posts] live count failed', { tenantId, error });
+      return -1;
+    }
+  });
 }
 
 async function readTenantStorageBytesLive(db: any, tenantId: string): Promise<number> {
@@ -5770,6 +5900,7 @@ function serializeTenantAdminSummary(
           maxMonthlyEmailReminders: coerceNumber(quotasRaw.maxMonthlyEmailReminders),
           maxMonthlyVoiceReminders: coerceNumber(quotasRaw.maxMonthlyVoiceReminders),
           maxStorageMb: coerceNumber(quotasRaw.maxStorageMb),
+          maxMonthlyNoticePosts: coerceNumber(quotasRaw.maxMonthlyNoticePosts),
         }
       : undefined,
     membershipCounts: membershipCountsRaw
@@ -5875,7 +6006,8 @@ type QuotaFieldKey =
   | 'maxMonthlySmsReminders'
   | 'maxMonthlyEmailReminders'
   | 'maxMonthlyVoiceReminders'
-  | 'maxStorageMb';
+  | 'maxStorageMb'
+  | 'maxMonthlyNoticePosts';
 
 function buildQuotaPatch(input: Partial<Record<QuotaFieldKey, number | null>>): Record<QuotaFieldKey, number | null> {
   const patch: Partial<Record<QuotaFieldKey, number | null>> = {};
@@ -5889,6 +6021,7 @@ function buildQuotaPatch(input: Partial<Record<QuotaFieldKey, number | null>>): 
       'maxMonthlyEmailReminders',
       'maxMonthlyVoiceReminders',
       'maxStorageMb',
+      'maxMonthlyNoticePosts',
     ] as QuotaFieldKey[]
   ).forEach((key) => {
     if (input[key] === undefined) {
@@ -10040,6 +10173,139 @@ export function createApp(options: CreateAppOptions = {}){
     }
   });
 
+  // How many notices the tenant can still post this month. The app calls this
+  // before uploading notice media so a post that would be rejected doesn't
+  // upload files first. Advisory only: POST below enforces the limit.
+  app.get('/tenants/:tenantId/notices/quota', requireParamsMemberTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    try {
+      const db = getFirestoreImpl();
+      const tenantId = tenantAccess.tenantId;
+      const monthId = formatMonthId(new Date());
+      const [planLimits, usedLive] = await Promise.all([
+        resolveTenantPlanLimitsForEnforcement(db, tenantId),
+        countUserNoticePostsThisMonthLiveCached(db, tenantId),
+      ]);
+      if (usedLive < 0) {
+        return res.status(503).json({ error: 'notice_quota_unavailable' });
+      }
+      const limit = noticePostLimitOf(planLimits);
+      return res.json({
+        monthId,
+        used: usedLive,
+        limit: limit > 0 ? limit : null,
+        remaining: limit > 0 ? Math.max(0, limit - usedLive) : null,
+        resetsAt: nextMonthStartIso(monthId),
+      });
+    } catch (error) {
+      console.error('[notices_quota] failed', error);
+      return res.status(500).json({ error: 'notice_quota_failed' });
+    }
+  });
+
+  // Posting a notice from the app. Clients can't create notices directly
+  // (firestore.rules), so the monthly notice-post limit is enforced here.
+  app.post('/tenants/:tenantId/notices', requireParamsMemberTenantAccess, async (req, res) => {
+    const tenantAccess = req.tenantAccess;
+    const authContext = req.authContext;
+    if (!tenantAccess) {
+      return res.status(500).json({ error: 'tenant_guard_missing' });
+    }
+    if (!authContext?.uid) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const parsed = noticeCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'validation_failed', issues: parsed.error.issues });
+    }
+
+    const tenantId = tenantAccess.tenantId;
+    const actorRole = tenantAccess.role;
+    const input = parsed.data;
+
+    // Only owners/admins may restrict who sees a notice, and the author must
+    // be able to see their own notice (same checks the security rules made
+    // when the app wrote notices directly).
+    const restrictedTo = normalizeTargetTenantRoles(input.targetTenantRoles);
+    if (restrictedTo.length > 0) {
+      if (actorRole !== 'owner' && actorRole !== 'admin') {
+        return res.status(403).json({ error: 'notice_audience_not_allowed' });
+      }
+      if (!restrictedTo.includes(actorRole)) {
+        return res.status(400).json({ error: 'notice_audience_excludes_author' });
+      }
+    }
+
+    try {
+      const db = getFirestoreImpl();
+      const createdByEmail = (await resolveAuthenticatedEmail(authContext)) || '';
+      const createdByName =
+        input.createdByName || (createdByEmail ? createdByEmail.split('@')[0] : '') || 'Unknown User';
+      const indexFields = deriveNoticeIndexFields({ ...input, targetTenantRoles: restrictedTo, source: 'user' });
+      const serverTimestamp = admin.firestore.FieldValue.serverTimestamp();
+
+      const record = stripUndefinedDeep({
+        title: input.title,
+        content: input.content,
+        priority: input.priority,
+        targetAudience: input.targetAudience.length > 0 ? input.targetAudience : ['all'],
+        imageUrl: input.imageUrl ?? undefined,
+        audioUrl: input.audioUrl ?? undefined,
+        audioFileName: input.audioFileName ?? undefined,
+        audioFileSize: input.audioFileSize ?? undefined,
+        audioDurationMs: input.audioDurationMs ?? undefined,
+        audioStoragePath: input.audioStoragePath ?? undefined,
+        linkUrl: input.linkUrl ?? undefined,
+        linkTitle: input.linkTitle ?? undefined,
+        // Stored only for restricted notices; "Everyone" notices omit it.
+        targetTenantRoles: restrictedTo.length > 0 ? restrictedTo : undefined,
+        ...indexFields,
+        tenantId,
+        createdAt: serverTimestamp,
+        updatedAt: serverTimestamp,
+        createdBy: authContext.uid,
+        createdByRole: actorRole,
+        createdByName,
+        createdByEmail,
+        isActive: true,
+        viewCount: 0,
+        userViews: {},
+        reactionCount: 0,
+      }) as Record<string, unknown>;
+
+      const result = await createUserNoticeWithinPlanLimit(db, tenantId, record);
+      invalidateLiveCount(noticePostsLiveCountKey(tenantId));
+      return res.status(201).json({
+        id: result.id,
+        createdByRole: actorRole,
+        createdByName,
+        createdByEmail,
+        visibleToRoles: indexFields.visibleToRoles,
+        quota: {
+          monthId: result.monthId,
+          used: result.used,
+          limit: result.limit > 0 ? result.limit : null,
+          remaining: result.limit > 0 ? Math.max(0, result.limit - result.used) : null,
+        },
+      });
+    } catch (error) {
+      if (error instanceof TenantNoticePostLimitError) {
+        return res.status(409).json({
+          error: 'notice_post_limit_reached',
+          limit: error.limit,
+          used: error.used,
+          resetsAt: nextMonthStartIso(formatMonthId(new Date())),
+        });
+      }
+      console.error('[notices_create] failed', error);
+      return res.status(500).json({ error: 'notice_create_failed' });
+    }
+  });
+
   app.delete('/tenants/:tenantId/notices/:noticeId', requireParamsMemberTenantAccess, async (req, res) => {
     const tenantAccess = req.tenantAccess;
     const authContext = req.authContext;
@@ -10158,6 +10424,8 @@ export function createApp(options: CreateAppOptions = {}){
       }
 
       await noticeRef.delete();
+      // A deleted user notice frees a slot in this month's notice-post allowance.
+      invalidateLiveCount(noticePostsLiveCountKey(tenantId));
       return res.json({ ok: true });
     } catch (error) {
       console.error('[notices_delete] failed', error);
@@ -15861,6 +16129,14 @@ export function createApp(options: CreateAppOptions = {}){
         liveStorageBytes = live >= 0 ? live : null;
       }
 
+      // Notice posts are enforced live at post time, so show the same live count
+      // for the current month instead of the (possibly hours old) rollup value.
+      let liveNoticePosts: number | null = null;
+      if (monthId === currentMonthId) {
+        const live = await countUserNoticePostsThisMonthLiveCached(db, tenantAccess.tenantId);
+        liveNoticePosts = live >= 0 ? live : null;
+      }
+
       const studentsValue = safeNumber(
         liveActiveStudents ?? usageData.activeStudents ?? usageData.students ?? usageData.studentCount,
         studentsFallback
@@ -15874,7 +16150,7 @@ export function createApp(options: CreateAppOptions = {}){
       const studentsAdded = safeNumber(
         usageData.studentsAdded ?? usageData.newStudents ?? usageData.studentsAddedThisMonth
       );
-      const noticePosts = safeNumber(usageData.noticePosts ?? usageData.noticeCount);
+      const noticePosts = safeNumber(liveNoticePosts ?? usageData.noticePosts ?? usageData.noticeCount);
       const deviceActions = safeNumber(usageData.deviceActions ?? usageData.deviceActionCount);
       const chatMessagesValue = coerceNumber(usageData.chatMessages ?? usageData.chatMessageCount);
       const metricsVersion = coerceNumber(usageData.metricsVersion);
@@ -15914,6 +16190,7 @@ export function createApp(options: CreateAppOptions = {}){
         staff: { value: summary.staff, limit: planLimits.staffSeats },
         reminders: { value: summary.reminders.total, limit: planLimits.reminders.total },
         storage: { value: summary.storageBytes, limit: planLimits.storageBytes },
+        noticePosts: { value: summary.noticePosts, limit: planLimits.noticePosts },
       };
 
       const alerts = alertsRaw.flatMap((alert) => {
@@ -15964,6 +16241,8 @@ export function createApp(options: CreateAppOptions = {}){
       if (reminderStatus) statuses.reminders = reminderStatus;
       const storageStatus = buildUsageMetricStatus(summary.storageBytes, planLimits.storageBytes);
       if (storageStatus) statuses.storage = storageStatus;
+      const noticePostsStatus = buildUsageMetricStatus(summary.noticePosts, planLimits.noticePosts);
+      if (noticePostsStatus) statuses.noticePosts = noticePostsStatus;
       summary.statuses = statuses;
 
       return res.json(summary);
@@ -16189,6 +16468,7 @@ export function createApp(options: CreateAppOptions = {}){
                 const staffSeats = coerceNumber((variantLimits as any).staffSeats);
                 const students = coerceNumber((variantLimits as any).students);
                 const storageMb = coerceNumber((variantLimits as any).storageMb);
+                const noticePosts = coerceNumber((variantLimits as any).noticePosts);
 
                 const reminders = (variantLimits as any).reminders;
                 const remindersTotal = coerceNumber(reminders?.total);
@@ -16225,6 +16505,8 @@ export function createApp(options: CreateAppOptions = {}){
                   },
                   storageBytes:
                     typeof storageMb === 'number' && storageMb >= 0 ? Math.round(storageMb * 1024 * 1024) : limits.storageBytes,
+                  noticePosts:
+                    typeof noticePosts === 'number' && noticePosts >= 0 ? Math.trunc(noticePosts) : limits.noticePosts,
                 };
               }
             } catch {

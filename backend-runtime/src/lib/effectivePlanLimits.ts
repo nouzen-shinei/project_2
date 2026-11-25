@@ -11,6 +11,7 @@ export interface TenantQuotaOverrides {
   maxMonthlyEmailReminders?: number | null;
   maxMonthlyVoiceReminders?: number | null;
   maxStorageMb?: number | null;
+  maxMonthlyNoticePosts?: number | null;
 }
 
 function normalizePlanId(value: unknown): PlanId {
@@ -147,6 +148,7 @@ function applyVariantLimitOverrides(basePlanLimits: PlanLimits, variant: { limit
   const remindersVoice = coerceNonNegativeNumber(limits.reminders?.voice);
   const remindersEmail = coerceNonNegativeNumber(limits.reminders?.email);
   const storageMb = coerceNonNegativeNumber(limits.storageMb);
+  const noticePosts = coerceNonNegativeNumber(limits.noticePosts);
 
   return {
     ...basePlanLimits,
@@ -161,6 +163,7 @@ function applyVariantLimitOverrides(basePlanLimits: PlanLimits, variant: { limit
       email: remindersEmail ?? basePlanLimits.reminders.email,
     },
     storageBytes: typeof storageMb === 'number' ? mbToBytes(storageMb) : basePlanLimits.storageBytes,
+    noticePosts: noticePosts ?? basePlanLimits.noticePosts,
   };
 }
 
@@ -318,6 +321,7 @@ export async function resolveEffectivePlanLimitsForTenant(
   const maxMonthlyEmailReminders = coercePositiveNumber(quotas.maxMonthlyEmailReminders);
   const maxMonthlyVoiceReminders = coercePositiveNumber(quotas.maxMonthlyVoiceReminders);
   const maxStorageMb = coercePositiveNumber(quotas.maxStorageMb);
+  const maxMonthlyNoticePosts = coercePositiveNumber(quotas.maxMonthlyNoticePosts);
 
   return {
     ...basePlanLimits,
@@ -332,5 +336,6 @@ export async function resolveEffectivePlanLimitsForTenant(
       voice: maxMonthlyVoiceReminders ?? basePlanLimits.reminders.voice,
     },
     storageBytes: typeof maxStorageMb === 'number' ? mbToBytes(maxStorageMb) : basePlanLimits.storageBytes,
+    noticePosts: maxMonthlyNoticePosts ?? basePlanLimits.noticePosts,
   };
 }

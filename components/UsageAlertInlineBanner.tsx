@@ -20,6 +20,7 @@ const metricLabelByKey: Record<UsageMetricKey, string> = {
   staff: 'Team seats',
   reminders: 'Monthly reminders',
   storage: 'Storage',
+  noticePosts: 'Monthly notice posts',
 };
 
 const formatValue = (metric: UsageMetricKey, value?: number | null) => {

@@ -52,6 +52,7 @@ export function BillingCatalogPanel() {
         staffSeats: 0,
         students: 0,
         storageMb: 0,
+        noticePosts: 0,
         reminders: {
           total: 0,
           whatsapp: 0,
@@ -123,6 +124,7 @@ export function BillingCatalogPanel() {
         staffSeats: entry.limits?.staffSeats ?? 0,
         students: entry.limits?.students ?? 0,
         storageMb: entry.limits?.storageMb ?? 0,
+        noticePosts: entry.limits?.noticePosts ?? 0,
         reminders: {
           total: entry.limits?.reminders?.total ?? 0,
           whatsapp: entry.limits?.reminders?.whatsapp ?? 0,
@@ -158,6 +160,7 @@ export function BillingCatalogPanel() {
           staffSeats: planDraft.limits?.staffSeats ? Number(planDraft.limits.staffSeats) : undefined,
           students: planDraft.limits?.students ? Number(planDraft.limits.students) : undefined,
           storageMb: planDraft.limits?.storageMb ? Number(planDraft.limits.storageMb) : undefined,
+          noticePosts: planDraft.limits?.noticePosts ? Number(planDraft.limits.noticePosts) : undefined,
           reminders: {
             total: planDraft.limits?.reminders?.total ? Number(planDraft.limits.reminders.total) : undefined,
             whatsapp: planDraft.limits?.reminders?.whatsapp ? Number(planDraft.limits.reminders.whatsapp) : undefined,
@@ -401,6 +404,23 @@ export function BillingCatalogPanel() {
                 placeholder="e.g. 20480"
               />
             </label>
+            <label>
+              Notice posts / month
+              <input
+                value={String(planDraft.limits?.noticePosts ?? 0)}
+                onChange={(e) =>
+                  setPlanDraft((s) => ({
+                    ...s,
+                    limits: { ...(s.limits || {}), noticePosts: Number(e.target.value || 0) },
+                  }))
+                }
+                inputMode="numeric"
+                placeholder="e.g. 500"
+              />
+              <span className="muted small-text">
+                Notices members post each month. Automatic usage/billing notices don&apos;t count.
+              </span>
+            </label>
 
             <label>
               Monthly reminders (total)
@@ -559,6 +579,7 @@ export function BillingCatalogPanel() {
                             entry.limits?.students ? `Students ${entry.limits.students}` : null,
                             entry.limits?.reminders?.total ? `Rem ${entry.limits.reminders.total}` : null,
                             entry.limits?.storageMb ? `Storage ${entry.limits.storageMb}MB` : null,
+                            entry.limits?.noticePosts ? `Notices ${entry.limits.noticePosts}/mo` : null,
                           ]
                             .filter(Boolean)
                             .join(' · ') || '—'}

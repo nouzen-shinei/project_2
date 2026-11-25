@@ -44,6 +44,8 @@ export interface TenantQuota {
   maxStaff: number | null;
   maxMonthlyReminders: number | null;
   maxStorageMb: number | null;
+  /** Notices people may post per month (automatic notices don't count). */
+  maxMonthlyNoticePosts?: number | null;
 }
 
 export interface TenantSettings {
