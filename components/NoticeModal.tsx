@@ -12,6 +12,8 @@ import {
   Dimensions,
   Linking,
   Platform,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
 } from 'react-native';
 import { useSubmitFailure } from '@/hooks/useSubmitFailure';
 import { SubmitFailedContent } from '@/components/SubmitFailedContent';
@@ -34,7 +36,8 @@ import {
   FileAudio
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
-import { useNotices } from '../hooks/useNotices';
+import { useNoticeActions, useNoticeCounts, useNoticeDocument, useNoticeFeed } from '../hooks/useNotices';
+import { matchesNoticeFilter, type NoticeFilter } from '../lib/noticeFilters';
 import { useAuth, authService } from '../hooks/useAuthUnified';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { useTenant } from '../hooks/useTenantContext';
@@ -103,6 +106,23 @@ const formatStorageBytesForUsageNotice = (value: number): string => {
   const mb = value / (1024 * 1024);
   return `${mb.toFixed(1)} MB`;
 };
+
+// Filter chips above the notice list. "Admins only" is shown to owners/admins
+// only, since nobody else can see those notices.
+const NOTICE_FILTERS: { id: NoticeFilter; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'high', label: 'High priority' },
+  { id: 'mine', label: 'Posted by me' },
+  { id: 'image', label: 'With image' },
+  { id: 'audio', label: 'With audio' },
+  { id: 'adminsOnly', label: 'Admins only' },
+];
+const STAFF_NOTICE_FILTERS = NOTICE_FILTERS.filter((f) => f.id !== 'adminsOnly');
+const NOTICE_FILTER_IDS_ALL = NOTICE_FILTERS.map((f) => f.id);
+const NOTICE_FILTER_IDS_STAFF = STAFF_NOTICE_FILTERS.map((f) => f.id);
+
+// Start loading the next page when the list is scrolled this close to its end.
+const LOAD_MORE_THRESHOLD_PX = 400;
 
 const getUsageNoticeContentOverride = (notice: any): string | null => {
   const metadata = notice?.metadata;
@@ -481,7 +501,7 @@ export const NoticeDetailModal: React.FC<NoticeDetailModalProps> = ({
   const { theme } = useTheme();
   const { user } = useAuth();
   const { activeTenant } = useTenant();
-  const { markNoticeAsViewed, toggleNoticeReaction } = useNotices();
+  const { markNoticeAsViewed, toggleNoticeReaction } = useNoticeActions();
   const { isOnline } = useNetworkStatus();
   const [creatorRole, setCreatorRole] = useState<TenantMembershipRole | 'system' | null>(null);
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
@@ -1016,11 +1036,31 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   const { theme } = useTheme();
   const { user } = useAuth();
   const { activeMembership, activeTenant } = useTenant();
-  const { notices, loading, addNotice, deleteNotice } = useNotices();
+  const { addNotice, deleteNotice } = useNoticeActions();
   const { isOnline } = useNetworkStatus();
   const [showAddForm, setShowAddForm] = useState(false);
+  const [noticeFilter, setNoticeFilter] = useState<NoticeFilter>('all');
   const [selectedNotice, setSelectedNotice] = useState<Notice | null>(null);
   const [showDetailModal, setShowDetailModal] = useState(false);
+
+  const canSetNoticeVisibility = activeMembership?.role === 'owner' || activeMembership?.role === 'admin';
+  const availableNoticeFilters = canSetNoticeVisibility ? NOTICE_FILTERS : STAFF_NOTICE_FILTERS;
+  // Fall back to "All" if the selected chip is no longer offered (e.g. role changed).
+  const activeNoticeFilter: NoticeFilter = availableNoticeFilters.some((f) => f.id === noticeFilter)
+    ? noticeFilter
+    : 'all';
+
+  // The list is loaded page by page, already filtered by Firestore; the chip
+  // counts come from Firestore count queries, so both stay exact however many
+  // notices the center has.
+  const noticeFeed = useNoticeFeed({ filter: activeNoticeFilter, enabled: visible });
+  const { notices, loading } = noticeFeed;
+  const { counts: noticeFilterCounts } = useNoticeCounts({
+    filters: canSetNoticeVisibility ? NOTICE_FILTER_IDS_ALL : NOTICE_FILTER_IDS_STAFF,
+    enabled: visible,
+  });
+  // Older list pages are one-time reads, so watch the open notice directly.
+  const liveSelectedNotice = useNoticeDocument(selectedNotice?.id, visible && showDetailModal);
   const [uploading, setUploading] = useState(false);
   // After a failed post the submit button turns red, says "Failed to post" and
   // stays disabled for a few seconds.
@@ -1118,10 +1158,11 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
     setAudioMetadataLoading(false);
   };
 
-  // Reset form and show state when modal is closed
+  // Reset form, filter and show state when modal is closed
   useEffect(() => {
     if (!visible) {
       setShowAddForm(false);
+      setNoticeFilter('all');
       resetForm();
     }
   }, [visible]);
@@ -1459,6 +1500,8 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
 
     try {
       await deleteNotice(noticeId);
+      // Older list pages aren't live, so drop it locally too.
+      noticeFeed.removeNotice(noticeId);
       Toast.show({
         type: 'success',
         text1: 'Notice deleted',
@@ -1549,13 +1592,12 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   };
 
   // Keep selected notice synced with the latest snapshot (reactions, views, edits, etc.)
+  const { updateLocalNotice } = noticeFeed;
   useEffect(() => {
-    if (!showDetailModal || !selectedNotice?.id) return;
-    const updated = notices.find((n) => n.id === selectedNotice.id);
-    if (updated) {
-      setSelectedNotice(updated);
-    }
-  }, [notices, showDetailModal, selectedNotice?.id]);
+    if (!showDetailModal || !liveSelectedNotice) return;
+    setSelectedNotice(liveSelectedNotice);
+    updateLocalNotice(liveSelectedNotice);
+  }, [liveSelectedNotice, showDetailModal, updateLocalNotice]);
 
   const renderReactionSummary = (notice: Notice) => {
     const counts = getReactionCounts(notice);
@@ -1612,7 +1654,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
       if (idToIndex.has(id)) {
         const index = idToIndex.get(id)!;
         baseList[index] = { ...baseList[index], __pendingDeletion: pendingNotice.__pendingDeletion };
-      } else {
+      } else if (matchesNoticeFilter(pendingNotice, activeNoticeFilter, user?.uid)) {
         baseList.push({ ...pendingNotice });
       }
     });
@@ -1624,7 +1666,7 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
     });
 
     return baseList;
-  }, [notices, pendingDeleteNotices]);
+  }, [notices, pendingDeleteNotices, activeNoticeFilter, user?.uid]);
 
   useEffect(() => {
     setPendingDeleteNotices(prev => {
@@ -1655,7 +1697,21 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
   const noticeFieldsComplete = Boolean(formData.title.trim() && formData.content.trim());
   const submitDisabled =
     uploading || postFailure.failed || audioMetadataLoading || !noticeFieldsComplete;
-  const canSetNoticeVisibility = activeMembership?.role === 'owner' || activeMembership?.role === 'admin';
+
+  // Show the chips whenever the center has notices (or a filter is active, so
+  // the user can always get back to "All").
+  const showNoticeFilters =
+    (noticeFilterCounts.all ?? 0) > 0 || noticesToDisplay.length > 0 || activeNoticeFilter !== 'all';
+  const activeNoticeFilterLabel = availableNoticeFilters.find((f) => f.id === activeNoticeFilter)?.label;
+
+  const handleNoticeListScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    if (!noticeFeed.hasMore || noticeFeed.loadingMore || noticeFeed.loadMoreError) return;
+    const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;
+    if (layoutMeasurement.height + contentOffset.y >= contentSize.height - LOAD_MORE_THRESHOLD_PX) {
+      void noticeFeed.loadMore();
+    }
+  };
+
   const isAdminsOnlyNotice = Array.isArray(formData.targetTenantRoles) && formData.targetTenantRoles.length > 0;
 
   return (
@@ -2057,9 +2113,58 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                 </View>
               </ScrollView>
             ) : (
+              <>
+              {showNoticeFilters ? (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  style={styles.noticeFilterScroll}
+                  contentContainerStyle={styles.noticeFilterRow}
+                >
+                  {availableNoticeFilters.map(({ id, label }) => {
+                    const selected = activeNoticeFilter === id;
+                    // Undefined until the first count query returns (or while offline).
+                    const count = noticeFilterCounts[id];
+                    return (
+                      <TouchableOpacity
+                        key={id}
+                        style={[
+                          styles.noticeFilterChip,
+                          {
+                            backgroundColor: selected ? theme.primary : theme.background,
+                            borderColor: selected ? theme.primary : theme.border,
+                          },
+                        ]}
+                        onPress={() => setNoticeFilter(id)}
+                        accessibilityRole="button"
+                        aria-selected={selected}
+                        accessibilityLabel={
+                          count === undefined ? label : `${label}, ${count} ${count === 1 ? 'notice' : 'notices'}`
+                        }
+                      >
+                        <Text style={[styles.noticeFilterChipText, { color: selected ? '#ffffff' : theme.text }]}>
+                          {label}
+                        </Text>
+                        {count !== undefined ? (
+                          <Text
+                            style={[
+                              styles.noticeFilterChipCount,
+                              { color: selected ? 'rgba(255,255,255,0.85)' : theme.textSecondary },
+                            ]}
+                          >
+                            {count}
+                          </Text>
+                        ) : null}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              ) : null}
               <ScrollView
                 style={styles.noticesList}
                 showsVerticalScrollIndicator={false}
+                onScroll={handleNoticeListScroll}
+                scrollEventThrottle={200}
                 contentContainerStyle={{
                   paddingBottom: Platform.select({ web: 0, default: 35 }),
                 }}
@@ -2068,6 +2173,15 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                   <View style={styles.loadingContainer}>
                     <ActivityIndicator size="large" color={theme.primary} />
                     <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading notices...</Text>
+                  </View>
+                ) : noticeFeed.error && noticesToDisplay.length === 0 ? (
+                  <View style={styles.emptyState}>
+                    <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>
+                      Couldn&apos;t load notices
+                    </Text>
+                    <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}>
+                      Check your connection, then close and reopen notices.
+                    </Text>
                   </View>
                 ) : noticesToDisplay.length > 0 ? (
                   noticesToDisplay.map((notice) => {
@@ -2097,8 +2211,21 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                                 <Text style={[styles.noticeBadgeText, { color: theme.primary }]}>Admins only</Text>
                               </View>
                             ) : null}
+                            {notice.imageUrl ? (
+                              <View
+                                style={[styles.noticeMediaBadge, { backgroundColor: `${theme.primary}15` }]}
+                                accessible
+                                accessibilityLabel="Has poster image"
+                              >
+                                <ImageIcon size={14} color={theme.primary} />
+                              </View>
+                            ) : null}
                             {notice.audioUrl ? (
-                              <View style={[styles.noticeAudioBadge, { backgroundColor: `${theme.primary}15` }]}> 
+                              <View
+                                style={[styles.noticeMediaBadge, { backgroundColor: `${theme.primary}15` }]}
+                                accessible
+                                accessibilityLabel="Has audio"
+                              >
                                 <Music size={14} color={theme.primary} />
                               </View>
                             ) : null}
@@ -2143,6 +2270,22 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                       </TouchableOpacity>
                     );
                   })
+                ) : activeNoticeFilter !== 'all' ? (
+                  <View style={styles.emptyState}>
+                    <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>
+                      No notices match this filter
+                    </Text>
+                    <Text style={[styles.emptyStateSubtext, { color: theme.textSecondary }]}>
+                      Filter: {activeNoticeFilterLabel}
+                    </Text>
+                    <TouchableOpacity
+                      style={[styles.noticeFilterClear, { borderColor: theme.border }]}
+                      onPress={() => setNoticeFilter('all')}
+                      accessibilityRole="button"
+                    >
+                      <Text style={[styles.noticeFilterClearText, { color: theme.primary }]}>Show all notices</Text>
+                    </TouchableOpacity>
+                  </View>
                 ) : (
                   <View style={styles.emptyState}>
                     <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>
@@ -2153,7 +2296,37 @@ const NoticeModal: React.FC<NoticeModalProps> = ({ visible, onClose }) => {
                     </Text>
                   </View>
                 )}
+
+                {!loading && noticesToDisplay.length > 0 ? (
+                  <View style={styles.noticeListFooter}>
+                    {noticeFeed.loadingMore ? (
+                      <ActivityIndicator size="small" color={theme.primary} />
+                    ) : noticeFeed.loadMoreError ? (
+                      <>
+                        <Text style={[styles.noticeListFooterText, { color: theme.textSecondary }]}>
+                          Couldn&apos;t load more notices
+                        </Text>
+                        <TouchableOpacity
+                          style={[styles.noticeFilterClear, { borderColor: theme.border }]}
+                          onPress={() => void noticeFeed.loadMore()}
+                          accessibilityRole="button"
+                        >
+                          <Text style={[styles.noticeFilterClearText, { color: theme.primary }]}>Try again</Text>
+                        </TouchableOpacity>
+                      </>
+                    ) : noticeFeed.hasMore ? (
+                      <TouchableOpacity
+                        style={[styles.noticeFilterClear, { borderColor: theme.border }]}
+                        onPress={() => void noticeFeed.loadMore()}
+                        accessibilityRole="button"
+                      >
+                        <Text style={[styles.noticeFilterClearText, { color: theme.primary }]}>Load more</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                ) : null}
               </ScrollView>
+              </>
             )}
           </View>
         </View>
@@ -2394,6 +2567,53 @@ const styles = StyleSheet.create({
   },
 
   // Notices List Styles
+  noticeFilterScroll: {
+    flexGrow: 0,
+    flexShrink: 0,
+  },
+  noticeFilterRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 20,
+    paddingTop: 16,
+  },
+  noticeFilterChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  noticeFilterChipText: {
+    fontSize: 13,
+    fontFamily: 'Inter-SemiBold',
+  },
+  noticeFilterChipCount: {
+    fontSize: 12,
+    fontFamily: 'Inter-Medium',
+  },
+  noticeFilterClear: {
+    marginTop: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  noticeFilterClearText: {
+    fontSize: 14,
+    fontFamily: 'Inter-SemiBold',
+  },
+  noticeListFooter: {
+    alignItems: 'center',
+    paddingBottom: 8,
+    minHeight: 24,
+  },
+  noticeListFooterText: {
+    fontSize: 13,
+    fontFamily: 'Inter-Regular',
+  },
   noticesList: {
     flex: 1,
     padding: 20,
@@ -2435,7 +2655,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  noticeAudioBadge: {
+  // Small icon chip next to the title for an attached poster image or audio.
+  noticeMediaBadge: {
     marginLeft: 8,
     padding: 9,
     borderRadius: 8,

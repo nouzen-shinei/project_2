@@ -153,18 +153,63 @@ service cloud.firestore {
       allow delete: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
     }
 
-    // Notices (security-rules-hardening, Phase 3.5 extension): tenant-scoped. The
-    // only client notices query filters `where('tenantId','==',tenantId)`
-    // (useNotices), and creates/updates (post, view-count, reactions) are done by
-    // active members of the owning tenant. DELETES are backend-only
-    // (noticeBackendClient → Admin SDK, which enforces role/ownership and bypasses
-    // these rules), so client delete is denied. tenantId is immutable on update.
+    // Notices: tenant-scoped with per-role visibility (notice schemaVersion 2,
+    // see lib/noticeIndexFields.ts).
+    //   - Read: the caller's tenant role must be in `visibleToRoles` ("Everyone"
+    //     notices list all four roles, "Admins only" lists owner + admin). Every
+    //     client query filters `where('tenantId','==',…)` AND
+    //     `where('visibleToRoles','array-contains',<own role>)` (hooks/useNotices.ts),
+    //     which is how list and count queries satisfy this rule. Docs without
+    //     `visibleToRoles` (pre-backfill) are unreadable from the client.
+    //   - Create: posted as yourself, with your own role, source 'user', and
+    //     visible to yourself. Only owners/admins may restrict the audience.
+    //   - Update: members may only record views and reactions; owners/admins may
+    //     also edit the notice. Nobody can change tenantId/createdBy/createdAt/
+    //     source from the client.
+    //   - Delete: backend-only (noticeBackendClient → Admin SDK, which enforces
+    //     role/ownership and bypasses these rules).
     // Excluded from the permissive fallback.
     match /notices/{noticeId} {
-      allow read: if isActiveTenantMember(resource.data.tenantId) || isAdmin();
-      allow create: if isActiveTenantMember(request.resource.data.tenantId);
-      allow update: if (isActiveTenantMember(resource.data.tenantId) || isAdmin())
-        && request.resource.data.tenantId == resource.data.tenantId;
+      function noticeRole(tenantId) {
+        return tenantMembership(tenantId).data.role;
+      }
+
+      function canSeeNotice(data) {
+        return isActiveTenantMember(data.tenantId)
+          && noticeRole(data.tenantId) in data.visibleToRoles;
+      }
+
+      function isValidNewNotice(data) {
+        return isActiveTenantMember(data.tenantId)
+          && data.createdBy == request.auth.uid
+          && data.createdByRole == noticeRole(data.tenantId)
+          && data.source == 'user'
+          && data.visibleToRoles is list
+          && noticeRole(data.tenantId) in data.visibleToRoles
+          && data.roleRestricted is bool
+          && (data.roleRestricted
+                ? hasTenantAdminAccess(data.tenantId)
+                : data.visibleToRoles.hasAll(['owner', 'admin', 'staff', 'member']));
+      }
+
+      function noticeChangedKeys() {
+        return request.resource.data.diff(resource.data).affectedKeys();
+      }
+
+      allow read: if canSeeNotice(resource.data) || isAdmin();
+      allow create: if isValidNewNotice(request.resource.data);
+      allow update: if request.resource.data.tenantId == resource.data.tenantId
+        && (
+          isAdmin()
+          || (
+            canSeeNotice(resource.data)
+            && !noticeChangedKeys().hasAny(['tenantId', 'createdBy', 'createdAt', 'source'])
+            && (
+              noticeChangedKeys().hasOnly(['viewCount', 'userViews', 'reactions', 'reactionCount', 'updatedAt'])
+              || hasTenantAdminAccess(resource.data.tenantId)
+            )
+          )
+        );
       allow delete: if false;
     }
 

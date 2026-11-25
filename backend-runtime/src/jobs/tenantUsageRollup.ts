@@ -5,6 +5,7 @@ import type { firestore as FirestoreNS, database as DatabaseNS } from 'firebase-
 import type { PlanId, PlanLimits } from '../lib/planLimits';
 import { resolveEffectivePlanLimitsForTenant, type TenantQuotaOverrides } from '../lib/effectivePlanLimits';
 import { stripUndefinedDeep } from '../lib/stripUndefinedDeep';
+import { ADMIN_NOTICE_ROLES, deriveNoticeIndexFields } from '../lib/noticeIndexFields';
 import { STORAGE_TENANT_CATEGORIES } from '../lib/storageObjectRef';
 import { notifyUsageAlert } from '../usageAlertNotifier';
 
@@ -441,9 +442,14 @@ async function collectReminderBreakdown(db: Firestore, tenantId: string, month: 
 }
 
 async function countNoticePosts(db: Firestore, tenantId: string, month: MonthCursor): Promise<number> {
+  // The "notice posts" usage figure counts only notices people posted, not
+  // the backend's own Usage Monitor / Billing notices. (Recorded for the admin
+  // console's usage history; plan noticePosts limits aren't enforced.)
+  // Index: notices (tenantId ASC, source ASC, createdAt ASC).
   const query = db
     .collection('notices')
     .where('tenantId', '==', tenantId)
+    .where('source', '==', 'user')
     .where('createdAt', '>=', month.startTimestamp)
     .where('createdAt', '<', month.endTimestamp);
   return countQuery(query, `notices:${tenantId}:${month.id}`);
@@ -1032,20 +1038,26 @@ async function createUsageNoticeForAlert(
 
   const firestore = usageDocRef.firestore;
   const noticesRef = firestore.collection('notices');
+  // Usage alerts are for the people who manage the plan: owners and admins.
+  const targetTenantRoles = [...ADMIN_NOTICE_ROLES];
   const noticeRef = await noticesRef.add(stripUndefinedDeep({
     tenantId,
     title,
     content,
     priority,
     targetAudience: ['admins'],
+    targetTenantRoles,
+    ...deriveNoticeIndexFields({ targetTenantRoles, source: 'usage_monitor' }),
     isActive: true,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     createdBy: 'usage_rollup',
+    createdByRole: 'system',
     createdByName: 'Usage Monitor',
     createdByEmail: 'usage-monitor@system',
     viewCount: 0,
     userViews: {},
+    reactionCount: 0,
     metadata: {
       metric,
       ratio,

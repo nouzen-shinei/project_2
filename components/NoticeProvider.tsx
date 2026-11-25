@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode, useMemo } from 'react';
 import { AppState, AppStateStatus } from 'react-native';
-import { useNotices } from '../hooks/useNotices';
+import { useRecentNotices } from '../hooks/useNotices';
 import { useAuth } from '../hooks/useAuthUnified';
 import { Notice } from '../types/notice';
 import NoticePopup from './NoticePopup';
@@ -12,6 +12,9 @@ interface NoticeContextType {
 }
 
 const NoticeContext = createContext<NoticeContextType | undefined>(undefined);
+
+/** Notices newer than this can pop up on startup. */
+const PENDING_NOTICE_DAYS = 14;
 
 export const useNoticeContext = () => {
   const context = useContext(NoticeContext);
@@ -28,7 +31,20 @@ interface NoticeProviderProps {
 
 export const NoticeProvider: React.FC<NoticeProviderProps> = ({ children, enabled = true }) => {
   const { user } = useAuth();
-  const { getPendingNotices, markNoticeAsViewed, loading } = useNotices();
+  // Only the last 14 days are watched (bounded, live), not every notice.
+  const { notices: recentNotices, loading } = useRecentNotices({ enabled, days: PENDING_NOTICE_DAYS });
+
+  // Recent, active notices this user has seen fewer than twice.
+  const getPendingNotices = useCallback((): Notice[] => {
+    if (!user) return [];
+    const cutoff = Date.now() - PENDING_NOTICE_DAYS * 24 * 60 * 60 * 1000;
+    return recentNotices.filter((notice) => {
+      if (!notice.isActive) return false;
+      const createdAt = new Date(notice.createdAt).getTime();
+      const viewCount = notice.userViews?.[user.uid]?.count ?? 0;
+      return createdAt > cutoff && viewCount < 2;
+    });
+  }, [recentNotices, user]);
   const [pendingNotices, setPendingNotices] = useState<Notice[]>([]);
   const [showPopup, setShowPopup] = useState(false);
   const [hasCheckedOnStartup, setHasCheckedOnStartup] = useState(false);

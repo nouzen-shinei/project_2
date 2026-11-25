@@ -42,6 +42,7 @@
     "compare:coverage": "ts-node scripts/compareCoverageReports.ts",
     "migration:run": "ts-node scripts/runTenantMigrationPlan.ts",
     "delete:tenant-data": "ts-node scripts/deleteTenantData.ts",
+    "backfill:notices": "ts-node -O '{\"module\":\"commonjs\",\"moduleResolution\":\"node\"}' scripts/backfillNoticeIndexFields.ts",
     "upload:admin": "node scripts/uploadWithAdminSDK.js",
     "upload:admin-force": "node scripts/uploadWithAdminSDK.js --force",
     "version:bump:patch": "node scripts/bumpVersion.js patch",

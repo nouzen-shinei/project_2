@@ -1,4 +1,5 @@
 import type { TenantMembershipRole } from './tenant';
+import type { NoticeSource } from '../lib/noticeIndexFields';
 
 export interface Notice {
   id: string;
@@ -29,6 +30,18 @@ export interface Notice {
   // Reactions are stored as { [reactionType]: [userId, ...] }
   // Counts are derived from the array lengths.
   reactions?: Record<string, string[]>;
+  /** Total reactions (sum of the `reactions` arrays), kept in sync on toggle. */
+  reactionCount?: number;
+
+  // Denormalized query fields (schemaVersion 2, see lib/noticeIndexFields.ts).
+  // Optional here because v1 docs written before the backfill lack them.
+  visibleToRoles?: TenantMembershipRole[];
+  roleRestricted?: boolean;
+  hasImage?: boolean;
+  hasAudio?: boolean;
+  hasLink?: boolean;
+  source?: NoticeSource;
+  schemaVersion?: number;
 }
 
 export interface NoticeFormData {

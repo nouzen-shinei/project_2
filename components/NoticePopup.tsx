@@ -26,7 +26,7 @@ import {
   ChevronRight
 } from 'lucide-react-native';
 import { useTheme } from '../hooks/useTheme';
-import { useNotices } from '../hooks/useNotices';
+import { useNoticeActions } from '../hooks/useNotices';
 import { useAuth } from '../hooks/useAuthUnified';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { Notice } from '../types/notice';
@@ -297,7 +297,7 @@ const NoticePopup: React.FC<NoticePopupProps> = ({ visible, onClose, notices }) 
   const { theme } = useTheme();
   const { user } = useAuth();
   const { activeTenant } = useTenant();
-  const { markNoticeAsViewed, toggleNoticeReaction } = useNotices();
+  const { markNoticeAsViewed, toggleNoticeReaction } = useNoticeActions();
   const { isOnline } = useNetworkStatus();
   const [currentIndex, setCurrentIndex] = useState(0);
   const [screenData, setScreenData] = useState(Dimensions.get('window'));

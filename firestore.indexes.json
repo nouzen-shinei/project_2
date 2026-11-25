@@ -314,6 +314,159 @@
       "density": "SPARSE_ALL"
     },
     {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "visibleToRoles",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "visibleToRoles",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "priority",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "visibleToRoles",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "createdBy",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "visibleToRoles",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "hasImage",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "visibleToRoles",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "hasAudio",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "visibleToRoles",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "roleRestricted",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "tenantId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "source",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
       "collectionGroup": "tenantCodes",
       "queryScope": "COLLECTION",
       "fields": [
@@ -1269,6 +1422,30 @@
     }
   ],
   "fieldOverrides": [
+    {
+      "collectionGroup": "notices",
+      "fieldPath": "content",
+      "ttl": false,
+      "indexes": []
+    },
+    {
+      "collectionGroup": "notices",
+      "fieldPath": "userViews",
+      "ttl": false,
+      "indexes": []
+    },
+    {
+      "collectionGroup": "notices",
+      "fieldPath": "reactions",
+      "ttl": false,
+      "indexes": []
+    },
+    {
+      "collectionGroup": "notices",
+      "fieldPath": "metadata",
+      "ttl": false,
+      "indexes": []
+    },
     {
       "collectionGroup": "fees",
       "fieldPath": "amount",

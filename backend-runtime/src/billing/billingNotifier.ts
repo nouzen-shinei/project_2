@@ -8,6 +8,7 @@ import {
   sendExpoMessages,
 } from '../pushUtils';
 import { sendBillingEventEmails } from '../tenantNotificationEmail';
+import { deriveNoticeIndexFields } from '../lib/noticeIndexFields';
 
 type FirestoreLike = ReturnType<typeof getFirestore>;
 
@@ -299,6 +300,8 @@ async function createBillingNotice(db: FirestoreLike, params: {
   dedupeKey?: string;
 }): Promise<string> {
   const notices = db.collection('notices');
+  // Query/visibility fields the app and security rules rely on.
+  const indexFields = deriveNoticeIndexFields({ targetTenantRoles: params.targetTenantRoles, source: 'billing' });
 
   if (!params.dedupeKey) {
     const ref = await notices.add({
@@ -308,6 +311,8 @@ async function createBillingNotice(db: FirestoreLike, params: {
       priority: params.priority,
       targetAudience: ['all'],
       targetTenantRoles: params.targetTenantRoles,
+      ...indexFields,
+      reactionCount: 0,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdBy: 'system',
@@ -340,6 +345,7 @@ async function createBillingNotice(db: FirestoreLike, params: {
           priority: params.priority,
           targetAudience: ['all'],
           targetTenantRoles: params.targetTenantRoles,
+          ...indexFields,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           isActive: true,
         },
@@ -355,6 +361,8 @@ async function createBillingNotice(db: FirestoreLike, params: {
       priority: params.priority,
       targetAudience: ['all'],
       targetTenantRoles: params.targetTenantRoles,
+      ...indexFields,
+      reactionCount: 0,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       createdBy: 'system',

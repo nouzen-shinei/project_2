@@ -19,7 +19,7 @@ import useStudents from '../../hooks/useStudents';
 import useFees from '../../hooks/useFees';
 import { useReminderHistory } from '../../hooks/useReminderHistory';
 import { useAuth } from '../../hooks/useAuthUnified';
-import { useNotices } from '../../hooks/useNotices';
+import { useNoticeCounts } from '../../hooks/useNotices';
 import type { Student } from '../../types';
 import { useTheme } from '../../hooks/useTheme';
 import { notificationService } from '../../services/notificationService';
@@ -34,6 +34,9 @@ import { useSharedTopPadding } from '@/hooks/useSharedTopPadding';
 import { useTenant } from '../../hooks/useTenantContext';
 import UsageAlertInlineBanner from '@/components/UsageAlertInlineBanner';
 import { useActiveUsageAlerts } from '@/hooks/useActiveUsageAlerts';
+import type { NoticeFilter } from '../../lib/noticeFilters';
+
+const HOME_NOTICE_COUNT_FILTERS: readonly NoticeFilter[] = ['all'];
 
 export default function Dashboard() {
   const insets = useSafeAreaInsets();
@@ -47,7 +50,12 @@ export default function Dashboard() {
   // NOTE: the dashboard uses the hook's `loading` for section skeletons and its
   // `refresh` for pull-to-refresh, so autoload stays on here (fees.tsx opts out).
   const { loading: reminderLoading, getRecentReminders, refresh: refreshReminders, canViewAllReminders } = useReminderHistory();
-  const { notices } = useNotices();
+  // Badge count from a Firestore count query (no notice downloads).
+  const { counts: noticeCounts, refresh: refreshNoticeCounts } = useNoticeCounts({
+    filters: HOME_NOTICE_COUNT_FILTERS,
+    enabled: true,
+  });
+  const noticeCount = noticeCounts.all ?? 0;
   const { activeTenant, refreshTenants } = useTenant();
   const tenantId = activeTenant?.id;
 
@@ -762,13 +770,15 @@ export default function Dashboard() {
   const onRefresh = async () => {
     try {
       setRefreshing(true);
-      // Refresh reminder history and recent reminders; students/fees/notices are live via snapshots
+      // Refresh reminder history, recent reminders and the notice badge count;
+      // students/fees are live via snapshots.
       await Promise.all([
         (async () => {
           try { await refreshReminders?.(); } catch {}
         })(),
         loadRecentReminders(),
         loadTodayReminderStats(),
+        refreshNoticeCounts(true),
       ]);
       // Recompute activities after data refresh
       loadRecentActivities();
@@ -840,9 +850,9 @@ export default function Dashboard() {
             onPress={() => setShowNoticeModal(true)}
           >
             <FileText size={24} color={theme.textSecondary} />
-            {notices.length > 0 && (
+            {noticeCount > 0 && (
               <View style={[styles.noticeBadge, { backgroundColor: theme.error }]}>
-                <Text allowFontScaling={false} style={styles.noticeBadgeText}>{notices.length > 99 ? '99+' : notices.length.toString()}</Text>
+                <Text allowFontScaling={false} style={styles.noticeBadgeText}>{noticeCount > 99 ? '99+' : noticeCount.toString()}</Text>
               </View>
             )}
           </TouchableOpacity>
